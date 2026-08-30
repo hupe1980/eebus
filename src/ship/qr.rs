@@ -239,6 +239,18 @@ impl ShipQr {
             out.push_str(secret);
             out.push(';');
         }
+        // Keys from a later version of the grammar go back out after the ones this
+        // version knows: `SRIP-310/15` has a reader skip them rather than reject them,
+        // which is only forward compatibility if a reader that re-emits keeps them.
+        for (key, value) in &self.unknown {
+            if !is_representable(key, value) {
+                continue;
+            }
+            out.push_str(key);
+            out.push(':');
+            out.push_str(value);
+            out.push(';');
+        }
         out.push_str("ENDSHIP;");
         out
     }
@@ -348,6 +360,48 @@ impl fmt::Display for ShipQr {
     }
 }
 
+/// The keys this version routes to a field of its own.
+///
+/// Only used to keep [`ShipQr::unknown`] from carrying one: the parser never puts a known
+/// key there, but the field is public and an entry that shadows a known key would come
+/// back as something else entirely.
+const KNOWN_KEYS: &[&str] = &[
+    "SKI",
+    "BSKI",
+    "B2SKI",
+    "ID",
+    "PIN",
+    "BRAND",
+    "TYPE",
+    "MODEL",
+    "SERIAL",
+    "PKEY",
+    "PBKEY",
+    "PB2KEY",
+    "CERTURL",
+    "CERTBURL",
+    "CERTB2URL",
+    "FPH256",
+    "SPSEC",
+    "CAT",
+    "NOMINALPOWER",
+];
+
+/// Whether `key:value` survives being written into a payload and read back.
+///
+/// The grammar has no escape, so a pair that would change meaning is dropped rather than
+/// allowed to corrupt the fields around it: `;` ends a field and the first `:` ends a
+/// key, and both ends of a field are trimmed on the way in. Everything the parser itself
+/// produces satisfies this, which is what makes the round trip total.
+fn is_representable(key: &str, value: &str) -> bool {
+    !key.contains([';', ':'])
+        && !value.contains(';')
+        && !key.starts_with(char::is_whitespace)
+        && !value.starts_with(char::is_whitespace)
+        && !value.ends_with(char::is_whitespace)
+        && !KNOWN_KEYS.contains(&key)
+}
+
 /// Inserts a space every four characters, the form `SRIP-310/9` prescribes for the SKI
 /// and the PIN so that a person can read them back.
 fn group_in_fours(value: &str) -> String {
@@ -374,6 +428,85 @@ mod tests {
                            PIN:5555 AAAA FF;ID:i:12345_u:123abc456def;BRAND:ExampleBrand;\
                            TYPE:Heatpump;MODEL:E1234;SERIAL:123abc456def;CAT:4;\
                            NOMINALPOWER:0,11000;ENDSHIP;";
+
+    const SKI: &str = "SKI:5555AAAAFFFF1111CCCC3333EEEEDDDD99992222";
+
+    /// `SRIP-310/15`: a key from a later version of the grammar is skipped on the way in
+    /// and kept on the way out. Dropping it would make a re-encoded code lossy.
+    #[test]
+    fn srip_310_15_unknown_keys_survive_a_round_trip() {
+        let text = alloc::format!("SHIP;{SKI};NEWKEY:whatever;BRAND:Example;ENDSHIP;");
+        let qr: ShipQr = text.parse().expect("parses");
+        assert_eq!(qr.unknown, [("NEWKEY".to_owned(), "whatever".to_owned())]);
+
+        let written = qr.to_payload();
+        assert!(written.contains("NEWKEY:whatever;"), "{written}");
+        assert_eq!(written.parse::<ShipQr>().expect("re-parses"), qr);
+    }
+
+    /// The shape `cargo fuzz` found: unknown values holding bytes that are neither
+    /// printable nor whitespace, and a key that happens to end in a known one.
+    #[test]
+    fn unknown_values_may_hold_anything_the_grammar_permits() {
+        let text = "SHIP;SKI:5555AAAAFFFF1111CCCC3333EEEEDDDD99992222;\
+                    %:\u{0}\u{0}\n$;xxSKI:FFFF\n\nFF\u{0};ENDSHIP;";
+        let qr: ShipQr = text.parse().expect("parses");
+        assert_eq!(qr.unknown.len(), 2);
+        // A leading newline is trimmed on the way in, so what is stored round trips.
+        assert_eq!(qr.unknown[0], ("%".to_owned(), "\u{0}\u{0}\n$".to_owned()));
+        assert_eq!(
+            qr.unknown[1],
+            ("xxSKI".to_owned(), "FFFF\n\nFF\u{0}".to_owned())
+        );
+        assert_eq!(qr.to_payload().parse::<ShipQr>().expect("re-parses"), qr);
+    }
+
+    /// A pair the grammar cannot express is dropped rather than left to corrupt the
+    /// fields around it — there is no escape for `;` or for the `:` that ends a key.
+    #[test]
+    fn an_inexpressible_unknown_key_is_left_out() {
+        let mut qr = ShipQr::new(
+            "5555AAAAFFFF1111CCCC3333EEEEDDDD99992222".parse().unwrap(),
+            ShipId::new("12345", "HEMS-1"),
+        );
+        qr.unknown = alloc::vec![
+            ("A;B".to_owned(), "x".to_owned()),
+            ("A:B".to_owned(), "x".to_owned()),
+            ("A".to_owned(), "x;y".to_owned()),
+            (" A".to_owned(), "x".to_owned()),
+            ("A".to_owned(), " x".to_owned()),
+            ("A".to_owned(), "x ".to_owned()),
+            // A known key would come back as that field rather than as an unknown one.
+            ("BRAND".to_owned(), "x".to_owned()),
+        ];
+        let written = qr.to_payload();
+        let back: ShipQr = written.parse().expect("re-parses");
+        assert!(back.unknown.is_empty(), "{written}");
+        assert_eq!(back.brand, None, "no key was smuggled into a known field");
+        assert_eq!(back.ski, qr.ski);
+    }
+
+    /// [`KNOWN_KEYS`] is a second list of what the parser routes, so it can drift from
+    /// the parser. Every entry has to be one the parser really does claim.
+    #[test]
+    fn every_known_key_is_one_the_parser_claims() {
+        for key in KNOWN_KEYS {
+            // A value each key accepts: the numeric ones are picky, the rest take text.
+            let value = match *key {
+                "CAT" => "4",
+                "NOMINALPOWER" => "0,11000",
+                "ID" => "i:12345_u:1",
+                "SKI" | "BSKI" | "B2SKI" => "5555AAAAFFFF1111CCCC3333EEEEDDDD99992222",
+                _ => "x",
+            };
+            let text = alloc::format!("SHIP;{SKI};{key}:{value};ENDSHIP;");
+            let qr: ShipQr = text.parse().unwrap_or_else(|e| panic!("{key}: {e}"));
+            assert!(
+                qr.unknown.is_empty(),
+                "{key} is listed as known but the parser left it in `unknown`"
+            );
+        }
+    }
 
     #[test]
     fn parses_the_specification_example() {
