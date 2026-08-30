@@ -111,11 +111,11 @@ pub fn detailed_discovery(device: &LocalDevice) -> NodeManagementDetailedDiscove
 /// send is ignored on receipt.
 pub fn use_case_data(
     device: &LocalDevice,
-    entries: &[(Vec<u32>, u32, &UseCaseDescriptor)],
+    entries: &[(Vec<u32>, u32, &UseCaseDescriptor, Vec<u32>)],
 ) -> NodeManagementUseCaseData {
     let mut information: Vec<NodeManagementUseCaseDataUseCaseInformation> = Vec::new();
 
-    for (entity, feature, descriptor) in entries {
+    for (entity, feature, descriptor, scenarios) in entries {
         let address = device.address_of(entity, *feature);
         let support = NodeManagementUseCaseDataUseCaseInformationUseCaseSupport {
             use_case_name: Some(descriptor.use_case_name()),
@@ -123,8 +123,9 @@ pub fn use_case_data(
             use_case_available: matches!(descriptor.role, crate::usecases::ActorRole::Client)
                 .then_some(true),
             scenario_support: Some(
-                descriptor
-                    .supported_scenarios()
+                scenarios
+                    .iter()
+                    .copied()
                     .map(UseCaseScenarioSupport)
                     .collect(),
             ),
@@ -534,7 +535,15 @@ mod tests {
     #[test]
     fn a_server_actor_does_not_send_use_case_available() {
         let device = heat_pump();
-        let data = use_case_data(&device, &[(alloc::vec![1], 1, &lpc::CONTROLLABLE_SYSTEM)]);
+        let data = use_case_data(
+            &device,
+            &[(
+                alloc::vec![1],
+                1,
+                &lpc::CONTROLLABLE_SYSTEM,
+                lpc::CONTROLLABLE_SYSTEM.required_scenarios().collect(),
+            )],
+        );
 
         let information = &data.use_case_information.as_ref().unwrap()[0];
         assert_eq!(
@@ -569,7 +578,15 @@ mod tests {
         device
             .add_entity(LocalEntity::new([1], EntityType::GridGuard))
             .unwrap();
-        let data = use_case_data(&device, &[(alloc::vec![1], 1, &lpc::ENERGY_GUARD)]);
+        let data = use_case_data(
+            &device,
+            &[(
+                alloc::vec![1],
+                1,
+                &lpc::ENERGY_GUARD,
+                lpc::ENERGY_GUARD.required_scenarios().collect(),
+            )],
+        );
         let support = &data.use_case_information.as_ref().unwrap()[0]
             .use_case_support
             .as_ref()
@@ -584,7 +601,12 @@ mod tests {
         remote.apply_detailed_discovery(&detailed_discovery(&device));
         remote.apply_use_case_data(&use_case_data(
             &device,
-            &[(alloc::vec![1], 1, &lpc::CONTROLLABLE_SYSTEM)],
+            &[(
+                alloc::vec![1],
+                1,
+                &lpc::CONTROLLABLE_SYSTEM,
+                lpc::CONTROLLABLE_SYSTEM.required_scenarios().collect(),
+            )],
         ));
 
         let use_case = remote
@@ -615,8 +637,18 @@ mod tests {
         let data = use_case_data(
             &device,
             &[
-                (alloc::vec![1], 1, &lpc::ENERGY_GUARD),
-                (alloc::vec![1], 1, &lpc::ENERGY_GUARD),
+                (
+                    alloc::vec![1],
+                    1,
+                    &lpc::ENERGY_GUARD,
+                    lpc::ENERGY_GUARD.required_scenarios().collect(),
+                ),
+                (
+                    alloc::vec![1],
+                    1,
+                    &lpc::ENERGY_GUARD,
+                    lpc::ENERGY_GUARD.required_scenarios().collect(),
+                ),
             ],
         );
         let information = data.use_case_information.as_ref().unwrap();

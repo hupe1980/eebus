@@ -153,7 +153,7 @@ struct Peer {
 pub struct Engine {
     device: LocalDevice,
     relations: Relations,
-    use_cases: Vec<(Vec<u32>, u32, &'static UseCaseDescriptor)>,
+    use_cases: Vec<(Vec<u32>, u32, &'static UseCaseDescriptor, Vec<u32>)>,
     counters: MsgCounterSource,
     peers: Vec<Peer>,
     outbox: VecDeque<Datagram>,
@@ -182,14 +182,42 @@ impl Engine {
         }
     }
 
-    /// Declares that an entity plays a use case, for use-case discovery.
+    /// Declares that an entity plays a use case, implementing what it requires.
+    ///
+    /// The scenarios announced are the ones the specification does not leave optional. A
+    /// device that implements optional scenarios too has to say so — see
+    /// [`add_use_case_scenarios`](Self::add_use_case_scenarios) — because a peer decides
+    /// what to ask for from this list, and will not look for what is not in it.
     pub fn add_use_case(
         &mut self,
         entity: impl Into<Vec<u32>>,
         feature: u32,
         descriptor: &'static UseCaseDescriptor,
     ) {
-        self.use_cases.push((entity.into(), feature, descriptor));
+        let scenarios = descriptor.required_scenarios().collect();
+        self.use_cases
+            .push((entity.into(), feature, descriptor, scenarios));
+    }
+
+    /// Declares that an entity plays a use case, implementing exactly these scenarios.
+    ///
+    /// Numbers the use case does not define for this actor are dropped rather than
+    /// announced: `useCaseScenarioSupport` is what a peer plans against, and a scenario
+    /// that does not exist would send it looking for functions nobody serves.
+    pub fn add_use_case_scenarios(
+        &mut self,
+        entity: impl Into<Vec<u32>>,
+        feature: u32,
+        descriptor: &'static UseCaseDescriptor,
+        scenarios: &[u32],
+    ) {
+        let scenarios = scenarios
+            .iter()
+            .copied()
+            .filter(|s| descriptor.defines_scenario(*s))
+            .collect();
+        self.use_cases
+            .push((entity.into(), feature, descriptor, scenarios));
     }
 
     /// The local device.
@@ -981,7 +1009,9 @@ impl Engine {
                 let entries: Vec<_> = self
                     .use_cases
                     .iter()
-                    .map(|(entity, feature, descriptor)| (entity.clone(), *feature, *descriptor))
+                    .map(|(entity, feature, descriptor, scenarios)| {
+                        (entity.clone(), *feature, *descriptor, scenarios.clone())
+                    })
                     .collect();
                 Some(CmdData::NodeManagementUseCaseData(use_case_data(
                     &self.device,

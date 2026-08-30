@@ -133,6 +133,9 @@ pub struct UseCaseDescriptor {
     /// The `useCaseDocumentSubRevision`, which the same section makes mandatory.
     pub document_sub_revision: &'static str,
     /// The entity types this actor may live on.
+    ///
+    /// Empty means the specification places no restriction — some client actors, such as
+    /// MPC's Monitoring Appliance, may sit behind any entity type.
     pub entity_types: &'static [EntityType],
     /// The actor on the other side of the use case.
     pub counterpart: &'static str,
@@ -141,12 +144,35 @@ pub struct UseCaseDescriptor {
 }
 
 impl UseCaseDescriptor {
-    /// The scenario numbers this actor supports, for `useCaseScenarioSupport`.
-    pub fn supported_scenarios(&self) -> impl Iterator<Item = u32> + '_ {
+    /// Whether this actor may live on an entity of the given type.
+    ///
+    /// An empty [`entity_types`](Self::entity_types) permits any, which is what a
+    /// specification that places no restriction means.
+    pub fn permits_entity(&self, entity: &EntityType) -> bool {
+        self.entity_types.is_empty() || self.entity_types.contains(entity)
+    }
+
+    /// The scenarios this actor has to implement: everything not marked optional.
+    ///
+    /// This is what the *specification* requires, not what a device has chosen to build.
+    /// A device that implements optional scenarios as well announces them explicitly —
+    /// see [`all_scenarios`](Self::all_scenarios) and
+    /// `Engine::add_use_case_scenarios`.
+    pub fn required_scenarios(&self) -> impl Iterator<Item = u32> + '_ {
         self.scenarios
             .iter()
             .filter(|s| s.support != Support::Optional)
             .map(|s| s.number)
+    }
+
+    /// Every scenario the use case defines for this actor.
+    pub fn all_scenarios(&self) -> impl Iterator<Item = u32> + '_ {
+        self.scenarios.iter().map(|s| s.number)
+    }
+
+    /// Whether the use case defines a scenario with this number for this actor.
+    pub fn defines_scenario(&self, scenario: u32) -> bool {
+        self.scenarios.iter().any(|s| s.number == scenario)
     }
 
     /// The features this actor has to expose, deduplicated across scenarios.
@@ -231,8 +257,7 @@ mod tests {
 
     #[test]
     fn a_descriptor_lists_its_mandatory_scenarios() {
-        let scenarios: alloc::vec::Vec<_> =
-            lpc::CONTROLLABLE_SYSTEM.supported_scenarios().collect();
+        let scenarios: alloc::vec::Vec<_> = lpc::CONTROLLABLE_SYSTEM.required_scenarios().collect();
         assert_eq!(scenarios, [1, 2, 3, 4]);
     }
 

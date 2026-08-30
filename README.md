@@ -11,10 +11,11 @@ on.
 > specification's own examples, the handshake, framing, discovery records, QR codes and
 > pairing service are tested against the official test specification, and the SPINE
 > engine carries discovery, bindings, subscriptions, reads, writes and notifications
-> between two nodes. Limitation of Power Consumption and Production both run over it end
-> to end — `cargo run --example grid_limit`. TLS, mDNS-SD and a Tokio runtime adapter are what
-> stand between this and a device on a real network. Nothing is published to crates.io
-> yet, and the API will change.
+> between two nodes. All four use cases certifiable since July 2026 — LPC, LPP, MPC and
+> MGCP — run over it end to end; `cargo run --example grid_limit` plays out the §14a
+> exchange. TLS, mDNS-SD and a Tokio runtime adapter are what stand between this and a
+> device on a real network. Nothing is published to crates.io yet, and the API will
+> change.
 
 ## What EEBUS is, and why this exists
 
@@ -96,6 +97,29 @@ The reference implementations duplicate the two. Here a fix to one is a fix to b
 the only thing the direction changes — the `limitDirection` on the wire and the name of
 the failsafe configuration key — is the thing the tests check.
 
+The two monitoring use cases share their implementation the same way, for the same
+reason: MPC and MGCP publish identical data and differ only in whether the energies are
+named from the appliance's side or the grid's.
+
+**A measurement keeps its meaning.** A `measurementListData` on the wire is identifiers
+and numbers — `{"measurementId": 3, "value": {"number": 2300}}` — and what it means is in
+two other functions read at commissioning. Resolve them once and an application sees the
+quantity, not the number it has to remember the meaning of:
+
+```rust
+readings.describe(&measurement_descriptions);   // what each id measures
+readings.describe(&parameter_descriptions);     // and on which phases
+readings.apply(&notification);
+
+readings.total_power();                                        // Some(2300.0) watts
+readings.value(&Measurand::on(Quantity::Current, Phase::A));   // Some(3.5) amperes
+```
+
+A value whose description never arrived is dropped rather than guessed at, and one the
+unit flagged as an error is not handed back as a number — [MPC-003] says its content is
+to be ignored, and an implementation that keeps serving the last good reading through a
+sensor failure is reporting something it knows to be false.
+
 **Illegal states are unrepresentable.** A SPINE command carries a payload *choice*, so
 "two payloads in one command" cannot be built; other implementations model it as two
 hundred optional fields. Identifiers are distinct types, so a `LoadControlLimitId` can
@@ -166,7 +190,9 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | TLS 1.2, mutual auth, certificates | ⬜ next | SHIP §9, §12 |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
 | Tokio runtime: sockets, timers, connection manager | ⬜ next | |
-| MPC, MGCP | ⬜ | UC TS, on the engine above |
+| MPC/MGCP measurements, descriptions, constraints | ✅ | MPC/MGCP UC TS §3.2.2 |
+| MPC/MGCP over the wire | ✅ | MPC scenarios 1–5, MGCP 2–7 |
+| MGCP PV curtailment factor (scenario 1) | ⬜ | MGCP UC TS §2.4.1 |
 | E-mobility, inverter, HVAC use cases | ⬜ | |
 
 Deliberate departures from the reference implementation, each driven by the

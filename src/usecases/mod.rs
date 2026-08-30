@@ -8,14 +8,21 @@
 //!
 //! Each use case is a module holding its [`UseCaseDescriptor`]s, one per actor, which is
 //! what a device publishes in `nodeManagementUseCaseData` and what a peer reads to find
-//! out what it is talking to. Where two use cases share their machinery — [`lpc`] and
-//! [`lpp`] are the same state machine pointed in opposite directions — that machinery
-//! lives in a module of its own ([`limitation`]) and the use-case modules carry only
-//! what distinguishes them.
+//! out what it is talking to. Where two use cases share their machinery, that machinery
+//! lives in a module of its own and the use-case modules carry only what distinguishes
+//! them — which, for both of the pairs here, is a handful of lines:
+//!
+//! * [`limitation`] serves [`lpc`] and [`lpp`], the same state machine pointed in
+//!   opposite directions.
+//! * [`monitoring`] serves [`mpc`] and [`mgcp`], the same measurements named from the
+//!   appliance's side or the grid's.
 
 pub mod descriptor;
 pub mod limitation;
 pub mod lpc;
 pub mod lpp;
+pub mod mgcp;
+pub mod monitoring;
+pub mod mpc;
 
 pub use descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};

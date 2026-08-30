@@ -65,8 +65,9 @@
 //! # Status
 //!
 //! Under construction, and not yet published. The model, codec, SHIP handshake, SPINE
-//! engine and the two limitation use cases — LPC and LPP — are implemented and tested;
-//! TLS, mDNS-SD and a runtime adapter are the remaining milestones. The API will change.
+//! engine and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP —
+//! are implemented and tested; TLS, mDNS-SD and a runtime adapter are the remaining
+//! milestones. The API will change.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
