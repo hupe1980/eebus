@@ -310,7 +310,7 @@ macro_rules! eebus_enum {
 ///
 /// The schema declares these as `xs:union` of an enumeration and `EnumExtendType`, the
 /// latter matching vendor-defined values of the form `_i:<PEN>_<name>`. Unknown values
-/// are preserved verbatim in [`Other`](Self::Other) so that they survive a
+/// are preserved verbatim in the generated `Other` variant so that they survive a
 /// decode/encode round trip instead of being dropped.
 #[macro_export]
 macro_rules! eebus_enum_ext {

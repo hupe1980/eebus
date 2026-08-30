@@ -2,7 +2,8 @@
 //!
 //! Every type here is generated from the XML Schemas shipped with
 //! `EEBus_SPINE_V1.3.0_Final.zip` by `cargo xtask codegen`, except for the two command
-//! frame types in [`payload`], which carry `xs:choice` groups and are written by hand.
+//! frame types [`Cmd`] and [`Filter`], which carry `xs:choice` groups and are written by
+//! hand.
 //!
 //! # Shape of the model
 //!
