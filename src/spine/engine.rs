@@ -16,15 +16,20 @@
 //!   classifier table of §5.2.4.
 //! * **Notification.** A local change is pushed to every subscriber.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use crate::model::rfe::RestrictError;
 use crate::model::{
-    AddressDevice, Cmd, CmdClassifier, CmdData, Datagram, FeatureAddress, Filter, Function, Header,
-    MsgCounter, NodeManagementBindingRequestCall, NodeManagementSubscriptionRequestCall, Payload,
-    ResultData, SpecificationVersion,
+    AddressDevice, BindingId, Cmd, CmdClassifier, CmdData, Datagram, FeatureAddress, Filter,
+    FilterSelectors, Function, Header, MsgCounter, NodeManagementBindingData,
+    NodeManagementBindingDataBindingEntry, NodeManagementBindingRequestCall,
+    NodeManagementSubscriptionData, NodeManagementSubscriptionDataSubscriptionEntry,
+    NodeManagementSubscriptionRequestCall, Payload, ResultData, SpecificationVersion,
+    SubscriptionId,
 };
 
 use super::ack::{DEFAULT_MAX_RESPONSE_DELAY, ErrorNumber, owes_ack};
@@ -62,20 +67,10 @@ pub enum SpineEvent {
     /// Nothing has been stored and nothing has been answered. Call
     /// [`Engine::accept_write`] or [`Engine::reject_write`] with the token; until then
     /// the peer is waiting, and the maximum response delay of ten seconds is running.
-    WriteRequested {
-        /// Identifies this write when resolving it.
-        token: WriteToken,
-        /// The feature that was written.
-        feature: FeatureAddress,
-        /// The peer that wrote it.
-        from: FeatureAddress,
-        /// What the peer sent.
-        data: CmdData,
-        /// Whether the write is partial.
-        partial: bool,
-        /// Whether the write is a delete.
-        delete: bool,
-    },
+    ///
+    /// Boxed because it is by far the largest thing an event can carry, and every event
+    /// queued behind it would otherwise be sized for it.
+    WriteRequested(Box<WriteRequest>),
     /// A peer notified data this device is subscribed to.
     DataNotified {
         /// The feature the data came from.
@@ -97,6 +92,38 @@ pub enum SpineEvent {
         /// What the peer reported.
         error: ErrorNumber,
     },
+    /// A peer was granted a binding on one of this device's features.
+    ///
+    /// The LPC implementation guide §3.8 turns this into a decision point: an energy
+    /// manager may expose several entities, and which of them is actually in control is
+    /// only settled once the bindings arrive.
+    BindingGranted {
+        /// The peer feature that asked.
+        client: FeatureAddress,
+        /// The local feature it may now write.
+        server: FeatureAddress,
+    },
+    /// A peer released a binding.
+    BindingReleased {
+        /// The peer feature that held it.
+        client: FeatureAddress,
+        /// The local feature it may no longer write.
+        server: FeatureAddress,
+    },
+    /// A peer was granted a subscription to one of this device's features.
+    SubscriptionGranted {
+        /// The peer feature that asked.
+        client: FeatureAddress,
+        /// The local feature it now watches.
+        server: FeatureAddress,
+    },
+    /// A peer released a subscription.
+    SubscriptionReleased {
+        /// The peer feature that held it.
+        client: FeatureAddress,
+        /// The local feature it no longer watches.
+        server: FeatureAddress,
+    },
     /// A request went unanswered for longer than the maximum response delay.
     ///
     /// The SPINE implementation guide §2.6.1 distinguishes this from a refusal: a
@@ -108,6 +135,45 @@ pub enum SpineEvent {
         /// Where it was sent.
         destination: FeatureAddress,
     },
+}
+
+/// A peer's write, waiting on the application's decision.
+///
+/// Carried by [`SpineEvent::WriteRequested`]. Resolve it with [`Engine::accept_write`] or
+/// [`Engine::reject_write`], naming the [`token`](Self::token).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WriteRequest {
+    /// Identifies this write when resolving it.
+    pub token: WriteToken,
+    /// The `msgCounter` of the write, which the acknowledgement will reference.
+    ///
+    /// Under §14a EnWG the pair — this counter and the answer that names it — is the
+    /// operator's evidence that a limit was received and applied (LPC implementation
+    /// guide §4.1.5), so an application that has to keep a record needs it here.
+    pub request: MsgCounter,
+    /// The feature that was written.
+    pub feature: FeatureAddress,
+    /// The peer that wrote it.
+    pub from: FeatureAddress,
+    /// What the peer sent, exactly as it arrived.
+    ///
+    /// This is the record of what was *asked for*, which under §14a EnWG is half of the
+    /// evidence, and it is what says *which* entries the write addresses. To decide what
+    /// those entries become, use [`resolved`](Self::resolved).
+    pub data: CmdData,
+    /// What the function would hold if this write were accepted: [`data`](Self::data)
+    /// merged into what is stored.
+    ///
+    /// A partial write carries only what changed and an omitted element means *unchanged*
+    /// (SPINE IG §3.3), so `data` alone does not describe the state the peer is asking
+    /// for — a limit update that adjusts only `value` leaves `isLimitActive` out, and
+    /// reading that as `false` turns a curtailment into a release back to full power.
+    /// Decide with both: `data` for the entries addressed, `resolved` for their values.
+    pub resolved: CmdData,
+    /// Whether the write is partial.
+    pub partial: bool,
+    /// Whether the write is a delete.
+    pub delete: bool,
 }
 
 /// Whether a command produced an answer now, or handed the decision to the application.
@@ -147,6 +213,14 @@ struct Peer {
     remote: RemoteDevice,
     counters: MsgCounterTracker,
 }
+
+/// How many peers one engine tracks.
+///
+/// A SPINE device on a home network talks to a handful of others; the cap exists because
+/// a peer's device address arrives in the header of every datagram, and a node that
+/// allocated an entry for each one it was told about would grow without bound on the word
+/// of whoever is on the wire. SHIP's own connection limit is ten.
+pub const MAX_PEERS: usize = 32;
 
 /// The SPINE engine of one device.
 #[derive(Debug)]
@@ -233,6 +307,20 @@ impl Engine {
     /// The bindings and subscriptions held.
     pub fn relations(&self) -> &Relations {
         &self.relations
+    }
+
+    /// Declares that these features belong to one use case and share a binding partner.
+    ///
+    /// See [`Relations::bind_together`]: it is what stops two energy managers each
+    /// winning one half of the pair LPC needs, after which neither can run the use case.
+    pub fn bind_features_together(&mut self, features: impl IntoIterator<Item = FeatureAddress>) {
+        self.relations.bind_together(features);
+    }
+
+    /// Replaces the binding policy, for a device whose features carry entries belonging
+    /// to several use cases with different controllers (LPC IG §3.5).
+    pub fn set_binding_policy(&mut self, policy: BindingPolicy) {
+        self.relations.set_policy(policy);
     }
 
     /// What this device knows about a peer.
@@ -492,6 +580,20 @@ impl Engine {
         self.outbox.push_back(datagram);
     }
 
+    /// Fills in the device part of a local address.
+    ///
+    /// A request may leave it out — the SPINE implementation guide §2.7 permits exactly
+    /// one message to do so, the opening detailed-discovery read — but a *response* may
+    /// not: the sender's own address is how the receiver knows whose data it is looking
+    /// at. Echoing the request's destination back unchanged loses that, and a peer that
+    /// bootstrapped without knowing our address would file the answer under nobody.
+    fn local_address(&self, addressed: &FeatureAddress) -> FeatureAddress {
+        FeatureAddress {
+            device: Some(self.device.address().clone()),
+            ..addressed.clone()
+        }
+    }
+
     fn header(
         &self,
         source: &FeatureAddress,
@@ -534,6 +636,43 @@ impl Engine {
         let Some(destination) = header.address_destination.as_ref() else {
             return false;
         };
+
+        // Implementation guide §2.5: a version string that does not match the pattern,
+        // or a major this implementation does not speak, is refused. `TC_SPINE_COMP_006`
+        // calls that the recommended behaviour — answering a datagram whose header
+        // cannot be trusted is how a peer ends up acting on a misread limit.
+        let version =
+            super::version::check(header.specification_version.as_ref().map(|v| v.as_str()));
+        if !version.is_acceptable() {
+            if owes_ack(classifier, true, ErrorNumber::General) {
+                self.send_result(source, destination, counter, ErrorNumber::General, now);
+            }
+            return false;
+        }
+
+        // §7.1.1.5: a datagram addressed to another device is not ours to serve.
+        // Enhanced-mode routing, where a node forwards on another's behalf, is not
+        // implemented, so `errorNumber` 5 — destination unreachable — is the truth.
+        if let Some(device) = &destination.device
+            && device != self.device.address()
+        {
+            let counter_ok = source.device.as_ref().is_none_or(|peer| {
+                self.peer_entry(peer)
+                    .counters
+                    .observe(counter)
+                    .is_acceptable()
+            });
+            if counter_ok && owes_ack(classifier, true, ErrorNumber::DestinationUnreachable) {
+                self.send_result(
+                    source,
+                    destination,
+                    counter,
+                    ErrorNumber::DestinationUnreachable,
+                    now,
+                );
+            }
+            return false;
+        }
 
         if let Some(device) = &source.device {
             let peer = self.peer_entry(device);
@@ -589,7 +728,7 @@ impl Engine {
                 CmdOutcome::Answer(self.handle_read(cmd, source, destination, counter, now))
             }
             CmdClassifier::Write => {
-                self.handle_write(cmd, source, destination, counter, ack_request)
+                self.handle_write(cmd, source, destination, counter, ack_request, now)
             }
             CmdClassifier::Call => CmdOutcome::Answer(self.handle_call(cmd, source)),
             CmdClassifier::Reply | CmdClassifier::Notify => {
@@ -625,39 +764,70 @@ impl Engine {
             return ErrorNumber::General;
         };
 
-        // A read carrying a filter asks for a partial reply. This node does not announce
-        // partial reads, so serving one would be answering a question that was not
-        // asked; §5.3.4 provides `errorNumber` 8 for exactly that.
-        if cmd.filter.iter().flatten().count() > 0 {
+        // §5.3.4.4: a read considers at most one filter. Two would have to be combined,
+        // and the specification does not say how, so the honest answer is number 8.
+        let mut filters = cmd.filter.iter().flatten();
+        let filter = filters.next();
+        if filters.next().is_some() {
             return ErrorNumber::RestrictedExchangeNotSupported;
         }
 
-        let data = if is_node_management(destination) {
-            self.node_management_data(&function)
-        } else {
-            let Some(feature) = self.device.resolve(destination) else {
-                return ErrorNumber::DestinationUnknown;
-            };
-            match feature.function(&function) {
-                None => return ErrorNumber::CommandNotSupported,
-                Some(entry) if !entry.operations.read => {
-                    return ErrorNumber::CommandNotSupported;
-                }
-                Some(entry) => entry.data.clone(),
+        // NodeManagement is resolved like any other feature — it *is* one — so a function
+        // it does not declare is refused rather than answered with an empty payload. Only
+        // its data differs: discovery, the use-case table and the two relation tables are
+        // computed rather than stored (§7.1.3, §7.3.2, §7.4.2, §7.5.3).
+        let Some(feature) = self.device.resolve(destination) else {
+            return ErrorNumber::DestinationUnknown;
+        };
+        let (stored, partial_offered) = match feature.function(&function) {
+            None => return ErrorNumber::CommandNotSupported,
+            Some(entry) if !entry.operations.read => {
+                return ErrorNumber::CommandNotSupported;
+            }
+            Some(entry) => {
+                let operations = entry.operations;
+                let stored = entry.data.clone();
+                let computed = if is_node_management(destination) {
+                    self.node_management_data(&function)
+                } else {
+                    None
+                };
+                (computed.or(stored), operations.read_partial)
             }
         };
 
-        let Some(data) = data else {
-            // The function exists but holds nothing yet. An empty payload of the right
-            // function is a truthful answer; an error would suggest it is unsupported.
-            return ErrorNumber::None;
+        // The function exists but holds nothing yet. An empty payload of the right
+        // function is a truthful answer, and it is an answer: a read left unanswered
+        // makes the peer wait out its whole response deadline for no reason.
+        let Some(data) = stored.or_else(|| CmdData::empty(function.as_str())) else {
+            return ErrorNumber::CommandNotSupported;
         };
 
+        let (data, partial) = match filter {
+            None => (data, false),
+            Some(filter) if !partial_offered => {
+                let _ = filter;
+                return ErrorNumber::RestrictedExchangeNotSupported;
+            }
+            Some(filter) => match restrict_for_read(&data, filter) {
+                Ok(data) => (data, true),
+                Err(error) => return error.error_number(),
+            },
+        };
+
+        let mut reply = Cmd::with_data(data);
+        if partial {
+            // §5.3.4.5: a partial reply says so, so the client knows the answer is a
+            // subset rather than the whole function.
+            reply = reply.with_filter(Filter::partial());
+        }
+
         let reply_counter = self.counters.next();
+        let reply_source = self.local_address(destination);
         self.send(
             Datagram {
                 header: Some(self.header(
-                    destination,
+                    &reply_source,
                     source,
                     reply_counter,
                     CmdClassifier::Reply,
@@ -665,7 +835,7 @@ impl Engine {
                     Some(counter),
                 )),
                 payload: Some(Payload {
-                    cmd: Some(vec![Cmd::with_data(data)]),
+                    cmd: Some(vec![reply]),
                 }),
             },
             None,
@@ -674,6 +844,7 @@ impl Engine {
         ErrorNumber::None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_write(
         &mut self,
         cmd: &Cmd,
@@ -681,6 +852,7 @@ impl Engine {
         destination: &FeatureAddress,
         counter: MsgCounter,
         ack_request: bool,
+        now: Duration,
     ) -> CmdOutcome {
         let Some(data) = cmd.data.clone() else {
             return CmdOutcome::Answer(ErrorNumber::General);
@@ -704,6 +876,7 @@ impl Engine {
         }
 
         if feature.write_approval() == WriteApproval::Deferred {
+            let resolved = resolve_write(feature.data(&function), &data, partial, delete);
             let token = WriteToken(self.next_token);
             self.next_token += 1;
             self.deferred.push(DeferredWrite {
@@ -716,14 +889,17 @@ impl Engine {
                 reference: counter,
                 ack_request,
             });
-            self.events.push_back(SpineEvent::WriteRequested {
-                token,
-                feature: destination.clone(),
-                from: source.clone(),
-                data,
-                partial,
-                delete,
-            });
+            self.events
+                .push_back(SpineEvent::WriteRequested(Box::new(WriteRequest {
+                    token,
+                    request: counter,
+                    feature: destination.clone(),
+                    from: source.clone(),
+                    data,
+                    resolved,
+                    partial,
+                    delete,
+                })));
             return CmdOutcome::Deferred;
         }
 
@@ -742,8 +918,13 @@ impl Engine {
                 self.events.push_back(SpineEvent::DataWritten {
                     feature: destination.clone(),
                     from: source.clone(),
-                    function,
+                    function: function.clone(),
                 });
+                // §7.4: a subscriber asked to be told when this feature's data changes,
+                // and a peer's write is a change. Without this a client that subscribed
+                // instead of polling — which the use-case implementation guide §3.2.2
+                // asks it to do — would never learn what the write did.
+                self.notify(destination, &function, now);
                 CmdOutcome::Answer(ErrorNumber::None)
             }
             Err(e) => CmdOutcome::Answer(e.error_number()),
@@ -753,10 +934,10 @@ impl Engine {
     /// Applies a deferred write and acknowledges it.
     ///
     /// ```ignore
-    /// SpineEvent::WriteRequested { token, data, .. } => {
-    ///     match use_case.decide(&data) {
-    ///         Accept => engine.accept_write(token, now),
-    ///         Reject => engine.reject_write(token, ErrorNumber::CommandRejected, now),
+    /// SpineEvent::WriteRequested(write) => {
+    ///     match use_case.decide(&write.resolved) {
+    ///         Accept => engine.accept_write(write.token, now),
+    ///         Reject => engine.reject_write(write.token, ErrorNumber::CommandRejected, now),
     ///     }
     /// }
     /// ```
@@ -776,8 +957,9 @@ impl Engine {
                 self.events.push_back(SpineEvent::DataWritten {
                     feature: write.feature.clone(),
                     from: write.peer.clone(),
-                    function,
+                    function: function.clone(),
                 });
+                self.notify(&write.feature, &function, now);
                 ErrorNumber::None
             }
             Err(e) => e.error_number(),
@@ -850,7 +1032,13 @@ impl Engine {
                     return ErrorNumber::DestinationUnknown;
                 }
                 match self.relations.add_binding(client, server) {
-                    Ok(_) => ErrorNumber::None,
+                    Ok(_) => {
+                        self.events.push_back(SpineEvent::BindingGranted {
+                            client: client.clone(),
+                            server: server.clone(),
+                        });
+                        ErrorNumber::None
+                    }
                     Err(e) => e,
                 }
             }
@@ -869,7 +1057,13 @@ impl Engine {
                     return ErrorNumber::DestinationUnknown;
                 }
                 match self.relations.add_subscription(client, server) {
-                    Ok(_) => ErrorNumber::None,
+                    Ok(_) => {
+                        self.events.push_back(SpineEvent::SubscriptionGranted {
+                            client: client.clone(),
+                            server: server.clone(),
+                        });
+                        ErrorNumber::None
+                    }
                     Err(e) => e,
                 }
             }
@@ -879,6 +1073,10 @@ impl Engine {
                         (&delete.client_address, &delete.server_address)
                 {
                     self.relations.remove_binding(client, server);
+                    self.events.push_back(SpineEvent::BindingReleased {
+                        client: client.clone(),
+                        server: server.clone(),
+                    });
                 }
                 ErrorNumber::None
             }
@@ -888,6 +1086,10 @@ impl Engine {
                         (&delete.client_address, &delete.server_address)
                 {
                     self.relations.remove_subscription(client, server);
+                    self.events.push_back(SpineEvent::SubscriptionReleased {
+                        client: client.clone(),
+                        server: server.clone(),
+                    });
                 }
                 ErrorNumber::None
             }
@@ -977,10 +1179,11 @@ impl Engine {
         now: Duration,
     ) {
         let counter = self.counters.next();
+        let result_source = self.local_address(destination);
         self.send(
             Datagram {
                 header: Some(self.header(
-                    destination,
+                    &result_source,
                     source,
                     counter,
                     CmdClassifier::Result,
@@ -1018,6 +1221,40 @@ impl Engine {
                     &entries,
                 )))
             }
+            // §7.3.2 and §7.4.2: the tables report the relations actually held, not a
+            // stored copy that would answer an empty list.
+            Function::NodeManagementBindingData => Some(CmdData::NodeManagementBindingData(
+                NodeManagementBindingData {
+                    binding_entry: Some(
+                        self.relations
+                            .bindings()
+                            .iter()
+                            .map(|relation| NodeManagementBindingDataBindingEntry {
+                                binding_id: Some(BindingId(relation.id)),
+                                client_address: Some(relation.client.clone()),
+                                server_address: Some(relation.server.clone()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                },
+            )),
+            Function::NodeManagementSubscriptionData => Some(
+                CmdData::NodeManagementSubscriptionData(NodeManagementSubscriptionData {
+                    subscription_entry: Some(
+                        self.relations
+                            .subscriptions()
+                            .iter()
+                            .map(|relation| NodeManagementSubscriptionDataSubscriptionEntry {
+                                subscription_id: Some(SubscriptionId(relation.id)),
+                                client_address: Some(relation.client.clone()),
+                                server_address: Some(relation.server.clone()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                }),
+            ),
             _ => None,
         }
     }
@@ -1029,6 +1266,20 @@ impl Engine {
             .position(|p| p.remote.address.as_ref() == Some(device))
         {
             return &mut self.peers[index];
+        }
+        if self.peers.len() >= MAX_PEERS {
+            // Drop the one that has told us least: a peer that never completed discovery
+            // is either gone or was never real, and keeping it would let whoever is
+            // sending addresses evict the peers that matter.
+            if let Some(index) = self
+                .peers
+                .iter()
+                .position(|p| p.remote.entities.is_empty() && p.remote.use_cases.is_empty())
+            {
+                self.peers.remove(index);
+            } else {
+                self.peers.remove(0);
+            }
         }
         self.peers.push(Peer {
             remote: RemoteDevice {
@@ -1060,6 +1311,84 @@ impl Engine {
     /// Records a subscription locally.
     pub fn insert_subscription(&mut self, client: &FeatureAddress, server: &FeatureAddress) {
         let _ = self.relations.add_subscription(client, server);
+    }
+}
+
+/// What a function would hold if a write were applied to it.
+///
+/// A partial write says only what changed, so the state the peer is asking for is that
+/// update merged into what is stored (SPINE IG §3.3) — an application deciding whether it
+/// can follow the request has to see that, not the fragment that arrived.
+fn resolve_write(
+    stored: Option<&CmdData>,
+    update: &CmdData,
+    partial: bool,
+    delete: bool,
+) -> CmdData {
+    let mut resolved = match stored {
+        Some(stored) => stored.clone(),
+        // Nothing stored yet: the merge starts from this function's empty value, so a
+        // partial write adds what it names and a delete removes nothing.
+        None => match CmdData::empty(update.key()) {
+            Some(empty) => empty,
+            None => return update.clone(),
+        },
+    };
+    let outcome = if delete {
+        resolved.delete(update)
+    } else {
+        resolved.apply(update.clone(), partial)
+    };
+    match outcome {
+        Ok(()) => resolved,
+        // The payload names a different function than the stored data. The write is
+        // refused either way, so report what actually arrived.
+        Err(_) => update.clone(),
+    }
+}
+
+/// Answers a partial read: the entries the filter's selectors pick, cut down to the
+/// elements it keeps.
+///
+/// Two selectors in one filter address two different sets of entries, so the answer is
+/// their union — merged by identifier, since both sets come from the same stored list
+/// and an entry named by both must appear once.
+fn restrict_for_read(data: &CmdData, filter: &Filter) -> Result<CmdData, RestrictError> {
+    let elements = filter.elements.as_ref();
+    let selectors = filter.selectors.as_deref().unwrap_or_default();
+
+    // Detailed discovery holds three parallel lists rather than one, so its selectors do
+    // not fit the generic shape and are applied by hand.
+    if let CmdData::NodeManagementDetailedDiscoveryData(discovery) = data {
+        let mut narrowed = discovery.clone();
+        for selector in selectors {
+            let FilterSelectors::NodeManagementDetailedDiscoveryDataSelectors(selector) = selector
+            else {
+                return Err(RestrictError::Mismatch);
+            };
+            narrowed = super::discovery::restrict_detailed_discovery(&narrowed, selector);
+        }
+        let narrowed = CmdData::NodeManagementDetailedDiscoveryData(narrowed);
+        return match elements {
+            None => Ok(narrowed),
+            Some(elements) => narrowed.restrict(None, Some(elements)),
+        };
+    }
+
+    match selectors {
+        [] => data.restrict(None, elements),
+        [only] => data.restrict(Some(only), elements),
+        many => {
+            let mut union: Option<CmdData> = None;
+            for selector in many {
+                let part = data.restrict(Some(selector), elements)?;
+                match &mut union {
+                    None => union = Some(part),
+                    Some(acc) => acc.apply(part, true).map_err(|_| RestrictError::Mismatch)?,
+                }
+            }
+            Ok(union.expect("`many` holds at least two selectors"))
+        }
     }
 }
 

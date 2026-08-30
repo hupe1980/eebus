@@ -22,5 +22,11 @@
 mod connection;
 pub use connection::*;
 
+mod hub;
+pub use hub::*;
+
 mod node;
 pub use node::*;
+
+mod reconnect;
+pub use reconnect::*;

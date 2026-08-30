@@ -163,4 +163,3 @@ crate::eebus_str! {
     /// `VendorStateCodeType`.
     pub struct VendorStateCode;
 }
-

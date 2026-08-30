@@ -1,0 +1,121 @@
+name: Release
+
+# Tagging is the whole interface: `git tag v0.1.0 && git push --tags` publishes, and the
+# tag is the version. Nothing here reads a changelog or a release branch.
+#
+# Publishing uses crates.io Trusted Publishing, so no API token is stored in this
+# repository. That has one prerequisite the first time round: a crate has to exist before
+# it can name a trusted publisher, so version one is published by hand
+# (`cargo publish -p eebus`), and the publisher is then configured under Settings →
+# Trusted Publishing on crates.io — owner `hupe1980`, repository `eebus`, workflow
+# `release.yml`, environment `crates-io`. Every release after that runs from here.
+on:
+  push:
+    tags: ["v*"]
+  # A rehearsal. It never publishes — if tagging is the interface, a second way in is a
+  # way to put a version on crates.io that no tag points at. A publish that fails partway
+  # is re-run from the Actions UI, which replays the tag it was triggered by.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A version can only be published once, so two runs must not race for it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # First because it is cheap. A tag that disagrees with the manifest is the classic
+  # release mistake, and finding it after the full matrix has run is ten minutes wasted.
+  version:
+    name: Tag matches the manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compare
+        run: |
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "eebus") | .version')
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            echo "rehearsal against version $manifest"
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME says $tag, Cargo.toml says $manifest"
+            exit 1
+          fi
+          echo "publishing $manifest as $GITHUB_REF_NAME"
+
+  # Tests, lints, docs, MSRV, the embedded target and the fuzzers — the same gate that
+  # guards `main`.
+  verify:
+    name: Verify
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: crates.io
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    # crates.io exchanges a GitHub OIDC assertion for a short-lived token scoped to this
+    # workflow, which the action revokes when the job ends.
+    permissions:
+      id-token: write
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A rehearsal stops here: it proves the crate packages and builds from the package,
+      # which is what usually breaks, without asking crates.io for anything.
+      - name: Package only
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo publish -p eebus --locked --dry-run
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: github.event_name == 'push'
+
+      # `--locked` so the published crate is the one CI resolved and tested, not whatever
+      # the index offers this minute.
+      - name: Publish
+        if: github.event_name == 'push'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p eebus --locked
+
+  # Notes come from the commits and pull requests since the previous tag, so there is no
+  # changelog to keep in step with the code.
+  announce:
+    name: GitHub release
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `--generate-notes` needs the history to find the previous tag.
+          fetch-depth: 0
+      - name: Create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A tag carrying a pre-release suffix — `v1.0.0-rc.1` — is marked as one.
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease=--prerelease ;;
+            *) prerelease= ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            $prerelease

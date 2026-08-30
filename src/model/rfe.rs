@@ -80,6 +80,13 @@ pub trait Identified {
 
     /// True when `self` and `other` identify the same entry.
     fn same_entry(&self, other: &Self) -> bool;
+
+    /// Copies the identifying elements back from `from`.
+    ///
+    /// Used after an `elements` filter has cut an entry down: the identifiers are how
+    /// the peer knows which entry it is looking at, so they are restored whether or not
+    /// the filter named them.
+    fn restore_identity(&mut self, from: &Self);
 }
 
 /// A SPINE `*ListData` function: a list of identified entries.
@@ -120,10 +127,139 @@ pub trait Selectors {
     const UNSUPPORTED_FIELDS: &'static [&'static str];
 
     /// True when `target` satisfies every element the filter sets.
+    ///
+    /// Elements listed in [`UNSUPPORTED_FIELDS`](Self::UNSUPPORTED_FIELDS) are not
+    /// considered, so a filter that sets one must be refused before this is consulted —
+    /// see [`uses_unsupported`](Self::uses_unsupported).
     fn matches(&self, target: &Self::Target) -> bool;
 
     /// True when the filter constrains nothing, and therefore selects every entry.
     fn is_empty(&self) -> bool;
+
+    /// True when the filter sets an element that cannot be matched by comparison.
+    ///
+    /// The answer is SPINE `errorNumber` 8, "restricted function exchange combination
+    /// not supported". Serving such a request as though the element were absent would
+    /// return entries the peer explicitly excluded, which is worse than refusing.
+    fn uses_unsupported(&self) -> bool;
+}
+
+/// Why a Restricted Function Exchange filter could not be applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RestrictError {
+    /// The filter addresses a different function than the data it was applied to.
+    #[error("the filter addresses a different function than the data")]
+    Mismatch,
+    /// The filter sets an element this implementation cannot match, such as an
+    /// interval selector.
+    #[error("the filter uses a selector that cannot be matched by comparison")]
+    Unsupported,
+}
+
+impl RestrictError {
+    /// The SPINE `errorNumber` this failure is reported with.
+    ///
+    /// Both are §5.2.5.2's number 8: a filter naming the wrong function and one naming
+    /// an element that cannot be matched are the same thing to the peer — a restricted
+    /// exchange combination this node does not support.
+    pub fn error_number(self) -> crate::model::ErrorNumber {
+        crate::model::ErrorNumber::RestrictedExchangeNotSupported
+    }
+}
+
+/// Answers a partial read of a list: the entries the selectors pick, cut down to the
+/// elements the filter keeps.
+///
+/// Identifiers survive an `elements` filter whether or not it names them, because
+/// SPINE addresses an entry by them: a reply whose entries cannot be told apart is not
+/// a smaller answer, it is an unusable one (implementation guide §3.1).
+pub fn restrict_list<L, S, E>(
+    stored: &L,
+    selectors: Option<&S>,
+    elements: Option<&E>,
+) -> Result<L, RestrictError>
+where
+    L: ListData + Default,
+    L::Item: Identified + Clone,
+    S: Selectors<Target = L::Item>,
+    E: Elements<Target = L::Item>,
+{
+    if let Some(selectors) = selectors
+        && selectors.uses_unsupported()
+    {
+        return Err(RestrictError::Unsupported);
+    }
+
+    let mut kept: Vec<L::Item> = stored
+        .entries()
+        .unwrap_or_default()
+        .iter()
+        .filter(|item| selectors.is_none_or(|s| s.matches(item)))
+        .cloned()
+        .collect();
+
+    if let Some(elements) = elements {
+        for entry in &mut kept {
+            let identity = entry.clone();
+            elements.retain_in(entry);
+            entry.restore_identity(&identity);
+        }
+    }
+
+    let mut out = L::default();
+    *out.entries_mut() = Some(kept);
+    Ok(out)
+}
+
+/// [`restrict_list`] for a list whose entries have no elements filter of their own.
+pub fn restrict_list_by_selectors<L, S>(stored: &L, selectors: &S) -> Result<L, RestrictError>
+where
+    L: ListData + Default,
+    L::Item: Clone,
+    S: Selectors<Target = L::Item>,
+{
+    if selectors.uses_unsupported() {
+        return Err(RestrictError::Unsupported);
+    }
+    let kept: Vec<L::Item> = stored
+        .entries()
+        .unwrap_or_default()
+        .iter()
+        .filter(|item| selectors.matches(item))
+        .cloned()
+        .collect();
+    let mut out = L::default();
+    *out.entries_mut() = Some(kept);
+    Ok(out)
+}
+
+/// [`restrict_list`] for a list the schemas give no selectors filter.
+pub fn restrict_list_by_elements<L, E>(stored: &L, elements: &E) -> L
+where
+    L: ListData + Default,
+    L::Item: Identified + Clone,
+    E: Elements<Target = L::Item>,
+{
+    let mut kept: Vec<L::Item> = stored.entries().unwrap_or_default().to_vec();
+    for entry in &mut kept {
+        let identity = entry.clone();
+        elements.retain_in(entry);
+        entry.restore_identity(&identity);
+    }
+    let mut out = L::default();
+    *out.entries_mut() = Some(kept);
+    out
+}
+
+/// Answers a partial read of a function that is not a list.
+pub fn restrict_plain<T, E>(stored: &T, elements: &E) -> T
+where
+    T: Clone,
+    E: Elements<Target = T>,
+{
+    let mut out = stored.clone();
+    elements.retain_in(&mut out);
+    out
 }
 
 /// Applies a full (non-partial) update: the list is replaced.

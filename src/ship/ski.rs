@@ -101,7 +101,7 @@ impl FromStr for Ski {
                 continue;
             }
             let index = nibbles / 2;
-            if nibbles % 2 == 0 {
+            if nibbles.is_multiple_of(2) {
                 bytes[index] = value << 4;
             } else {
                 bytes[index] |= value;

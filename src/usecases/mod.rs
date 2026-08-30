@@ -18,6 +18,7 @@
 //!   appliance's side or the grid's.
 
 pub mod descriptor;
+pub mod emobility;
 pub mod limitation;
 pub mod lpc;
 pub mod lpp;

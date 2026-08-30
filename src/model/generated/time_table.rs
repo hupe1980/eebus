@@ -85,7 +85,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TimeTableConstraintsData => TimeTableConstraintsListDataSelectors {  } unsupported { "timeTableId" });
+crate::eebus_selectors!(TimeTableConstraintsData => TimeTableConstraintsListDataSelectors {  } unsupported { time_table_id: "timeTableId" });
 
 crate::eebus_struct! {
     /// `TimeTableConstraintsListDataType`.
@@ -131,7 +131,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(TimeTableData { time_table_id, time_slot_id });
+crate::eebus_identity!(TimeTableData {
+    time_table_id,
+    time_slot_id
+});
 
 crate::eebus_struct! {
     /// `TimeTableDescriptionDataElementsType`.
@@ -179,7 +182,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TimeTableDescriptionData => TimeTableDescriptionListDataSelectors {  } unsupported { "timeTableId" });
+crate::eebus_selectors!(TimeTableDescriptionData => TimeTableDescriptionListDataSelectors {  } unsupported { time_table_id: "timeTableId" });
 
 crate::eebus_struct! {
     /// `TimeTableDescriptionListDataType`.
@@ -217,4 +220,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(TimeTableListData => TimeTableData { time_table_data });
-

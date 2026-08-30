@@ -36,4 +36,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(SpecificationVersionListData => SpecificationVersionData { specification_version_data });
-

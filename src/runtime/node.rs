@@ -3,7 +3,6 @@
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::time::Duration;
 use std::sync::Mutex;
 
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -13,6 +12,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as ServerRequest, Response as ServerResponse,
 };
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::ship::{DEFAULT_PATH, HandshakeConfig, Role, SUBPROTOCOL, Ski, Trust};
 use crate::tls::{PeerObserver, ShipTls};
@@ -75,6 +75,27 @@ impl TrustStore {
     }
 }
 
+/// The largest SHIP message this node will accept.
+///
+/// SHIP fixes no maximum, and neither does SPINE. But a peer on the same subnet can send
+/// whatever it likes once TLS is up, and the default in the WebSocket layer is 64 MiB —
+/// enough to exhaust a heat-pump controller by accident. The largest legitimate message
+/// is a detailed-discovery reply from a device with a great many entities, which is a few
+/// tens of kilobytes; a megabyte is generous.
+pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// The WebSocket configuration SHIP asks for.
+///
+/// Bounded on both sides, and unmasked frames refused: RFC 6455 requires a client to mask,
+/// and accepting unmasked frames from one is accepting a peer that is not speaking
+/// WebSocket properly.
+fn socket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE))
+        .accept_unmasked_frames(false)
+}
+
 /// A SHIP node: an identity, a trust store, and the sockets that use them.
 ///
 /// ```no_run
@@ -112,6 +133,18 @@ impl Node {
             tls,
             trust,
         }
+    }
+
+    /// Declares this node's key material, so it takes part in certificate updates.
+    ///
+    /// SHIP §12.1.3: without it the node behaves as a 1.0.1 node — its certificate can
+    /// only be replaced by re-establishing trust by hand. With it, the `updateCounter`
+    /// rides in every `hello` and a renewal reaches peers over the connections the old
+    /// certificate still secures.
+    #[must_use]
+    pub fn key_material(mut self, keys: crate::ship::OwnKeys) -> Self {
+        self.handshake.key_material = Some(keys);
+        self
     }
 
     /// Overrides the handshake timers, for a device with unusual constraints.
@@ -178,9 +211,12 @@ impl Node {
             HeaderValue::from_static(SUBPROTOCOL),
         );
 
-        let (socket, response) =
-            tokio_tungstenite::client_async(request, tokio_rustls::TlsStream::Client(stream))
-                .await?;
+        let (socket, response) = tokio_tungstenite::client_async_with_config(
+            request,
+            tokio_rustls::TlsStream::Client(stream),
+            Some(socket_config()),
+        )
+        .await?;
         check_subprotocol(response.headers().get("Sec-WebSocket-Protocol"))?;
 
         run_handshake(
@@ -201,9 +237,10 @@ impl Node {
         let stream = acceptor.accept(stream).await?;
         let peer = observed.ski().ok_or(ConnectionError::NoPeerIdentity)?;
 
-        let socket = tokio_tungstenite::accept_hdr_async(
+        let socket = tokio_tungstenite::accept_hdr_async_with_config(
             tokio_rustls::TlsStream::Server(stream),
             offer_ship,
+            Some(socket_config()),
         )
         .await?;
 
@@ -268,15 +305,4 @@ fn offer_ship(
         HeaderValue::from_static(SUBPROTOCOL),
     );
     Ok(response)
-}
-
-/// How long to wait before dialling a peer again after a failure.
-///
-/// SHIP does not fix the schedule, only that a node must not hammer a peer that is down.
-/// This is exponential with a cap, and the caller is expected to add jitter if many nodes
-/// might restart together.
-pub fn reconnect_delay(attempt: u32) -> Duration {
-    const BASE: u64 = 1;
-    const CAP: u64 = 120;
-    Duration::from_secs(BASE.saturating_mul(1u64 << attempt.min(7)).min(CAP))
 }

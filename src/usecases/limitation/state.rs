@@ -62,7 +62,7 @@ pub const FAILSAFE_DURATION_RANGE: core::ops::RangeInclusive<Duration> =
     Duration::from_secs(2 * 3_600)..=Duration::from_secs(24 * 3_600);
 
 /// The states of LPC/LPP UC TS §2.3.2.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LimitationState {
     /// Just (re)started: limited by the failsafe value until the Energy Guard is heard
     /// from ([LPC/LPP-901]).
@@ -99,7 +99,7 @@ impl EffectiveLimit {
 }
 
 /// A write on the Active Power Consumption or Production Limit.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LimitWrite {
     /// Whether the limit is in force ([LPC/LPP-008]).
     pub is_active: bool,
@@ -156,7 +156,9 @@ pub enum LocalDecision {
 }
 
 /// Why a Controllable System may refuse a limit (LPC/LPP UC TS §2.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize,
+)]
 pub enum RejectReason {
     /// Following the limit would damage the device.
     #[error("self-protection")]
@@ -177,7 +179,7 @@ pub enum RejectReason {
 /// SPINE carries these as a `result` message: `errorNumber` 0 for an acceptance and 7,
 /// "command rejected", for a refusal. Under §14a the pair is also the evidence the
 /// operator is required to be able to produce (implementation guide §4.1.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WriteOutcome {
     /// Accepted: `ACK`, [LPC/LPP-002].
     Accepted,
@@ -205,7 +207,9 @@ impl WriteOutcome {
 }
 
 /// Why a write was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize,
+)]
 pub enum NackReason {
     /// The device cannot follow the value.
     #[error("cannot apply the value: {0}")]
@@ -213,6 +217,10 @@ pub enum NackReason {
     /// A negative limit, which [LPC/LPP-001] and implementation guide §3.6 forbid.
     #[error("a limit below zero is not permitted")]
     NegativeValue,
+    /// A limit that is not a finite number, which [LPC/LPP-001] does not admit: a
+    /// `scaledNumber` whose `scale` overflows `f64` is refused, not read as unrestricted.
+    #[error("the limit is not a finite value")]
+    NotFinite,
     /// A failsafe duration outside the two-to-twenty-four-hour range ([LPC/LPP-022/4]).
     #[error("the failsafe duration minimum must be between 2 and 24 hours")]
     DurationOutOfRange,
@@ -227,6 +235,14 @@ pub enum NackReason {
     /// heartbeat and a limit write has completed (implementation guide §2.11).
     #[error("the heartbeat-then-limit sequence has not completed")]
     SequenceIncomplete,
+    /// The peer refused and did not say why.
+    ///
+    /// This is what an Energy Guard sees, and it is not a gap in the protocol: [LPC-003]
+    /// carries `errorNumber` 7 and nothing else, because the reason a Controllable System
+    /// cannot follow a limit is local to it. A guard recording *why* would be recording
+    /// something it invented, which in an evidence log is worse than recording nothing.
+    #[error("the peer refused without stating a reason")]
+    Unstated,
 }
 
 /// How this Controllable System is set up.
@@ -247,6 +263,13 @@ pub struct CsConfig {
     pub nominal_max_watts: Option<f64>,
     /// The contractual maximum an energy manager is allowed to draw or feed in ([LPC/LPP-042]).
     pub contractual_max_watts: Option<f64>,
+    /// Whether this Controllable System runs inside a Customer Energy Manager.
+    ///
+    /// The specification treats the two differently in one place: an energy manager may
+    /// interrupt a limitation because uncontrolled loads make it unreachable
+    /// ([LPC/LPP-901/2], [LPC/LPP-923]), and a device may not — a device has no loads but
+    /// its own.
+    pub on_cem: bool,
 }
 
 impl CsConfig {
@@ -258,7 +281,15 @@ impl CsConfig {
             failsafe_duration_max: *FAILSAFE_DURATION_RANGE.end(),
             nominal_max_watts: None,
             contractual_max_watts: None,
+            on_cem: false,
         }
+    }
+
+    /// Says this Controllable System runs inside a Customer Energy Manager.
+    #[must_use]
+    pub fn on_cem(mut self) -> Self {
+        self.on_cem = true;
+        self
     }
 
     /// Sets the device's nominal maximum ([LPC/LPP-041]).
@@ -324,9 +355,41 @@ impl ControllableSystem {
         &self.config
     }
 
+    /// The most power the device may draw or feed in right now, in watts.
+    ///
+    /// This is the number an appliance acts on, and it is not always the Energy Guard's:
+    /// an energy manager playing the Controllable System has a Contractual Nominal Max
+    /// ([LPC/LPP-042]) it must never exceed whatever the Energy Guard says, including
+    /// when the Energy Guard says nothing at all. [`None`] means genuinely unbounded.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::usecases::limitation::{ControllableSystem, CsConfig};
+    ///
+    /// let cs = ControllableSystem::new(
+    ///     CsConfig::new(4_200.0, Duration::from_secs(7_200)).with_contractual_max(11_000.0),
+    ///     Duration::ZERO,
+    /// );
+    /// // In `init` the failsafe applies, and it is below the contract.
+    /// assert_eq!(cs.power_ceiling(), Some(4_200.0));
+    /// ```
+    pub fn power_ceiling(&self) -> Option<f64> {
+        match (
+            self.effective_limit().watts(),
+            self.config.contractual_max_watts,
+        ) {
+            (Some(limit), Some(contract)) => Some(limit.min(contract)),
+            (Some(limit), None) => Some(limit),
+            (None, contract) => contract,
+        }
+    }
+
     /// What the device is limited to right now.
     ///
-    /// This is the value to act on; everything else in this type exists to compute it.
+    /// The limitation use case's own view: what the Energy Guard asked for, or the
+    /// failsafe value standing in for it. [`power_ceiling`](Self::power_ceiling) is the
+    /// number to act on, because it also honours a contractual maximum the use case
+    /// knows nothing about.
     pub fn effective_limit(&self) -> EffectiveLimit {
         match self.state {
             LimitationState::Init | LimitationState::FailsafeState => {
@@ -367,7 +430,18 @@ impl ControllableSystem {
         decision: LocalDecision,
         now: Duration,
     ) -> WriteOutcome {
-        // [LPC/LPP-001], implementation guide §3.6: a limit below zero is never valid.
+        // Table 1 makes the answer depend on whether a heartbeat was received *in time*
+        // ([LPC/LPP-914]), which is a question about the clock rather than about this
+        // message. Bringing the timers up to date first means the answer does not depend
+        // on how punctually the caller happened to tick.
+        self.handle_timeout(now);
+
+        // [LPC/LPP-001], implementation guide §3.6: a limit below zero is never valid, nor
+        // is one that is not a number. An application can construct a `LimitWrite`
+        // directly, so this does not rely on the wire parser having caught it.
+        if !write.watts.is_finite() {
+            return WriteOutcome::Rejected(NackReason::NotFinite);
+        }
         if write.watts < 0.0 {
             return WriteOutcome::Rejected(NackReason::NegativeValue);
         }
@@ -414,6 +488,10 @@ impl ControllableSystem {
 
     /// Applies a write on the failsafe active power limit ([LPC/LPP-021]).
     pub fn on_failsafe_limit_write(&mut self, watts: f64, now: Duration) -> WriteOutcome {
+        self.handle_timeout(now);
+        if !watts.is_finite() {
+            return WriteOutcome::Rejected(NackReason::NotFinite);
+        }
         if let Some(rejection) = self.check_secondary_write(watts, now) {
             return rejection;
         }
@@ -431,6 +509,7 @@ impl ControllableSystem {
         duration: Duration,
         now: Duration,
     ) -> WriteOutcome {
+        self.handle_timeout(now);
         if let Some(rejection) = self.check_secondary_write(0.0, now) {
             return rejection;
         }
@@ -441,6 +520,32 @@ impl ControllableSystem {
         }
         self.config.failsafe_duration = duration;
         WriteOutcome::Accepted
+    }
+
+    /// Interrupts an active limitation for a reason the specification permits
+    /// ([LPC/LPP-923]).
+    ///
+    /// The one transition out of `limited` that the device itself makes: a heat pump that
+    /// must run to defrost, an inverter a regulator requires to keep feeding in. The
+    /// state moves to `unlimited/controlled`, so the Energy Guard sees the limit
+    /// deactivated and can act on that.
+    ///
+    /// The permitted reasons are narrower off a CEM than on one: `UncontrolledLoads` is a
+    /// reason an energy manager may give and a device may not, since a device has no
+    /// loads but its own — see [`CsConfig::on_cem`]. Returns whether the interruption
+    /// took effect; it does nothing outside `limited`, where there is no limitation to
+    /// interrupt.
+    pub fn interrupt(&mut self, reason: RejectReason, now: Duration) -> bool {
+        if self.state != LimitationState::Limited {
+            return false;
+        }
+        if reason == RejectReason::UncontrolledLoads && !self.config.on_cem {
+            return false;
+        }
+        self.limit = None;
+        self.limit_expiry = None;
+        self.enter(LimitationState::UnlimitedControlled, now);
+        true
     }
 
     /// Advances the timers.

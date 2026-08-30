@@ -39,17 +39,30 @@ impl ScaledNumber {
         Self::new(number, 0)
     }
 
-    /// The value as `number × 10^scale`, or [`None`] if `number` is absent.
+    /// The value as `number × 10^scale`, or [`None`] if it is not a finite number.
     ///
     /// An absent `scale` is read as zero, which is what the Resource Specification says
     /// and what peers written against it send.
+    ///
+    /// A product that overflows `f64` is [`None`] rather than infinity: `scale` is signed
+    /// 16-bit, so a `number` near [`i64::MAX`] reaches infinity in one well-formed
+    /// message, and an unrepresentable value is not a value. Saying so lets the caller
+    /// refuse the message instead of acting on a number nobody sent.
+    ///
+    /// ```
+    /// use eebus::model::ScaledNumber;
+    ///
+    /// assert_eq!(ScaledNumber::new(42, 2).to_f64(), Some(4200.0));
+    /// assert_eq!(ScaledNumber::new(i64::MAX, 308).to_f64(), None, "overflows f64");
+    /// ```
     pub fn to_f64(&self) -> Option<f64> {
         let number = self.number?.get() as f64;
         let scale = i32::from(self.scale.unwrap_or(Scale(0)).get());
         if abs_i32(scale) > MAX_ABS_SCALE {
             return None;
         }
-        Some(number * pow10(scale))
+        let value = number * pow10(scale);
+        value.is_finite().then_some(value)
     }
 
     /// Approximates `value` with at most `max_decimals` decimal places.
@@ -65,6 +78,11 @@ impl ScaledNumber {
     /// assert_eq!(ScaledNumber::from_f64(23.5, 2), ScaledNumber::new(235, -1));
     /// ```
     pub fn from_f64(value: f64, max_decimals: u8) -> Self {
+        // Neither infinity nor NaN is a quantity, and the alternative to zero here is a
+        // saturated `i64::MAX` on the wire.
+        if !value.is_finite() {
+            return Self::new(0, 0);
+        }
         let max_decimals = i16::from(max_decimals.min(9));
         for decimals in 0..=max_decimals {
             let scaled = value * pow10(i32::from(decimals));
@@ -142,9 +160,20 @@ impl AbsoluteOrRelativeTime {
 /// assert_eq!(parse_iso8601_duration("PT1M30S"), Some(Duration::from_secs(90)));
 /// assert_eq!(parse_iso8601_duration("P1DT12H"), Some(Duration::from_secs(129_600)));
 /// assert_eq!(parse_iso8601_duration("P1M"), None, "months have no fixed length");
+///
+/// // A span pointing backwards has no time left to run, and `Duration` is unsigned.
+/// assert_eq!(parse_iso8601_duration("-PT2H"), Some(Duration::ZERO));
+/// // At least one component is required; `P` and `PT` say nothing.
+/// assert_eq!(parse_iso8601_duration("PT"), None);
 /// ```
 pub fn parse_iso8601_duration(s: &str) -> Option<core::time::Duration> {
-    let s = s.strip_prefix('-').map_or(s, |rest| rest); // negative durations clamp to 0 below
+    // A duration pointing backwards, which `Duration` cannot hold, reads as zero rather
+    // than as its magnitude: these values are timers, and a span that has elapsed has
+    // nothing left to run.
+    let (negative, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
     let rest = s.strip_prefix('P')?;
     let (date_part, time_part) = match rest.split_once('T') {
         Some((d, t)) => (d, Some(t)),
@@ -153,6 +182,9 @@ pub fn parse_iso8601_duration(s: &str) -> Option<core::time::Duration> {
 
     let mut secs: u64 = 0;
     let mut nanos: u32 = 0;
+    // ISO 8601 requires at least one component: reading bare `P` or `PT` as zero would
+    // turn a truncated field into a valid instruction.
+    let mut components = 0u32;
 
     let mut number = String::new();
     for c in date_part.chars() {
@@ -161,9 +193,11 @@ pub fn parse_iso8601_duration(s: &str) -> Option<core::time::Duration> {
             'Y' | 'M' => return None, // calendar-dependent
             'W' => {
                 secs = secs.checked_add(take_u64(&mut number)?.checked_mul(604_800)?)?;
+                components += 1;
             }
             'D' => {
                 secs = secs.checked_add(take_u64(&mut number)?.checked_mul(86_400)?)?;
+                components += 1;
             }
             _ => return None,
         }
@@ -176,14 +210,23 @@ pub fn parse_iso8601_duration(s: &str) -> Option<core::time::Duration> {
         for c in time_part.chars() {
             match c {
                 '0'..='9' | '.' => number.push(c),
-                'H' => secs = secs.checked_add(take_u64(&mut number)?.checked_mul(3_600)?)?,
-                'M' => secs = secs.checked_add(take_u64(&mut number)?.checked_mul(60)?)?,
+                'H' => {
+                    secs = secs.checked_add(take_u64(&mut number)?.checked_mul(3_600)?)?;
+                    components += 1;
+                }
+                'M' => {
+                    secs = secs.checked_add(take_u64(&mut number)?.checked_mul(60)?)?;
+                    components += 1;
+                }
                 'S' => {
                     let raw = core::mem::take(&mut number);
                     let (whole, frac) = match raw.split_once('.') {
                         Some((w, f)) => (w, Some(f)),
                         None => (raw.as_str(), None),
                     };
+                    if whole.is_empty() && frac.is_none_or(str::is_empty) {
+                        return None;
+                    }
                     if !whole.is_empty() {
                         secs = secs.checked_add(whole.parse::<u64>().ok()?)?;
                     }
@@ -195,6 +238,7 @@ pub fn parse_iso8601_duration(s: &str) -> Option<core::time::Duration> {
                             .collect();
                         nanos = digits.parse::<u32>().ok()?;
                     }
+                    components += 1;
                 }
                 _ => return None,
             }
@@ -204,6 +248,12 @@ pub fn parse_iso8601_duration(s: &str) -> Option<core::time::Duration> {
         }
     }
 
+    if components == 0 {
+        return None;
+    }
+    if negative {
+        return Some(core::time::Duration::ZERO);
+    }
     Some(core::time::Duration::new(secs, nanos))
 }
 
@@ -354,7 +404,32 @@ mod tests {
         assert_eq!(parse_iso8601_duration("P1Y"), None);
         assert_eq!(parse_iso8601_duration("P1M"), None);
         assert_eq!(parse_iso8601_duration("nonsense"), None);
-        assert_eq!(parse_iso8601_duration("PT"), Some(Duration::ZERO));
+    }
+
+    /// A duration with no components says nothing, and reading it as zero would turn a
+    /// truncated field into "deactivate now".
+    #[test]
+    fn a_duration_without_components_is_rejected() {
+        assert_eq!(parse_iso8601_duration("P"), None);
+        assert_eq!(parse_iso8601_duration("PT"), None);
+        assert_eq!(parse_iso8601_duration("PT.S"), None);
+        // Zero itself is still expressible, and round trips.
+        assert_eq!(parse_iso8601_duration("PT0S"), Some(Duration::ZERO));
+        assert_eq!(format_iso8601_duration(Duration::ZERO), "PT0S");
+    }
+
+    /// A span pointing backwards has already elapsed, so nothing is left to run.
+    ///
+    /// `core::time::Duration` is unsigned, so the only alternatives are zero and the
+    /// magnitude — and the magnitude is the dangerous one: it would keep a curtailment
+    /// whose `endTime` lies two hours in the past alive for another two hours.
+    #[test]
+    fn a_negative_duration_collapses_to_zero() {
+        assert_eq!(parse_iso8601_duration("-PT2H"), Some(Duration::ZERO));
+        assert_eq!(parse_iso8601_duration("-P1DT12H"), Some(Duration::ZERO));
+        // Still parsed, so malformed input is still refused rather than zeroed.
+        assert_eq!(parse_iso8601_duration("-P1M"), None);
+        assert_eq!(parse_iso8601_duration("-PT"), None);
     }
 
     #[test]

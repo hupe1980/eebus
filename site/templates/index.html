@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block body_class %}home{% endblock %}
+
+{% block content %}
+<main id="main">
+
+<section class="hero">
+  <div class="hero-inner">
+    <p class="eyebrow">SHIP · SPINE · certifiable grid use cases</p>
+    <h1>EEBUS, in Rust,<br>down to the socket.</h1>
+    <p class="lede">{{ section.extra.lede }}</p>
+    <div class="cta">
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+      <a class="btn" href="{{ get_url(path='@/docs/_index.md') | safe }}">Read the docs</a>
+      <a class="btn btn-ghost" href="{{ config.extra.repo }}" rel="noopener">GitHub ↗</a>
+    </div>
+    <p class="hero-note">{{ section.extra.status }}</p>
+  </div>
+  <div class="hero-code">
+    <div class="code-frame" aria-hidden="false">
+      <div class="code-frame-bar"><span></span><span></span><span></span><em>energy_guard.rs</em></div>
+{{ section.extra.hero_code | markdown | safe }}
+    </div>
+  </div>
+</section>
+
+<section class="strip" aria-label="At a glance">
+  <div class="strip-inner">
+    {% for s in section.extra.stats %}
+    <div class="stat"><b>{{ s.value }}</b><span>{{ s.label }}</span></div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="features" aria-labelledby="features-h">
+  <div class="section-head">
+    <h2 id="features-h">Why this one</h2>
+    <p>Built to pass certification, not merely to interoperate.</p>
+  </div>
+  <div class="grid">
+    {% for f in section.extra.features %}
+    <article class="card">
+      <h3>{{ f.title }}</h3>
+      <p>{{ f.body }}</p>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<div class="prose-wide">
+{{ section.content | safe }}
+</div>
+
+<section class="closing">
+  <div class="closing-inner">
+    <h2>Start with the exchange itself</h2>
+    <p>A grid operator's control box limits a heat pump, first against a virtual clock and
+       then over a real socket. Both are runnable examples in the repository.</p>
+    <div class="cta">
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+      <a class="btn" href="{{ get_url(path='@/docs/limitation.md') | safe }}">LPC and LPP</a>
+    </div>
+  </div>
+</section>
+
+</main>
+{% endblock %}

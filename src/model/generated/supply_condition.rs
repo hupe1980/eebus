@@ -175,7 +175,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(SupplyConditionData => SupplyConditionListDataSelectors { condition_id, event_type, originator } unsupported { "timestampInterval" });
+crate::eebus_selectors!(SupplyConditionData => SupplyConditionListDataSelectors { condition_id, event_type, originator } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `SupplyConditionListDataType`.
@@ -240,7 +240,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(SupplyConditionThresholdRelationData => SupplyConditionThresholdRelationListDataSelectors { condition_id } unsupported { "thresholdId" });
+crate::eebus_selectors!(SupplyConditionThresholdRelationData => SupplyConditionThresholdRelationListDataSelectors { condition_id } unsupported { threshold_id: "thresholdId" });
 
 crate::eebus_struct! {
     /// `SupplyConditionThresholdRelationListDataType`.
@@ -251,4 +251,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(SupplyConditionThresholdRelationListData => SupplyConditionThresholdRelationData { supply_condition_threshold_relation_data });
-

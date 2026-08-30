@@ -213,7 +213,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TimeSeriesData => TimeSeriesListDataSelectors { time_series_id } unsupported { "timeSeriesSlotId" });
+crate::eebus_selectors!(TimeSeriesData => TimeSeriesListDataSelectors { time_series_id } unsupported { time_series_slot_id: "timeSeriesSlotId" });
 
 crate::eebus_struct! {
     /// `TimeSeriesListDataType`.
@@ -297,4 +297,3 @@ crate::eebus_enum_ext! {
         "productionLimitCurve" => ProductionLimitCurve,
     }
 }
-

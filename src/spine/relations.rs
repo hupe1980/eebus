@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use crate::model::{BindingId, FeatureAddress, SubscriptionId};
 
 use super::ack::ErrorNumber;
-use super::address::{is_node_management, same_feature};
+use super::address::{is_node_management, same_entity, same_feature};
 
 /// How many clients may bind to one server feature.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,6 +30,9 @@ pub enum BindingPolicy {
     /// guide §3.5 asks implementers to apply it already. Without it, two energy managers
     /// can each hold a binding on the same `LoadControl` feature and fight over the
     /// limit, which SPINE gives no way to resolve.
+    ///
+    /// Features declared with [`Relations::bind_together`] share one partner rather than
+    /// holding one each.
     #[default]
     SinglePerFeature,
     /// Several clients may bind to the same feature.
@@ -56,6 +59,7 @@ pub struct Relation {
 pub struct Relations {
     bindings: Vec<Relation>,
     subscriptions: Vec<Relation>,
+    groups: Vec<Vec<FeatureAddress>>,
     next_binding: u32,
     next_subscription: u32,
     policy: BindingPolicy,
@@ -73,15 +77,43 @@ impl Relations {
         Self {
             bindings: Vec::new(),
             subscriptions: Vec::new(),
+            groups: Vec::new(),
             next_binding: 1,
             next_subscription: 1,
             policy,
         }
     }
 
+    /// Declares that these features belong to one use case and share a binding partner.
+    ///
+    /// The LPC implementation guide §3.5 (version 1.1.0) describes the race this closes.
+    /// LPC needs a binding on `LoadControl` *and* on `DeviceConfiguration`; with a
+    /// per-feature lock alone, two energy managers coming up together can each win one
+    /// of them, after which neither can run the use case and neither can recover. Locking
+    /// the group means the first device to bind any of them holds all of them.
+    pub fn bind_together(&mut self, features: impl IntoIterator<Item = FeatureAddress>) {
+        let group: Vec<FeatureAddress> = features.into_iter().collect();
+        if group.len() > 1 {
+            self.groups.push(group);
+        }
+    }
+
+    /// The features that share a binding partner with `server`, `server` included.
+    fn group_of<'a>(&'a self, server: &'a FeatureAddress) -> &'a [FeatureAddress] {
+        self.groups
+            .iter()
+            .find(|group| group.iter().any(|f| same_feature(f, server)))
+            .map_or(core::slice::from_ref(server), Vec::as_slice)
+    }
+
     /// The binding policy in force.
     pub fn policy(&self) -> BindingPolicy {
         self.policy
+    }
+
+    /// Replaces the binding policy.
+    pub fn set_policy(&mut self, policy: BindingPolicy) {
+        self.policy = policy;
     }
 
     /// The bindings held.
@@ -128,13 +160,14 @@ impl Relations {
             return Ok(BindingId(existing.id));
         }
 
-        if self.policy == BindingPolicy::SinglePerFeature
-            && self
-                .bindings
-                .iter()
-                .any(|b| same_feature(&b.server, server))
-        {
-            return Err(ErrorNumber::CommandRejected);
+        if self.policy == BindingPolicy::SinglePerFeature {
+            let group = self.group_of(server);
+            let taken = self.bindings.iter().any(|b| {
+                group.iter().any(|f| same_feature(&b.server, f)) && !same_entity(&b.client, client)
+            });
+            if taken {
+                return Err(ErrorNumber::CommandRejected);
+            }
         }
 
         let id = self.next_binding;
@@ -294,6 +327,55 @@ mod tests {
         );
         assert!(relations.is_bound(&client, &server));
         assert!(!relations.is_bound(&other, &server));
+    }
+
+    /// LPC implementation guide §3.5 (1.1.0): features one use case needs together are
+    /// locked to one partner, so two energy managers racing cannot win one each.
+    #[test]
+    fn features_bound_together_go_to_one_partner() {
+        let heat_pump = device_address("i:67890", "HeatPump").unwrap();
+        let load_control = feature_address(&heat_pump, &[1], 1);
+        let configuration = feature_address(&heat_pump, &[1], 2);
+
+        let first = feature_address(&device_address("i:12345", "CemA").unwrap(), &[1], 1);
+        let second = feature_address(&device_address("i:99999", "CemB").unwrap(), &[1], 1);
+
+        let mut relations = Relations::default();
+        relations.bind_together([load_control.clone(), configuration.clone()]);
+
+        // The race the guide describes: A takes LoadControl, B goes for
+        // DeviceConfiguration a moment later.
+        relations.add_binding(&first, &load_control).unwrap();
+        assert_eq!(
+            relations.add_binding(&second, &configuration),
+            Err(ErrorNumber::CommandRejected),
+            "the group is A's now"
+        );
+        assert!(relations.add_binding(&first, &configuration).is_ok());
+    }
+
+    /// §3.8: the two bindings may come from different features of the same entity —
+    /// which feature an actor writes from is its own business.
+    #[test]
+    fn one_entity_may_bind_a_group_from_two_of_its_features() {
+        let heat_pump = device_address("i:67890", "HeatPump").unwrap();
+        let load_control = feature_address(&heat_pump, &[1], 1);
+        let configuration = feature_address(&heat_pump, &[1], 2);
+
+        let cem = device_address("i:12345", "Cem").unwrap();
+        let generic = feature_address(&cem, &[1], 1);
+        let other = feature_address(&cem, &[1], 7);
+        let elsewhere = feature_address(&cem, &[2], 1);
+
+        let mut relations = Relations::default();
+        relations.bind_together([load_control.clone(), configuration.clone()]);
+        relations.add_binding(&generic, &load_control).unwrap();
+        assert!(relations.add_binding(&other, &configuration).is_ok());
+        assert_eq!(
+            relations.add_binding(&elsewhere, &configuration),
+            Err(ErrorNumber::CommandRejected),
+            "a second entity of the same device is still a second entity"
+        );
     }
 
     /// Where a feature carries entries for several use cases, the server may allow more

@@ -70,7 +70,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(DirectControlActivityData => DirectControlActivityListDataSelectors {  } unsupported { "timestampInterval" });
+crate::eebus_selectors!(DirectControlActivityData => DirectControlActivityListDataSelectors {  } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `DirectControlActivityListDataType`.
@@ -122,4 +122,3 @@ crate::eebus_struct! {
         "energyUnit" => energy_unit: UnitOfMeasurement,
     }
 }
-

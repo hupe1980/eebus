@@ -197,7 +197,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(IncentiveData => IncentiveListDataSelectors { incentive_id, value_type } unsupported { "timestampInterval" });
+crate::eebus_selectors!(IncentiveData => IncentiveListDataSelectors { incentive_id, value_type } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `IncentiveListDataType`.
@@ -282,7 +282,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TariffBoundaryRelationData => TariffBoundaryRelationListDataSelectors { tariff_id } unsupported { "boundaryId" });
+crate::eebus_selectors!(TariffBoundaryRelationData => TariffBoundaryRelationListDataSelectors { tariff_id } unsupported { boundary_id: "boundaryId" });
 
 crate::eebus_struct! {
     /// `TariffBoundaryRelationListDataType`.
@@ -371,7 +371,11 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(TariffDescriptionData { tariff_id, commodity_id, measurement_id });
+crate::eebus_identity!(TariffDescriptionData {
+    tariff_id,
+    commodity_id,
+    measurement_id
+});
 
 crate::eebus_struct! {
     /// `TariffDescriptionListDataSelectorsType`.
@@ -414,7 +418,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TariffData => TariffListDataSelectors { tariff_id } unsupported { "activeTierId" });
+crate::eebus_selectors!(TariffData => TariffListDataSelectors { tariff_id } unsupported { active_tier_id: "activeTierId" });
 
 crate::eebus_struct! {
     /// `TariffListDataType`.
@@ -506,7 +510,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TariffTierRelationData => TariffTierRelationListDataSelectors { tariff_id } unsupported { "tierId" });
+crate::eebus_selectors!(TariffTierRelationData => TariffTierRelationListDataSelectors { tariff_id } unsupported { tier_id: "tierId" });
 
 crate::eebus_struct! {
     /// `TariffTierRelationListDataType`.
@@ -795,7 +799,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TierIncentiveRelationData => TierIncentiveRelationListDataSelectors { tier_id } unsupported { "incentiveId" });
+crate::eebus_selectors!(TierIncentiveRelationData => TierIncentiveRelationListDataSelectors { tier_id } unsupported { incentive_id: "incentiveId" });
 
 crate::eebus_struct! {
     /// `TierIncentiveRelationListDataType`.
@@ -817,7 +821,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(TierData => TierListDataSelectors { tier_id } unsupported { "activeIncentiveId" });
+crate::eebus_selectors!(TierData => TierListDataSelectors { tier_id } unsupported { active_incentive_id: "activeIncentiveId" });
 
 crate::eebus_struct! {
     /// `TierListDataType`.
@@ -841,4 +845,3 @@ crate::eebus_enum_ext! {
         "dynamicCost" => DynamicCost,
     }
 }
-

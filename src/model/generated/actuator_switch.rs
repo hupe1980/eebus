@@ -62,4 +62,3 @@ crate::eebus_enum_ext! {
         "toggle" => Toggle,
     }
 }
-

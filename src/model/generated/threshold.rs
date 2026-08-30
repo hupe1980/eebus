@@ -199,4 +199,3 @@ crate::eebus_enum_ext! {
         "swellThreshold" => SwellThreshold,
     }
 }
-

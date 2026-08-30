@@ -22,6 +22,12 @@ use crate::usecases::descriptor::names;
 mod actor;
 pub use actor::*;
 
+mod audit;
+pub use audit::*;
+
+mod guard;
+pub use guard::*;
+
 mod state;
 pub use state::*;
 

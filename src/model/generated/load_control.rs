@@ -93,7 +93,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(LoadControlEventData => LoadControlEventListDataSelectors { event_id } unsupported { "timestampInterval" });
+crate::eebus_selectors!(LoadControlEventData => LoadControlEventListDataSelectors { event_id } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `LoadControlEventListDataType`.
@@ -400,7 +400,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(LoadControlStateData => LoadControlStateListDataSelectors { event_id } unsupported { "timestampInterval" });
+crate::eebus_selectors!(LoadControlStateData => LoadControlStateListDataSelectors { event_id } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `LoadControlStateListDataType`.
@@ -411,4 +411,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(LoadControlStateListData => LoadControlStateData { load_control_state_data });
-

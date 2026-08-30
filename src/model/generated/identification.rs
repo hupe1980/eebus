@@ -122,7 +122,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(SessionIdentificationData { session_id, identification_id });
+crate::eebus_identity!(SessionIdentificationData {
+    session_id,
+    identification_id
+});
 
 crate::eebus_struct! {
     /// `SessionIdentificationListDataSelectorsType`.
@@ -184,7 +187,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(SessionMeasurementRelationData => SessionMeasurementRelationListDataSelectors { session_id } unsupported { "measurementId" });
+crate::eebus_selectors!(SessionMeasurementRelationData => SessionMeasurementRelationListDataSelectors { session_id } unsupported { measurement_id: "measurementId" });
 
 crate::eebus_struct! {
     /// `SessionMeasurementRelationListDataType`.
@@ -195,4 +198,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(SessionMeasurementRelationListData => SessionMeasurementRelationData { session_measurement_relation_data });
-

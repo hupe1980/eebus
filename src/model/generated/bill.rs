@@ -541,4 +541,3 @@ crate::eebus_struct! {
         "valuePercentage" => value_percentage: ScaledNumber,
     }
 }
-

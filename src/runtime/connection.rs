@@ -1,6 +1,6 @@
 //! One SHIP connection: a socket, and the handshake that makes it usable.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use core::time::Duration;
 use std::time::Instant;
 
@@ -73,6 +73,11 @@ pub struct ShipConnection {
     peer: Ski,
     peer_ship_id: Option<String>,
     started: Instant,
+    awaiting_pong: bool,
+    /// Key material the peer announced, waiting to be taken up (SHIP §12.1.3.3).
+    peer_key_material: Vec<crate::ship::KeyMaterialState>,
+    /// The `updateCounter` the peer's `hello` carried (§12.1.3.4).
+    peer_key_counter: Option<u16>,
 }
 
 impl ShipConnection {
@@ -121,7 +126,23 @@ impl ShipConnection {
     /// application working in SPINE has no use for them.
     pub async fn recv(&mut self) -> Result<Datagram, ConnectionError> {
         loop {
-            match self.recv_ship().await? {
+            let message = match self.next_message().await {
+                Ok(message) => message,
+                Err(ConnectionError::NotBinary) => {
+                    let _ = self
+                        .socket
+                        .close(Some(CloseFrame {
+                            code: 1003.into(),
+                            reason: "SHIP carries binary frames only".into(),
+                        }))
+                        .await;
+                    return Err(ConnectionError::NotBinary);
+                }
+                Err(error) => return Err(error),
+            };
+            self.handle_message(&message)?;
+            self.flush().await?;
+            match message {
                 ShipMessage::Data(data) => {
                     if let Some(datagram) = crate::ship::spine_datagram(&data)? {
                         return Ok(datagram);
@@ -134,26 +155,117 @@ impl ShipConnection {
         }
     }
 
-    /// Waits for the next SHIP message, letting the handshake answer the control ones.
-    pub async fn recv_ship(&mut self) -> Result<ShipMessage, ConnectionError> {
-        let message = self.read_frame().await?;
+    /// Reads one SHIP message off the socket, and nothing else.
+    ///
+    /// Cancel-safe, which is what lets a caller select over several connections at once:
+    /// it awaits a single read and performs no writes, so dropping the future in favour
+    /// of another loses nothing but the wait. Whatever it returns has to be passed to
+    /// [`handle_message`](Self::handle_message) — the state machine has not seen it yet.
+    ///
+    /// A frame SHIP §10.3 forbids comes back as an error rather than being answered here,
+    /// because answering means writing and writing is what would make this unsafe to
+    /// cancel. The answer is [`reject`](Self::reject).
+    pub async fn next_message(&mut self) -> Result<ShipMessage, ConnectionError> {
+        self.read_frame().await
+    }
+
+    /// Closes the socket with a WebSocket status code, for a frame SHIP does not allow.
+    ///
+    /// §10.3: a text frame is answered with 1003, "unsupported data". Telling the peer
+    /// which rule it broke is the difference between a bug it can find and a connection
+    /// that mysteriously drops.
+    pub async fn reject(mut self, code: u16, reason: &str) {
+        let _ = self
+            .socket
+            .close(Some(CloseFrame {
+                code: code.into(),
+                reason: reason.to_string().into(),
+            }))
+            .await;
+    }
+
+    /// Feeds a received message to the SHIP state machine.
+    ///
+    /// Control messages are answered from here — the answer is queued, and goes out on
+    /// the next [`flush`](Self::flush) — so an application working in SPINE never sees
+    /// them. Data messages are the caller's.
+    pub fn handle_message(&mut self, message: &ShipMessage) -> Result<(), ConnectionError> {
         if matches!(message, ShipMessage::Control(_) | ShipMessage::End(_)) {
             self.handshake
                 .handle_message(message.clone(), self.clock.elapsed())?;
             self.absorb_events();
-            self.flush().await?;
         }
-        Ok(message)
+        Ok(())
+    }
+
+    /// Advances the SHIP timers, which the close handshake and its `maxTime` run on.
+    pub fn handle_timeout(&mut self) -> Result<(), ConnectionError> {
+        // A handshake that has finished has nothing left to time out, and says so by
+        // refusing the call rather than by pretending.
+        let _ = self.handshake.handle_timeout(self.clock.elapsed());
+        self.absorb_events();
+        Ok(())
+    }
+
+    /// When the SHIP state machine wants to be woken, if it does.
+    pub fn poll_timeout(&self) -> Option<Duration> {
+        self.handshake.poll_timeout()
+    }
+
+    /// Sends a WebSocket ping.
+    ///
+    /// SHIP §10.4 uses these two ways: as a keep-alive on an idle connection, at least
+    /// every fifty seconds, and as the liveness probe the double-connection rule of
+    /// §12.2.3 falls back to.
+    pub async fn ping(&mut self) -> Result<(), ConnectionError> {
+        self.socket.send(Message::Ping(Vec::new().into())).await?;
+        self.awaiting_pong = true;
+        Ok(())
+    }
+
+    /// Whether a ping is still unanswered.
+    pub fn awaiting_pong(&self) -> bool {
+        self.awaiting_pong
+    }
+
+    /// Whether the SHIP layer still considers the connection usable.
+    pub fn is_open(&self) -> bool {
+        self.handshake.is_ready_for_data()
     }
 
     /// Closes the connection, telling the peer why (SHIP §13.4.8).
     ///
-    /// The `connectionClose` goes out before the socket does, so the peer learns this was
-    /// deliberate rather than a network failure — which is what stops it retrying against
-    /// a node that has gone away on purpose.
-    pub async fn close(mut self, reason: ConnectionCloseReason) -> Result<(), ConnectionError> {
-        self.handshake.close(reason, Duration::from_secs(0));
+    /// The close is a handshake of its own: `connectionClose{announce}` goes out, the
+    /// peer confirms, and only then does the socket close. `max_time` is what the peer is
+    /// told it has to answer in, and how long this waits before closing anyway — a peer
+    /// that has already gone must not hold the caller up.
+    ///
+    /// Announcing it matters: without it a peer cannot tell a deliberate shutdown from a
+    /// network failure, and will keep retrying against a node that has gone on purpose.
+    pub async fn close(
+        mut self,
+        reason: ConnectionCloseReason,
+        max_time: Duration,
+    ) -> Result<(), ConnectionError> {
+        self.handshake.close(reason, max_time, self.clock.elapsed());
         let _ = self.flush().await;
+
+        // Wait for the confirmation, but not past the time the peer was given.
+        let deadline = tokio::time::sleep(max_time);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                message = self.read_frame() => match message {
+                    Ok(ShipMessage::End(_)) => break,
+                    Ok(message) => {
+                        let _ = self.handle_message(&message);
+                    }
+                    Err(_) => break,
+                },
+            }
+        }
+
         let _ = self.socket.close(None).await;
         Ok(())
     }
@@ -164,7 +276,11 @@ impl ShipConnection {
     }
 
     /// Sends everything the handshake has queued.
-    async fn flush(&mut self) -> Result<(), ConnectionError> {
+    ///
+    /// Not cancel-safe: a dropped future may leave a control message half-written. Call
+    /// it where cancellation cannot happen, which is what
+    /// [`next_message`](Self::next_message) exists to make possible.
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
         while let Some(message) = self.handshake.poll_transmit() {
             let bytes = message.encode()?;
             self.socket.send(Message::Binary(bytes.into())).await?;
@@ -175,12 +291,47 @@ impl ShipConnection {
     /// Takes what the handshake learned from a control message.
     fn absorb_events(&mut self) {
         while let Some(event) = self.handshake.poll_event() {
-            // SHIP 1.1.0 makes `accessMethods.id` the peer's SHIP ID, which is what a
-            // node needs to dial it back in the other direction.
-            if let Event::PeerAccessMethods(methods) = event {
-                self.peer_ship_id = methods.id;
+            match event {
+                // SHIP 1.1.0 makes `accessMethods.id` the peer's SHIP ID, which is what a
+                // node needs to dial it back in the other direction.
+                Event::PeerAccessMethods(methods) => self.peer_ship_id = methods.id,
+                Event::PeerKeyMaterial(state) => self.peer_key_material.push(state),
+                Event::PeerKeyMaterialCounter { update_counter } => {
+                    self.peer_key_counter = Some(update_counter);
+                }
+                _ => {}
             }
         }
+    }
+
+    /// The `updateCounter` the peer announced in its `hello`, if it announced one.
+    ///
+    /// A peer that announces nothing is a peer speaking SHIP 1.0.1, which has no
+    /// certificate-update mechanism at all.
+    pub fn peer_key_counter(&self) -> Option<u16> {
+        self.peer_key_counter
+    }
+
+    /// Takes the key material the peer has announced since this was last called.
+    pub fn take_peer_key_material(&mut self) -> Vec<crate::ship::KeyMaterialState> {
+        core::mem::take(&mut self.peer_key_material)
+    }
+
+    /// Asks the peer for its key material (SHIP §12.1.3.4).
+    ///
+    /// `known_update_counter` is what this node has stored for it.
+    pub async fn request_key_material(
+        &mut self,
+        known_update_counter: u16,
+    ) -> Result<(), ConnectionError> {
+        self.handshake.request_key_material(known_update_counter);
+        self.flush().await
+    }
+
+    /// Announces this node's key material to the peer (SHIP §12.1.3.2).
+    pub async fn send_key_material(&mut self) -> Result<(), ConnectionError> {
+        self.handshake.send_key_material(self.clock.elapsed());
+        self.flush().await
     }
 
     /// One frame off the socket, refusing what SHIP §10.3 forbids.
@@ -191,18 +342,12 @@ impl ShipConnection {
             };
             match frame? {
                 Message::Binary(bytes) => return Ok(ShipMessage::decode(&bytes)?),
-                Message::Text(_) => {
-                    let _ = self
-                        .socket
-                        .close(Some(CloseFrame {
-                            code: 1003.into(),
-                            reason: "SHIP carries binary frames only".into(),
-                        }))
-                        .await;
-                    return Err(ConnectionError::NotBinary);
-                }
+                // §10.3 forbids it; the caller answers with 1003 through `reject`.
+                Message::Text(_) => return Err(ConnectionError::NotBinary),
                 Message::Close(_) => return Err(ConnectionError::Closed),
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                Message::Pong(_) => self.awaiting_pong = false,
+                // Tungstenite answers a ping itself; nothing is owed here.
+                Message::Ping(_) | Message::Frame(_) => {}
             }
         }
     }
@@ -223,6 +368,10 @@ pub(crate) async fn run_handshake(
     let clock = Instant::now();
     let mut handshake = Handshake::new(role, config, trust, Duration::ZERO);
     let peer_ship_id = None;
+    // §12.1.3.4 puts the peer's key-material counter in the `hello`, which happens before
+    // there is a `ShipConnection` to hold it. Kept here and handed over below, or the
+    // one signal that says "your stored certificate is stale" is thrown away.
+    let mut peer_key_counter = None;
 
     loop {
         // Everything the state machine wants to send.
@@ -232,9 +381,15 @@ pub(crate) async fn run_handshake(
         }
 
         for event in core::iter::from_fn(|| handshake.poll_event()) {
-            if let Event::Aborted(reason) = event {
-                let _ = socket.close(None).await;
-                return Err(ConnectionError::Aborted(reason));
+            match event {
+                Event::Aborted(reason) => {
+                    let _ = socket.close(None).await;
+                    return Err(ConnectionError::Aborted(reason));
+                }
+                Event::PeerKeyMaterialCounter { update_counter } => {
+                    peer_key_counter = Some(update_counter);
+                }
+                _ => {}
             }
         }
 
@@ -249,6 +404,9 @@ pub(crate) async fn run_handshake(
                 peer,
                 peer_ship_id,
                 started,
+                awaiting_pong: false,
+                peer_key_material: Vec::new(),
+                peer_key_counter,
             };
             connection.flush().await?;
             return Ok(connection);

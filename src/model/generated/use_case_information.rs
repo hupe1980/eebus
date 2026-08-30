@@ -51,7 +51,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(UseCaseInformationData => UseCaseInformationListDataSelectors { address, actor } unsupported { "useCaseSupport" });
+crate::eebus_selectors!(UseCaseInformationData => UseCaseInformationListDataSelectors { address, actor } unsupported { use_case_support: "useCaseSupport" });
 
 crate::eebus_struct! {
     /// `UseCaseInformationListDataType`.
@@ -118,4 +118,3 @@ crate::eebus_struct! {
         "useCaseDocumentSubRevision" => use_case_document_sub_revision: String,
     }
 }
-

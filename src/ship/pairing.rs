@@ -329,11 +329,13 @@ fn is_upper_hex(s: &str) -> bool {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, PairingError> {
     let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         return Err(PairingError::InvalidHex);
     }
     cleaned
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hi = (pair[0] as char)
                 .to_digit(16)

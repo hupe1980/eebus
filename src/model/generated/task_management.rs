@@ -322,4 +322,3 @@ crate::eebus_struct! {
         "sequenceId" => sequence_id: PowerSequenceId,
     }
 }
-

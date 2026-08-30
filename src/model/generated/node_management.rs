@@ -65,7 +65,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(NodeManagementBindingDataBindingEntry => NodeManagementBindingDataSelectors {  } unsupported { "bindingEntry" });
+crate::eebus_selectors!(NodeManagementBindingDataBindingEntry => NodeManagementBindingDataSelectors {  } unsupported { binding_entry: "bindingEntry" });
 
 crate::eebus_struct! {
     /// `NodeManagementBindingDataType`.
@@ -233,7 +233,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(NodeManagementDestinationData => NodeManagementDestinationListDataSelectors {  } unsupported { "deviceDescription" });
+crate::eebus_selectors!(NodeManagementDestinationData => NodeManagementDestinationListDataSelectors {  } unsupported { device_description: "deviceDescription" });
 
 crate::eebus_struct! {
     /// `NodeManagementDestinationListDataType`.
@@ -584,7 +584,8 @@ crate::eebus_struct! {
 }
 
 /// `NodeManagementSpecificationVersionListElementsSpecificationVersionType` (restriction of `SpecificationVersionDataElementsType`).
-pub type NodeManagementSpecificationVersionListElementsSpecificationVersion = SpecificationVersionDataElements;
+pub type NodeManagementSpecificationVersionListElementsSpecificationVersion =
+    SpecificationVersionDataElements;
 
 crate::eebus_struct! {
     /// `NodeManagementSpecificationVersionListElementsType`.
@@ -654,7 +655,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(NodeManagementSubscriptionDataSubscriptionEntry => NodeManagementSubscriptionDataSelectors {  } unsupported { "subscriptionEntry" });
+crate::eebus_selectors!(NodeManagementSubscriptionDataSubscriptionEntry => NodeManagementSubscriptionDataSelectors {  } unsupported { subscription_entry: "subscriptionEntry" });
 
 crate::eebus_struct! {
     /// `NodeManagementSubscriptionDataSubscriptionEntryType`.
@@ -822,7 +823,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(NodeManagementUseCaseDataUseCaseInformation => NodeManagementUseCaseDataSelectors {  } unsupported { "useCaseInformation" });
+crate::eebus_selectors!(NodeManagementUseCaseDataUseCaseInformation => NodeManagementUseCaseDataSelectors {  } unsupported { use_case_information: "useCaseInformation" });
 
 crate::eebus_struct! {
     /// `NodeManagementUseCaseDataSelectorsUseCaseInformationType`.
@@ -885,4 +886,3 @@ crate::eebus_struct! {
         "useCaseDocumentSubRevision" => use_case_document_sub_revision: String,
     }
 }
-

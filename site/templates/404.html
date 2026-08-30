@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<main id="main" class="prose-wide">
+  <h1>Page not found</h1>
+  <p class="lede">That URL does not exist. It may have moved while the documentation was
+     being written — nothing here is stable yet.</p>
+  <div class="cta">
+    <a class="btn btn-primary" href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+    <a class="btn" href="{{ get_url(path='@/_index.md') | safe }}">Home</a>
+    <a class="btn btn-ghost" href="{{ config.extra.repo }}" rel="noopener">GitHub ↗</a>
+  </div>
+</main>
+{% endblock %}

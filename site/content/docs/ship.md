@@ -1,0 +1,106 @@
++++
+title = "SHIP: the transport"
+description = "SHIP explained: mDNS-SD discovery, TLS 1.2 with mutual authentication, the five-phase handshake, trust by Subject Key Identifier, and double-connection resolution."
+weight = 50
+[extra]
+group = "Protocol"
++++
+
+SHIP — *Smart Home IP* — gets two devices from "on the same LAN" to "exchanging SPINE
+datagrams". It covers discovery, transport security, trust establishment and framing, and
+it is where most interoperability failures actually happen.
+
+## Finding a peer
+
+A SHIP node announces itself over mDNS-SD as `_ship._tcp.local`, with a TXT record
+carrying its identity and state:
+
+```text
+id=Demo-HeatPump-123456    the SHIP ID
+ski=43c9da85a18329d6…      the Subject Key Identifier, 40 hex characters
+path=/ship/                the WebSocket path
+register=false             whether it is inviting pairing
+```
+
+`register` is **never** `true` in this crate: SHIP IG §2.3 forbids advertising open
+registration, and forbids an "auto accept" mode along with it. Pairing is a deliberate act.
+
+With the `mdns` feature the crate both announces and browses; without it you supply the
+address yourself.
+
+## Identity is the certificate
+
+There is no username, no central authority and no PKI. A node holds a self-signed ECDSA
+P-256 certificate, and its name is the **Subject Key Identifier** — twenty bytes derived
+from the public key, written as forty hex characters. Two devices are paired when each has
+recorded the other's SKI. Everything else follows from that.
+
+The consequences are worth stating plainly, because they are unusual:
+
+* Trust is per-node and symmetric. There is nobody to revoke it centrally.
+* A certificate cannot be replaced casually — replacing it changes the node's name. SHIP
+  §12.1.3 defines a rotation procedure with an `updateCounter` for exactly this reason.
+* **Session resumption is off.** §9.6 makes it a SHOULD, but a resumed session skips the
+  certificate exchange, and the certificate is what identifies the peer.
+
+## TLS 1.2, and only 1.2
+
+SHIP §9 says TLS 1.3 "is not considered in this version", so the crate offers 1.2 with
+mutual authentication and the cipher suites §9.1 mandates. A peer offering only CBC suites
+will not connect.
+
+The `cert` feature generates conforming node certificates. One detail is easy to miss and
+fatal: `rcgen` writes the Subject Key Identifier extension only for certificate
+authorities, and a SHIP node certificate is a leaf. Without the extension written by hand
+the field §12.2 expects is simply absent, and a peer cannot identify the node at all.
+
+## The handshake
+
+Once the WebSocket is up, five phases run before any SPINE datagram may cross (§13.4.3–13.4.8):
+
+1. **`init`** — a single byte in each direction.
+2. **`hello`** — each side declares whether it is `ready`, `pending` or `aborted`, with a
+   waiting time. Trust is settled here: an untrusted peer stays `pending` while the user is
+   asked, and the wait is prolonged for as long as the decision takes. `T_hello_init` is
+   two minutes and a person takes longer, so the prolongation is what carries a
+   commissioning through: the `pending` node asks, and granting a request restarts the
+   granter's own Wait-For-Ready-Timer (§13.4.4.1.3).
+3. **`protocolHandshake`** — agree the SHIP version and the message format. JSON-UTF8 in
+   practice; the specification allows others.
+4. **`pinVerification`** — optional, with penalties for wrong attempts.
+5. **`accessMethods`** — exchange identities. `accessMethods.id` is populated, which SHIP
+   1.1.0 makes mandatory and which a peer needs in order to dial back in the other
+   direction.
+
+The close handshake (§13.4.8) is symmetric and equally required; dropping the socket is not
+a close.
+
+```rust
+handshake.handle_message(&msg, now);   // a frame arrived
+handshake.poll_transmit();             // frames to send
+handshake.poll_timeout();              // when the next SHIP timer fires
+handshake.poll_event();                // "trust needed", "ready", "closed"
+```
+
+## The Pairing Service
+
+Beyond manual SKI approval, the Pairing Service 1.0.0 lets an installer scan a QR code
+carrying a shared secret and have trust established automatically. The crate implements the
+digest and the replay guard (§7, §11), and the QR payload format from the installation
+requirements. It is behind the `pairing` feature, on by default.
+
+## Two nodes that dial each other at once
+
+If both peers discover each other simultaneously, both dial, and two connections exist
+where one should. SHIP §12.2.3 resolves it deterministically: the node with the **larger
+SKI** keeps the **most recent** connection and drops the older; the node with the smaller
+SKI waits three seconds and then pings to confirm which survived.
+
+Both halves are implemented. This is a place where the crate deliberately differs from
+`ship-go`, which keeps the initiator's connection instead — see
+[Conformance](@/docs/conformance.md).
+
+## Framing
+
+SHIP messages are length-prefixed binary frames with a one-byte type. The framing layer is
+one of the five fuzz targets, because it is the first thing an attacker on the LAN reaches.

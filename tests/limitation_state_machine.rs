@@ -527,3 +527,119 @@ fn every_timed_state_reports_a_deadline() {
         "autonomous waits only for the Energy Guard to speak"
     );
 }
+
+/// [LPC/LPP-923]: the Controllable System may interrupt `limited` for reasons the
+/// specification names, and the Energy Guard sees the limit deactivated.
+///
+/// This is the one transition out of `limited` the device makes for itself. Without it a
+/// heat pump that must run to defrost has no way to say so except by violating the limit
+/// silently.
+#[test]
+fn lpc_923_the_system_may_interrupt_a_limitation_for_a_permitted_reason() {
+    let mut cs = new_cs();
+    commission(&mut cs, LimitWrite::active(3_000.0));
+    assert_eq!(cs.state(), LimitationState::Limited);
+    assert!(cs.is_limit_active());
+
+    let now = Duration::from_secs(20);
+    assert!(cs.interrupt(RejectReason::SelfProtection, now));
+    assert_eq!(cs.state(), LimitationState::UnlimitedControlled);
+    assert_eq!(cs.effective_limit(), EffectiveLimit::None);
+    assert!(
+        !cs.is_limit_active(),
+        "[LPC-009/2]: the limit reads deactivated outside `limited`"
+    );
+}
+
+/// `uncontrolledLoads` is a reason an energy manager may give and a device may not: a
+/// device has no loads but its own.
+#[test]
+fn lpc_923_uncontrolled_loads_is_a_reason_only_an_energy_manager_has() {
+    let mut device = new_cs();
+    commission(&mut device, LimitWrite::active(3_000.0));
+    assert!(!device.interrupt(RejectReason::UncontrolledLoads, Duration::from_secs(20)));
+    assert_eq!(device.state(), LimitationState::Limited);
+
+    let mut manager = ControllableSystem::new(
+        CsConfig::new(FAILSAFE_WATTS, FAILSAFE_DURATION).on_cem(),
+        Duration::ZERO,
+    );
+    commission(&mut manager, LimitWrite::active(3_000.0));
+    assert!(manager.interrupt(RejectReason::UncontrolledLoads, Duration::from_secs(20)));
+    assert_eq!(manager.state(), LimitationState::UnlimitedControlled);
+}
+
+/// There is nothing to interrupt outside `limited`.
+#[test]
+fn an_interruption_outside_limited_does_nothing() {
+    let mut cs = new_cs();
+    assert_eq!(cs.state(), LimitationState::Init);
+    assert!(!cs.interrupt(RejectReason::SelfProtection, Duration::from_secs(1)));
+    assert_eq!(cs.state(), LimitationState::Init);
+}
+
+/// [LPC/LPP-042]: an energy manager never exceeds its contractual maximum, whatever the
+/// Energy Guard says — including when it says nothing.
+#[test]
+fn lpc_042_the_contractual_maximum_caps_everything() {
+    let config = CsConfig::new(FAILSAFE_WATTS, FAILSAFE_DURATION).with_contractual_max(11_000.0);
+    let mut cs = ControllableSystem::new(config, Duration::ZERO);
+
+    // In `init` the failsafe is the smaller of the two.
+    assert_eq!(cs.power_ceiling(), Some(4_200.0));
+
+    // Unlimited by the use case still means capped by the contract.
+    let now = Duration::from_secs(10);
+    cs.on_heartbeat(now);
+    cs.on_limit_write(&LimitWrite::deactivated(), LocalDecision::Apply, now);
+    assert_eq!(cs.state(), LimitationState::UnlimitedControlled);
+    assert_eq!(cs.effective_limit(), EffectiveLimit::None);
+    assert_eq!(cs.power_ceiling(), Some(11_000.0));
+
+    // A limit below the contract wins; one above it does not.
+    cs.on_limit_write(&LimitWrite::active(3_000.0), LocalDecision::Apply, now);
+    assert_eq!(cs.power_ceiling(), Some(3_000.0));
+    cs.on_limit_write(&LimitWrite::active(30_000.0), LocalDecision::Apply, now);
+    assert_eq!(cs.power_ceiling(), Some(11_000.0));
+}
+
+/// A device with no contract is bounded only by what it is told.
+#[test]
+fn without_a_contract_the_ceiling_is_the_limit_itself() {
+    let mut cs = new_cs();
+    assert_eq!(cs.power_ceiling(), Some(4_200.0), "the failsafe, in `init`");
+
+    let now = Duration::from_secs(10);
+    cs.on_heartbeat(now);
+    cs.on_limit_write(&LimitWrite::deactivated(), LocalDecision::Apply, now);
+    assert_eq!(cs.power_ceiling(), None, "genuinely unbounded");
+}
+
+/// Table 1 asks whether the heartbeat arrived *in time*, which is a question about the
+/// clock. The answer must not depend on how punctually the caller ticked.
+#[test]
+fn lpc_914_a_stale_heartbeat_is_stale_even_if_no_timer_was_run() {
+    let mut cs = new_cs();
+    cs.on_heartbeat(Duration::from_secs(1));
+    cs.on_limit_write(
+        &LimitWrite::active(3_000.0),
+        LocalDecision::Apply,
+        Duration::from_secs(2),
+    );
+    assert_eq!(cs.state(), LimitationState::Limited);
+
+    // Five minutes later, with no `handle_timeout` in between, a limit arrives. The
+    // system has long since been in the failsafe state, and the write finds it there —
+    // without a fresh heartbeat, so §2.14 refuses it.
+    let outcome = cs.on_limit_write(
+        &LimitWrite::active(5_000.0),
+        LocalDecision::Apply,
+        Duration::from_secs(300),
+    );
+    assert_eq!(
+        outcome,
+        WriteOutcome::Rejected(NackReason::NoRecentHeartbeat)
+    );
+    assert_eq!(cs.state(), LimitationState::FailsafeState);
+    assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(4_200.0));
+}

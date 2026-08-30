@@ -47,7 +47,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(PowerSequenceAlternativesRelationData => PowerSequenceAlternativesRelationListDataSelectors { alternatives_id } unsupported { "sequenceId" });
+crate::eebus_selectors!(PowerSequenceAlternativesRelationData => PowerSequenceAlternativesRelationListDataSelectors { alternatives_id } unsupported { sequence_id: "sequenceId" });
 
 crate::eebus_struct! {
     /// `PowerSequenceAlternativesRelationListDataType`.
@@ -234,7 +234,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(PowerSequencePriceData => PowerSequencePriceListDataSelectors { sequence_id } unsupported { "potentialStartTimeInterval" });
+crate::eebus_selectors!(PowerSequencePriceData => PowerSequencePriceListDataSelectors { sequence_id } unsupported { potential_start_time_interval: "potentialStartTimeInterval" });
 
 crate::eebus_struct! {
     /// `PowerSequencePriceListDataType`.
@@ -753,4 +753,3 @@ crate::eebus_enum_ext! {
         "energySkewness" => EnergySkewness,
     }
 }
-

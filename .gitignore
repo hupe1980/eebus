@@ -21,6 +21,8 @@ target
 #.idea/
 
 # Internal-only documents (not published)
-CONCEPT.md
 specs/
 .DS_Store
+
+# Zola output
+site/public

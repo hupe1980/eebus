@@ -34,7 +34,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(IncentiveTableConstraints => IncentiveTableConstraintsDataSelectors {  } unsupported { "tariff" });
+crate::eebus_selectors!(IncentiveTableConstraints => IncentiveTableConstraintsDataSelectors {  } unsupported { tariff: "tariff" });
 
 crate::eebus_struct! {
     /// `IncentiveTableConstraintsDataType`.
@@ -160,7 +160,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(IncentiveTable => IncentiveTableDataSelectors {  } unsupported { "tariff" });
+crate::eebus_selectors!(IncentiveTable => IncentiveTableDataSelectors {  } unsupported { tariff: "tariff" });
 
 crate::eebus_struct! {
     /// `IncentiveTableDataType`.
@@ -200,7 +200,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(IncentiveTableDescription => IncentiveTableDescriptionDataSelectors {  } unsupported { "tariffDescription" });
+crate::eebus_selectors!(IncentiveTableDescription => IncentiveTableDescriptionDataSelectors {  } unsupported { tariff_description: "tariffDescription" });
 
 crate::eebus_struct! {
     /// `IncentiveTableDescriptionDataType`.
@@ -635,4 +635,3 @@ crate::eebus_struct! {
         "incentiveSlot" => incentive_slot: Vec<IncentiveTableIncentiveSlot>,
     }
 }
-

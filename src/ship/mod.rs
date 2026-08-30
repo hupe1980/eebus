@@ -26,6 +26,12 @@ pub use discovery::*;
 mod qr;
 pub use qr::*;
 
+mod keys;
+pub use keys::*;
+
+mod policy;
+pub use policy::*;
+
 mod spine;
 pub use spine::*;
 

@@ -181,6 +181,23 @@ impl Readings {
         applied
     }
 
+    /// The measurements described so far, whether or not a value has arrived for them.
+    ///
+    /// A measurement counts as described once its quantity *and* its phases are known —
+    /// which takes both description functions, since only the parameter descriptions
+    /// carry `acMeasuredPhases`.
+    pub fn described(&self) -> impl Iterator<Item = (MeasurementId, Measurand)> + '_ {
+        self.known.iter().filter_map(|known| {
+            Some((
+                known.id,
+                Measurand {
+                    quantity: known.quantity,
+                    phases: known.phases.clone()?,
+                },
+            ))
+        })
+    }
+
     /// What a `measurementId` means, once both its descriptions have been read.
     pub fn measurand_of(&self, id: MeasurementId) -> Option<Measurand> {
         let known = self.known.iter().find(|k| k.id == id)?;
@@ -214,6 +231,181 @@ impl Readings {
     /// Every reading held, in the order the measurements were first described.
     pub fn all(&self) -> impl Iterator<Item = &Reading> {
         self.values.iter().map(|(_, reading)| reading)
+    }
+}
+
+/// Where one Monitored Unit's measurements live.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitoredUnitPeer {
+    /// The peer's device address.
+    pub device: crate::model::AddressDevice,
+    /// Its `ElectricalConnection` feature, which says which measurement covers which
+    /// phases.
+    pub electrical_connection: crate::model::FeatureAddress,
+    /// Its `Measurement` feature, which says what each measurement is and what it reads.
+    pub measurement: crate::model::FeatureAddress,
+}
+
+/// Finds a peer's monitoring features from its detailed discovery and use-case data.
+///
+/// `actor` is [`crate::usecases::descriptor::actors::MONITORED_UNIT`] for MPC and
+/// [`crate::usecases::descriptor::actors::GRID_CONNECTION_POINT`] for MGCP — the two use
+/// cases publish the same data and differ only in who is publishing it.
+pub fn locate(
+    remote: &crate::spine::RemoteDevice,
+    use_case: &str,
+    actor: &str,
+) -> Option<MonitoredUnitPeer> {
+    use crate::model::{FeatureType, Role};
+
+    let found = remote.use_case(use_case, actor)?;
+    Some(MonitoredUnitPeer {
+        device: remote.address.clone()?,
+        electrical_connection: remote.address_of(
+            found,
+            &FeatureType::ElectricalConnection,
+            Role::Server,
+        )?,
+        measurement: remote.address_of(found, &FeatureType::Measurement, Role::Server)?,
+    })
+}
+
+/// The Monitoring Appliance, wired to a SPINE engine.
+///
+/// Its whole job is bookkeeping: read the two description functions once, subscribe to
+/// the values, and resolve every notification that arrives against what the descriptions
+/// said. The use-case implementation guide §3.2.2 is why it subscribes rather than
+/// polling — a poll loop over a dozen devices is what an energy manager cannot afford.
+///
+/// There is no binding: a Monitoring Appliance never writes.
+#[derive(Debug)]
+pub struct MonitoringApplianceActor {
+    client: crate::model::FeatureAddress,
+    peers: Vec<TrackedUnit>,
+}
+
+#[derive(Debug)]
+struct TrackedUnit {
+    peer: MonitoredUnitPeer,
+    readings: Readings,
+    described: bool,
+}
+
+/// What a Monitoring Appliance learned.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitoringEvent {
+    /// A unit's descriptions arrived, so its values can now be read.
+    UnitDescribed {
+        /// The unit.
+        device: crate::model::AddressDevice,
+    },
+    /// New values arrived from a unit.
+    Measured {
+        /// The unit.
+        device: crate::model::AddressDevice,
+        /// What changed.
+        readings: Vec<Reading>,
+    },
+}
+
+impl MonitoringApplianceActor {
+    /// An appliance reading from `client`, the actor's single `Generic` client feature.
+    pub fn new(client: crate::model::FeatureAddress) -> Self {
+        Self {
+            client,
+            peers: Vec::new(),
+        }
+    }
+
+    /// Starts monitoring a unit: reads its descriptions, then subscribes to its values.
+    ///
+    /// Calling it again for a unit already tracked restarts the exchange, which is what
+    /// a reconnection needs — the subscription did not survive it, and the descriptions
+    /// may have changed while the connection was down.
+    pub fn attach(
+        &mut self,
+        engine: &mut crate::spine::Engine,
+        peer: MonitoredUnitPeer,
+        now: core::time::Duration,
+    ) {
+        use crate::model::Function;
+
+        let device = peer.device.clone();
+        self.peers.retain(|t| t.peer.device != device);
+
+        for function in [
+            Function::ElectricalConnectionDescriptionListData,
+            Function::ElectricalConnectionParameterDescriptionListData,
+        ] {
+            engine.read(&peer.electrical_connection, &self.client, function, now);
+        }
+        for function in [
+            Function::MeasurementDescriptionListData,
+            Function::MeasurementConstraintsListData,
+            Function::MeasurementListData,
+        ] {
+            engine.read(&peer.measurement, &self.client, function, now);
+        }
+        engine.request_subscription(&self.client, &peer.measurement, now);
+
+        self.peers.push(TrackedUnit {
+            peer,
+            readings: Readings::new(),
+            described: false,
+        });
+    }
+
+    /// Stops monitoring a unit.
+    pub fn detach(&mut self, device: &crate::model::AddressDevice) {
+        self.peers.retain(|t| &t.peer.device != device);
+    }
+
+    /// The units being monitored.
+    pub fn units(&self) -> impl Iterator<Item = &MonitoredUnitPeer> {
+        self.peers.iter().map(|t| &t.peer)
+    }
+
+    /// What is known about one unit's measurements.
+    pub fn readings(&self, device: &crate::model::AddressDevice) -> Option<&Readings> {
+        self.peers
+            .iter()
+            .find(|t| &t.peer.device == device)
+            .map(|t| &t.readings)
+    }
+
+    /// Feeds one engine event to the actor.
+    pub fn handle_event(&mut self, event: &crate::spine::SpineEvent) -> Option<MonitoringEvent> {
+        use crate::spine::SpineEvent;
+
+        let (feature, data) = match event {
+            SpineEvent::ReplyReceived { feature, data }
+            | SpineEvent::DataNotified { feature, data } => (feature, data),
+            _ => return None,
+        };
+        let device = feature.device.as_ref()?;
+        let index = self.peers.iter().position(|t| &t.peer.device == device)?;
+        let tracked = &mut self.peers[index];
+
+        if tracked.readings.describe(data) {
+            // The descriptions are what make a value legible; a unit is "described" once
+            // at least one measurement has both a meaning and its phases.
+            if !tracked.described && tracked.readings.described().next().is_some() {
+                tracked.described = true;
+                return Some(MonitoringEvent::UnitDescribed {
+                    device: device.clone(),
+                });
+            }
+            return None;
+        }
+
+        let readings = tracked.readings.apply(data);
+        if readings.is_empty() {
+            return None;
+        }
+        Some(MonitoringEvent::Measured {
+            device: device.clone(),
+            readings,
+        })
     }
 }
 

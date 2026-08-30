@@ -339,9 +339,14 @@ impl MonitoredUnit {
         now: Duration,
     ) {
         let address = measurement.clone();
-        if let Some(feature) = engine.device_mut().resolve_mut(&address) {
-            let _ = feature.set_data(self.measurements());
+        let changed = engine
+            .device_mut()
+            .resolve_mut(&address)
+            .and_then(|feature| feature.set_data(self.measurements()).ok())
+            .unwrap_or(false);
+        // Implementation guide §2.4: a reading that has not moved is not news.
+        if changed {
+            engine.notify(&address, &Function::MeasurementListData, now);
         }
-        engine.notify(&address, &Function::MeasurementListData, now);
     }
 }

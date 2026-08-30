@@ -40,6 +40,12 @@ use crate::ship::Ski;
 /// The signature algorithm SHIP requires: ECDSA on secp256r1 with SHA-256.
 const ALGORITHM: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ECDSA_P256_SHA256;
 
+/// The object identifier of the Subject Key Identifier extension, 2.5.29.14.
+const OID_SUBJECT_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 14];
+
+/// DER tag for an `OCTET STRING`.
+const DER_OCTET_STRING: u8 = 0x04;
+
 /// Why a certificate could not be made or read.
 #[derive(Debug, thiserror::Error)]
 pub enum CertError {
@@ -197,6 +203,7 @@ pub fn self_signed_with(params: CertParams, key: rcgen::KeyPair) -> Result<Ident
     // Both ends of a SHIP connection authenticate, and either may dial, so one
     // certificate has to serve as both a server's and a client's.
     certificate.key_identifier_method = KeyIdMethod::PreSpecified(ski.as_bytes().to_vec());
+    certificate.custom_extensions = alloc::vec![subject_key_identifier_extension(&ski)];
 
     let certificate = certificate.self_signed(&key)?;
     Ok(Identity {
@@ -204,6 +211,24 @@ pub fn self_signed_with(params: CertParams, key: rcgen::KeyPair) -> Result<Ident
         certificate,
         key,
     })
+}
+
+/// The Subject Key Identifier extension, written by hand.
+///
+/// `rcgen` emits this extension only for certificates marked as a certificate authority,
+/// and a SHIP node certificate is a leaf. Without it a peer has to fall back to computing
+/// the digest itself — which SHIP §12.2 permits, but which a specification-following peer
+/// may equally decline to do, leaving a node that cannot be identified at all.
+///
+/// The value is `SubjectKeyIdentifier ::= KeyIdentifier ::= OCTET STRING`, so the content
+/// is the twenty SHA-1 bytes wrapped in one DER octet string; `rcgen` wraps that in the
+/// extension's own octet string in turn. Non-critical, as RFC 5280 §4.2.1.2 requires.
+fn subject_key_identifier_extension(ski: &Ski) -> rcgen::CustomExtension {
+    let mut content = Vec::with_capacity(Ski::LEN + 2);
+    content.push(DER_OCTET_STRING);
+    content.push(Ski::LEN as u8);
+    content.extend_from_slice(ski.as_bytes());
+    rcgen::CustomExtension::from_oid_content(OID_SUBJECT_KEY_IDENTIFIER, content)
 }
 
 /// Reads a private key back from the PKCS#8 DER [`Identity::key_der`] produced.
@@ -307,6 +332,37 @@ mod tests {
             identity.ski
         );
         assert_eq!(identity.ski.to_string().len(), 40);
+    }
+
+    /// RFC 5280 method 1, computed independently of how the certificate was built.
+    ///
+    /// The test above is circular on its own: it reads back the extension this crate
+    /// wrote. This one derives the digest from the certificate's raw `subjectPublicKey`
+    /// bits the way a peer that finds no extension would, and requires the two to agree.
+    /// If they ever diverge, every device that computes the fallback sees a different
+    /// SKI from the one on this node's label.
+    #[test]
+    fn the_extension_matches_what_a_peer_would_compute_for_itself() {
+        use x509_parser::prelude::*;
+
+        let identity = self_signed(CertParams::new("i:46925_u:HeatPump-1")).unwrap();
+        let (_, certificate) = X509Certificate::from_der(identity.certificate_der()).unwrap();
+
+        let computed = ski_of(&certificate.public_key().subject_public_key.data);
+        assert_eq!(
+            computed, identity.ski,
+            "the SKI in the extension is not the SHA-1 of the public key bits"
+        );
+
+        let extension = certificate
+            .get_extension_unique(&oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+            .unwrap()
+            .expect("SHIP 12.2: the extension is present");
+        let ParsedExtension::SubjectKeyIdentifier(id) = extension.parsed_extension() else {
+            panic!("expected a subject key identifier");
+        };
+        assert_eq!(id.0.len(), 20, "SHA-1, not a truncated SHA-256");
+        assert_eq!(id.0, identity.ski.as_bytes());
     }
 
     #[test]

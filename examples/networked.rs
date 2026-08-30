@@ -9,6 +9,11 @@
 //! cargo run --example networked --features runtime
 //! ```
 //!
+//! Both sides are a [`Hub`] driving a [`Engine`](eebus::spine::Engine) and one use-case
+//! actor. The loop is the same on each: ask the hub what happened, hand it to the actor,
+//! tell the hub when the actor next wants waking. Discovery, routing, keep-alives and
+//! the double-connection rule are the hub's business and do not appear here.
+//!
 //! Two nodes are created with fresh certificates and told to trust each other, which is
 //! what an installer scanning two QR codes amounts to. Everything after that is what the
 //! devices would do on a real network.
@@ -16,19 +21,18 @@
 use core::time::Duration;
 
 use eebus::cert::{self, CertParams};
-use eebus::model::{
-    CmdData, DeviceType, EntityType, FeatureType, Function, LoadControlLimitData,
-    LoadControlLimitListData, Role, ScaledNumber,
-};
-use eebus::runtime::{Node, TrustStore};
-use eebus::spine::{
-    Engine, ErrorNumber, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management,
-};
+use eebus::model::{DeviceType, EntityType};
+use eebus::runtime::{Hub, HubEvent, Node, TrustStore};
+use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::tls::ShipTls;
-use eebus::usecases::limitation::{ControllableSystem, ControllableSystemActor, CsConfig};
-use eebus::usecases::{limitation, lpc};
+use eebus::usecases::limitation::{
+    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, EnergyGuardActor,
+    GuardEvent, LimitWrite,
+};
+use eebus::usecases::lpc;
 
 const FAILSAFE_WATTS: f64 = 4_200.0;
+const REQUIRED_WATTS: f64 = 3_000.0;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,145 +66,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- The heat pump: applies limits, and answers for them ----------------
     let appliance = tokio::spawn(async move {
+        let (engine, mut actor) = build_heat_pump();
+        let mut hub = Hub::new(heat_pump, engine);
+
         let (stream, from) = listener.accept().await.expect("a caller");
-        let mut connection = heat_pump.accept(stream).await.expect("the SHIP handshake");
-        println!(
-            "[pump] {from} completed the handshake as {}",
-            connection.peer()
-        );
+        let ski = hub.accept(stream).await.expect("the SHIP handshake");
+        println!("[pump] {from} completed the handshake as {ski}");
+        actor.install(hub.engine_mut(), Duration::ZERO);
 
-        let (mut engine, mut lpc_actor) = build_heat_pump();
-        lpc_actor.publish(&mut engine);
-        // The control box is on the far side of a live connection, so its heartbeat is
-        // what this stands in for.
-        lpc_actor.system_mut().on_heartbeat(Duration::from_secs(1));
-
-        let mut now = Duration::from_secs(2);
-        for _ in 0..8 {
-            let Ok(datagram) = connection.recv().await else {
-                break;
+        loop {
+            let now = hub.now();
+            let event = match hub.next().await {
+                Ok(event) => event,
+                Err(_) => break,
             };
-            engine.handle_datagram(&datagram, now);
-
-            let events: Vec<SpineEvent> = core::iter::from_fn(|| engine.poll_event()).collect();
-            for event in &events {
-                if let Some(outcome) = lpc_actor.handle_event(&mut engine, event, now) {
-                    println!(
-                        "[pump] a limit was {}; now {:?} at {:?}",
-                        if outcome.is_accepted() {
-                            "accepted"
-                        } else {
-                            "refused"
-                        },
-                        lpc_actor.system().state(),
-                        lpc_actor.system().effective_limit(),
-                    );
+            match event {
+                HubEvent::Spine(event) => {
+                    if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
+                        actor.handle_event(hub.engine_mut(), &event, now)
+                    {
+                        println!(
+                            "[pump] a {:.0} W limit was {}; now {:?} at {:?}",
+                            write.watts,
+                            if outcome.is_accepted() {
+                                "accepted"
+                            } else {
+                                "refused"
+                            },
+                            actor.system().state(),
+                            actor.system().effective_limit(),
+                        );
+                    }
                 }
+                HubEvent::Tick => {
+                    actor.handle_timeout(hub.engine_mut(), now);
+                }
+                HubEvent::Disconnected { .. } => break,
+                _ => {}
             }
-            while let Some(answer) = engine.poll_transmit() {
-                connection.send(&answer).await.expect("the answer");
-            }
-            now += Duration::from_secs(1);
+            let next = actor.poll_timeout();
+            hub.wake_at(next);
         }
+        println!("[pump] the connection ended");
     });
 
     // ---- The control box: discovers, binds, and sends a limit ---------------
-    let mut connection = control_box.connect(address).await?;
-    println!("[box]  connected to {}\n", connection.peer());
+    let (engine, client, diagnosis) = build_control_box();
+    let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
+    let mut hub = Hub::new(control_box, engine);
 
-    let mut engine = build_control_box();
-    let client = engine.device().address_of(&[1], 1);
-    let peer = eebus::spine::device_address("i:46925", "HeatPump-1")?;
-    let mut now = Duration::from_secs(2);
+    let ski = hub.connect(address).await?;
+    println!("[box]  connected to {ski}\n");
 
-    // Discovery.
-    engine.read(
-        &node_management(&peer),
-        &node_management(engine.device().address()),
-        Function::NodeManagementDetailedDiscoveryData,
-        now,
-    );
-    engine.read(
-        &node_management(&peer),
-        &node_management(engine.device().address()),
-        Function::NodeManagementUseCaseData,
-        now,
-    );
-    pump(&mut engine, &mut connection, 2).await?;
+    // The grid needs 3 kW. Everything from here — the heartbeat that has to precede the
+    // limit, the binding it needs first — belongs to the actor.
+    let mut required = Some(LimitWrite::active(REQUIRED_WATTS));
 
-    let remote = engine.peer(&peer).expect("the heat pump");
-    let use_case = remote
-        .use_case("limitationOfPowerConsumption", "ControllableSystem")
-        .expect("it plays the Controllable System");
-    let load_control = remote
-        .address_of(use_case, &FeatureType::LoadControl, Role::Server)
-        .expect("its LoadControl feature");
-    println!(
-        "[box]  discovered {} playing {} for scenarios {:?}\n",
-        peer.as_str(),
-        use_case.name,
-        use_case.scenarios
-    );
+    for _ in 0..64 {
+        let now = hub.now();
+        let event = tokio::time::timeout(Duration::from_secs(5), hub.next()).await??;
+        let mut reports = Vec::new();
 
-    // The binding is what authorises a write, and only one manager may hold it.
-    now += Duration::from_secs(1);
-    engine.request_binding(&client, &load_control, now);
-    pump(&mut engine, &mut connection, 1).await?;
-    println!("[box]  bound to the LoadControl feature\n");
+        match event {
+            HubEvent::PeerDiscovered { device, .. } => {
+                let remote = hub.engine().peer(&device).expect("the peer we just heard");
+                let peer = limitation::locate(remote, lpc::DIRECTION)
+                    .expect("it plays the Controllable System");
+                println!(
+                    "[box]  discovered {} playing the Controllable System",
+                    device.as_str()
+                );
+                guard.attach(hub.engine_mut(), peer, now);
+                if let Some(limit) = required.take() {
+                    guard.require(&device, Some(limit), now);
+                }
+            }
+            HubEvent::Spine(event) => {
+                reports.extend(guard.handle_event(hub.engine_mut(), &event, now));
+            }
+            HubEvent::Tick => reports = guard.handle_timeout(hub.engine_mut(), now),
+            HubEvent::Disconnected { .. } => break,
+            HubEvent::Connected { .. } | HubEvent::PeerKeysUpdated { .. } => {}
+        }
 
-    // The limit itself.
-    now += Duration::from_secs(1);
-    engine.write(
-        &load_control,
-        &client,
-        CmdData::LoadControlLimitListData(LoadControlLimitListData {
-            load_control_limit_data: Some(vec![LoadControlLimitData {
-                limit_id: Some(limitation::LIMIT_ID),
-                is_limit_active: Some(true),
-                value: Some(ScaledNumber::from_f64(3_000.0, 0)),
-                ..Default::default()
-            }]),
-        }),
-        true,
-        now,
-    );
-    println!("[box]  wrote a 3000 W limit");
-    pump(&mut engine, &mut connection, 1).await?;
+        let mut done = false;
+        for report in reports {
+            match report {
+                GuardEvent::Ready { .. } => println!("[box]  bound to the LoadControl feature"),
+                GuardEvent::LimitAccepted { limit, request, .. } => {
+                    println!(
+                        "[box]  {:.0} W accepted, answering msgCounter {} — the §14a evidence",
+                        limit.watts,
+                        request.get()
+                    );
+                    done = true;
+                }
+                GuardEvent::LimitRefused { limit, error, .. } => {
+                    println!("[box]  {:.0} W refused: {error}", limit.watts);
+                    done = true;
+                }
+                GuardEvent::PeerHeartbeatLost { .. } => {}
+            }
+        }
+        if done {
+            break;
+        }
+        hub.wake_at(guard.poll_timeout());
+    }
 
-    let result = core::iter::from_fn(|| engine.poll_event())
-        .find_map(|event| match event {
-            SpineEvent::ResultReceived { error, .. } => Some(error),
-            _ => None,
-        })
-        .expect("the heat pump answered");
-    println!("[box]  answered errorNumber {} ({result})", result.number());
-    assert_eq!(result, ErrorNumber::None);
-
-    connection
-        .close(eebus::ship::ConnectionCloseReason::Unspecific)
-        .await?;
-    appliance.await?;
+    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), appliance).await;
     println!("\ndone — the whole stack, over a socket");
     Ok(())
 }
 
-/// Sends everything the engine has queued, then waits for `expect` answers.
-async fn pump(
-    engine: &mut Engine,
-    connection: &mut eebus::runtime::ShipConnection,
-    expect: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    while let Some(datagram) = engine.poll_transmit() {
-        connection.send(&datagram).await?;
-    }
-    for _ in 0..expect {
-        let datagram = tokio::time::timeout(Duration::from_secs(5), connection.recv()).await??;
-        engine.handle_datagram(&datagram, Duration::from_secs(2));
-    }
-    Ok(())
-}
-
-fn build_control_box() -> Engine {
+/// The control box: an Energy Guard on a `GridGuard` entity.
+fn build_control_box() -> (
+    Engine,
+    eebus::model::FeatureAddress,
+    eebus::model::FeatureAddress,
+) {
     let mut device = LocalDevice::new(
         "i:46925",
         "ControlBox-1",
@@ -209,18 +195,20 @@ fn build_control_box() -> Engine {
     .expect("a valid address");
     device
         .add_entity(
-            LocalEntity::new([1], EntityType::GridGuard).with_feature(LocalFeature::new(
-                1,
-                FeatureType::Generic,
-                Role::Client,
-            )),
+            LocalEntity::new([1], EntityType::GridGuard)
+                .with_feature(limitation::client_feature(1))
+                .with_feature(limitation::device_diagnosis_feature(2)),
         )
         .expect("a fresh entity");
+
+    let client = device.address_of(&[1], 1);
+    let diagnosis = device.address_of(&[1], 2);
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::ENERGY_GUARD);
-    engine
+    (engine, client, diagnosis)
 }
 
+/// The heat pump: a Controllable System with the features LPC asks of it.
 fn build_heat_pump() -> (Engine, ControllableSystemActor) {
     let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)
         .expect("a valid address");

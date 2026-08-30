@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{%- set_global page_title = "" -%}
+{%- set_global page_desc = config.description -%}
+{%- set_global canonical = config.base_url -%}
+{%- set_global og_type = "website" -%}
+{%- if page -%}
+  {%- set_global page_title = page.title -%}
+  {%- set_global page_desc = page.description | default(value=config.description) -%}
+  {%- set_global canonical = page.permalink -%}
+  {%- set_global og_type = "article" -%}
+{%- elif section -%}
+  {%- set_global canonical = section.permalink -%}
+  {%- if not section.extra.landing -%}
+    {%- set_global page_title = section.title -%}
+    {%- set_global page_desc = section.description | default(value=config.description) -%}
+  {%- endif -%}
+{%- endif -%}
+
+<title>{% if page_title %}{{ page_title }} · {{ config.title }}{% else %}{{ config.title }} — {{ config.extra.tagline }}{% endif %}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ canonical | safe }}">
+
+<meta property="og:type" content="{{ og_type }}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{% if page_title %}{{ page_title }}{% else %}{{ config.title }} — {{ config.extra.tagline }}{% endif %}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:image" content="{{ get_url(path='og.png') | safe }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{% if page_title %}{{ page_title }}{% else %}{{ config.title }} — {{ config.extra.tagline }}{% endif %}">
+<meta name="twitter:description" content="{{ page_desc }}">
+<meta name="twitter:image" content="{{ get_url(path='og.png') | safe }}">
+
+<meta name="theme-color" content="#0b1017" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="light dark">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') | safe }}" type="image/svg+xml">
+<link rel="apple-touch-icon" href="{{ get_url(path='icon-180.png') | safe }}">
+<link rel="stylesheet" href="{{ get_url(path='style.css') | safe }}">
+<link id="syn-light" rel="stylesheet" href="{{ get_url(path='giallo-light.css') | safe }}" media="(prefers-color-scheme: light)">
+<link id="syn-dark" rel="stylesheet" href="{{ get_url(path='giallo-dark.css') | safe }}" media="(prefers-color-scheme: dark)">
+{% block head %}{% endblock %}
+
+<script type="application/ld+json">
+{%- if section and section.extra.landing -%}
+{"@context":"https://schema.org","@graph":[
+{"@type":"SoftwareSourceCode","name":"eebus","description":{{ config.description | json_encode | safe }},
+ "codeRepository":"{{ config.extra.repo }}","programmingLanguage":"Rust","runtimePlatform":"Rust",
+ "license":"https://spdx.org/licenses/MIT.html","url":"{{ config.base_url }}/","author":{"@type":"Person","name":"{{ config.author }}"}},
+{"@type":"WebSite","name":"eebus","url":"{{ config.base_url }}/","description":{{ config.description | json_encode | safe }}}]}
+{%- elif page -%}
+{"@context":"https://schema.org","@graph":[
+{"@type":"TechArticle","headline":{{ page.title | json_encode | safe }},"description":{{ page_desc | json_encode | safe }},
+ "url":"{{ page.permalink | safe }}","inLanguage":"en",
+ "isPartOf":{"@type":"WebSite","name":"eebus","url":"{{ config.base_url }}/"},
+ "author":{"@type":"Person","name":"{{ config.author }}"}},
+{"@type":"BreadcrumbList","itemListElement":[
+ {"@type":"ListItem","position":1,"name":"Home","item":"{{ config.base_url }}/"},
+ {"@type":"ListItem","position":2,"name":"Documentation","item":"{{ config.base_url }}/docs/"},
+ {"@type":"ListItem","position":3,"name":{{ page.title | json_encode | safe }}}]}]}
+{%- else -%}
+{"@context":"https://schema.org","@type":"CollectionPage","name":{{ page_title | json_encode | safe }},
+ "description":{{ page_desc | json_encode | safe }},"url":"{{ canonical | safe }}","inLanguage":"en"}
+{%- endif -%}
+</script>
+<script>
+(function () {
+  var mode = "auto";
+  try {
+    var t = localStorage.getItem("theme");
+    if (t === "light" || t === "dark") mode = t;
+  } catch (e) {}
+  document.documentElement.setAttribute("data-theme", mode);
+  var l = document.getElementById("syn-light"), d = document.getElementById("syn-dark");
+  if (l && d && mode !== "auto") {
+    l.media = mode === "light" ? "all" : "not all";
+    d.media = mode === "dark" ? "all" : "not all";
+  }
+})();
+</script>
+</head>
+<body class="{% block body_class %}{% endblock %}">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') | safe }}">
+      <svg class="brand-mark" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true" focusable="false">
+        <path d="M6 22 L13 6 L19 18 L23 10 L26 16" fill="none" stroke="currentColor" stroke-width="2.6"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="brand-name">eebus</span>
+    </a>
+    <nav class="topnav" aria-label="Main">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}"{% if current_path and "/docs" in current_path %} aria-current="page"{% endif %}>Docs</a>
+      <a href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+      <a href="{{ config.extra.apidocs }}" rel="noopener">API</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Switch colour theme" title="Switch colour theme">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+        <path d="M12 3v2m0 14v2m9-9h-2M5 12H3m14.5-6.5-1.4 1.4M7.9 16.1l-1.4 1.4m0-11.9 1.4 1.4m8.2 8.2 1.4 1.4"
+              fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+{% block content %}{% endblock %}
+
+<footer class="footer">
+  <div class="footer-inner">
+    <p><strong>eebus</strong> — {{ config.extra.tagline }}. MIT or Apache-2.0.</p>
+    <nav aria-label="Footer">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+      <a href="{{ config.extra.apidocs }}" rel="noopener">API reference</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">Source</a>
+    </nav>
+    <p class="fine">EEBUS® is a trademark of EEBus Initiative e.V. This project is not affiliated with or
+    endorsed by the EEBus Initiative.</p>
+  </div>
+</footer>
+
+<script>window.SEARCH_INDEX_URL = "{{ get_url(path='search_index.en.json') | safe }}";</script>
+<script src="{{ get_url(path='app.js') | safe }}" defer></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

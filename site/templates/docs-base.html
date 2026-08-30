@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block body_class %}docs{% endblock %}
+
+{% block content %}
+<div class="docs-shell">
+
+  <input type="checkbox" id="nav-toggle" class="nav-toggle-input" hidden>
+  <label for="nav-toggle" class="nav-toggle" tabindex="0" role="button">Contents</label>
+
+  <aside class="sidebar" aria-label="Documentation">
+    <form class="search" role="search" onsubmit="return false">
+      <label class="sr-only" for="q">Search the documentation</label>
+      <input id="q" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
+      <div id="results" class="results" hidden></div>
+    </form>
+    {%- set docs = get_section(path="docs/_index.md") -%}
+    <nav>
+      <a class="sidebar-link{% if current_path == docs.path %} active{% endif %}" href="{{ docs.permalink | safe }}">Overview</a>
+      {%- set_global group = "" -%}
+      {%- for p in docs.pages -%}
+        {%- set g = p.extra.group | default(value="Guide") -%}
+        {%- if g != group %}
+      <p class="sidebar-group">{{ g }}</p>
+        {%- set_global group = g -%}
+        {%- endif %}
+      <a class="sidebar-link{% if page and current_path == p.path %} active{% endif %}" href="{{ p.permalink | safe }}">{{ p.title }}</a>
+      {%- endfor %}
+      <p class="sidebar-group">Reference</p>
+      <a class="sidebar-link ext" href="{{ config.extra.apidocs }}" rel="noopener">API on docs.rs ↗</a>
+      <a class="sidebar-link ext" href="{{ config.extra.repo }}" rel="noopener">Source on GitHub ↗</a>
+    </nav>
+  </aside>
+
+  <main id="main" class="docs-main">
+    {% block docs_content %}{% endblock %}
+  </main>
+
+</div>
+{% endblock %}

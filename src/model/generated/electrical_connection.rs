@@ -86,7 +86,11 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(ElectricalConnectionCharacteristicData { electrical_connection_id, parameter_id, characteristic_id });
+crate::eebus_identity!(ElectricalConnectionCharacteristicData {
+    electrical_connection_id,
+    parameter_id,
+    characteristic_id
+});
 
 crate::eebus_id! {
     /// `ElectricalConnectionCharacteristicIdType`.
@@ -218,7 +222,9 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(ElectricalConnectionDescriptionData { electrical_connection_id });
+crate::eebus_identity!(ElectricalConnectionDescriptionData {
+    electrical_connection_id
+});
 
 crate::eebus_struct! {
     /// `ElectricalConnectionDescriptionListDataSelectorsType`.
@@ -328,7 +334,11 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(ElectricalConnectionParameterDescriptionData { electrical_connection_id, parameter_id, measurement_id });
+crate::eebus_identity!(ElectricalConnectionParameterDescriptionData {
+    electrical_connection_id,
+    parameter_id,
+    measurement_id
+});
 
 crate::eebus_struct! {
     /// `ElectricalConnectionParameterDescriptionListDataSelectorsType`.
@@ -387,7 +397,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(ElectricalConnectionPermittedValueSetData { electrical_connection_id, parameter_id });
+crate::eebus_identity!(ElectricalConnectionPermittedValueSetData {
+    electrical_connection_id,
+    parameter_id
+});
 
 crate::eebus_struct! {
     /// `ElectricalConnectionPermittedValueSetListDataSelectorsType`.
@@ -482,7 +495,9 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(ElectricalConnectionStateData { electrical_connection_id });
+crate::eebus_identity!(ElectricalConnectionStateData {
+    electrical_connection_id
+});
 
 crate::eebus_struct! {
     /// `ElectricalConnectionStateListDataSelectorsType`.
@@ -516,4 +531,3 @@ crate::eebus_enum_ext! {
         "dc" => Dc,
     }
 }
-

@@ -1,5 +1,8 @@
-//! An EEBUS implementation in Rust: SHIP transport, SPINE data model and protocol, and
-//! the certifiable grid use cases on top.
+//! An unofficial EEBUS implementation in Rust: SHIP transport, SPINE data model and
+//! protocol, and the certifiable grid use cases on top.
+//!
+//! Guides, and the standard explained alongside the code:
+//! <https://hupe1980.github.io/eebus/docs/>
 //!
 //! EEBUS is the communication standard that connects heat pumps, wallboxes, batteries,
 //! inverters and energy managers to each other and to the grid operator. It is the
@@ -11,14 +14,16 @@
 //! | Layer | Module | Specification |
 //! |---|---|---|
 //! | Use cases | [`usecases`] | `EEBus_UC_TS_*` + the 2026 implementation guides |
+//! | E-mobility | [`usecases::emobility`] | EVSECC 1.0.1, OPEV 1.0.1b |
 //! | Protocol | [`spine`] | SPINE 1.3.0 Protocol Specification |
 //! | Information model | [`model`] | SPINE 1.3.0 Resource Specification |
 //! | Transport | [`ship`] | SHIP 1.0.1 / 1.1.0 |
 //! | Wire format | [`codec`] | SHIP 1.1.0 §11.4 (XML→JSON) |
+//! | Sockets | [`runtime`] | TCP, TLS 1.2, WebSocket, the connection table |
 //!
 //! # Sans-IO
 //!
-//! Nothing in this crate opens a socket or reads a clock. Both protocol cores —
+//! Nothing below [`runtime`] opens a socket or reads a clock. Both protocol cores —
 //! [`ship::Handshake`] and [`spine::Engine`] — are driven the same way:
 //!
 //! ```text
@@ -36,22 +41,26 @@
 //!
 //! # Getting started
 //!
+//! A device is entities, and an entity is features. NodeManagement is created for you.
+//!
 //! ```
 //! use core::time::Duration;
-//! use eebus::model::{DeviceType, EntityType, FeatureType, Function, Role};
-//! use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, node_management};
+//! use eebus::prelude::*;
 //!
-//! // A device is entities, and an entity is features. NodeManagement is created for you.
 //! let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)?;
 //! device.add_entity(
 //!     LocalEntity::new([1], EntityType::HeatPumpAppliance)
-//!         .with_feature(LocalFeature::new(1, FeatureType::LoadControl, Role::Server)),
+//!         .with_feature(limitation::load_control_feature(1))
+//!         .with_feature(limitation::device_configuration_feature(2))
+//!         .with_feature(limitation::device_diagnosis_feature(3)),
 //! )?;
 //!
-//! // The engine turns application calls into datagrams and datagrams into events.
 //! let mut engine = Engine::new(device);
+//! engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
+//!
+//! // The engine turns application calls into datagrams and datagrams into events.
 //! let source = engine.device().address_of(&[1], 1);
-//! let peer = node_management(&eebus::spine::device_address("i:12345", "ControlBox-1")?);
+//! let peer = node_management(&device_address("i:12345", "ControlBox-1")?);
 //! engine.read(&peer, &source, Function::NodeManagementDetailedDiscoveryData, Duration::ZERO);
 //!
 //! let datagram = engine.poll_transmit().expect("a read to send");
@@ -59,15 +68,24 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! See `examples/grid_limit.rs` for the whole §14a exchange: the SHIP handshake,
-//! discovery, a binding, a limit, and the acknowledgement that answers it.
+//! On a network, [`runtime::Hub`] owns the sockets and the clock: it dials and accepts,
+//! runs the opening discovery, routes each datagram to the peer it names, keeps idle
+//! connections alive, and resolves the double connections two nodes that dial each other
+//! at the same moment would otherwise both hold.
+//!
+//! See `examples/grid_limit.rs` for the whole §14a exchange against a virtual clock, and
+//! `examples/networked.rs` for the same thing over a socket.
 //!
 //! # Status
 //!
-//! Under construction, and not yet published. The model, codec, SHIP handshake, SPINE
-//! engine and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP —
-//! are implemented and tested; TLS, mDNS-SD and a runtime adapter are the remaining
-//! milestones. The API will change.
+//! Under construction, and not yet published. The model, codec, SHIP handshake and
+//! transport including certificate updates, the SPINE engine, the runtime, and all four
+//! use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are implemented and
+//! tested on both sides of each, as are two of the e-mobility family
+//! ([`usecases::emobility`]). The API will change.
+//!
+//! EEBUS® is a trademark of EEBus Initiative e.V. This project is not affiliated with or
+//! endorsed by the EEBus Initiative.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
@@ -83,6 +101,7 @@ pub mod codec;
 #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
 pub mod mdns;
 pub mod model;
+pub mod prelude;
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 pub mod runtime;

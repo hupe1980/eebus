@@ -76,7 +76,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(SensingData => SensingListDataSelectors {  } unsupported { "timestampInterval" });
+crate::eebus_selectors!(SensingData => SensingListDataSelectors {  } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `SensingListDataType`.
@@ -209,4 +209,3 @@ crate::eebus_enum_ext! {
         "dayNightIndicator" => DayNightIndicator,
     }
 }
-

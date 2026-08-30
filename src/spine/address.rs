@@ -169,6 +169,21 @@ pub fn same_feature(a: &FeatureAddress, b: &FeatureAddress) -> bool {
     entity_path(a) == entity_path(b) && a.feature == b.feature
 }
 
+/// True when two addresses name features of the same entity.
+///
+/// The LPC implementation guide §3.8 turns this into a rule: an energy manager may
+/// expose several `CEM` entities, and the one that binds `LoadControl` and
+/// `DeviceConfiguration` must be one and the same — but which of its features it binds
+/// from is its own business.
+pub fn same_entity(a: &FeatureAddress, b: &FeatureAddress) -> bool {
+    if let (Some(x), Some(y)) = (&a.device, &b.device)
+        && x != y
+    {
+        return false;
+    }
+    entity_path(a) == entity_path(b)
+}
+
 /// True when the address names a primary NodeManagement instance.
 pub fn is_node_management(address: &FeatureAddress) -> bool {
     entity_path(address) == [NODE_MANAGEMENT_ENTITY]

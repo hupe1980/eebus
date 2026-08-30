@@ -1885,4 +1885,3 @@ crate::eebus_enum_ext! {
         "kg/Wh" => KgPerWh,
     }
 }
-

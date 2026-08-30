@@ -41,15 +41,14 @@ pub struct Operations {
 }
 
 impl Operations {
-    /// Readable, in full.
+    /// Readable in full only.
     ///
-    /// Partial reads are not announced. A node must not claim an operation it cannot
-    /// perform: a client that sees `read.partial` will send a filter and expect the
-    /// reply to honour it, and answering with the whole function instead is a quiet
-    /// protocol violation. Where partial reads are only recommended — LPC Table 21 marks
-    /// them `partial (R)` — a client that finds them unsupported performs a full read,
-    /// which is the documented fallback.
-    pub const fn read() -> Self {
+    /// A node must not claim an operation it cannot perform: a client that sees
+    /// `read.partial` will send a filter and expect the reply to honour it, and
+    /// answering with the whole function instead is a quiet protocol violation. Use this
+    /// for a function whose data the engine cannot narrow — one the generated
+    /// Restricted Function Exchange table does not cover.
+    pub const fn read_full() -> Self {
         Self {
             read: true,
             read_partial: false,
@@ -58,17 +57,43 @@ impl Operations {
         }
     }
 
-    /// Readable and writeable, with partial writes.
+    /// Readable, in full or in part.
+    ///
+    /// The default for a readable function, because the engine serves a filtered read
+    /// generically for every function the schemas give selectors or an elements filter —
+    /// which is nearly all of them. LPC Table 21 marks partial reads `partial (R)`;
+    /// announcing them is what lets a client ask for the one limit it cares about
+    /// instead of the whole list.
+    pub const fn read() -> Self {
+        Self {
+            read: true,
+            read_partial: true,
+            write: false,
+            write_partial: false,
+        }
+    }
+
+    /// Readable and writeable, both in full and in part.
     ///
     /// This is what LPC Table 21 requires of `loadControlLimitListData`:
     /// `write (M). partial (M)`. Partial writes carry the limit updates the use case is
-    /// built on, so unlike partial reads they are not optional.
+    /// built on.
     pub const fn read_write() -> Self {
+        Self {
+            read: true,
+            read_partial: true,
+            write: true,
+            write_partial: true,
+        }
+    }
+
+    /// Readable and writeable, but only in full.
+    pub const fn read_write_full() -> Self {
         Self {
             read: true,
             read_partial: false,
             write: true,
-            write_partial: true,
+            write_partial: false,
         }
     }
 
@@ -151,8 +176,18 @@ impl LocalFeature {
     }
 
     /// Declares a function this feature offers.
+    ///
+    /// `read.partial` is dropped for a function the engine cannot narrow — the schemas
+    /// give most functions a selectors or elements filter, but not all of them, and a
+    /// node that announced partial reads it could not serve would have clients sending
+    /// filters only to be answered with `errorNumber` 8.
     #[must_use]
     pub fn with_function(mut self, function: Function, operations: Operations) -> Self {
+        let operations = Operations {
+            read_partial: operations.read_partial
+                && CmdData::supports_restriction(function.as_str()),
+            ..operations
+        };
         self.functions.push(FunctionEntry {
             function,
             operations,
@@ -201,6 +236,10 @@ impl LocalFeature {
         if partial && !entry.operations.write_partial {
             return Err(FeatureError::PartialNotSupported);
         }
+        // Use-case IG §3.1: every message carries an entry's primary and sub identifiers.
+        if !update.entries_identified() {
+            return Err(FeatureError::MissingIdentifier);
+        }
         Ok(())
     }
 
@@ -213,17 +252,25 @@ impl LocalFeature {
         self.function(function)?.data.as_ref()
     }
 
-    /// Replaces a function's data outright.
+    /// Replaces a function's data outright, and says whether that changed anything.
     ///
     /// Used by the application to publish a value; a peer's write goes through
     /// [`apply`](Self::apply) instead, which honours the partial rules.
-    pub fn set_data(&mut self, data: CmdData) -> Result<(), FeatureError> {
+    ///
+    /// The answer matters: the SPINE implementation guide §2.4 asks a server not to
+    /// notify data that has not changed, and an energy manager holding a dozen
+    /// subscriptions is the reason — a device that re-notifies every second because it
+    /// re-published the same reading floods the peer it depends on.
+    pub fn set_data(&mut self, data: CmdData) -> Result<bool, FeatureError> {
         let function = Function::from(data.key());
         let entry = self
             .function_mut(&function)
             .ok_or(FeatureError::UnknownFunction)?;
+        if entry.data.as_ref() == Some(&data) {
+            return Ok(false);
+        }
         entry.data = Some(data);
-        Ok(())
+        Ok(true)
     }
 
     /// Applies a peer's write.
@@ -242,6 +289,9 @@ impl LocalFeature {
         if partial && !entry.operations.write_partial {
             return Err(FeatureError::PartialNotSupported);
         }
+        if !update.entries_identified() {
+            return Err(FeatureError::MissingIdentifier);
+        }
         match &mut entry.data {
             Some(stored) => stored.apply(update, partial)?,
             None => entry.data = Some(update),
@@ -257,6 +307,9 @@ impl LocalFeature {
             .ok_or(FeatureError::UnknownFunction)?;
         if !entry.operations.write {
             return Err(FeatureError::NotWriteable);
+        }
+        if !update.entries_identified() {
+            return Err(FeatureError::MissingIdentifier);
         }
         if let Some(stored) = &mut entry.data {
             stored.delete(update)?;
@@ -287,6 +340,9 @@ pub enum FeatureError {
     /// A partial write was attempted on a function that only accepts full writes.
     #[error("the function does not support partial writes")]
     PartialNotSupported,
+    /// A list entry arrived without the identifiers that say which entry it is.
+    #[error("a list entry is missing its identifiers")]
+    MissingIdentifier,
     /// The payload belonged to a different function than the stored data.
     #[error(transparent)]
     Mismatch(#[from] FunctionMismatch),
@@ -297,7 +353,9 @@ impl FeatureError {
     pub fn error_number(self) -> super::ErrorNumber {
         match self {
             Self::UnknownFunction => super::ErrorNumber::CommandNotSupported,
-            Self::NotWriteable | Self::Mismatch(_) => super::ErrorNumber::CommandRejected,
+            Self::NotWriteable | Self::MissingIdentifier | Self::Mismatch(_) => {
+                super::ErrorNumber::CommandRejected
+            }
             Self::PartialNotSupported => super::ErrorNumber::RestrictedExchangeNotSupported,
         }
     }

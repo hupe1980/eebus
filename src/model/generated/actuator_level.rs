@@ -80,4 +80,3 @@ crate::eebus_enum_ext! {
         "relative" => Relative,
     }
 }
-

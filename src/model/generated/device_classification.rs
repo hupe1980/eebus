@@ -119,4 +119,3 @@ crate::eebus_enum_ext! {
         "dc" => Dc,
     }
 }
-

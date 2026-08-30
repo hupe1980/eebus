@@ -732,7 +732,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(SmartEnergyManagementPsPriceDataPrice => SmartEnergyManagementPsPriceDataSelectors {  } unsupported { "price" });
+crate::eebus_selectors!(SmartEnergyManagementPsPriceDataPrice => SmartEnergyManagementPsPriceDataSelectors {  } unsupported { price: "price" });
 
 crate::eebus_struct! {
     /// `SmartEnergyManagementPsPriceDataType`.
@@ -743,4 +743,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(SmartEnergyManagementPsPriceData => SmartEnergyManagementPsPriceDataPrice { price });
-

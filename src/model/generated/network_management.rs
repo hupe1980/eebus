@@ -519,4 +519,3 @@ crate::eebus_str! {
     /// `NetworkManagementTechnologyAddressType`.
     pub struct NetworkManagementTechnologyAddress;
 }
-

@@ -49,8 +49,9 @@ use core::time::Duration;
 
 use super::{
     AccessMethods, AccessMethodsDnsSdMDns, ConnectionClose, ConnectionClosePhase,
-    ConnectionCloseReason, ConnectionHello, ConnectionHelloPhase, ConnectionPinError,
-    ConnectionPinInput, ConnectionPinState, ControlMessage, EndMessage, FORMAT_JSON_UTF8,
+    ConnectionCloseReason, ConnectionHello, ConnectionHelloKeyMaterialState, ConnectionHelloPhase,
+    ConnectionPinError, ConnectionPinInput, ConnectionPinState, ControlMessage, EndMessage,
+    FORMAT_JSON_UTF8, KeyMaterialState, KeyMaterialStateRequest, KeyMaterialStateResponse,
     MessageProtocolFormat, MessageProtocolFormats, MessageProtocolHandshake,
     MessageProtocolHandshakeError, MessageProtocolHandshakeVersion, PinInputPermission, PinState,
     ProtocolHandshakeType, ShipMessage,
@@ -119,6 +120,12 @@ pub struct HandshakeConfig {
     pub peer_pin: Option<String>,
     /// This node's SHIP ID, returned in `accessMethods.id`.
     pub ship_id: Option<String>,
+    /// This node's key material, if it takes part in SHIP 1.1.0 certificate updates.
+    ///
+    /// Present means the `hello` phase carries the `updateCounter` of §12.1.3.4, so a
+    /// peer that has been away can tell at once that this node's certificate has changed
+    /// and ask for the rest. Absent means the node behaves as a 1.0.1 node does.
+    pub key_material: Option<super::OwnKeys>,
 }
 
 impl Default for HandshakeConfig {
@@ -132,6 +139,7 @@ impl Default for HandshakeConfig {
             pin: PinRequirement::None,
             peer_pin: None,
             ship_id: None,
+            key_material: None,
         }
     }
 }
@@ -144,6 +152,36 @@ const T_HELLO_PROLONG_WAITING_GAP: Duration = Duration::from_secs(15);
 /// `T_hello_prolong_min`: a prolongation request timer below this is pointless, and
 /// honouring one would let a peer drive the exchange with near-zero waiting times.
 const T_HELLO_PROLONG_MIN: Duration = Duration::from_secs(1);
+
+/// The penalty after the third to fifth invalid PIN (SHIP §13.4.4.3.4 rule 2).
+///
+/// The specification permits 10–15 seconds and the parameter table recommends 15; longer
+/// only "in case of increased security requirements".
+pub const PIN_PENALTY_SHORT: Duration = Duration::from_secs(15);
+
+/// The penalty after the sixth invalid PIN and beyond (§13.4.4.3.4 rule 3).
+pub const PIN_PENALTY_LONG: Duration = Duration::from_secs(90);
+
+/// How many invalid PINs are tolerated before the short penalty applies.
+const PIN_ATTEMPTS_BEFORE_SHORT_PENALTY: u32 = 3;
+
+/// How many invalid PINs before the long penalty applies.
+const PIN_ATTEMPTS_BEFORE_LONG_PENALTY: u32 = 6;
+
+/// The penalty owed after `attempts` invalid PINs.
+///
+/// The point of the escalation is that a brute-force search over an eight-digit hex PIN
+/// becomes arithmetically impossible rather than merely slow: at ninety seconds a try,
+/// the search space outlives the device.
+pub const fn pin_penalty(attempts: u32) -> Option<Duration> {
+    if attempts >= PIN_ATTEMPTS_BEFORE_LONG_PENALTY {
+        Some(PIN_PENALTY_LONG)
+    } else if attempts >= PIN_ATTEMPTS_BEFORE_SHORT_PENALTY {
+        Some(PIN_PENALTY_SHORT)
+    } else {
+        None
+    }
+}
 
 /// Which of the five phases the connection is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +226,26 @@ pub enum Event {
     PeerPinState(PinState),
     /// The peer supplied its access methods.
     PeerAccessMethods(AccessMethods),
+    /// The peer's `hello` announced the state of its key material (SHIP §12.1.3.4).
+    ///
+    /// Compare it with what is stored for this peer: a higher counter means its
+    /// certificate has changed, and [`Handshake::request_key_material`] asks for the
+    /// rest once data exchange opens.
+    PeerKeyMaterialCounter {
+        /// What the peer announced.
+        update_counter: u16,
+    },
+    /// The peer sent its key material.
+    ///
+    /// It has already been acknowledged; what to do with it is
+    /// [`PeerKeys::apply`](super::PeerKeys::apply)'s answer, and the curve to pass is
+    /// the one this connection's TLS negotiated.
+    PeerKeyMaterial(KeyMaterialState),
+    /// The peer asked for this node's key material, which has been sent.
+    PeerAskedForKeyMaterial {
+        /// The counter the peer says it holds.
+        known_update_counter: u16,
+    },
     /// The connection is finished or was given up.
     Aborted(AbortReason),
 }
@@ -239,14 +297,26 @@ pub struct Handshake {
     hello_announced_pending: bool,
     /// The peer's most recently announced waiting time, used to size our own timers.
     hello_peer_waiting: Option<Duration>,
+    /// When the peer's Wait-For-Ready-Timer expires, by its own last announcement.
+    ///
+    /// The instant, not the span: a prolongation request has to precede *that*, and
+    /// re-deriving it from a later `now` — when this node re-announces, say — would slide
+    /// the request past the deadline it exists to beat.
+    hello_peer_deadline: Option<Duration>,
 
     /// What the server offered, kept to compare against the client's confirmation.
     proposed: Option<MessageProtocolHandshake>,
     negotiated: Option<((u16, u16), String)>,
 
+    /// When the outstanding `keyMaterialState` was sent, for the resend of §12.1.3.2.
+    key_material_sent_at: Option<Duration>,
+    key_material_resent: bool,
+
     local_pin_state: PinState,
     peer_pin_state: Option<PinState>,
     pin_attempts: u32,
+    /// When the current brute-force penalty ends (§13.4.4.3.4).
+    pin_penalty_until: Option<Duration>,
 
     timers: Timers,
     outbox: VecDeque<ShipMessage>,
@@ -260,6 +330,11 @@ struct Timers {
     send_prolongation: Option<Duration>,
     prolongation_reply: Option<Duration>,
     wait: Option<Duration>,
+    /// The brute-force penalty of §13.4.4.3.4, and the close handshake's `maxTime`.
+    pin_penalty: Option<Duration>,
+    close: Option<Duration>,
+    /// Waiting for a `keyMaterialStateResponse` (§12.1.3.2).
+    key_material: Option<Duration>,
 }
 
 impl Timers {
@@ -270,6 +345,9 @@ impl Timers {
             self.send_prolongation,
             self.prolongation_reply,
             self.wait,
+            self.pin_penalty,
+            self.close,
+            self.key_material,
         ]
         .into_iter()
         .flatten()
@@ -306,11 +384,15 @@ impl Handshake {
             hello_remote_ready: false,
             hello_announced_pending: false,
             hello_peer_waiting: None,
+            hello_peer_deadline: None,
             proposed: None,
             negotiated: None,
+            key_material_sent_at: None,
+            key_material_resent: false,
             local_pin_state,
             peer_pin_state: None,
             pin_attempts: 0,
+            pin_penalty_until: None,
             timers: Timers::default(),
             outbox: VecDeque::new(),
             events: VecDeque::new(),
@@ -370,11 +452,22 @@ impl Handshake {
     }
 
     /// Announces a connection termination (SHIP §13.4.8).
-    pub fn close(&mut self, reason: ConnectionCloseReason, max_time: Duration) {
-        if matches!(self.phase, Phase::Closed | Phase::Aborted) {
+    ///
+    /// The close is a handshake of its own: `connectionClose{announce}` goes out, the
+    /// peer confirms, and only then is the connection finished. `max_time` is what the
+    /// peer is told it has to answer in, and it is also how long this waits — a peer that
+    /// has already gone cannot confirm anything, and a node that waited for a
+    /// confirmation that will never come would hold the socket forever. When it expires,
+    /// [`handle_timeout`](Self::handle_timeout) finishes the close.
+    ///
+    /// Announcing it matters: without it a peer cannot tell a deliberate shutdown from a
+    /// network failure, and will keep retrying against a node that has gone on purpose.
+    pub fn close(&mut self, reason: ConnectionCloseReason, max_time: Duration, now: Duration) {
+        if matches!(self.phase, Phase::Closed | Phase::Aborted | Phase::Closing) {
             return;
         }
         self.phase = Phase::Closing;
+        self.timers.close = Some(now + max_time);
         self.outbox
             .push_back(ShipMessage::End(EndMessage::ConnectionClose(
                 ConnectionClose {
@@ -383,6 +476,97 @@ impl Handshake {
                     reason: Some(reason),
                 },
             )));
+    }
+
+    /// Sends a PIN to the peer, as entered by a user.
+    ///
+    /// The peer having said it requires one, this is how the answer gets there: a device
+    /// with a display shows the request, a person types the PIN off the other device's
+    /// label, and it arrives here. Where the PIN is known in advance —
+    /// [`HandshakeConfig::peer_pin`] — it is sent automatically instead.
+    ///
+    /// It stays available after this node's own data exchange has opened: §13.4.4.3.5.2
+    /// lets each side decide for itself, so a node with no PIN of its own is already in
+    /// data exchange while the peer is still holding back for one.
+    pub fn send_pin(&mut self, pin: impl Into<String>) {
+        if !matches!(self.phase, Phase::Pin | Phase::DataExchange) {
+            return;
+        }
+        if !matches!(
+            self.peer_pin_state,
+            Some(PinState::Required | PinState::Optional)
+        ) {
+            return;
+        }
+        self.outbox
+            .push_back(ShipMessage::Control(ControlMessage::ConnectionPinInput(
+                ConnectionPinInput {
+                    pin: Some(super::PinValue(pin.into())),
+                },
+            )));
+    }
+
+    /// Sends this node's key material to the peer (SHIP §12.1.3.2).
+    ///
+    /// Called when a certificate update begins, and answered by the peer with a
+    /// `keyMaterialStateResponse`. If none arrives within
+    /// [`STATE_RESPONSE_TIMEOUT`](super::STATE_RESPONSE_TIMEOUT) the message goes again;
+    /// if the second attempt is also unanswered the connection is given up, because a
+    /// peer that will not acknowledge a certificate update is a peer that will stop being
+    /// able to talk to this node when the transition ends.
+    ///
+    /// Does nothing for a node with no key material configured, or before data exchange
+    /// opens.
+    pub fn send_key_material(&mut self, now: Duration) {
+        let Some(message) = self
+            .config
+            .key_material
+            .as_ref()
+            .map(super::OwnKeys::to_message)
+        else {
+            return;
+        };
+        if !self.is_ready_for_data() {
+            return;
+        }
+        self.outbox
+            .push_back(ShipMessage::Control(ControlMessage::KeyMaterialState(
+                message,
+            )));
+        self.key_material_sent_at = Some(now);
+        self.key_material_resent = false;
+        self.timers.key_material = Some(now + super::STATE_RESPONSE_TIMEOUT);
+    }
+
+    /// Asks the peer for its key material (SHIP §12.1.3.4).
+    ///
+    /// `known_update_counter` is what this node has stored for the peer. Sending it lets
+    /// the peer answer only when it has something newer — and settles the race where both
+    /// ends decide to talk about certificates at once.
+    pub fn request_key_material(&mut self, known_update_counter: u16) {
+        if !self.is_ready_for_data() {
+            return;
+        }
+        self.outbox.push_back(ShipMessage::Control(
+            ControlMessage::KeyMaterialStateRequest(KeyMaterialStateRequest {
+                known_update_counter: Some(known_update_counter),
+            }),
+        ));
+    }
+
+    /// Whether a `keyMaterialState` is still waiting to be acknowledged.
+    pub fn key_material_outstanding(&self) -> bool {
+        self.key_material_sent_at.is_some()
+    }
+
+    /// How many invalid PINs this peer has sent.
+    pub fn invalid_pin_attempts(&self) -> u32 {
+        self.pin_attempts
+    }
+
+    /// Whether a brute-force penalty is in force, so `inputPermission` reads `busy`.
+    pub fn pin_penalty_active(&self) -> bool {
+        self.pin_penalty_until.is_some()
     }
 
     /// Asks the peer for the addresses it can be reached at (SHIP §13.4.6).
@@ -447,6 +631,39 @@ impl Handshake {
             self.abort(AbortReason::Timeout(Phase::Hello));
             return Ok(());
         }
+        if expired(&mut self.timers.close, now) {
+            // §13.4.8: the peer was given `maxTime` to confirm and did not.
+            self.finish(AbortReason::Closed("no confirmation within maxTime"));
+            return Ok(());
+        }
+        if expired(&mut self.timers.key_material, now) {
+            // §12.1.3.2: resend once, then give up on this connection and try a fresh one.
+            if self.key_material_resent {
+                self.key_material_sent_at = None;
+                self.key_material_resent = false;
+                self.abort(AbortReason::Timeout(Phase::DataExchange));
+                return Ok(());
+            }
+            self.key_material_resent = true;
+            if let Some(message) = self
+                .config
+                .key_material
+                .as_ref()
+                .map(super::OwnKeys::to_message)
+            {
+                self.outbox
+                    .push_back(ShipMessage::Control(ControlMessage::KeyMaterialState(
+                        message,
+                    )));
+                self.key_material_sent_at = Some(now);
+                self.timers.key_material = Some(now + super::STATE_RESPONSE_TIMEOUT);
+            }
+        }
+        if expired(&mut self.timers.pin_penalty, now) {
+            // §13.4.4.3.5: the penalty is over, so input is permitted again.
+            self.pin_penalty_until = None;
+            self.send_pin_state();
+        }
         if expired(&mut self.timers.wait_for_ready, now) {
             if self.trust == Trust::Pending {
                 // Still waiting for a person: renew our announcement rather than drop
@@ -480,15 +697,28 @@ impl Handshake {
         self.announce_hello(now);
     }
 
+    /// The key-material state to put in a `hello` (SHIP §12.1.3.4).
+    ///
+    /// Present only for a node that takes part in certificate updates. It is what lets a
+    /// peer notice, in the first phase of a new connection, that this node's certificate
+    /// has changed since they last spoke.
+    fn hello_key_material(&self) -> Option<ConnectionHelloKeyMaterialState> {
+        Some(ConnectionHelloKeyMaterialState {
+            update_counter: Some(self.config.key_material.as_ref()?.update_counter()),
+        })
+    }
+
     /// Sends this node's current hello state and (re)starts the Wait-For-Ready timer.
     fn announce_hello(&mut self, now: Duration) {
         let waiting = self.config.hello_init;
+        let key_material_state = self.hello_key_material();
         let hello = match self.trust {
             Trust::Trusted => {
                 self.hello_local_ready = true;
                 ConnectionHello {
                     phase: Some(ConnectionHelloPhase::Ready),
                     waiting: Some(millis(waiting)),
+                    key_material_state,
                     ..Default::default()
                 }
             }
@@ -500,6 +730,7 @@ impl Handshake {
                 ConnectionHello {
                     phase: Some(ConnectionHelloPhase::Pending),
                     waiting: Some(millis(waiting)),
+                    key_material_state,
                     ..Default::default()
                 }
             }
@@ -518,6 +749,7 @@ impl Handshake {
         self.outbox
             .push_back(ShipMessage::Control(ControlMessage::ConnectionHello(hello)));
         self.timers.wait_for_ready = Some(now + waiting);
+        self.arm_prolongation(now);
     }
 
     fn on_hello(&mut self, hello: ConnectionHello, now: Duration) {
@@ -529,12 +761,23 @@ impl Handshake {
         let peer_waiting = hello.waiting.map(|ms| Duration::from_millis(u64::from(ms)));
         if let Some(waiting) = peer_waiting {
             self.hello_peer_waiting = Some(waiting);
+            self.hello_peer_deadline = Some(now + waiting);
+        }
+
+        // §12.1.3.4: the counter rides in every connection establishment, which is how a
+        // node that has been switched off learns its stored key material is stale.
+        if let Some(update_counter) = hello
+            .key_material_state
+            .as_ref()
+            .and_then(|state| state.update_counter)
+        {
+            self.events
+                .push_back(Event::PeerKeyMaterialCounter { update_counter });
         }
 
         match hello.phase {
             Some(ConnectionHelloPhase::Ready) => {
                 self.hello_remote_ready = true;
-                self.timers.send_prolongation = None;
                 self.timers.prolongation_reply = None;
                 self.try_finish_hello(now);
             }
@@ -543,7 +786,6 @@ impl Handshake {
                 self.timers.prolongation_reply = None;
                 if let Some(waiting) = peer_waiting {
                     self.events.push_back(Event::PeerAwaitingTrust { waiting });
-                    self.arm_prolongation(waiting, now);
                 }
             }
             Some(ConnectionHelloPhase::Aborted) => {
@@ -556,31 +798,51 @@ impl Handshake {
             }
         }
 
-        // A prolongation request may accompany either phase: the peer asking is
-        // whichever side's Wait-For-Ready-Timer is about to expire, and that is
-        // usually the side that is already `ready` and waiting on us.
+        // A prolongation request may accompany either phase. Granting it restarts *our*
+        // Wait-For-Ready-Timer, which is the one the asking node is trying to keep alive.
         if self.phase == Phase::Hello && hello.prolongation_request == Some(true) {
             self.accept_prolongation(now);
         }
+
+        // Whether to keep asking is our own state's business, not the peer's phase.
+        if self.phase == Phase::Hello {
+            self.arm_prolongation(now);
+        }
     }
 
-    /// Arms the Send-Prolongation-Request timer from the peer's announced waiting time.
+    /// Arms the Send-Prolongation-Request timer, if this node is the one asking.
     ///
-    /// SHIP §13.4.4.1.3: the new value is the peer's `waiting` less
-    /// `T_hello_prolong_waiting_gap`, and the timer is disabled when that would fall
-    /// below `T_hello_prolong_min` — which also stops a peer from driving us with
-    /// near-zero waiting times.
-    fn arm_prolongation(&mut self, peer_waiting: Duration, now: Duration) {
-        if peer_waiting < T_HELLO_PROLONG_THR_INC {
+    /// SHIP §13.4.4.1.3: the node still in `pending` is the one holding the connection up,
+    /// so it is the one that asks — before the *peer's* Wait-For-Ready-Timer expires, which
+    /// the peer announced as `waiting`. Hence `waiting` less
+    /// `T_hello_prolong_waiting_gap`. A node that is already `ready` never asks; it waits,
+    /// and grants what it is asked.
+    ///
+    /// Below `T_hello_prolong_thr_inc` a peer's announced wait is not worth prolonging,
+    /// which also stops one from driving the exchange with near-zero waits.
+    fn arm_prolongation(&mut self, now: Duration) {
+        if self.hello_local_ready {
             self.timers.send_prolongation = None;
             return;
         }
-        let lead = peer_waiting.saturating_sub(T_HELLO_PROLONG_WAITING_GAP);
-        if lead < T_HELLO_PROLONG_MIN {
+        let announced = self.hello_peer_waiting.unwrap_or(self.config.hello_init);
+        if announced < T_HELLO_PROLONG_THR_INC {
             self.timers.send_prolongation = None;
             return;
         }
-        self.timers.send_prolongation = Some(now + lead);
+        let deadline = self
+            .hello_peer_deadline
+            .unwrap_or_else(|| now + self.config.hello_init);
+        let at = deadline.saturating_sub(T_HELLO_PROLONG_WAITING_GAP);
+        // Already inside the gap — which happens when the peer's grant crossed our own
+        // re-announcement. Ask on the next turn of the crank rather than not at all: a
+        // request that is late still has `T_hello_prolong_waiting_gap` to arrive in, and
+        // not asking is a certain abort.
+        self.timers.send_prolongation = if at.saturating_sub(now) < T_HELLO_PROLONG_MIN {
+            Some(now)
+        } else {
+            Some(at)
+        };
     }
 
     fn send_prolongation_request(&mut self, now: Duration) {
@@ -796,9 +1058,21 @@ impl Handshake {
     fn enter_pin(&mut self, now: Duration) {
         self.phase = Phase::Pin;
         self.timers.wait = Some(now + self.config.wait_timer);
+        self.send_pin_state();
+    }
+
+    /// Sends this node's PIN requirement (§13.4.4.3.5.1).
+    ///
+    /// `inputPermission` is present exactly when a PIN can be sent, and reads `busy`
+    /// while a brute-force penalty is running — which is how the peer is told to stop
+    /// trying rather than being left to guess from the silence.
+    fn send_pin_state(&mut self) {
         let input_permission = match self.local_pin_state {
-            // §13.4.4.3.5.1: `inputPermission` is present exactly when a PIN can be sent.
-            PinState::Required | PinState::Optional => Some(PinInputPermission::Ok),
+            PinState::Required | PinState::Optional => Some(if self.pin_penalty_until.is_some() {
+                PinInputPermission::Busy
+            } else {
+                PinInputPermission::Ok
+            }),
             _ => None,
         };
         self.outbox
@@ -837,6 +1111,14 @@ impl Handshake {
     }
 
     fn on_pin_input(&mut self, input: ConnectionPinInput, now: Duration) {
+        // §13.4.4.3.5: while a penalty runs, an input is answered with the requirement —
+        // reading `busy` — and not verified. Verifying it would let an attacker keep
+        // guessing through the penalty.
+        if self.pin_penalty_until.is_some() {
+            self.send_pin_state();
+            return;
+        }
+
         let expected = match &self.config.pin {
             PinRequirement::Required(p) | PinRequirement::Optional(p) => Some(p.clone()),
             PinRequirement::None => None,
@@ -857,13 +1139,19 @@ impl Handshake {
                 )));
             self.try_finish_pin(now);
         } else {
-            self.pin_attempts += 1;
+            self.pin_attempts = self.pin_attempts.saturating_add(1);
             self.outbox
                 .push_back(ShipMessage::Control(ControlMessage::ConnectionPinError(
                     ConnectionPinError {
                         error: Some(super::ConnectionPinErrorError(1)),
                     },
                 )));
+            // §13.4.4.3.4: three invalid PINs cost fifteen seconds, six cost ninety.
+            if let Some(penalty) = pin_penalty(self.pin_attempts) {
+                self.pin_penalty_until = Some(now + penalty);
+                self.timers.pin_penalty = Some(now + penalty);
+                self.send_pin_state();
+            }
         }
     }
 
@@ -915,7 +1203,41 @@ impl Handshake {
             ControlMessage::AccessMethods(methods) => {
                 self.events.push_back(Event::PeerAccessMethods(methods));
             }
-            // SHIP 1.1.0 key material exchange is handled above the handshake.
+            ControlMessage::KeyMaterialState(state) => {
+                // §12.1.3.3: acknowledge within twenty seconds. The response says the
+                // message arrived and nothing about whether the keys were taken up —
+                // that decision belongs to the trust store, and the peer is not told.
+                self.outbox.push_back(ShipMessage::Control(
+                    ControlMessage::KeyMaterialStateResponse(KeyMaterialStateResponse {
+                        accept: Some(true),
+                    }),
+                ));
+                self.events.push_back(Event::PeerKeyMaterial(state));
+            }
+            ControlMessage::KeyMaterialStateResponse(_) => {
+                self.key_material_sent_at = None;
+                self.key_material_resent = false;
+                self.timers.key_material = None;
+            }
+            ControlMessage::KeyMaterialStateRequest(request) => {
+                // §12.1.3.4: answer only when what we hold differs from what the peer
+                // says it has, which is also what settles the race with an unsolicited
+                // announcement crossing the request.
+                let known = request.known_update_counter.unwrap_or(0);
+                let ours = self
+                    .config
+                    .key_material
+                    .as_ref()
+                    .map(super::OwnKeys::update_counter);
+                if ours.is_some_and(|ours| ours != known) {
+                    self.send_key_material(now);
+                }
+                self.events.push_back(Event::PeerAskedForKeyMaterial {
+                    known_update_counter: known,
+                });
+            }
+            // The SHIP commissioning family is out of scope: the Installation
+            // Requirements Annex A.6 does not require it.
             _ => {}
         }
     }

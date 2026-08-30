@@ -88,7 +88,7 @@ impl Link {
             configuration,
             diagnosis,
         );
-        actor.publish(&mut pump);
+        actor.install(&mut pump, Duration::ZERO);
 
         let mut guard_device = LocalDevice::new(
             "i:12345",
@@ -400,8 +400,9 @@ fn the_heat_pumps_heartbeat_reaches_its_subscriber() {
     let mut link = Link::new();
     link.commission();
 
-    link.actor
-        .send_heartbeat(&mut link.pump, 1, "2026-08-30T10:00:00Z", link.now);
+    // Sixty seconds on, the producer puts one on the wire (LPC/LPP Table 26).
+    link.now += Duration::from_secs(60);
+    link.actor.handle_timeout(&mut link.pump, link.now);
     link.pump_messages();
 
     let notified = link
@@ -583,5 +584,100 @@ fn discovery_tells_the_two_use_cases_apart() {
     assert!(
         peer.use_case("limitationOfPowerConsumption", "ControllableSystem")
             .is_none()
+    );
+}
+
+/// SPINE implementation guide §3.3: in a partial write an omitted element means
+/// *unchanged*, so a write that adjusts only `value` leaves the limit active.
+///
+/// Deciding on the arriving fragment instead would read the absent `isLimitActive` as
+/// `false` and release the heat pump back to full power.
+#[test]
+fn ig_3_3_a_partial_limit_write_that_omits_is_limit_active_stays_active() {
+    let mut link = Link::new();
+    link.commission();
+    link.heartbeat();
+
+    // A limit is in force at 3 kW.
+    assert_eq!(link.write_limit(3_000.0, true), Some(ErrorNumber::None));
+    assert_eq!(link.actor.system().state(), LimitationState::Limited);
+
+    // The grid tightens it to 2 kW, sending only what changed.
+    let client = link.guard_client();
+    let server = link.pump_feature(1);
+    let data = CmdData::LoadControlLimitListData(eebus::model::LoadControlLimitListData {
+        load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
+            limit_id: Some(limitation::LIMIT_ID),
+            is_limit_active: None, // omitted: unchanged
+            value: Some(ScaledNumber::from_f64(2_000.0, 0)),
+            ..Default::default()
+        }]),
+    });
+    link.guard.write(&server, &client, data, true, link.now);
+    link.pump_messages();
+
+    assert_eq!(link.last_result(), Some(ErrorNumber::None));
+    assert_eq!(
+        link.actor.system().state(),
+        LimitationState::Limited,
+        "an omitted `isLimitActive` is unchanged, not a deactivation"
+    );
+    assert_eq!(
+        link.actor.system().effective_limit(),
+        EffectiveLimit::Active(2_000.0),
+        "and the new value is the one in force"
+    );
+}
+
+/// Use-case implementation guide §3.1: every message carries an entry's identifiers.
+///
+/// An entry without them names nothing stored, so appending it as new would leave two
+/// limits where the use case defines one.
+#[test]
+fn ig_3_1_a_limit_write_without_its_identifier_is_refused() {
+    let mut link = Link::new();
+    link.commission();
+    link.heartbeat();
+    assert_eq!(link.write_limit(3_000.0, true), Some(ErrorNumber::None));
+
+    let client = link.guard_client();
+    let server = link.pump_feature(1);
+    let data = CmdData::LoadControlLimitListData(eebus::model::LoadControlLimitListData {
+        load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
+            limit_id: None, // no identifier: this entry names nothing
+            is_limit_active: Some(false),
+            value: Some(ScaledNumber::from_f64(0.0, 0)),
+            ..Default::default()
+        }]),
+    });
+    link.guard.write(&server, &client, data, true, link.now);
+    link.pump_messages();
+
+    assert_eq!(
+        link.last_result(),
+        Some(ErrorNumber::CommandRejected),
+        "an unidentifiable entry is refused rather than appended"
+    );
+
+    // The stored list still holds exactly the one limit the use case defines.
+    let published = link
+        .pump
+        .device()
+        .resolve(&server)
+        .unwrap()
+        .data(&Function::LoadControlLimitListData)
+        .expect("the limit is published");
+    let CmdData::LoadControlLimitListData(list) = published else {
+        panic!("expected the limit list");
+    };
+    assert_eq!(
+        list.load_control_limit_data.as_ref().unwrap().len(),
+        1,
+        "no phantom entry was appended"
+    );
+    assert_eq!(
+        link.actor.system().state(),
+        LimitationState::Limited,
+        "and the limit that was in force is untouched"
     );
 }

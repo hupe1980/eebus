@@ -1,0 +1,10 @@
+{% extends "docs-base.html" %}
+
+{% block docs_content %}
+<article class="prose">
+  <p class="crumbs"><a href="{{ get_url(path='@/_index.md') | safe }}">Home</a> <span>/</span> Documentation</p>
+  <h1>{{ section.title }}</h1>
+  <p class="lede">{{ section.description }}</p>
+  {{ section.content | safe }}
+</article>
+{% endblock %}

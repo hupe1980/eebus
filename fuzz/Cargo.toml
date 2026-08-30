@@ -1,0 +1,53 @@
+[package]
+name = "eebus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.eebus]
+path = ".."
+features = ["std", "pairing"]
+
+[[bin]]
+name = "ship_frame"
+path = "fuzz_targets/ship_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spine_datagram"
+path = "fuzz_targets/spine_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ship_qr"
+path = "fuzz_targets/ship_qr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ship_txt"
+path = "fuzz_targets/ship_txt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spine_engine"
+path = "fuzz_targets/spine_engine.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

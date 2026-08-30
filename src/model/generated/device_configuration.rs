@@ -328,4 +328,3 @@ crate::eebus_struct! {
         "integer" => integer: i64,
     }
 }
-

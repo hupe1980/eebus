@@ -17,4 +17,3 @@ crate::eebus_struct! {
         "description" => description: Description,
     }
 }
-

@@ -55,7 +55,9 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(StateInformationData { state_information_id });
+crate::eebus_identity!(StateInformationData {
+    state_information_id
+});
 
 crate::eebus_struct! {
     /// `StateInformationListDataSelectorsType`.
@@ -122,4 +124,3 @@ crate::eebus_id! {
     /// `stateInformationIdType`.
     pub struct StateInformationId(u32);
 }
-

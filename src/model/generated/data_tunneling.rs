@@ -65,4 +65,3 @@ crate::eebus_str! {
     /// `PurposeIdType`.
     pub struct PurposeId;
 }
-

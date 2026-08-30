@@ -339,4 +339,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(OperatingConstraintsResumeImplicationListData => OperatingConstraintsResumeImplicationData { operating_constraints_resume_implication_data });
-

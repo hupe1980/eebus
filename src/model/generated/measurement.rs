@@ -199,7 +199,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(MeasurementData => MeasurementListDataSelectors { measurement_id, value_type } unsupported { "timestampInterval" });
+crate::eebus_selectors!(MeasurementData => MeasurementListDataSelectors { measurement_id, value_type } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `MeasurementListDataType`.
@@ -271,7 +271,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(MeasurementSeriesData => MeasurementSeriesListDataSelectors { measurement_id, value_type } unsupported { "timestampInterval" });
+crate::eebus_selectors!(MeasurementSeriesData => MeasurementSeriesListDataSelectors { measurement_id, value_type } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `MeasurementSeriesListDataType`.
@@ -317,7 +317,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(MeasurementThresholdRelationData => MeasurementThresholdRelationListDataSelectors { measurement_id } unsupported { "thresholdId" });
+crate::eebus_selectors!(MeasurementThresholdRelationData => MeasurementThresholdRelationListDataSelectors { measurement_id } unsupported { threshold_id: "thresholdId" });
 
 crate::eebus_struct! {
     /// `MeasurementThresholdRelationListDataType`.
@@ -485,4 +485,3 @@ crate::eebus_enum_ext! {
         "standardDeviation" => StandardDeviation,
     }
 }
-

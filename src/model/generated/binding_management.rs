@@ -124,4 +124,3 @@ crate::eebus_struct! {
         "serverFeatureType" => server_feature_type: FeatureType,
     }
 }
-

@@ -228,7 +228,14 @@ fn lower(profile: &Profile, schema: &Schema) -> Result<Lowered, String> {
         bodies.entry(module).or_default().push((name.clone(), text));
     }
 
-    emit_rfe_metadata(&ctx, &mut bodies, &module_of)?;
+    let rfe = emit_rfe_metadata(&ctx, &mut bodies, &module_of)?;
+    if let Some(text) = emit_restrict_table(&ctx, &rfe)? {
+        let module = profile.single_module.unwrap_or("command_frame").to_string();
+        bodies
+            .entry(module)
+            .or_default()
+            .push(("~restrict".to_string(), text));
+    }
 
     for (module, mut items) in bodies {
         items.sort_by(|a, b| a.0.cmp(&b.0));
@@ -690,6 +697,31 @@ fn write_modules(profile: &Profile, lowered: &Lowered) -> Result<(), String> {
     }
     std::fs::write(out_dir.join("mod.rs"), mod_rs)
         .map_err(|e| format!("writing {out_dir:?}/mod.rs: {e}"))?;
+    format_dir(out_dir)
+}
+
+/// Runs `rustfmt` over what was just written.
+///
+/// Without this the generator's output differs from the same code after `cargo fmt`,
+/// and the CI job that re-runs codegen and checks for drift fails on whitespace rather
+/// than on a real change to the model.
+fn format_dir(dir: &Path) -> Result<(), String> {
+    let files: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {dir:?}: {e}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "rs"))
+        .collect();
+
+    let status = std::process::Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2024")
+        .args(&files)
+        .status()
+        .map_err(|e| format!("running rustfmt: {e}"))?;
+    if !status.success() {
+        return Err(format!("rustfmt failed on {dir:?}"));
+    }
     Ok(())
 }
 
@@ -701,12 +733,32 @@ fn write_modules(profile: &Profile, lowered: &Lowered) -> Result<(), String> {
 /// follows throughout — identifiers first, `XListData` holding `XData`, `XDataElements`
 /// mirroring `XData` — so that the merge rules can be written once, generically, rather
 /// than per use case.
+/// Which Restricted Function Exchange implementations were actually emitted.
+///
+/// The filters are matched to their data types by name, and the names do not always
+/// line up: a few filter types are aliases, a few are shared by two data types, and a
+/// list without leading identifiers gets no `Identified` implementation at all. Only the
+/// pairs recorded here exist as trait implementations, so only they may appear in the
+/// restrict table.
+#[derive(Default)]
+struct RfeImpls {
+    /// `XListDataType` → its entry type.
+    lists: BTreeMap<String, String>,
+    /// Entry types that have an `Identified` implementation.
+    identified: BTreeSet<String>,
+    /// `XElementsType` → the data type it addresses.
+    elements: BTreeMap<String, String>,
+    /// `XSelectorsType` → the entry type it selects from.
+    selectors: BTreeMap<String, String>,
+}
+
 fn emit_rfe_metadata(
     ctx: &Ctx<'_>,
     bodies: &mut BTreeMap<String, Vec<(String, String)>>,
     module_of: &dyn Fn(&str) -> String,
-) -> Result<(), String> {
+) -> Result<RfeImpls, String> {
     let schema = ctx.schema;
+    let mut impls = RfeImpls::default();
 
     for (list_name, list_def) in &schema.complex {
         let fields = flatten_fields(ctx, list_name, list_def, 0)?;
@@ -731,11 +783,13 @@ fn emit_rfe_metadata(
             .entry(module_of(list_name))
             .or_default()
             .push((format!("{list_name}~list"), text));
+        impls.lists.insert(list_name.clone(), item_xsd.clone());
 
         // Identifiers of the entry type.
         let item_def = &schema.complex[&item_xsd];
         let identifiers = leading_identifiers(ctx, &item_xsd, item_def)?;
         if !identifiers.is_empty() && !is_alias(ctx, &item_xsd)? {
+            impls.identified.insert(item_xsd.clone());
             let mut text = String::new();
             writeln!(
                 text,
@@ -834,6 +888,7 @@ fn emit_rfe_metadata(
             .entry(module_of(&elements_name))
             .or_default()
             .push((format!("{elements_name}~elements"), text));
+        impls.elements.insert(elements_name, data_name);
     }
 
     // Selectors filters match entries of the list they belong to.
@@ -866,7 +921,7 @@ fn emit_rfe_metadata(
                 .find(|i| i.rust_name == f.rust_name && i.rust_type == f.rust_type)
             {
                 Some(_) => matched.push(f.rust_name.clone()),
-                None => unsupported.push(format!("{:?}", f.wire)),
+                None => unsupported.push(format!("{}: {:?}", f.rust_name, f.wire)),
             }
         }
 
@@ -884,9 +939,125 @@ fn emit_rfe_metadata(
             .entry(module_of(selectors_name))
             .or_default()
             .push((format!("{selectors_name}~selectors"), text));
+        impls
+            .selectors
+            .insert(selectors_name.clone(), item_xsd.clone());
     }
 
-    Ok(())
+    Ok(impls)
+}
+
+/// Emits the table that ties each data alternative to the filters that address it.
+///
+/// A line appears only where every implementation it needs was emitted above. A data
+/// type whose filters are missing — because the schemas alias them, share them, or give
+/// its list no identifiers — is simply absent, and the engine answers a filtered request
+/// for it with `errorNumber` 8 rather than serving it unfiltered.
+fn emit_restrict_table(ctx: &Ctx<'_>, rfe: &RfeImpls) -> Result<Option<String>, String> {
+    let Some((data_group, sel_group, el_group)) =
+        ctx.profile.choices.iter().find_map(|(g, _, _)| {
+            (*g == "DataChoiceGroup").then_some((
+                "DataChoiceGroup",
+                "DataSelectorsChoiceGroup",
+                "DataElementsChoiceGroup",
+            ))
+        })
+    else {
+        return Ok(None);
+    };
+
+    let alternatives = |group: &str| -> Result<Vec<(String, String)>, String> {
+        let Some(def) = ctx.schema.groups.get(group) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        collect_alternatives(ctx, group, def, &mut out, 0)?;
+        Ok(out
+            .into_iter()
+            .map(|(wire, _, xsd)| (xsd, variant_name(&wire)))
+            .collect())
+    };
+
+    let data_alts = alternatives(data_group)?;
+    let sel_alts: BTreeMap<String, String> = alternatives(sel_group)?.into_iter().collect();
+    let el_alts: BTreeMap<String, String> = alternatives(el_group)?.into_iter().collect();
+
+    let stem = |name: &str| name.strip_suffix("Type").unwrap_or(name).to_string();
+    let wire_of: BTreeMap<String, String> = {
+        let Some(def) = ctx.schema.groups.get(data_group) else {
+            return Ok(None);
+        };
+        let mut raw = Vec::new();
+        collect_alternatives(ctx, data_group, def, &mut raw, 0)?;
+        raw.into_iter()
+            .map(|(wire, _, _)| (variant_name(&wire), wire))
+            .collect()
+    };
+    let mut lines = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for (data_xsd, variant) in &data_alts {
+        if !seen.insert(variant.clone()) {
+            continue;
+        }
+        let wire = format!("{:?}", wire_of[variant]);
+        // Which type the filters address: a list's entry, or the data itself.
+        let target = rfe.lists.get(data_xsd).unwrap_or(data_xsd);
+        let is_list = rfe.lists.contains_key(data_xsd);
+
+        let selectors = {
+            let name = format!("{}SelectorsType", stem(data_xsd));
+            (rfe.selectors.get(&name) == Some(target))
+                .then(|| sel_alts.get(&name))
+                .flatten()
+        };
+        let elements = {
+            let name = format!("{}ElementsType", stem(target));
+            (rfe.elements.get(&name) == Some(target))
+                .then(|| el_alts.get(&name))
+                .flatten()
+        };
+
+        match (is_list, selectors, elements) {
+            // A list needs identifiers before its entries can be cut down safely.
+            (true, sel, el) if sel.is_some() || el.is_some() => {
+                if el.is_some() && !rfe.identified.contains(target) {
+                    if let Some(sel) = sel {
+                        lines.push(format!("        list {wire} {variant} sel {sel};"));
+                    }
+                    continue;
+                }
+                match (sel, el) {
+                    (Some(sel), Some(el)) => {
+                        lines.push(format!("        list {wire} {variant} sel {sel} el {el};"));
+                    }
+                    (Some(sel), None) => {
+                        lines.push(format!("        list {wire} {variant} sel {sel};"))
+                    }
+                    (None, Some(el)) => {
+                        // Elements alone on a list still needs the selector type to
+                        // exist for the generic path; without one there is nothing to
+                        // choose, so the whole list is returned element-filtered.
+                        lines.push(format!("        list {wire} {variant} el {el};"));
+                    }
+                    (None, None) => {}
+                }
+            }
+            (false, None, Some(el)) => {
+                lines.push(format!("        plain {wire} {variant} el {el};"))
+            }
+            _ => {}
+        }
+    }
+
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    lines.sort();
+    Ok(Some(format!(
+        "crate::eebus_restrict! {{\n    CmdData by FilterSelectors / FilterElements {{\n{}\n    }}\n}}\n",
+        lines.join("\n")
+    )))
 }
 
 /// True for a complex type emitted as a type alias rather than a struct.

@@ -34,6 +34,28 @@ pub enum MdnsError {
     Record(#[from] DiscoveryError),
 }
 
+/// What a [`Browse`] reported.
+///
+/// A node that leaves is news too: an application that dials what it discovers would
+/// otherwise keep a departed peer in its redial schedule for the life of the process.
+// Boxing the arrival would make every caller dereference to reach the fields it wants,
+// for a stack frame nobody is short of: these arrive one at a time off a channel.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowseEvent {
+    /// A SHIP node announced itself, or changed what it announces.
+    Found(Discovered),
+    /// A SHIP node withdrew its announcement.
+    ///
+    /// Only the instance name comes with it: the TXT record that carried the SKI is what
+    /// has been withdrawn. [`Hub::forget_discovered`](crate::runtime::Hub::forget_discovered)
+    /// takes it from here.
+    Lost {
+        /// The instance name that has gone.
+        instance: String,
+    },
+}
+
 /// A SHIP node found on the network.
 ///
 /// Everything here came off the wire, so treat it as a claim rather than a fact — the
@@ -193,58 +215,66 @@ impl core::fmt::Debug for Browse {
 }
 
 impl Browse {
-    /// Waits for the next SHIP node.
+    /// Waits for the next arrival or departure.
     ///
     /// Services whose TXT record cannot be read are skipped rather than reported: a
     /// record without a readable SKI names nothing a trust decision could be made about.
-    pub fn recv(&self) -> Option<Discovered> {
+    /// An application that only cares about arrivals matches [`BrowseEvent::Found`].
+    pub fn recv(&self) -> Option<BrowseEvent> {
         loop {
-            match self.events.recv().ok()? {
-                mdns_sd::ServiceEvent::ServiceResolved(service) => {
-                    if let Some(found) = read(&service) {
-                        return Some(found);
-                    }
-                }
-                mdns_sd::ServiceEvent::SearchStopped(_) => return None,
-                _ => {}
+            if let Some(event) = interpret(self.events.recv().ok()?) {
+                return event;
             }
         }
     }
 
-    /// The next SHIP node, or [`None`] if none has resolved yet.
-    pub fn try_recv(&self) -> Option<Discovered> {
+    /// The next arrival or departure, or [`None`] if nothing has happened yet.
+    pub fn try_recv(&self) -> Option<BrowseEvent> {
         loop {
-            match self.events.try_recv().ok()? {
-                mdns_sd::ServiceEvent::ServiceResolved(service) => {
-                    if let Some(found) = read(&service) {
-                        return Some(found);
-                    }
-                }
-                mdns_sd::ServiceEvent::SearchStopped(_) => return None,
-                _ => {}
+            if let Some(event) = interpret(self.events.try_recv().ok()?) {
+                return event;
             }
         }
     }
 
-    /// The next SHIP node, giving up after `timeout`.
-    pub fn recv_timeout(&self, timeout: core::time::Duration) -> Option<Discovered> {
+    /// The next arrival or departure, giving up after `timeout`.
+    pub fn recv_timeout(&self, timeout: core::time::Duration) -> Option<BrowseEvent> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 return None;
             }
-            match self.events.recv_timeout(left).ok()? {
-                mdns_sd::ServiceEvent::ServiceResolved(service) => {
-                    if let Some(found) = read(&service) {
-                        return Some(found);
-                    }
-                }
-                mdns_sd::ServiceEvent::SearchStopped(_) => return None,
-                _ => {}
+            if let Some(event) = interpret(self.events.recv_timeout(left).ok()?) {
+                return event;
             }
         }
     }
+}
+
+/// Turns one mDNS event into a [`BrowseEvent`].
+///
+/// `None` means "nothing to report, keep waiting"; `Some(None)` means the search itself
+/// has ended and the caller should stop.
+fn interpret(event: mdns_sd::ServiceEvent) -> Option<Option<BrowseEvent>> {
+    match event {
+        mdns_sd::ServiceEvent::ServiceResolved(service) => {
+            read(&service).map(|found| Some(BrowseEvent::Found(found)))
+        }
+        mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => Some(Some(BrowseEvent::Lost {
+            instance: instance_of(&fullname),
+        })),
+        mdns_sd::ServiceEvent::SearchStopped(_) => Some(None),
+        _ => None,
+    }
+}
+
+/// The instance part of a DNS-SD full name, which is what identifies one service.
+fn instance_of(fullname: &str) -> String {
+    fullname
+        .split_once('.')
+        .map(|(instance, _)| instance.to_string())
+        .unwrap_or_else(|| fullname.to_string())
 }
 
 /// Turns a resolved service into a [`Discovered`], or nothing if it is not usable.
@@ -261,11 +291,7 @@ fn read(service: &mdns_sd::ResolvedService) -> Option<Discovered> {
         record,
         addresses: service.addresses.iter().map(|a| a.to_ip_addr()).collect(),
         port: service.port,
-        instance: service
-            .fullname
-            .split_once('.')
-            .map(|(instance, _)| instance.to_string())
-            .unwrap_or_else(|| service.fullname.clone()),
+        instance: instance_of(&service.fullname),
     })
 }
 

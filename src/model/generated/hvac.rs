@@ -279,7 +279,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(HvacSystemFunctionData { system_function_id, current_operation_mode_id });
+crate::eebus_identity!(HvacSystemFunctionData {
+    system_function_id,
+    current_operation_mode_id
+});
 
 crate::eebus_struct! {
     /// `HvacSystemFunctionDescriptionDataElementsType`.
@@ -472,7 +475,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(HvacSystemFunctionSetpointRelationData { system_function_id, operation_mode_id });
+crate::eebus_identity!(HvacSystemFunctionSetpointRelationData {
+    system_function_id,
+    operation_mode_id
+});
 
 crate::eebus_struct! {
     /// `HvacSystemFunctionSetpointRelationListDataSelectorsType`.
@@ -512,4 +518,3 @@ crate::eebus_enum_ext! {
         "dhw" => Dhw,
     }
 }
-

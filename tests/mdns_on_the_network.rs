@@ -9,7 +9,7 @@
 
 use core::time::Duration;
 
-use eebus::mdns::Mdns;
+use eebus::mdns::{BrowseEvent, Mdns};
 use eebus::ship::{DeviceCategory, ShipId, ShipTxtRecord, Ski};
 
 fn record(ski: Ski) -> ShipTxtRecord {
@@ -42,15 +42,40 @@ fn a_node_announces_itself_and_is_found() {
         )
         .expect("the announcement");
 
-    match browse.recv_timeout(Duration::from_secs(5)) {
-        Some(found) => {
+    let instance = match browse.recv_timeout(Duration::from_secs(5)) {
+        Some(BrowseEvent::Found(found)) => {
             assert_eq!(found.ski, ski, "the SKI a peer will be asked to trust");
             assert_eq!(found.port, 4712);
             assert_eq!(found.record.brand.as_deref(), Some("ExampleBrand"));
             assert!(found.socket_address().is_some(), "and where to dial it");
+            Some(found.instance)
         }
-        None => eprintln!("multicast did not reach this process; skipping the assertions"),
-    }
+        Some(BrowseEvent::Lost { .. }) => panic!("nothing had arrived to be lost"),
+        None => {
+            eprintln!("multicast did not reach this process; skipping the assertions");
+            None
+        }
+    };
 
     responder.withdraw().expect("the withdrawal");
+
+    // A node that leaves is news too: an application that dials what it discovers would
+    // otherwise keep a departed peer in its redial schedule for the life of the process.
+    if let Some(instance) = instance {
+        let mut lost = None;
+        for _ in 0..8 {
+            match browse.recv_timeout(Duration::from_secs(5)) {
+                Some(BrowseEvent::Lost { instance }) => {
+                    lost = Some(instance);
+                    break;
+                }
+                Some(BrowseEvent::Found(_)) => {}
+                None => break,
+            }
+        }
+        match lost {
+            Some(gone) => assert_eq!(gone, instance, "the instance that withdrew"),
+            None => eprintln!("no removal reached this process; skipping the assertion"),
+        }
+    }
 }

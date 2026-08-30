@@ -103,6 +103,94 @@ pub fn detailed_discovery(device: &LocalDevice) -> NodeManagementDetailedDiscove
     }
 }
 
+/// Narrows detailed discovery data to what a partial read asked for (§7.1.3).
+///
+/// Detailed discovery is the one function whose selectors do not follow the generic
+/// list pattern: it holds three parallel lists, and the selectors address them
+/// separately by type or by address. A client that only wants to know where the peer's
+/// `LoadControl` feature lives sends `featureInformation.featureType`, and gets back an
+/// answer that is a few hundred bytes rather than the whole device tree.
+///
+/// Entity and feature selectors are applied independently, which is what the
+/// specification's table describes. The device information is dropped only when a
+/// device selector is given and does not match — a client asking about entities still
+/// needs to know whose entities they are.
+pub fn restrict_detailed_discovery(
+    data: &NodeManagementDetailedDiscoveryData,
+    selectors: &crate::model::NodeManagementDetailedDiscoveryDataSelectors,
+) -> NodeManagementDetailedDiscoveryData {
+    let mut out = data.clone();
+
+    if let Some(wanted) = &selectors.device_information {
+        let described = data
+            .device_information
+            .as_ref()
+            .and_then(|d| d.description.as_ref());
+        // An element the selector leaves unset constrains nothing — the same rule the
+        // entity and feature blocks below follow.
+        let wanted_device = wanted
+            .device_address
+            .as_ref()
+            .and_then(|a| a.device.as_ref());
+        let stored_device = described
+            .and_then(|d| d.device_address.as_ref())
+            .and_then(|a| a.device.as_ref());
+        let address_matches = wanted_device.is_none() || stored_device == wanted_device;
+        let type_matches = wanted.device_type.is_none()
+            || described.and_then(|d| d.device_type.as_ref()) == wanted.device_type.as_ref();
+        if !(address_matches && type_matches) {
+            out.device_information = None;
+        }
+    }
+
+    if let Some(wanted) = &selectors.entity_information {
+        let wanted_entity = wanted
+            .entity_address
+            .as_ref()
+            .and_then(|a| a.entity.clone());
+        out.entity_information = out.entity_information.map(|entities| {
+            entities
+                .into_iter()
+                .filter(|e| {
+                    let description = e.description.as_ref();
+                    let address = description
+                        .and_then(|d| d.entity_address.as_ref())
+                        .and_then(|a| a.entity.clone());
+                    (wanted_entity.is_none() || address == wanted_entity)
+                        && (wanted.entity_type.is_none()
+                            || description.and_then(|d| d.entity_type.as_ref())
+                                == wanted.entity_type.as_ref())
+                })
+                .collect()
+        });
+    }
+
+    if let Some(wanted) = &selectors.feature_information {
+        let wanted_address = wanted.feature_address.as_ref();
+        out.feature_information = out.feature_information.map(|features| {
+            features
+                .into_iter()
+                .filter(|f| {
+                    let description = f.description.as_ref();
+                    let address = description.and_then(|d| d.feature_address.as_ref());
+                    let address_matches = wanted_address.is_none_or(|w| {
+                        address.is_some_and(|a| {
+                            (w.entity.is_none() || a.entity == w.entity)
+                                && (w.feature.is_none() || a.feature == w.feature)
+                        })
+                    });
+                    address_matches
+                        && (wanted.feature_type.is_none()
+                            || description.and_then(|d| d.feature_type.as_ref())
+                                == wanted.feature_type.as_ref())
+                })
+                .collect()
+        });
+    }
+
+    out
+}
+
 /// Builds this device's `nodeManagementUseCaseData` from the use cases each entity plays.
 ///
 /// `useCaseAvailable` is set only for client actors. The SPINE implementation guide §2.2
@@ -524,8 +612,8 @@ mod tests {
         assert!(load_control.is_writeable(&Function::LoadControlLimitListData));
         assert!(!load_control.is_writeable(&Function::LoadControlLimitDescriptionListData));
         assert!(
-            !load_control.supports_partial_read(&Function::LoadControlLimitListData),
-            "partial reads are not announced, so a peer performs a full read"
+            load_control.supports_partial_read(&Function::LoadControlLimitListData),
+            "LPC Table 21 recommends partial reads, and the engine serves them"
         );
         assert!(!load_control.supports(&Function::DeviceDiagnosisHeartbeatData));
     }

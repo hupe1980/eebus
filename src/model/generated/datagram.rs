@@ -51,4 +51,3 @@ crate::eebus_struct! {
 }
 
 crate::eebus_list!(Payload => Cmd { cmd });
-

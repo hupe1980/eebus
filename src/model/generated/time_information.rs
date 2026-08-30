@@ -99,4 +99,3 @@ crate::eebus_struct! {
         "clockDrift" => clock_drift: i64,
     }
 }
-

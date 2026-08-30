@@ -53,7 +53,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_selectors!(MessagingData => MessagingListDataSelectors { messaging_number } unsupported { "timestampInterval" });
+crate::eebus_selectors!(MessagingData => MessagingListDataSelectors { messaging_number } unsupported { timestamp_interval: "timestampInterval" });
 
 crate::eebus_struct! {
     /// `MessagingListDataType`.
@@ -90,4 +90,3 @@ crate::eebus_enum_ext! {
         "obsolete" => Obsolete,
     }
 }
-

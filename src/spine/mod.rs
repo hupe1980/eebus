@@ -25,8 +25,14 @@ pub use discovery::*;
 mod engine;
 pub use engine::*;
 
+mod heartbeat;
+pub use heartbeat::*;
+
 mod relations;
 pub use relations::*;
 
 mod counter;
 pub use counter::*;
+
+mod version;
+pub use version::*;

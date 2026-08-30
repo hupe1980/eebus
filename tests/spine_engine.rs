@@ -41,6 +41,18 @@ fn heat_pump() -> Engine {
     engine
 }
 
+/// A sub-meter: a Monitored Unit publishing measurements.
+fn sub_meter() -> Engine {
+    let mut device =
+        LocalDevice::new("i:67890", "SubMeter-1", DeviceType::ElectricitySupplySystem).unwrap();
+    let meter = LocalEntity::new([1], EntityType::SubMeterElectricity).with_feature(
+        LocalFeature::new(1, FeatureType::Measurement, eebus::model::Role::Server)
+            .with_function(Function::MeasurementListData, Operations::read()),
+    );
+    device.add_entity(meter).unwrap();
+    Engine::new(device)
+}
+
 /// A control box: the Energy Guard of LPC.
 fn control_box() -> Engine {
     let mut device = LocalDevice::new(
@@ -414,44 +426,304 @@ fn tc_spine_data_007_a_read_is_answered_by_its_reply_alone() {
     );
 }
 
-/// A read carrying a filter asks for a partial reply. This node does not announce
-/// partial reads, so it says so rather than answering a different question.
+/// A partial read is answered with what the filter asked for, and nothing else.
+///
+/// SPINE §5.3.4.4: selectors name the entries, elements name the parts of them. The
+/// reply says it is partial (§5.3.4.5) and keeps every identifier, because that is how
+/// the client tells the entries apart.
 #[test]
-fn a_partial_read_is_refused_rather_than_answered_in_full() {
+fn a_partial_read_returns_only_the_selected_entries() {
     let now = Duration::ZERO;
     let mut pump_device = heat_pump();
 
+    let target = pump_device.device().address_of(&[1], 1);
+    pump_device
+        .device_mut()
+        .resolve_mut(&target)
+        .unwrap()
+        .set_data(CmdData::LoadControlLimitListData(
+            LoadControlLimitListData {
+                load_control_limit_data: Some(vec![
+                    LoadControlLimitData {
+                        limit_id: Some(LoadControlLimitId(1)),
+                        is_limit_active: Some(true),
+                        value: Some(ScaledNumber::new(4_200, 0)),
+                        ..Default::default()
+                    },
+                    LoadControlLimitData {
+                        limit_id: Some(LoadControlLimitId(2)),
+                        is_limit_active: Some(false),
+                        value: Some(ScaledNumber::new(11_000, 0)),
+                        ..Default::default()
+                    },
+                ]),
+            },
+        ))
+        .unwrap();
+
     let guard = control_box();
     let source = guard.device().address_of(&[1], 1);
-    let target = pump_device.device().address_of(&[1], 1);
 
-    let datagram = Datagram {
-        header: Some(eebus::model::Header {
-            msg_counter: Some(MsgCounter(1)),
-            cmd_classifier: Some(CmdClassifier::Read),
-            address_source: Some(source),
-            address_destination: Some(target),
-            ack_request: Some(true),
-            ..Default::default()
-        }),
-        payload: Some(Payload {
-            cmd: Some(vec![
-                eebus::model::Cmd::read(Function::LoadControlLimitListData)
-                    .with_filter(eebus::model::Filter::partial()),
-            ]),
-        }),
+    let filter = eebus::model::Filter::partial().select(
+        eebus::model::FilterSelectors::LoadControlLimitListDataSelectors(
+            eebus::model::LoadControlLimitListDataSelectors {
+                limit_id: Some(LoadControlLimitId(2)),
+            },
+        ),
+    );
+    pump_device.handle_datagram(
+        &read_with(&source, &target, Function::LoadControlLimitListData, filter),
+        now,
+    );
+
+    let answer = pump_device.poll_transmit().expect("a reply");
+    let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    assert!(
+        cmd.filter
+            .iter()
+            .flatten()
+            .any(eebus::model::Filter::is_partial),
+        "the reply announces itself as partial"
+    );
+    let Some(CmdData::LoadControlLimitListData(list)) = &cmd.data else {
+        panic!("expected the limit list, got {:?}", cmd.data);
     };
-    pump_device.handle_datagram(&datagram, now);
+    let entries = list.load_control_limit_data.as_ref().unwrap();
+    assert_eq!(entries.len(), 1, "only the selected entry comes back");
+    assert_eq!(entries[0].limit_id, Some(LoadControlLimitId(2)));
+    assert_eq!(entries[0].value, Some(ScaledNumber::new(11_000, 0)));
+}
+
+/// An elements filter narrows what comes back, but never the identifiers: §5.3.4.5 says
+/// they are full in a reply even when the read did not ask for them.
+#[test]
+fn an_elements_filter_keeps_the_identifiers() {
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let target = pump_device.device().address_of(&[1], 1);
+    pump_device
+        .device_mut()
+        .resolve_mut(&target)
+        .unwrap()
+        .set_data(CmdData::LoadControlLimitListData(
+            LoadControlLimitListData {
+                load_control_limit_data: Some(vec![LoadControlLimitData {
+                    limit_id: Some(LoadControlLimitId(1)),
+                    is_limit_active: Some(true),
+                    is_limit_changeable: Some(true),
+                    value: Some(ScaledNumber::new(4_200, 0)),
+                    ..Default::default()
+                }]),
+            },
+        ))
+        .unwrap();
+
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+    let filter = eebus::model::Filter::partial().covering(
+        eebus::model::FilterElements::LoadControlLimitDataElements(
+            eebus::model::LoadControlLimitDataElements {
+                value: Some(Default::default()),
+                ..Default::default()
+            },
+        ),
+    );
+    pump_device.handle_datagram(
+        &read_with(&source, &target, Function::LoadControlLimitListData, filter),
+        now,
+    );
+
+    let answer = pump_device.poll_transmit().expect("a reply");
+    let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    let Some(CmdData::LoadControlLimitListData(list)) = &cmd.data else {
+        panic!("expected the limit list");
+    };
+    let entry = &list.load_control_limit_data.as_ref().unwrap()[0];
+    assert_eq!(
+        entry.limit_id,
+        Some(LoadControlLimitId(1)),
+        "the identifier survives"
+    );
+    assert_eq!(entry.value, Some(ScaledNumber::new(4_200, 0)));
+    assert_eq!(
+        entry.is_limit_active, None,
+        "elements not asked for are dropped"
+    );
+    assert_eq!(entry.is_limit_changeable, None);
+}
+
+/// A selector this implementation cannot match by comparison — an interval, say — is
+/// refused with `errorNumber` 8 rather than served as though it were absent.
+///
+/// Serving it would return entries the client explicitly excluded, which is a worse
+/// answer than no answer: §5.3.4.9 provides number 8 for exactly this.
+#[test]
+fn an_unsupported_selector_is_refused() {
+    let now = Duration::ZERO;
+    let mut meter = sub_meter();
+    let target = meter.device().address_of(&[1], 1);
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+
+    let filter = eebus::model::Filter::partial().select(
+        eebus::model::FilterSelectors::MeasurementListDataSelectors(
+            eebus::model::MeasurementListDataSelectors {
+                timestamp_interval: Some(Default::default()),
+                ..Default::default()
+            },
+        ),
+    );
+    meter.handle_datagram(
+        &read_with(&source, &target, Function::MeasurementListData, filter),
+        now,
+    );
+
+    let answer = meter.poll_transmit().expect("an answer");
+    let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    let Some(CmdData::ResultData(result)) = &cmd.data else {
+        panic!("expected a result, got {:?}", cmd.data);
+    };
+    assert_eq!(
+        result.error_number,
+        Some(ErrorNumber::RestrictedExchangeNotSupported)
+    );
+}
+
+/// A filter naming another function's selectors is the same kind of refusal.
+#[test]
+fn a_filter_for_another_function_is_refused() {
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let target = pump_device.device().address_of(&[1], 1);
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+
+    let filter = eebus::model::Filter::partial().select(
+        eebus::model::FilterSelectors::MeasurementListDataSelectors(Default::default()),
+    );
+    pump_device.handle_datagram(
+        &read_with(&source, &target, Function::LoadControlLimitListData, filter),
+        now,
+    );
 
     let answer = pump_device.poll_transmit().expect("an answer");
+    let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    let Some(CmdData::ResultData(result)) = &cmd.data else {
+        panic!("expected a result, got {:?}", cmd.data);
+    };
+    assert_eq!(
+        result.error_number,
+        Some(ErrorNumber::RestrictedExchangeNotSupported)
+    );
+}
+
+/// A read of a function that exists but holds nothing is answered with an empty payload.
+///
+/// Silence would leave the peer waiting out its ten-second response deadline for a
+/// question that has a perfectly good answer.
+#[test]
+fn a_read_of_an_empty_function_is_still_answered() {
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let target = pump_device.device().address_of(&[1], 1);
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+
+    pump_device.handle_datagram(
+        &Datagram {
+            header: Some(eebus::model::Header {
+                msg_counter: Some(MsgCounter(1)),
+                cmd_classifier: Some(CmdClassifier::Read),
+                address_source: Some(source),
+                address_destination: Some(target),
+                ..Default::default()
+            }),
+            payload: Some(Payload {
+                cmd: Some(vec![eebus::model::Cmd::read(
+                    Function::LoadControlLimitListData,
+                )]),
+            }),
+        },
+        now,
+    );
+
+    let answer = pump_device.poll_transmit().expect("a reply");
+    assert_eq!(
+        answer.header.as_ref().unwrap().cmd_classifier,
+        Some(CmdClassifier::Reply)
+    );
+    let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    assert!(matches!(
+        cmd.data,
+        Some(CmdData::LoadControlLimitListData(_))
+    ));
+}
+
+/// A datagram addressed to some other device is not ours to serve: enhanced-mode
+/// routing is not implemented, so §5.2.5.2's number 5 is the truthful answer.
+#[test]
+fn a_datagram_for_another_device_is_reported_unreachable() {
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+    let elsewhere = eebus::spine::feature_address(
+        &eebus::spine::device_address("i:99999", "SomeoneElse").unwrap(),
+        &[1],
+        1,
+    );
+
+    let accepted = pump_device.handle_datagram(
+        &Datagram {
+            header: Some(eebus::model::Header {
+                msg_counter: Some(MsgCounter(1)),
+                cmd_classifier: Some(CmdClassifier::Write),
+                address_source: Some(source),
+                address_destination: Some(elsewhere),
+                ack_request: Some(true),
+                ..Default::default()
+            }),
+            payload: Some(Payload {
+                cmd: Some(vec![eebus::model::Cmd::with_data(
+                    CmdData::LoadControlLimitListData(LoadControlLimitListData::default()),
+                )]),
+            }),
+        },
+        now,
+    );
+
+    assert!(!accepted);
+    let answer = pump_device.poll_transmit().expect("a result");
     let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
     let Some(CmdData::ResultData(result)) = &cmd.data else {
         panic!("expected a result");
     };
     assert_eq!(
         result.error_number,
-        Some(ErrorNumber::RestrictedExchangeNotSupported)
+        Some(ErrorNumber::DestinationUnreachable)
     );
+}
+
+/// A read of `function` carrying `filter`.
+fn read_with(
+    source: &FeatureAddress,
+    destination: &FeatureAddress,
+    function: Function,
+    filter: eebus::model::Filter,
+) -> Datagram {
+    Datagram {
+        header: Some(eebus::model::Header {
+            msg_counter: Some(MsgCounter(1)),
+            cmd_classifier: Some(CmdClassifier::Read),
+            address_source: Some(source.clone()),
+            address_destination: Some(destination.clone()),
+            ack_request: Some(true),
+            ..Default::default()
+        }),
+        payload: Some(Payload {
+            cmd: Some(vec![eebus::model::Cmd::read(function).with_filter(filter)]),
+        }),
+    }
 }
 
 /// A request that goes unanswered expires, and the implementation guide §2.6.1 wants
@@ -546,4 +818,303 @@ fn ig_2_7_every_address_carries_the_device_part() {
         assert!(address.entity.is_some());
         assert!(address.feature.is_some());
     }
+}
+
+/// Partial detailed discovery (§7.1.3): a client that only wants to know where one
+/// feature lives asks for it by type, and gets that instead of the whole device tree.
+#[test]
+fn partial_detailed_discovery_returns_only_the_matching_features() {
+    use eebus::model::{
+        NodeManagementDetailedDiscoveryDataSelectors,
+        NodeManagementDetailedDiscoveryDataSelectorsFeatureInformation,
+    };
+
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+    let target = node_management(pump_device.device().address());
+
+    let filter = eebus::model::Filter::partial().select(
+        eebus::model::FilterSelectors::NodeManagementDetailedDiscoveryDataSelectors(
+            NodeManagementDetailedDiscoveryDataSelectors {
+                feature_information: Some(
+                    NodeManagementDetailedDiscoveryDataSelectorsFeatureInformation {
+                        feature_type: Some(FeatureType::LoadControl),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        ),
+    );
+    pump_device.handle_datagram(
+        &read_with(
+            &source,
+            &target,
+            Function::NodeManagementDetailedDiscoveryData,
+            filter,
+        ),
+        now,
+    );
+
+    let answer = pump_device.poll_transmit().expect("a reply");
+    let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    let Some(CmdData::NodeManagementDetailedDiscoveryData(discovery)) = &cmd.data else {
+        panic!("expected discovery data, got {:?}", cmd.data);
+    };
+    let features = discovery.feature_information.as_ref().unwrap();
+    assert_eq!(features.len(), 1, "only the LoadControl feature comes back");
+    assert_eq!(
+        features[0]
+            .description
+            .as_ref()
+            .unwrap()
+            .feature_type
+            .as_ref(),
+        Some(&FeatureType::LoadControl)
+    );
+    assert!(
+        discovery.device_information.is_some(),
+        "the client still needs to know whose feature it is"
+    );
+}
+
+/// A peer's write is a change, and a subscriber asked to be told about changes.
+///
+/// The use-case implementation guide §3.2.2 makes subscriptions the primary mechanism
+/// and polling the fallback, which only works if a write actually produces a notify.
+#[test]
+fn a_write_notifies_the_subscribers_of_the_feature() {
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let mut guard = control_box();
+
+    let client = guard.device().address_of(&[1], 1);
+    let server = pump_device.device().address_of(&[1], 1);
+    let watcher = eebus::spine::feature_address(
+        &eebus::spine::device_address("i:11111", "Display").unwrap(),
+        &[1],
+        1,
+    );
+    pump_device.insert_binding(&client, &server);
+    pump_device.insert_subscription(&watcher, &server);
+
+    guard.write(
+        &server,
+        &client,
+        CmdData::LoadControlLimitListData(LoadControlLimitListData {
+            load_control_limit_data: Some(vec![LoadControlLimitData {
+                limit_id: Some(LoadControlLimitId(1)),
+                is_limit_active: Some(true),
+                value: Some(ScaledNumber::new(3_000, 0)),
+                ..Default::default()
+            }]),
+        }),
+        true,
+        now,
+    );
+    let write = guard.poll_transmit().expect("the write");
+    pump_device.handle_datagram(&write, now);
+
+    let out: Vec<Datagram> = core::iter::from_fn(|| pump_device.poll_transmit()).collect();
+    let notify = out
+        .iter()
+        .find(|d| {
+            d.header.as_ref().unwrap().cmd_classifier == Some(CmdClassifier::Notify)
+                && d.header.as_ref().unwrap().address_destination.as_ref() == Some(&watcher)
+        })
+        .expect("the subscriber was told");
+    let cmd = &notify.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+    let Some(CmdData::LoadControlLimitListData(list)) = &cmd.data else {
+        panic!("expected the limit list");
+    };
+    assert_eq!(
+        list.load_control_limit_data.as_ref().unwrap()[0].value,
+        Some(ScaledNumber::new(3_000, 0))
+    );
+}
+
+/// `TC_SPINE_COMP_006`: a header whose `specificationVersion` breaks the implementation
+/// guide's format rule is refused with an application error rather than acted on.
+#[test]
+fn tc_spine_comp_006_a_malformed_version_is_refused() {
+    let now = Duration::ZERO;
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+
+    for version in ["TS1.3.0", "V0.3.0", "v0.3.0", "0.3.0", "2.0.0"] {
+        let mut pump_device = heat_pump();
+        let target = node_management(pump_device.device().address());
+        let accepted = pump_device.handle_datagram(
+            &Datagram {
+                header: Some(eebus::model::Header {
+                    specification_version: Some(eebus::model::SpecificationVersion::from(version)),
+                    msg_counter: Some(MsgCounter(1)),
+                    cmd_classifier: Some(CmdClassifier::Read),
+                    address_source: Some(source.clone()),
+                    address_destination: Some(target),
+                    ..Default::default()
+                }),
+                payload: Some(Payload {
+                    cmd: Some(vec![eebus::model::Cmd::read(
+                        Function::NodeManagementDetailedDiscoveryData,
+                    )]),
+                }),
+            },
+            now,
+        );
+
+        assert!(!accepted, "{version:?} was processed");
+        let answer = pump_device.poll_transmit().expect("an answer");
+        let cmd = &answer.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+        let Some(CmdData::ResultData(result)) = &cmd.data else {
+            panic!("expected a result for {version:?}, got {:?}", cmd.data);
+        };
+        assert_eq!(
+            result.error_number,
+            Some(ErrorNumber::General),
+            "{version:?}"
+        );
+    }
+}
+
+/// `TC_SPINE_COMP_002`: a peer one minor version ahead is served normally.
+#[test]
+fn tc_spine_comp_002_a_newer_minor_version_is_served() {
+    let now = Duration::ZERO;
+    let mut pump_device = heat_pump();
+    let guard = control_box();
+    let source = guard.device().address_of(&[1], 1);
+    let target = node_management(pump_device.device().address());
+
+    pump_device.handle_datagram(
+        &Datagram {
+            header: Some(eebus::model::Header {
+                specification_version: Some(eebus::model::SpecificationVersion::from("1.4.0")),
+                msg_counter: Some(MsgCounter(1)),
+                cmd_classifier: Some(CmdClassifier::Read),
+                address_source: Some(source),
+                address_destination: Some(target),
+                ..Default::default()
+            }),
+            payload: Some(Payload {
+                cmd: Some(vec![eebus::model::Cmd::read(
+                    Function::NodeManagementDetailedDiscoveryData,
+                )]),
+            }),
+        },
+        now,
+    );
+
+    let answer = pump_device.poll_transmit().expect("a reply");
+    assert_eq!(
+        answer.header.as_ref().unwrap().cmd_classifier,
+        Some(CmdClassifier::Reply)
+    );
+}
+
+/// §7.3.2 and §7.4.2: a node that announces its binding and subscription tables as
+/// readable answers with the relations it actually holds.
+///
+/// An empty list — what a declared but never-stored function gives — would tell a peer
+/// that the binding it is relying on does not exist.
+#[test]
+fn the_binding_and_subscription_tables_report_what_is_held() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+
+    let guard_nm = node_management(guard.device().address());
+    let pump_nm = node_management(pump_device.device().address());
+    let guard_client = guard.device().address_of(&[1], 1);
+    let load_control = pump_device.device().address_of(&[1], 1);
+
+    // The control box binds to and subscribes to the heat pump's LoadControl.
+    guard.request_binding(&guard_client, &load_control, now);
+    guard.request_subscription(&guard_client, &load_control, now);
+    pump(&mut guard, &mut pump_device, now);
+    assert_eq!(pump_device.relations().bindings().len(), 1);
+    assert_eq!(pump_device.relations().subscriptions().len(), 1);
+
+    // Now it reads the two tables back.
+    for function in [
+        Function::NodeManagementBindingData,
+        Function::NodeManagementSubscriptionData,
+    ] {
+        guard.read(&pump_nm, &guard_nm, function.clone(), now);
+    }
+    pump(&mut guard, &mut pump_device, now);
+
+    let replies: Vec<CmdData> = events(&mut guard)
+        .into_iter()
+        .filter_map(|event| match event {
+            SpineEvent::ReplyReceived { data, .. } => Some(data),
+            _ => None,
+        })
+        .collect();
+
+    let bindings = replies
+        .iter()
+        .find_map(|data| match data {
+            CmdData::NodeManagementBindingData(list) => Some(list),
+            _ => None,
+        })
+        .expect("the binding table was served");
+    let entry = &bindings.binding_entry.as_ref().expect("entries")[0];
+    assert_eq!(entry.client_address.as_ref(), Some(&guard_client));
+    assert_eq!(entry.server_address.as_ref(), Some(&load_control));
+    assert!(
+        entry.binding_id.is_some(),
+        "the server's identifier is named"
+    );
+
+    let subscriptions = replies
+        .iter()
+        .find_map(|data| match data {
+            CmdData::NodeManagementSubscriptionData(list) => Some(list),
+            _ => None,
+        })
+        .expect("the subscription table was served");
+    let entry = &subscriptions.subscription_entry.as_ref().expect("entries")[0];
+    assert_eq!(entry.client_address.as_ref(), Some(&guard_client));
+    assert_eq!(entry.server_address.as_ref(), Some(&load_control));
+    assert!(entry.subscription_id.is_some());
+}
+
+/// A NodeManagement function this node does not serve is refused, not answered empty:
+/// `possibleOperations` lists four, and a read of anything else is `errorNumber` 6.
+#[test]
+fn an_unserved_node_management_function_is_not_answered_with_an_empty_payload() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+
+    let guard_nm = node_management(guard.device().address());
+    let pump_nm = node_management(pump_device.device().address());
+    guard.read(
+        &pump_nm,
+        &guard_nm,
+        Function::NodeManagementDestinationListData,
+        now,
+    );
+    pump(&mut guard, &mut pump_device, now);
+
+    let seen = events(&mut guard);
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            SpineEvent::ResultReceived {
+                error: ErrorNumber::CommandNotSupported,
+                ..
+            }
+        )),
+        "expected errorNumber 6, saw {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, SpineEvent::ReplyReceived { .. })),
+        "and no reply pretending the function is served"
+    );
 }

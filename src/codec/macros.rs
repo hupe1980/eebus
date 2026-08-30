@@ -561,11 +561,41 @@ macro_rules! eebus_choice {
                 match self { $( $name::$variant(_) => $wire, )* }
             }
 
+            /// The empty value of the alternative `key` names.
+            ///
+            /// A `read` of a function a feature declares but has never been given a
+            /// value for is answered with this rather than with silence: SPINE's reply
+            /// carries the function, and an empty payload says "nothing yet" where no
+            /// reply at all leaves the peer waiting out its response deadline.
+            pub fn empty(key: &str) -> $crate::codec::__private::Option<Self> {
+                match key {
+                    $( $wire => $crate::codec::__private::Some(
+                        $name::$variant(::core::default::Default::default())
+                    ), )*
+                    _ => $crate::codec::__private::None,
+                }
+            }
+
             /// True when this alternative holds a list whose entries carry identifiers,
             /// and so can take part in a Restricted Function Exchange merge.
             pub const fn is_mergeable_list(&self) -> bool {
                 match self {
                     $( $name::$variant(_) => $crate::eebus_choice!(@is_list $kind), )*
+                }
+            }
+
+            /// True when every entry of a list alternative carries all of its
+            /// identifiers, and for any alternative that is not a list.
+            ///
+            /// SPINE addresses a list entry by its primary and sub identifiers, which
+            /// use-case IG §3.1 requires in every message "regardless of being writeable
+            /// or not". An entry that omits one names nothing stored, so it can neither
+            /// update nor delete; taking it for a *new* entry would let a peer grow the
+            /// list it meant to modify.
+            pub fn entries_identified(&self) -> bool {
+                match self {
+                    $( $name::$variant(__v) =>
+                        $crate::eebus_choice!(@identified $kind __v), )*
                 }
             }
 
@@ -715,6 +745,19 @@ macro_rules! eebus_choice {
     (@is_list list) => { true };
     (@is_list plain) => { false };
 
+    (@identified list $value:ident) => {{
+        use $crate::model::rfe::ListData as _;
+        $value
+            .entries()
+            .unwrap_or_default()
+            .iter()
+            .all($crate::model::rfe::Identified::has_identity)
+    }};
+    (@identified plain $value:ident) => {{
+        let _ = $value;
+        true
+    }};
+
     (@apply list $stored:ident $update:ident $partial:ident) => {
         if $partial {
             $crate::model::rfe::apply_partial($stored, $update);
@@ -760,6 +803,10 @@ macro_rules! eebus_identity {
                 self.has_identity()
                     && other.has_identity()
                     $( && self.$field == other.$field )+
+            }
+
+            fn restore_identity(&mut self, from: &Self) {
+                $( self.$field = ::core::clone::Clone::clone(&from.$field); )+
             }
         }
     };
@@ -882,7 +929,7 @@ macro_rules! eebus_selectors {
     (
         $target:ident => $selectors:ident {
             $($field:ident),* $(,)?
-        } unsupported { $($unsupported:literal),* $(,)? }
+        } unsupported { $($ufield:ident : $unsupported:literal),* $(,)? }
     ) => {
         impl $crate::model::rfe::Selectors for $selectors {
             type Target = $target;
@@ -904,6 +951,153 @@ macro_rules! eebus_selectors {
             #[allow(unused_variables)]
             fn is_empty(&self) -> bool {
                 true $( && self.$field.is_none() )*
+                    $( && self.$ufield.is_none() )*
+            }
+
+            #[allow(unused_variables)]
+            fn uses_unsupported(&self) -> bool {
+                false $( || self.$ufield.is_some() )*
+            }
+        }
+    };
+}
+
+/// Wires a data choice to the *selectors* and *elements* choices that filter it.
+///
+/// SPINE's Restricted Function Exchange addresses a function's data through three
+/// parallel choice groups: `DataChoiceGroup` holds the data, `DataSelectorsChoiceGroup`
+/// says which entries of it a command means, and `DataElementsChoiceGroup` says which
+/// elements of those entries. Nothing in the schemas connects the three — the connection
+/// is a naming convention the generator resolves — so this macro is where the resulting
+/// table becomes one method.
+///
+/// Each line names a data alternative and the filter alternatives that address it.
+/// Alternatives with no filter of their own are simply absent, and a filtered request
+/// naming one is answered with `errorNumber` 8 rather than served unfiltered.
+#[macro_export]
+macro_rules! eebus_restrict {
+    (
+        $data:ident by $sels:ident / $els:ident {
+            $(
+                $kind:ident $wire:literal $variant:ident $(sel $sel:ident)? $(el $el:ident)? ;
+            )*
+        }
+    ) => {
+        impl $data {
+            /// Whether a filtered exchange of the function `key` names can be served.
+            ///
+            /// A function is restrictable when the schemas give it a selectors or an
+            /// elements filter that the generator could pair with it. Everything else
+            /// is answered in full, and a feature must not announce `read.partial` for
+            /// it — see [`Operations`](crate::spine::Operations).
+            pub fn supports_restriction(key: &str) -> bool {
+                ::core::matches!(key, $( $wire )|*)
+            }
+
+            /// Answers a Restricted Function Exchange read: the entries the selectors
+            /// pick, cut down to the elements the filter keeps.
+            ///
+            /// A filter that addresses another function, or that sets a selector this
+            /// implementation cannot match by comparison, is refused rather than served
+            /// approximately — SPINE §5.3.4.9 provides `errorNumber` 8 for exactly that,
+            /// and a reply that quietly ignored the filter would be worse than none.
+            #[allow(unreachable_patterns, unused_variables)]
+            pub fn restrict(
+                &self,
+                selectors: $crate::codec::__private::Option<&$sels>,
+                elements: $crate::codec::__private::Option<&$els>,
+            ) -> $crate::codec::__private::Result<Self, $crate::model::rfe::RestrictError> {
+                if selectors.is_none() && elements.is_none() {
+                    return $crate::codec::__private::Ok(::core::clone::Clone::clone(self));
+                }
+                match self {
+                    $(
+                        $data::$variant(__value) => $crate::eebus_restrict!(
+                            @arm $kind $data $variant __value selectors elements $sels $els
+                            $(sel $sel)? $(el $el)?
+                        ),
+                    )*
+                    _ => $crate::codec::__private::Err(
+                        $crate::model::rfe::RestrictError::Unsupported
+                    ),
+                }
+            }
+        }
+    };
+
+    // A list with both a selectors and an elements filter: the ordinary case.
+    (@arm list $data:ident $variant:ident $value:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident sel $sel:ident el $el:ident) => {{
+        let __s = $crate::eebus_restrict!(@pick $selectors $sels $sel);
+        let __e = $crate::eebus_restrict!(@pick $elements $els $el);
+        $crate::model::rfe::restrict_list($value, __s, __e).map($data::$variant)
+    }};
+
+    // A list the schemas give selectors but no per-entry elements filter.
+    (@arm list $data:ident $variant:ident $value:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident sel $sel:ident) => {{
+        if $elements.is_some() {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        match $crate::eebus_restrict!(@pick $selectors $sels $sel) {
+            $crate::codec::__private::Some(__s) =>
+                $crate::model::rfe::restrict_list_by_selectors($value, __s)
+                    .map($data::$variant),
+            $crate::codec::__private::None => $crate::codec::__private::Ok(
+                $data::$variant(::core::clone::Clone::clone($value))
+            ),
+        }
+    }};
+
+    // A list the schemas give no selectors filter: the elements filter applies to every
+    // entry.
+    (@arm list $data:ident $variant:ident $value:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident el $el:ident) => {{
+        if $selectors.is_some() {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        match $crate::eebus_restrict!(@pick $elements $els $el) {
+            $crate::codec::__private::Some(__e) => $crate::codec::__private::Ok(
+                $data::$variant($crate::model::rfe::restrict_list_by_elements($value, __e))
+            ),
+            $crate::codec::__private::None => $crate::codec::__private::Ok(
+                $data::$variant(::core::clone::Clone::clone($value))
+            ),
+        }
+    }};
+
+    // A function that is not a list: only an elements filter applies to it.
+    (@arm plain $data:ident $variant:ident $value:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident el $el:ident) => {{
+        if $selectors.is_some() {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        match $crate::eebus_restrict!(@pick $elements $els $el) {
+            $crate::codec::__private::Some(__e) => $crate::codec::__private::Ok(
+                $data::$variant($crate::model::rfe::restrict_plain($value, __e))
+            ),
+            $crate::codec::__private::None => $crate::codec::__private::Ok(
+                $data::$variant(::core::clone::Clone::clone($value))
+            ),
+        }
+    }};
+
+    // Narrows a filter choice to the alternative that addresses this function.
+    (@pick $filter:ident $choice:ident $variant:ident) => {
+        match $filter {
+            $crate::codec::__private::None => $crate::codec::__private::None,
+            $crate::codec::__private::Some($choice::$variant(__inner)) =>
+                $crate::codec::__private::Some(__inner),
+            $crate::codec::__private::Some(_) => {
+                return $crate::codec::__private::Err(
+                    $crate::model::rfe::RestrictError::Mismatch
+                );
             }
         }
     };
