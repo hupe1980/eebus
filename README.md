@@ -192,7 +192,7 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | Tokio runtime: sockets, timers, connection manager | ⬜ next | |
 | MPC/MGCP measurements, descriptions, constraints | ✅ | MPC/MGCP UC TS §3.2.2 |
 | MPC/MGCP over the wire | ✅ | MPC scenarios 1–5, MGCP 2–7 |
-| MGCP PV curtailment factor (scenario 1) | ⬜ | MGCP UC TS §2.4.1 |
+| MGCP PV curtailment factor (scenario 1) | ✅ | MGCP UC TS §2.4.1, Table 23 |
 | E-mobility, inverter, HVAC use cases | ⬜ | |
 
 Deliberate departures from the reference implementation, each driven by the
