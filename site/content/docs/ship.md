@@ -89,6 +89,10 @@ carrying a shared secret and have trust established automatically. The crate imp
 digest and the replay guard (§7, §11), and the QR payload format from the installation
 requirements. It is behind the `pairing` feature, on by default.
 
+Keys the payload grammar gains later are skipped on the way in (`SRIP-310/15`) and written
+back out unchanged, so a tool that re-renders a code — onto a screen after a certificate
+update, say — does not strip fields it happens not to understand.
+
 ## Two nodes that dial each other at once
 
 If both peers discover each other simultaneously, both dial, and two connections exist

@@ -294,6 +294,22 @@ proptest! {
         let _ = alloc_format(&fields).parse::<eebus::ship::ShipQr>();
     }
 
+    /// A payload that parses is one this crate can write back unchanged.
+    ///
+    /// An installer's tool reads a code and re-renders it — onto a screen after a
+    /// certificate update, say — so a field that survives the parser and not the writer
+    /// is a field that disappears off the sticker.
+    #[test]
+    fn a_qr_payload_that_parses_round_trips(text in qr_payload()) {
+        if let Ok(qr) = text.parse::<eebus::ship::ShipQr>() {
+            let written = qr.to_payload();
+            let back = written
+                .parse::<eebus::ship::ShipQr>()
+                .expect("what we wrote does not parse");
+            prop_assert_eq!(back, qr, "unstable payload: {}", written);
+        }
+    }
+
     /// The `_ship._tcp` TXT record parser never panics.
     #[test]
     fn the_txt_parser_survives_arbitrary_pairs(
@@ -322,6 +338,25 @@ proptest! {
 /// `SHIP;…;ENDSHIP;` around whatever was generated.
 fn alloc_format(fields: &str) -> String {
     format!("SHIP;{fields};ENDSHIP;")
+}
+
+/// A QR payload carrying a real SKI, so the round trip is actually reached.
+///
+/// Random text almost never contains forty hexadecimal digits, and without them the
+/// parser refuses the payload before any of it is exercised.
+fn qr_payload() -> impl Strategy<Value = String> {
+    (
+        any::<[u8; 20]>(),
+        proptest::collection::vec((".{0,12}", ".{0,24}"), 0..6),
+    )
+        .prop_map(|(ski, extra)| {
+            let mut out = format!("SHIP;SKI:{};", Ski::from_bytes(ski).to_txt_value());
+            for (key, value) in extra {
+                out.push_str(&format!("{key}:{value};"));
+            }
+            out.push_str("ENDSHIP;");
+            out
+        })
 }
 
 /// Arbitrary JSON, up to a few levels deep.
