@@ -51,6 +51,14 @@ mdns-sd = { version = "0.21", default-features = false, optional = true }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 
+# The sans-IO example needs nothing; the networked one needs a socket.
+[[example]]
+name = "grid_limit"
+
+[[example]]
+name = "networked"
+required-features = ["runtime"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

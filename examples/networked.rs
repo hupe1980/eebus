@@ -13,8 +13,6 @@
 //! what an installer scanning two QR codes amounts to. Everything after that is what the
 //! devices would do on a real network.
 
-#![cfg(feature = "runtime")]
-
 use core::time::Duration;
 
 use eebus::cert::{self, CertParams};
