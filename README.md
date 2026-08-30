@@ -13,10 +13,10 @@ on.
 > engine carries discovery, bindings, subscriptions, reads, writes and notifications
 > between two nodes. All four use cases certifiable since July 2026 — LPC, LPP, MPC and
 > MGCP — run over it end to end; `cargo run --example grid_limit` plays out the §14a
-> exchange. Only service discovery stands between this and a
+> exchange. Little now stands between this and a
 > device on a real network: `cargo run --example networked --features runtime` runs the
-> same exchange over TCP, TLS 1.2 and a WebSocket. mDNS-SD service discovery is the last
-> piece outstanding. Nothing is published to crates.io yet, and the API will change.
+> same exchange over TCP, TLS 1.2 and a WebSocket, and `mdns` announces and finds nodes
+> on the local network. Nothing is published to crates.io yet, and the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -190,7 +190,7 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
 | Node certificates: secp256r1, SHA-1 SKI, PEM/DER | ✅ | SHIP §9.3, §12.2 (`cert`) |
 | TLS 1.2, mutual auth, SHIP cipher suites | ✅ | SHIP §9, §12 (`tls`) |
-| mDNS-SD announce and browse | ⬜ next | SHIP §5 |
+| mDNS-SD announce and browse | ✅ | SHIP §5 (`mdns`) |
 | Tokio runtime: TCP, TLS, WebSocket, handshake | ✅ | SHIP §10 (`runtime`) |
 | Trust store, reconnect back-off | ✅ | SHIP §12.2 (`runtime`) |
 | MPC/MGCP measurements, descriptions, constraints | ✅ | MPC/MGCP UC TS §3.2.2 |
@@ -254,6 +254,18 @@ let mut connection = node.connect("192.0.2.10:4712").await?;   // TCP, TLS, WebS
 connection.send(&datagram).await?;                             // and now SPINE
 ```
 
+With the `mdns` feature, finding that address is the network's job rather than the
+installer's:
+
+```rust
+let browse = mdns.browse()?;
+while let Some(found) = browse.recv() {
+    if trusted.contains(&found.ski) {
+        node.connect(found.socket_address().unwrap()).await?;
+    }
+}
+```
+
 `cargo run --example networked --features runtime` runs the §14a exchange over loopback:
 two nodes generate certificates, approve each other's SKI, complete TLS 1.2 with mutual
 authentication and the SHIP handshake, and then discover, bind, and exchange a limit.
@@ -291,6 +303,7 @@ committed.
 | `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the SHIP handshake. |
+| `mdns` | — | `_ship._tcp` announcement and discovery (`mdns-sd`). |
 
 ## License
 

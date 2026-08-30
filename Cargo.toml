@@ -27,6 +27,8 @@ cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:time"]
 tls = ["cert", "dep:rustls"]
 # Sockets: TCP, TLS and WebSocket on Tokio, driving the sans-IO cores.
 runtime = ["tls", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:futures-util"]
+# mDNS-SD: announcing `_ship._tcp` and finding the peers that announce it.
+mdns = ["std", "dep:mdns-sd"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
@@ -43,6 +45,7 @@ tokio = { version = "1", default-features = false, features = ["net", "rt", "tim
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
+mdns-sd = { version = "0.21", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }

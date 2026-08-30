@@ -79,6 +79,9 @@ extern crate alloc;
 #[cfg_attr(docsrs, doc(cfg(feature = "cert")))]
 pub mod cert;
 pub mod codec;
+#[cfg(feature = "mdns")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
+pub mod mdns;
 pub mod model;
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
