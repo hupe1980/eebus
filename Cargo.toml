@@ -23,6 +23,8 @@ std = ["serde/std", "serde_json/std", "thiserror/std"]
 pairing = ["dep:hmac", "dep:sha2"]
 # Certificates: generating a node's own, and reading a peer's SKI out of one.
 cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:time"]
+# TLS 1.2 as SHIP §9 mandates, with the trust decision deferred to the SHIP handshake.
+tls = ["cert", "dep:rustls"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
@@ -34,6 +36,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 x509-parser = { version = "0.18", optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 time = { version = "0.3", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"], optional = true }
 
 [dev-dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }

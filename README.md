@@ -13,9 +13,9 @@ on.
 > engine carries discovery, bindings, subscriptions, reads, writes and notifications
 > between two nodes. All four use cases certifiable since July 2026 — LPC, LPP, MPC and
 > MGCP — run over it end to end; `cargo run --example grid_limit` plays out the §14a
-> exchange. TLS, mDNS-SD and a Tokio runtime adapter are what stand between this and a
-> device on a real network. Nothing is published to crates.io yet, and the API will
-> change.
+> exchange. mDNS-SD and a runtime adapter are what stand between this and a
+> device on a real network — TLS is in place, mDNS-SD and a runtime adapter are not.
+> Nothing is published to crates.io yet, and the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -188,7 +188,7 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | LPC/LPP Controllable System over the wire | ✅ | LPC/LPP UC TS §3.3 scenarios 1–4 |
 | Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
 | Node certificates: secp256r1, SHA-1 SKI, PEM/DER | ✅ | SHIP §9.3, §12.2 (`cert`) |
-| TLS 1.2, mutual auth | ⬜ next | SHIP §9, §12 |
+| TLS 1.2, mutual auth, SHIP cipher suites | ✅ | SHIP §9, §12 (`tls`) |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
 | Tokio runtime: sockets, timers, connection manager | ⬜ next | |
 | MPC/MGCP measurements, descriptions, constraints | ✅ | MPC/MGCP UC TS §3.2.2 |
@@ -269,6 +269,7 @@ committed.
 | `std` | ✅ | Standard library. Without it the crate builds `no_std + alloc`. |
 | `pairing` | ✅ | SHIP Pairing Service (pulls in `hmac` and `sha2`). |
 | `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
+| `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 
 ## License
 

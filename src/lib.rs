@@ -82,4 +82,7 @@ pub mod codec;
 pub mod model;
 pub mod ship;
 pub mod spine;
+#[cfg(feature = "tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+pub mod tls;
 pub mod usecases;
