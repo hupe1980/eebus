@@ -401,41 +401,41 @@ crate::eebus_choice! {
     /// `MsgTypeControlGroup`: exactly one alternative.
     pub enum ControlMessage {
         /// `connectionHello`.
-        "connectionHello" => ConnectionHello(ConnectionHello),
+        plain "connectionHello" => ConnectionHello(ConnectionHello),
         /// `messageProtocolHandshake`.
-        "messageProtocolHandshake" => MessageProtocolHandshake(MessageProtocolHandshake),
+        plain "messageProtocolHandshake" => MessageProtocolHandshake(MessageProtocolHandshake),
         /// `messageProtocolHandshakeError`.
-        "messageProtocolHandshakeError" => MessageProtocolHandshakeError(MessageProtocolHandshakeError),
+        plain "messageProtocolHandshakeError" => MessageProtocolHandshakeError(MessageProtocolHandshakeError),
         /// `connectionPinState`.
-        "connectionPinState" => ConnectionPinState(ConnectionPinState),
+        plain "connectionPinState" => ConnectionPinState(ConnectionPinState),
         /// `connectionPinInput`.
-        "connectionPinInput" => ConnectionPinInput(ConnectionPinInput),
+        plain "connectionPinInput" => ConnectionPinInput(ConnectionPinInput),
         /// `connectionPinError`.
-        "connectionPinError" => ConnectionPinError(ConnectionPinError),
+        plain "connectionPinError" => ConnectionPinError(ConnectionPinError),
         /// `accessMethodsRequest`.
-        "accessMethodsRequest" => AccessMethodsRequest(AccessMethodsRequest),
+        plain "accessMethodsRequest" => AccessMethodsRequest(AccessMethodsRequest),
         /// `accessMethods`.
-        "accessMethods" => AccessMethods(AccessMethods),
+        plain "accessMethods" => AccessMethods(AccessMethods),
         /// `commissioningRequest`.
-        "commissioningRequest" => CommissioningRequest(CommissioningRequest),
+        plain "commissioningRequest" => CommissioningRequest(CommissioningRequest),
         /// `commissioningResponse`.
-        "commissioningResponse" => CommissioningResponse(CommissioningResponse),
+        plain "commissioningResponse" => CommissioningResponse(CommissioningResponse),
         /// `keyMaterialRequest`.
-        "keyMaterialRequest" => KeyMaterialRequest(KeyMaterialRequest),
+        plain "keyMaterialRequest" => KeyMaterialRequest(KeyMaterialRequest),
         /// `keyMaterial`.
-        "keyMaterial" => KeyMaterial(KeyMaterial),
+        plain "keyMaterial" => KeyMaterial(KeyMaterial),
         /// `keyMaterialResponse`.
-        "keyMaterialResponse" => KeyMaterialResponse(KeyMaterialResponse),
+        plain "keyMaterialResponse" => KeyMaterialResponse(KeyMaterialResponse),
         /// `keyMaterialDelete`.
-        "keyMaterialDelete" => KeyMaterialDelete(KeyMaterialDelete),
+        plain "keyMaterialDelete" => KeyMaterialDelete(KeyMaterialDelete),
         /// `keyMaterialDeleteResponse`.
-        "keyMaterialDeleteResponse" => KeyMaterialDeleteResponse(KeyMaterialDeleteResponse),
+        plain "keyMaterialDeleteResponse" => KeyMaterialDeleteResponse(KeyMaterialDeleteResponse),
         /// `keyMaterialState`.
-        "keyMaterialState" => KeyMaterialState(KeyMaterialState),
+        plain "keyMaterialState" => KeyMaterialState(KeyMaterialState),
         /// `keyMaterialStateResponse`.
-        "keyMaterialStateResponse" => KeyMaterialStateResponse(KeyMaterialStateResponse),
+        plain "keyMaterialStateResponse" => KeyMaterialStateResponse(KeyMaterialStateResponse),
         /// `keyMaterialStateRequest`.
-        "keyMaterialStateRequest" => KeyMaterialStateRequest(KeyMaterialStateRequest),
+        plain "keyMaterialStateRequest" => KeyMaterialStateRequest(KeyMaterialStateRequest),
     }
 }
 
@@ -443,7 +443,7 @@ crate::eebus_choice! {
     /// `MsgTypeDataGroup`: exactly one alternative.
     pub enum DataMessage {
         /// `data`.
-        "data" => Data(Data),
+        plain "data" => Data(Data),
     }
 }
 
@@ -451,7 +451,7 @@ crate::eebus_choice! {
     /// `MsgTypeEndGroup`: exactly one alternative.
     pub enum EndMessage {
         /// `connectionClose`.
-        "connectionClose" => ConnectionClose(ConnectionClose),
+        plain "connectionClose" => ConnectionClose(ConnectionClose),
     }
 }
 

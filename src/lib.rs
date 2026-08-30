@@ -10,15 +10,63 @@
 //!
 //! | Layer | Module | Specification |
 //! |---|---|---|
-//! | Use cases | `usecases` | `EEBus_UC_TS_*` + implementation guides |
+//! | Use cases | [`usecases`] | `EEBus_UC_TS_*` + the 2026 implementation guides |
+//! | Protocol | [`spine`] | SPINE 1.3.0 Protocol Specification |
 //! | Information model | [`model`] | SPINE 1.3.0 Resource Specification |
+//! | Transport | [`ship`] | SHIP 1.0.1 / 1.1.0 |
 //! | Wire format | [`codec`] | SHIP 1.1.0 §11.4 (XML→JSON) |
-//! | Transport | `ship` | SHIP 1.0.1 / 1.1.0 |
+//!
+//! # Sans-IO
+//!
+//! Nothing in this crate opens a socket or reads a clock. Both protocol cores —
+//! [`ship::Handshake`] and [`spine::Engine`] — are driven the same way:
+//!
+//! ```text
+//! handle_message(msg, now) / handle_datagram(msg, now)   // something arrived
+//! handle_timeout(now)                                    // a timer fired
+//! poll_transmit()                                        // what to send
+//! poll_timeout()                                         // when to come back
+//! poll_event()                                           // what the application should know
+//! ```
+//!
+//! Time is a parameter, so every timeout in the standard — the two-minute hello, the
+//! SPINE response deadline, the LPC heartbeat window — is an ordinary unit test against a
+//! virtual clock, and the same code runs under an async runtime, in a simulator, or on a
+//! microcontroller.
+//!
+//! # Getting started
+//!
+//! ```
+//! use core::time::Duration;
+//! use eebus::model::{DeviceType, EntityType, FeatureType, Function, Role};
+//! use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, node_management};
+//!
+//! // A device is entities, and an entity is features. NodeManagement is created for you.
+//! let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)?;
+//! device.add_entity(
+//!     LocalEntity::new([1], EntityType::HeatPumpAppliance)
+//!         .with_feature(LocalFeature::new(1, FeatureType::LoadControl, Role::Server)),
+//! )?;
+//!
+//! // The engine turns application calls into datagrams and datagrams into events.
+//! let mut engine = Engine::new(device);
+//! let source = engine.device().address_of(&[1], 1);
+//! let peer = node_management(&eebus::spine::device_address("i:12345", "ControlBox-1")?);
+//! engine.read(&peer, &source, Function::NodeManagementDetailedDiscoveryData, Duration::ZERO);
+//!
+//! let datagram = engine.poll_transmit().expect("a read to send");
+//! println!("{}", eebus::model::to_json(&datagram)?);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! See `examples/grid_limit.rs` for the whole §14a exchange: the SHIP handshake,
+//! discovery, a binding, a limit, and the acknowledgement that answers it.
 //!
 //! # Status
 //!
-//! Under construction. The SPINE model and its codec are in place; SHIP, the SPINE
-//! engine and the use cases are landing milestone by milestone.
+//! Under construction, and not yet published. The model, codec, SHIP handshake, SPINE
+//! engine and the Limitation of Power Consumption use case are implemented and tested;
+//! TLS, mDNS-SD and a runtime adapter are the remaining milestones. The API will change.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

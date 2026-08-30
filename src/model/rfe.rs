@@ -53,6 +53,19 @@ use alloc::vec::Vec;
 
 use crate::codec::Merge;
 
+/// A command carried a payload for a different function than the one stored.
+///
+/// SPINE addresses a function by name, so this is a routing error rather than a merge
+/// that failed: the recipient answers with `errorNumber` 6, "command not supported".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("expected a `{stored}` payload, received `{received}`")]
+pub struct FunctionMismatch {
+    /// The function the stored data belongs to.
+    pub stored: &'static str,
+    /// The function the received payload belongs to.
+    pub received: &'static str,
+}
+
 /// A list entry that can be told apart from its siblings.
 pub trait Identified {
     /// The Rust names of the elements that identify an entry, in schema order.

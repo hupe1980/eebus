@@ -37,6 +37,8 @@
 
 use core::time::Duration;
 
+use crate::model::ErrorNumber;
+
 /// No heartbeat for this long moves the system into the failsafe state
 /// ([LPC-911], [LPC-912]).
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -184,10 +186,14 @@ impl WriteOutcome {
     }
 
     /// The SPINE `errorNumber` this outcome is reported with.
-    pub fn error_number(self) -> u8 {
+    ///
+    /// [LPC-002] answers an accepted write with a plain acknowledgement; [LPC-003]
+    /// answers a refused one with `commandRejected`, which is the only refusal the use
+    /// case defines — the reason itself is local, and is not sent to the Energy Guard.
+    pub fn error_number(self) -> ErrorNumber {
         match self {
-            WriteOutcome::Accepted => 0,
-            WriteOutcome::Rejected(_) => 7,
+            WriteOutcome::Accepted => ErrorNumber::None,
+            WriteOutcome::Rejected(_) => ErrorNumber::CommandRejected,
         }
     }
 }

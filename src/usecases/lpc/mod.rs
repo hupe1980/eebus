@@ -19,6 +19,9 @@
 //! [`ControllableSystem`] implements the state machine of §2.3 together with the rules
 //! the 2026 implementation guide added.
 
+mod actor;
+pub use actor::*;
+
 mod descriptor;
 pub use descriptor::*;
 

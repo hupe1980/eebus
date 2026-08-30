@@ -216,11 +216,13 @@ fn lower(profile: &Profile, schema: &Schema) -> Result<Lowered, String> {
             .push((name.clone(), text));
     }
 
+    let mergeable = mergeable_lists(&ctx)?;
+
     for (name, group) in &schema.groups {
         if !group.is_choice || !ctx.is_generated_choice(name) {
             continue;
         }
-        let text = emit_choice(&ctx, name, group)?;
+        let text = emit_choice(&ctx, name, group, &mergeable)?;
         out.choices += 1;
         let module = profile.single_module.unwrap_or("command_frame").to_string();
         bodies.entry(module).or_default().push((name.clone(), text));
@@ -394,7 +396,36 @@ fn emit_complex(ctx: &Ctx<'_>, name: &str, def: &ComplexDef) -> Result<(String, 
     Ok((s, Kind::Struct))
 }
 
-fn emit_choice(ctx: &Ctx<'_>, group: &str, def: &GroupDef) -> Result<String, String> {
+/// The list types whose entries carry identifiers, and so can be merged entry by entry.
+///
+/// A list without identifiers — `nodeManagementUseCaseData`, for one — has no way to
+/// say which stored entry an update refers to, so a partial update of it can only
+/// replace, and the choice marks it `plain`.
+fn mergeable_lists(ctx: &Ctx<'_>) -> Result<BTreeSet<String>, String> {
+    let mut out = BTreeSet::new();
+    for (list_name, list_def) in &ctx.schema.complex {
+        let Some(item) = single_repeated_item(ctx, list_def)? else {
+            continue;
+        };
+        let Some(item_def) = ctx.schema.complex.get(&item) else {
+            continue;
+        };
+        if is_alias(ctx, list_name)? || is_alias(ctx, &item)? {
+            continue;
+        }
+        if !leading_identifiers(ctx, &item, item_def)?.is_empty() {
+            out.insert(list_name.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn emit_choice(
+    ctx: &Ctx<'_>,
+    group: &str,
+    def: &GroupDef,
+    mergeable: &BTreeSet<String>,
+) -> Result<String, String> {
     let rust = ctx.choice_type(group);
     let mut alternatives = Vec::new();
     collect_alternatives(ctx, group, def, &mut alternatives, 0)?;
@@ -404,13 +435,18 @@ fn emit_choice(ctx: &Ctx<'_>, group: &str, def: &GroupDef) -> Result<String, Str
     writeln!(s, "    /// `{group}`: exactly one alternative.").unwrap();
     writeln!(s, "    pub enum {rust} {{").unwrap();
     let mut seen = BTreeSet::new();
-    for (wire, ty) in alternatives {
+    for (wire, ty, xsd) in alternatives {
         let variant = variant_name(&wire);
         if !seen.insert(variant.clone()) {
             continue;
         }
+        let kind = if mergeable.contains(&xsd) {
+            "list"
+        } else {
+            "plain"
+        };
         writeln!(s, "        /// `{wire}`.").unwrap();
-        writeln!(s, "        {wire:?} => {variant}({ty}),").unwrap();
+        writeln!(s, "        {kind} {wire:?} => {variant}({ty}),").unwrap();
     }
     writeln!(s, "    }}\n}}").unwrap();
     Ok(s)
@@ -421,7 +457,7 @@ fn collect_alternatives(
     ctx: &Ctx<'_>,
     owner: &str,
     def: &GroupDef,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<(String, String, String)>,
     depth: usize,
 ) -> Result<(), String> {
     if depth > 4 {
@@ -431,7 +467,8 @@ fn collect_alternatives(
         match p {
             Particle::Element { wire, ty, .. } => {
                 let resolved = resolve(ctx, ty)?;
-                out.push((wire.clone(), rust_type(ctx, &resolved, false)?));
+                let rust = rust_type(ctx, &resolved, false)?;
+                out.push((wire.clone(), rust, resolved));
             }
             Particle::Group { name, .. } => {
                 let nested = ctx

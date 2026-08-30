@@ -7,6 +7,8 @@
 
 use core::time::Duration;
 
+use eebus::model::ErrorNumber;
+
 use eebus::usecases::lpc::{
     ControllableSystem, CsConfig, EffectiveLimit, LimitWrite, LocalDecision, LpcState, NackReason,
     RejectReason, WriteOutcome,
@@ -271,7 +273,11 @@ fn lpc_907_a_rejection_does_not_change_a_controlled_state() {
         outcome,
         WriteOutcome::Rejected(NackReason::CannotApply(RejectReason::SelfProtection))
     );
-    assert_eq!(outcome.error_number(), 7, "SPINE: command rejected");
+    assert_eq!(
+        outcome.error_number(),
+        ErrorNumber::CommandRejected,
+        "SPINE: command rejected"
+    );
     assert_eq!(
         cs.state(),
         LpcState::Limited,

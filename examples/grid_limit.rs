@@ -1,9 +1,10 @@
 //! A grid operator's control box limits a heat pump, end to end.
 //!
 //! This is the §14a EnWG exchange in miniature, using every layer of the crate: the SHIP
-//! handshake brings two nodes to the point where they may exchange data, a SPINE
-//! datagram carries the heartbeat and then the limit, and the Limitation of Power
-//! Consumption state machine decides what the heat pump actually does with it.
+//! handshake brings two nodes to the point where they may exchange data, the SPINE engine
+//! discovers what the other one is and negotiates the permission to write, and the
+//! Limitation of Power Consumption state machine decides what the heat pump actually does
+//! with the limit it is sent.
 //!
 //! Run it with:
 //!
@@ -11,41 +12,41 @@
 //! cargo run --example grid_limit
 //! ```
 //!
-//! Everything here is in-memory and driven by a virtual clock: there is no socket, no
-//! TLS and no mDNS, because none of the protocol logic needs any of them.
+//! Everything is in-memory and driven by a virtual clock: there is no socket, no TLS and
+//! no mDNS, because none of the protocol logic needs any of them.
 
 use core::time::Duration;
 
 use eebus::model::{
-    self, AddressDevice, AddressEntity, AddressFeature, Cmd, CmdClassifier, CmdData, Datagram,
-    FeatureAddress, Filter, Header, LoadControlLimitData, LoadControlLimitId,
-    LoadControlLimitListData, MsgCounter, Payload, ResultData, ScaledNumber, SpecificationVersion,
-    TimePeriod,
+    self, CmdData, Datagram, DeviceType, EntityType, FeatureType, Function, LoadControlLimitData,
+    LoadControlLimitListData, Role, ScaledNumber,
 };
 use eebus::ship::{
-    Data, DataMessage, Handshake, HandshakeConfig, ProtocolId, Role, ShipMessage, Trust,
+    Data, DataMessage, Handshake, HandshakeConfig, ProtocolId, Role as ShipRole, ShipMessage, Trust,
 };
-use eebus::spine::{ErrorNumber, MsgCounterSource, owes_ack};
+use eebus::spine::{
+    Engine, ErrorNumber, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management,
+};
 use eebus::usecases::lpc::{
-    ControllableSystem, CsConfig, EffectiveLimit, LimitWrite, LocalDecision, LpcState,
+    self, ControllableSystem, ControllableSystemActor, CsConfig, EffectiveLimit,
 };
-
-/// The SPINE version both sides speak.
-const SPINE_VERSION: &str = "1.3.0";
 
 /// The `protocolId` that marks a SHIP data message as carrying SPINE.
 const SPINE_PROTOCOL_ID: &str = "ee1.0";
 
+/// The power §14a EnWG leaves a controllable consumer.
+const FAILSAFE_WATTS: f64 = 4_200.0;
+
 fn main() {
     let mut now = Duration::ZERO;
 
-    // ---- 1. The SHIP handshake -------------------------------------------------
+    // ---- 1. SHIP: two nodes reach the point where they may exchange data --------
     //
-    // The control box dials the heat pump, so it is the SHIP client. Both already
-    // trust each other's key — an installer scanned the QR codes at commissioning.
+    // The control box dials the heat pump, so it is the SHIP client. Both already trust
+    // each other's key — an installer scanned the QR codes at commissioning.
 
-    let mut control_box = Handshake::new(
-        Role::Client,
+    let mut control_link = Handshake::new(
+        ShipRole::Client,
         HandshakeConfig {
             ship_id: Some("i:12345_u:ControlBox-1".into()),
             ..HandshakeConfig::default()
@@ -53,8 +54,8 @@ fn main() {
         Trust::Trusted,
         now,
     );
-    let mut heat_pump = Handshake::new(
-        Role::Server,
+    let mut pump_link = Handshake::new(
+        ShipRole::Server,
         HandshakeConfig {
             ship_id: Some("i:67890_u:HeatPump-1".into()),
             ..HandshakeConfig::default()
@@ -66,14 +67,14 @@ fn main() {
     let mut frames = 0;
     loop {
         let mut moved = false;
-        while let Some(message) = control_box.poll_transmit() {
+        while let Some(message) = control_link.poll_transmit() {
             frames += 1;
-            deliver(&message, &mut heat_pump, now);
+            deliver(&message, &mut pump_link, now);
             moved = true;
         }
-        while let Some(message) = heat_pump.poll_transmit() {
+        while let Some(message) = pump_link.poll_transmit() {
             frames += 1;
-            deliver(&message, &mut control_box, now);
+            deliver(&message, &mut control_link, now);
             moved = true;
         }
         if !moved {
@@ -82,246 +83,232 @@ fn main() {
         now += Duration::from_millis(1);
     }
 
-    let ((major, minor), format) = control_box.negotiated().cloned().expect("negotiated");
-    println!("SHIP handshake complete after {frames} frames");
-    println!("  version {major}.{minor}, format {format}\n");
-    assert!(control_box.is_ready_for_data() && heat_pump.is_ready_for_data());
+    let ((major, minor), format) = control_link.negotiated().cloned().expect("negotiated");
+    assert!(control_link.is_ready_for_data() && pump_link.is_ready_for_data());
+    println!("1. SHIP handshake complete after {frames} frames");
+    println!("   version {major}.{minor}, format {format}\n");
 
-    // ---- 2. The heat pump's use-case state ------------------------------------
-    //
-    // Failsafe values are pre-configured by the installer: 4.2 kW, held for at least
-    // two hours if the control box goes silent.
+    // ---- 2. The two SPINE nodes -------------------------------------------------
 
-    let mut lpc = ControllableSystem::new(
-        CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)).with_nominal_max(11_000.0),
+    let mut control_box = build_control_box();
+    let (mut heat_pump, mut lpc) = build_heat_pump();
+    lpc.publish(&mut heat_pump);
+
+    println!("2. The heat pump starts in {:?}", lpc.system().state());
+    println!(
+        "   limited to {:?}\n   — a restart runs on the failsafe value, not unlimited\n",
+        lpc.system().effective_limit()
+    );
+    assert_eq!(
+        lpc.system().effective_limit(),
+        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+    );
+
+    // ---- 3. Discovery -----------------------------------------------------------
+
+    let control_nm = node_management(control_box.device().address());
+    let pump_nm = node_management(heat_pump.device().address());
+    control_box.read(
+        &pump_nm,
+        &control_nm,
+        Function::NodeManagementDetailedDiscoveryData,
         now,
     );
-    println!("Heat pump starts in {:?}", lpc.state());
-    println!("  limited to {:?}\n", lpc.effective_limit());
-    assert_eq!(lpc.effective_limit(), EffectiveLimit::Failsafe(4_200.0));
-
-    // ---- 3. A heartbeat, on the wire -------------------------------------------
-
-    let mut counters = MsgCounterSource::default();
-    now += Duration::from_secs(1);
-
-    let heartbeat = datagram(
-        Node::ControlBox,
-        counters.next(),
-        CmdClassifier::Notify,
-        false,
-        CmdData::DeviceDiagnosisHeartbeatData(model::DeviceDiagnosisHeartbeatData {
-            timestamp: Some("2026-08-30T10:00:00Z".into()),
-            heartbeat_counter: Some(1),
-            heartbeat_timeout: Some("PT1M".into()),
-        }),
-        None,
+    control_box.read(
+        &pump_nm,
+        &control_nm,
+        Function::NodeManagementUseCaseData,
+        now,
     );
-    let frame = send(&heartbeat);
-    println!(
-        "control box → heat pump, heartbeat ({} bytes, SHIP type 0x{:02x}):",
-        frame.len(),
-        frame[0]
-    );
-    println!("  {}\n", model::to_json(&heartbeat).expect("encode"));
+    exchange(&mut control_box, &mut heat_pump, &mut lpc, now);
 
-    assert_eq!(receive(&frame), heartbeat, "the datagram survives the wire");
-    lpc.on_heartbeat(now);
+    let pump_address = heat_pump.device().address().clone();
+    let remote = control_box.peer(&pump_address).expect("the peer");
+    let use_case = remote
+        .use_case("limitationOfPowerConsumption", "ControllableSystem")
+        .expect("the heat pump plays the Controllable System");
+    let load_control = remote
+        .address_of(use_case, &FeatureType::LoadControl, Role::Server)
+        .expect("the LoadControl feature");
 
-    // ---- 4. The limit ----------------------------------------------------------
+    println!("3. Discovery found the heat pump");
+    println!("   device    {}", pump_address.as_str());
+    println!("   plays     {} as {}", use_case.name, use_case.actor);
+    println!("   scenarios {:?}", use_case.scenarios);
+    println!("   writes    loadControlLimitListData\n");
+
+    // ---- 4. Binding and subscription --------------------------------------------
     //
-    // A partial write on `loadControlLimitListData`: 3 kW for fifteen minutes. The
-    // filter marks it partial, so elements the control box leaves out keep the values
-    // the heat pump already holds.
+    // A write without a binding is refused with errorNumber 9, which is what stops a
+    // second energy manager from overriding this one's limit.
+
+    let client = control_box.device().address_of(&[1], 1);
+    control_box.request_binding(&client, &load_control, now);
+    control_box.request_subscription(&client, &load_control, now);
+    exchange(&mut control_box, &mut heat_pump, &mut lpc, now);
+    drain(&mut control_box);
+
+    assert!(heat_pump.relations().is_bound(&client, &load_control));
+    println!("4. Bound and subscribed to the LoadControl feature\n");
+
+    // ---- 5. Heartbeat, then the limit -------------------------------------------
+    //
+    // The order matters: the implementation guide §2.11 evaluates a limit only when a
+    // heartbeat arrived within the preceding sixty seconds, so an Energy Guard that has
+    // lost its own upstream link cannot lift a limitation it can no longer justify.
 
     now += Duration::from_secs(1);
-    let limit_counter = counters.next();
-    let write = datagram(
-        Node::ControlBox,
-        limit_counter,
-        CmdClassifier::Write,
-        true,
-        CmdData::LoadControlLimitListData(LoadControlLimitListData {
-            load_control_limit_data: Some(vec![LoadControlLimitData {
-                limit_id: Some(LoadControlLimitId(1)),
-                is_limit_active: Some(true),
-                time_period: Some(TimePeriod {
-                    end_time: Some("PT15M".into()),
-                    ..Default::default()
-                }),
-                value: Some(ScaledNumber::from_f64(3_000.0, 0)),
-                ..Default::default()
-            }]),
-        }),
-        Some(Filter::partial()),
+    lpc.system_mut().on_heartbeat(now);
+    println!("5. Heartbeat received");
+
+    now += Duration::from_secs(1);
+    let limit = CmdData::LoadControlLimitListData(LoadControlLimitListData {
+        load_control_limit_data: Some(vec![LoadControlLimitData {
+            limit_id: Some(lpc::LIMIT_ID),
+            is_limit_active: Some(true),
+            value: Some(ScaledNumber::from_f64(3_000.0, 0)),
+            ..Default::default()
+        }]),
+    });
+    control_box.write(&load_control, &client, limit, true, now);
+    println!("   3000 W limit written\n");
+
+    exchange(&mut control_box, &mut heat_pump, &mut lpc, now);
+
+    let result = drain(&mut control_box)
+        .into_iter()
+        .find_map(|event| match event {
+            SpineEvent::ResultReceived { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("the heat pump answered");
+
+    assert_eq!(result, ErrorNumber::None);
+    assert_eq!(
+        lpc.system().effective_limit(),
+        EffectiveLimit::Active(3_000.0)
     );
-    let frame = send(&write);
-    println!("control box → heat pump, limit:");
-    println!("  {}\n", model::to_json(&write).expect("encode"));
-
-    // The heat pump decodes it, hands the values to its use-case logic, and answers.
-    let outcome = apply(&receive(&frame), &mut lpc, now);
-
-    println!("Heat pump is now in {:?}", lpc.state());
-    println!("  limited to {:?}", lpc.effective_limit());
+    println!("6. The heat pump is now in {:?}", lpc.system().state());
+    println!("   limited to {:?}", lpc.system().effective_limit());
     println!(
-        "  answered with errorNumber {} ({outcome})\n",
-        outcome.number()
-    );
-    assert_eq!(lpc.state(), LpcState::Limited);
-    assert_eq!(lpc.effective_limit(), EffectiveLimit::Active(3_000.0));
-
-    // The write asked for an acknowledgement, so one is owed either way — this is the
-    // ACK that §14a expects the operator to be able to produce as evidence.
-    assert!(owes_ack(CmdClassifier::Write, true, outcome));
-    let mut result = datagram(
-        Node::HeatPump,
-        counters.next(),
-        CmdClassifier::Result,
-        false,
-        CmdData::ResultData(ResultData {
-            error_number: Some(outcome),
-            description: None,
-        }),
-        None,
-    );
-    // The reference is what ties the answer to the limit it answers, and what makes the
-    // pair usable as evidence.
-    if let Some(header) = result.header.as_mut() {
-        header.msg_counter_reference = Some(limit_counter);
-    }
-    println!(
-        "heat pump → control box, result:\n  {}\n",
-        model::to_json(&result).expect("encode")
+        "   answered errorNumber {} ({result}) — the §14a evidence\n",
+        result.number()
     );
 
-    // ---- 5. The control box goes quiet ----------------------------------------
+    // ---- 6. The control box goes quiet ------------------------------------------
     //
-    // No disconnection is signalled and none is needed: the heartbeats simply stop.
-    // Two minutes later the failsafe takes over, and it holds for at least the
-    // Failsafe Duration Minimum — the rule the 2026 implementation guide added, after
-    // implementations were found returning to `init` and going unlimited instead.
+    // No disconnection is signalled and none is needed: the heartbeats stop. Two minutes
+    // later the failsafe takes over, and holds — the rule the 2026 implementation guide
+    // added, after implementations were found returning to `init` and going unlimited.
 
     now += Duration::from_secs(200);
-    lpc.handle_timeout(now);
-    println!("Two minutes of silence later: {:?}", lpc.state());
-    println!("  limited to {:?}", lpc.effective_limit());
-    assert_eq!(lpc.state(), LpcState::FailsafeState);
-    assert_eq!(lpc.effective_limit(), EffectiveLimit::Failsafe(4_200.0));
+    lpc.system_mut().handle_timeout(now);
+    assert_eq!(
+        lpc.system().effective_limit(),
+        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+    );
+    println!(
+        "7. After two minutes of silence: {:?}",
+        lpc.system().state()
+    );
+    println!("   limited to {:?}", lpc.system().effective_limit());
 }
 
-/// Encodes a message, hands it to the peer, and checks it framed correctly on the way.
-fn deliver(message: &ShipMessage, peer: &mut Handshake, now: Duration) {
-    let bytes = message.encode().expect("encode");
-    let decoded = ShipMessage::decode(&bytes).expect("decode");
-    assert_eq!(&decoded, message, "framing round-trips");
-    peer.handle_message(decoded, now).expect("handshake input");
+/// The control box: an Energy Guard on a `GridGuard` entity.
+fn build_control_box() -> Engine {
+    let mut device = LocalDevice::new(
+        "i:12345",
+        "ControlBox-1",
+        DeviceType::ElectricitySupplySystem,
+    )
+    .expect("a valid device address");
+    device
+        .add_entity(
+            // The use-case implementation guide §3.3 asks an actor to use one `Generic`
+            // client feature for all of its client functionality.
+            LocalEntity::new([1], EntityType::GridGuard).with_feature(LocalFeature::new(
+                1,
+                FeatureType::Generic,
+                Role::Client,
+            )),
+        )
+        .expect("a fresh entity");
+
+    let mut engine = Engine::new(device);
+    engine.add_use_case([1], 1, &lpc::ENERGY_GUARD);
+    engine
 }
 
-/// Builds a datagram addressed from the control box to the heat pump.
-fn datagram(
-    from: Node,
-    counter: MsgCounter,
-    classifier: CmdClassifier,
-    ack_request: bool,
-    data: CmdData,
-    filter: Option<Filter>,
-) -> Datagram {
-    let mut cmd = Cmd::with_data(data);
-    if let Some(filter) = filter {
-        cmd = cmd.with_filter(filter);
+/// The heat pump: a Controllable System with the three features LPC asks of it.
+fn build_heat_pump() -> (Engine, ControllableSystemActor) {
+    let mut device = LocalDevice::new("i:67890", "HeatPump-1", DeviceType::HeatGenerationSystem)
+        .expect("a valid device address");
+    device
+        .add_entity(
+            LocalEntity::new([1], EntityType::HeatPumpAppliance)
+                .with_feature(lpc::load_control_feature(1))
+                .with_feature(lpc::device_configuration_feature(2))
+                .with_feature(lpc::device_diagnosis_feature(3)),
+        )
+        .expect("a fresh entity");
+
+    let load_control = device.address_of(&[1], 1);
+    let configuration = device.address_of(&[1], 2);
+    let diagnosis = device.address_of(&[1], 3);
+
+    let mut engine = Engine::new(device);
+    engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
+
+    let actor = ControllableSystemActor::new(
+        ControllableSystem::new(
+            CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
+                .with_nominal_max(11_000.0),
+            Duration::ZERO,
+        ),
+        load_control,
+        configuration,
+        diagnosis,
+    );
+    (engine, actor)
+}
+
+/// Carries datagrams both ways over SHIP, letting the use case decide on any write.
+fn exchange(
+    control_box: &mut Engine,
+    heat_pump: &mut Engine,
+    lpc: &mut ControllableSystemActor,
+    now: Duration,
+) {
+    for _ in 0..64 {
+        let mut moved = false;
+        while let Some(datagram) = control_box.poll_transmit() {
+            heat_pump.handle_datagram(&over_ship(&datagram), now);
+            moved = true;
+        }
+        while let Some(datagram) = heat_pump.poll_transmit() {
+            control_box.handle_datagram(&over_ship(&datagram), now);
+            moved = true;
+        }
+        // The use case decides on any write that is waiting, which is what produces the
+        // acknowledgement the control box is expecting.
+        let events: Vec<SpineEvent> = core::iter::from_fn(|| heat_pump.poll_event()).collect();
+        for event in &events {
+            if lpc.handle_event(heat_pump, event, now).is_some() {
+                moved = true;
+            }
+        }
+        if !moved {
+            return;
+        }
     }
-    let (source, destination) = match from {
-        Node::ControlBox => (CONTROL_BOX, HEAT_PUMP),
-        Node::HeatPump => (HEAT_PUMP, CONTROL_BOX),
-    };
-    Datagram {
-        header: Some(Header {
-            specification_version: Some(SpecificationVersion::from(SPINE_VERSION)),
-            address_source: Some(address(source.0, source.1, source.2)),
-            address_destination: Some(address(destination.0, destination.1, destination.2)),
-            msg_counter: Some(counter),
-            cmd_classifier: Some(classifier),
-            ack_request: Some(ack_request).filter(|v| *v),
-            ..Default::default()
-        }),
-        payload: Some(Payload {
-            cmd: Some(vec![cmd]),
-        }),
-    }
+    panic!("the exchange did not settle");
 }
 
-/// Which end of the connection a message comes from.
-#[derive(Clone, Copy)]
-enum Node {
-    ControlBox,
-    HeatPump,
-}
-
-/// `(device, entity, feature)` of each side's LPC feature.
-const CONTROL_BOX: (&str, u32, u32) = ("d:_i:12345_ControlBox", 1, 1);
-const HEAT_PUMP: (&str, u32, u32) = ("d:_i:67890_HeatPump", 1, 3);
-
-/// The SPINE implementation guide §2.7 requires the device component of an address to
-/// be populated in both directions.
-fn address(device: &str, entity: u32, feature: u32) -> FeatureAddress {
-    FeatureAddress {
-        device: Some(AddressDevice::from(device)),
-        entity: Some(vec![AddressEntity(entity)]),
-        feature: Some(AddressFeature(feature)),
-    }
-}
-
-/// The heat pump's side: read the limit out of the datagram and hand it to the use case.
+/// Wraps a datagram in a SHIP data message, frames it, and unwraps it again.
 ///
-/// This is what the feature layer will do once it exists; doing it by hand here keeps
-/// the example honest about what the wire actually carries.
-fn apply(datagram: &Datagram, lpc: &mut ControllableSystem, now: Duration) -> ErrorNumber {
-    let Some(cmd) = datagram
-        .payload
-        .as_ref()
-        .and_then(|p| p.cmd.as_ref())
-        .and_then(|c| c.first())
-    else {
-        return ErrorNumber::General;
-    };
-    let Some(CmdData::LoadControlLimitListData(list)) = &cmd.data else {
-        return ErrorNumber::CommandNotSupported;
-    };
-    let Some(entry) = list
-        .load_control_limit_data
-        .as_ref()
-        .and_then(|e| e.first())
-    else {
-        return ErrorNumber::General;
-    };
-
-    let write = LimitWrite {
-        is_active: entry.is_limit_active.unwrap_or(false),
-        watts: entry
-            .value
-            .as_ref()
-            .and_then(ScaledNumber::to_f64)
-            .unwrap_or(0.0),
-        duration: entry
-            .time_period
-            .as_ref()
-            .and_then(|p| p.end_time.as_ref())
-            .and_then(|t| t.as_duration()),
-    };
-
-    // A real heat pump would ask its controller whether it can follow the limit; here it
-    // always can.
-    match lpc.on_limit_write(&write, LocalDecision::Apply, now) {
-        outcome if outcome.is_accepted() => ErrorNumber::None,
-        _ => ErrorNumber::CommandRejected,
-    }
-}
-
-/// Wraps a datagram in the SHIP data message it travels in, and frames it.
-///
-/// `protocolId` names the protocol inside; SHIP itself never looks at the payload.
-fn send(datagram: &Datagram) -> Vec<u8> {
+/// The round trip is what makes this an honest demonstration rather than two objects
+/// passing each other in memory: everything crosses the wire format in both directions.
+fn over_ship(datagram: &Datagram) -> Datagram {
     let message = ShipMessage::Data(DataMessage::Data(Data {
         header: Some(eebus::ship::Header {
             protocol_id: Some(ProtocolId(SPINE_PROTOCOL_ID.into())),
@@ -329,12 +316,9 @@ fn send(datagram: &Datagram) -> Vec<u8> {
         payload: Some(model::to_json_value(datagram).expect("encode")),
         extension: None,
     }));
-    message.encode().expect("frame")
-}
+    let frame = message.encode().expect("frame");
 
-/// Unwraps a framed SHIP data message back into a datagram.
-fn receive(frame: &[u8]) -> Datagram {
-    let ShipMessage::Data(DataMessage::Data(data)) = ShipMessage::decode(frame).expect("decode")
+    let ShipMessage::Data(DataMessage::Data(data)) = ShipMessage::decode(&frame).expect("decode")
     else {
         panic!("expected a data message");
     };
@@ -343,5 +327,19 @@ fn receive(frame: &[u8]) -> Datagram {
         Some(SPINE_PROTOCOL_ID.to_string()),
         "the payload is SPINE"
     );
-    model::from_json_value(data.payload.expect("payload")).expect("datagram")
+    let decoded = model::from_json_value(data.payload.expect("payload")).expect("datagram");
+    assert_eq!(&decoded, datagram, "the datagram survives the wire");
+    decoded
+}
+
+/// Encodes a SHIP message, hands it to the peer, and checks the framing on the way.
+fn deliver(message: &ShipMessage, peer: &mut Handshake, now: Duration) {
+    let bytes = message.encode().expect("encode");
+    let decoded = ShipMessage::decode(&bytes).expect("decode");
+    assert_eq!(&decoded, message, "framing round-trips");
+    peer.handle_message(decoded, now).expect("handshake input");
+}
+
+fn drain(engine: &mut Engine) -> Vec<SpineEvent> {
+    core::iter::from_fn(|| engine.poll_event()).collect()
 }

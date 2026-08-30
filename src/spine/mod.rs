@@ -13,5 +13,20 @@
 mod ack;
 pub use ack::*;
 
+mod address;
+pub use address::*;
+
+mod device;
+pub use device::*;
+
+mod discovery;
+pub use discovery::*;
+
+mod engine;
+pub use engine::*;
+
+mod relations;
+pub use relations::*;
+
 mod counter;
 pub use counter::*;

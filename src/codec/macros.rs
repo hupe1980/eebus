@@ -543,7 +543,7 @@ macro_rules! eebus_choice {
     (
         $(#[$attr:meta])*
         $vis:vis enum $name:ident {
-            $( $(#[$vattr:meta])* $wire:literal => $variant:ident($ty:ty) ),* $(,)?
+            $( $(#[$vattr:meta])* $kind:ident $wire:literal => $variant:ident($ty:ty) ),* $(,)?
         }
     ) => {
         $(#[$attr])*
@@ -559,6 +559,65 @@ macro_rules! eebus_choice {
             /// The wire name of the selected alternative.
             pub const fn key(&self) -> &'static str {
                 match self { $( $name::$variant(_) => $wire, )* }
+            }
+
+            /// True when this alternative holds a list whose entries carry identifiers,
+            /// and so can take part in a Restricted Function Exchange merge.
+            pub const fn is_mergeable_list(&self) -> bool {
+                match self {
+                    $( $name::$variant(_) => $crate::eebus_choice!(@is_list $kind), )*
+                }
+            }
+
+            /// Applies `update` to this alternative with the semantics `partial` asks for.
+            ///
+            /// A partial update merges into what is stored: for a list, entry by entry
+            /// by identifier; for anything else, element by element. A full update
+            /// replaces. Returns an error when the two alternatives are not the same
+            /// function, which is a protocol error rather than a merge.
+            #[allow(unreachable_patterns)]
+            pub fn apply(
+                &mut self,
+                update: Self,
+                partial: bool,
+            ) -> $crate::codec::__private::Result<(), $crate::model::rfe::FunctionMismatch> {
+                match (self, update) {
+                    $(
+                        ($name::$variant(stored), $name::$variant(update)) => {
+                            $crate::eebus_choice!(@apply $kind stored update partial);
+                            $crate::codec::__private::Ok(())
+                        }
+                    )*
+                    (stored, update) => {
+                        $crate::codec::__private::Err($crate::model::rfe::FunctionMismatch {
+                            stored: stored.key(),
+                            received: update.key(),
+                        })
+                    }
+                }
+            }
+
+            /// Deletes what `update` identifies: whole entries for a list, and the
+            /// whole value otherwise.
+            #[allow(unreachable_patterns)]
+            pub fn delete(
+                &mut self,
+                update: &Self,
+            ) -> $crate::codec::__private::Result<(), $crate::model::rfe::FunctionMismatch> {
+                match (self, update) {
+                    $(
+                        ($name::$variant(stored), $name::$variant(update)) => {
+                            $crate::eebus_choice!(@delete $kind stored update);
+                            $crate::codec::__private::Ok(())
+                        }
+                    )*
+                    (stored, update) => {
+                        $crate::codec::__private::Err($crate::model::rfe::FunctionMismatch {
+                            stored: stored.key(),
+                            received: update.key(),
+                        })
+                    }
+                }
             }
 
             /// Reads the alternative named `key` from a map access positioned at its value.
@@ -651,6 +710,32 @@ macro_rules! eebus_choice {
                 deserializer.deserialize_map(__V)
             }
         }
+    };
+
+    (@is_list list) => { true };
+    (@is_list plain) => { false };
+
+    (@apply list $stored:ident $update:ident $partial:ident) => {
+        if $partial {
+            $crate::model::rfe::apply_partial($stored, $update);
+        } else {
+            $crate::model::rfe::apply_full($stored, $update);
+        }
+    };
+    (@apply plain $stored:ident $update:ident $partial:ident) => {
+        if $partial {
+            $crate::codec::Merge::merge($stored, $update);
+        } else {
+            *$stored = $update;
+        }
+    };
+
+    (@delete list $stored:ident $update:ident) => {
+        $crate::model::rfe::delete_entries($stored, $update);
+    };
+    (@delete plain $stored:ident $update:ident) => {
+        let _ = $update;
+        *$stored = ::core::default::Default::default();
     };
 }
 

@@ -40,289 +40,289 @@ crate::eebus_choice! {
     /// `DataChoiceGroup`: exactly one alternative.
     pub enum CmdData {
         /// `actuatorLevelData`.
-        "actuatorLevelData" => ActuatorLevelData(ActuatorLevelData),
+        plain "actuatorLevelData" => ActuatorLevelData(ActuatorLevelData),
         /// `actuatorLevelDescriptionData`.
-        "actuatorLevelDescriptionData" => ActuatorLevelDescriptionData(ActuatorLevelDescriptionData),
+        plain "actuatorLevelDescriptionData" => ActuatorLevelDescriptionData(ActuatorLevelDescriptionData),
         /// `actuatorSwitchData`.
-        "actuatorSwitchData" => ActuatorSwitchData(ActuatorSwitchData),
+        plain "actuatorSwitchData" => ActuatorSwitchData(ActuatorSwitchData),
         /// `actuatorSwitchDescriptionData`.
-        "actuatorSwitchDescriptionData" => ActuatorSwitchDescriptionData(ActuatorSwitchDescriptionData),
+        plain "actuatorSwitchDescriptionData" => ActuatorSwitchDescriptionData(ActuatorSwitchDescriptionData),
         /// `alarmListData`.
-        "alarmListData" => AlarmListData(AlarmListData),
+        list "alarmListData" => AlarmListData(AlarmListData),
         /// `billConstraintsListData`.
-        "billConstraintsListData" => BillConstraintsListData(BillConstraintsListData),
+        list "billConstraintsListData" => BillConstraintsListData(BillConstraintsListData),
         /// `billDescriptionListData`.
-        "billDescriptionListData" => BillDescriptionListData(BillDescriptionListData),
+        list "billDescriptionListData" => BillDescriptionListData(BillDescriptionListData),
         /// `billListData`.
-        "billListData" => BillListData(BillListData),
+        list "billListData" => BillListData(BillListData),
         /// `bindingManagementDeleteCall`.
-        "bindingManagementDeleteCall" => BindingManagementDeleteCall(BindingManagementDeleteCall),
+        plain "bindingManagementDeleteCall" => BindingManagementDeleteCall(BindingManagementDeleteCall),
         /// `bindingManagementEntryListData`.
-        "bindingManagementEntryListData" => BindingManagementEntryListData(BindingManagementEntryListData),
+        list "bindingManagementEntryListData" => BindingManagementEntryListData(BindingManagementEntryListData),
         /// `bindingManagementRequestCall`.
-        "bindingManagementRequestCall" => BindingManagementRequestCall(BindingManagementRequestCall),
+        plain "bindingManagementRequestCall" => BindingManagementRequestCall(BindingManagementRequestCall),
         /// `commodityListData`.
-        "commodityListData" => CommodityListData(CommodityListData),
+        list "commodityListData" => CommodityListData(CommodityListData),
         /// `dataTunnelingCall`.
-        "dataTunnelingCall" => DataTunnelingCall(DataTunnelingCall),
+        plain "dataTunnelingCall" => DataTunnelingCall(DataTunnelingCall),
         /// `deviceClassificationManufacturerData`.
-        "deviceClassificationManufacturerData" => DeviceClassificationManufacturerData(DeviceClassificationManufacturerData),
+        plain "deviceClassificationManufacturerData" => DeviceClassificationManufacturerData(DeviceClassificationManufacturerData),
         /// `deviceClassificationUserData`.
-        "deviceClassificationUserData" => DeviceClassificationUserData(DeviceClassificationUserData),
+        plain "deviceClassificationUserData" => DeviceClassificationUserData(DeviceClassificationUserData),
         /// `deviceConfigurationKeyValueConstraintsListData`.
-        "deviceConfigurationKeyValueConstraintsListData" => DeviceConfigurationKeyValueConstraintsListData(DeviceConfigurationKeyValueConstraintsListData),
+        list "deviceConfigurationKeyValueConstraintsListData" => DeviceConfigurationKeyValueConstraintsListData(DeviceConfigurationKeyValueConstraintsListData),
         /// `deviceConfigurationKeyValueDescriptionListData`.
-        "deviceConfigurationKeyValueDescriptionListData" => DeviceConfigurationKeyValueDescriptionListData(DeviceConfigurationKeyValueDescriptionListData),
+        list "deviceConfigurationKeyValueDescriptionListData" => DeviceConfigurationKeyValueDescriptionListData(DeviceConfigurationKeyValueDescriptionListData),
         /// `deviceConfigurationKeyValueListData`.
-        "deviceConfigurationKeyValueListData" => DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData),
+        list "deviceConfigurationKeyValueListData" => DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData),
         /// `deviceDiagnosisHeartbeatData`.
-        "deviceDiagnosisHeartbeatData" => DeviceDiagnosisHeartbeatData(DeviceDiagnosisHeartbeatData),
+        plain "deviceDiagnosisHeartbeatData" => DeviceDiagnosisHeartbeatData(DeviceDiagnosisHeartbeatData),
         /// `deviceDiagnosisServiceData`.
-        "deviceDiagnosisServiceData" => DeviceDiagnosisServiceData(DeviceDiagnosisServiceData),
+        plain "deviceDiagnosisServiceData" => DeviceDiagnosisServiceData(DeviceDiagnosisServiceData),
         /// `deviceDiagnosisStateData`.
-        "deviceDiagnosisStateData" => DeviceDiagnosisStateData(DeviceDiagnosisStateData),
+        plain "deviceDiagnosisStateData" => DeviceDiagnosisStateData(DeviceDiagnosisStateData),
         /// `directControlActivityListData`.
-        "directControlActivityListData" => DirectControlActivityListData(DirectControlActivityListData),
+        plain "directControlActivityListData" => DirectControlActivityListData(DirectControlActivityListData),
         /// `directControlDescriptionData`.
-        "directControlDescriptionData" => DirectControlDescriptionData(DirectControlDescriptionData),
+        plain "directControlDescriptionData" => DirectControlDescriptionData(DirectControlDescriptionData),
         /// `electricalConnectionCharacteristicListData`.
-        "electricalConnectionCharacteristicListData" => ElectricalConnectionCharacteristicListData(ElectricalConnectionCharacteristicListData),
+        list "electricalConnectionCharacteristicListData" => ElectricalConnectionCharacteristicListData(ElectricalConnectionCharacteristicListData),
         /// `electricalConnectionDescriptionListData`.
-        "electricalConnectionDescriptionListData" => ElectricalConnectionDescriptionListData(ElectricalConnectionDescriptionListData),
+        list "electricalConnectionDescriptionListData" => ElectricalConnectionDescriptionListData(ElectricalConnectionDescriptionListData),
         /// `electricalConnectionParameterDescriptionListData`.
-        "electricalConnectionParameterDescriptionListData" => ElectricalConnectionParameterDescriptionListData(ElectricalConnectionParameterDescriptionListData),
+        list "electricalConnectionParameterDescriptionListData" => ElectricalConnectionParameterDescriptionListData(ElectricalConnectionParameterDescriptionListData),
         /// `electricalConnectionPermittedValueSetListData`.
-        "electricalConnectionPermittedValueSetListData" => ElectricalConnectionPermittedValueSetListData(ElectricalConnectionPermittedValueSetListData),
+        list "electricalConnectionPermittedValueSetListData" => ElectricalConnectionPermittedValueSetListData(ElectricalConnectionPermittedValueSetListData),
         /// `electricalConnectionStateListData`.
-        "electricalConnectionStateListData" => ElectricalConnectionStateListData(ElectricalConnectionStateListData),
+        list "electricalConnectionStateListData" => ElectricalConnectionStateListData(ElectricalConnectionStateListData),
         /// `hvacOperationModeDescriptionListData`.
-        "hvacOperationModeDescriptionListData" => HvacOperationModeDescriptionListData(HvacOperationModeDescriptionListData),
+        list "hvacOperationModeDescriptionListData" => HvacOperationModeDescriptionListData(HvacOperationModeDescriptionListData),
         /// `hvacOverrunDescriptionListData`.
-        "hvacOverrunDescriptionListData" => HvacOverrunDescriptionListData(HvacOverrunDescriptionListData),
+        list "hvacOverrunDescriptionListData" => HvacOverrunDescriptionListData(HvacOverrunDescriptionListData),
         /// `hvacOverrunListData`.
-        "hvacOverrunListData" => HvacOverrunListData(HvacOverrunListData),
+        list "hvacOverrunListData" => HvacOverrunListData(HvacOverrunListData),
         /// `hvacSystemFunctionDescriptionListData`.
-        "hvacSystemFunctionDescriptionListData" => HvacSystemFunctionDescriptionListData(HvacSystemFunctionDescriptionListData),
+        list "hvacSystemFunctionDescriptionListData" => HvacSystemFunctionDescriptionListData(HvacSystemFunctionDescriptionListData),
         /// `hvacSystemFunctionListData`.
-        "hvacSystemFunctionListData" => HvacSystemFunctionListData(HvacSystemFunctionListData),
+        list "hvacSystemFunctionListData" => HvacSystemFunctionListData(HvacSystemFunctionListData),
         /// `hvacSystemFunctionOperationModeRelationListData`.
-        "hvacSystemFunctionOperationModeRelationListData" => HvacSystemFunctionOperationModeRelationListData(HvacSystemFunctionOperationModeRelationListData),
+        list "hvacSystemFunctionOperationModeRelationListData" => HvacSystemFunctionOperationModeRelationListData(HvacSystemFunctionOperationModeRelationListData),
         /// `hvacSystemFunctionPowerSequenceRelationListData`.
-        "hvacSystemFunctionPowerSequenceRelationListData" => HvacSystemFunctionPowerSequenceRelationListData(HvacSystemFunctionPowerSequenceRelationListData),
+        list "hvacSystemFunctionPowerSequenceRelationListData" => HvacSystemFunctionPowerSequenceRelationListData(HvacSystemFunctionPowerSequenceRelationListData),
         /// `hvacSystemFunctionSetpointRelationListData`.
-        "hvacSystemFunctionSetpointRelationListData" => HvacSystemFunctionSetpointRelationListData(HvacSystemFunctionSetpointRelationListData),
+        list "hvacSystemFunctionSetpointRelationListData" => HvacSystemFunctionSetpointRelationListData(HvacSystemFunctionSetpointRelationListData),
         /// `identificationListData`.
-        "identificationListData" => IdentificationListData(IdentificationListData),
+        list "identificationListData" => IdentificationListData(IdentificationListData),
         /// `incentiveDescriptionListData`.
-        "incentiveDescriptionListData" => IncentiveDescriptionListData(IncentiveDescriptionListData),
+        list "incentiveDescriptionListData" => IncentiveDescriptionListData(IncentiveDescriptionListData),
         /// `incentiveListData`.
-        "incentiveListData" => IncentiveListData(IncentiveListData),
+        list "incentiveListData" => IncentiveListData(IncentiveListData),
         /// `incentiveTableConstraintsData`.
-        "incentiveTableConstraintsData" => IncentiveTableConstraintsData(IncentiveTableConstraintsData),
+        plain "incentiveTableConstraintsData" => IncentiveTableConstraintsData(IncentiveTableConstraintsData),
         /// `incentiveTableData`.
-        "incentiveTableData" => IncentiveTableData(IncentiveTableData),
+        plain "incentiveTableData" => IncentiveTableData(IncentiveTableData),
         /// `incentiveTableDescriptionData`.
-        "incentiveTableDescriptionData" => IncentiveTableDescriptionData(IncentiveTableDescriptionData),
+        plain "incentiveTableDescriptionData" => IncentiveTableDescriptionData(IncentiveTableDescriptionData),
         /// `loadControlEventListData`.
-        "loadControlEventListData" => LoadControlEventListData(LoadControlEventListData),
+        plain "loadControlEventListData" => LoadControlEventListData(LoadControlEventListData),
         /// `loadControlLimitConstraintsListData`.
-        "loadControlLimitConstraintsListData" => LoadControlLimitConstraintsListData(LoadControlLimitConstraintsListData),
+        list "loadControlLimitConstraintsListData" => LoadControlLimitConstraintsListData(LoadControlLimitConstraintsListData),
         /// `loadControlLimitDescriptionListData`.
-        "loadControlLimitDescriptionListData" => LoadControlLimitDescriptionListData(LoadControlLimitDescriptionListData),
+        list "loadControlLimitDescriptionListData" => LoadControlLimitDescriptionListData(LoadControlLimitDescriptionListData),
         /// `loadControlLimitListData`.
-        "loadControlLimitListData" => LoadControlLimitListData(LoadControlLimitListData),
+        list "loadControlLimitListData" => LoadControlLimitListData(LoadControlLimitListData),
         /// `loadControlNodeData`.
-        "loadControlNodeData" => LoadControlNodeData(LoadControlNodeData),
+        plain "loadControlNodeData" => LoadControlNodeData(LoadControlNodeData),
         /// `loadControlStateListData`.
-        "loadControlStateListData" => LoadControlStateListData(LoadControlStateListData),
+        plain "loadControlStateListData" => LoadControlStateListData(LoadControlStateListData),
         /// `measurementConstraintsListData`.
-        "measurementConstraintsListData" => MeasurementConstraintsListData(MeasurementConstraintsListData),
+        list "measurementConstraintsListData" => MeasurementConstraintsListData(MeasurementConstraintsListData),
         /// `measurementDescriptionListData`.
-        "measurementDescriptionListData" => MeasurementDescriptionListData(MeasurementDescriptionListData),
+        list "measurementDescriptionListData" => MeasurementDescriptionListData(MeasurementDescriptionListData),
         /// `measurementListData`.
-        "measurementListData" => MeasurementListData(MeasurementListData),
+        list "measurementListData" => MeasurementListData(MeasurementListData),
         /// `measurementSeriesListData`.
-        "measurementSeriesListData" => MeasurementSeriesListData(MeasurementSeriesListData),
+        list "measurementSeriesListData" => MeasurementSeriesListData(MeasurementSeriesListData),
         /// `measurementThresholdRelationListData`.
-        "measurementThresholdRelationListData" => MeasurementThresholdRelationListData(MeasurementThresholdRelationListData),
+        list "measurementThresholdRelationListData" => MeasurementThresholdRelationListData(MeasurementThresholdRelationListData),
         /// `messagingListData`.
-        "messagingListData" => MessagingListData(MessagingListData),
+        plain "messagingListData" => MessagingListData(MessagingListData),
         /// `networkManagementAbortCall`.
-        "networkManagementAbortCall" => NetworkManagementAbortCall(NetworkManagementAbortCall),
+        plain "networkManagementAbortCall" => NetworkManagementAbortCall(NetworkManagementAbortCall),
         /// `networkManagementAddNodeCall`.
-        "networkManagementAddNodeCall" => NetworkManagementAddNodeCall(NetworkManagementAddNodeCall),
+        plain "networkManagementAddNodeCall" => NetworkManagementAddNodeCall(NetworkManagementAddNodeCall),
         /// `networkManagementDeviceDescriptionListData`.
-        "networkManagementDeviceDescriptionListData" => NetworkManagementDeviceDescriptionListData(NetworkManagementDeviceDescriptionListData),
+        plain "networkManagementDeviceDescriptionListData" => NetworkManagementDeviceDescriptionListData(NetworkManagementDeviceDescriptionListData),
         /// `networkManagementDiscoverCall`.
-        "networkManagementDiscoverCall" => NetworkManagementDiscoverCall(NetworkManagementDiscoverCall),
+        plain "networkManagementDiscoverCall" => NetworkManagementDiscoverCall(NetworkManagementDiscoverCall),
         /// `networkManagementEntityDescriptionListData`.
-        "networkManagementEntityDescriptionListData" => NetworkManagementEntityDescriptionListData(NetworkManagementEntityDescriptionListData),
+        plain "networkManagementEntityDescriptionListData" => NetworkManagementEntityDescriptionListData(NetworkManagementEntityDescriptionListData),
         /// `networkManagementFeatureDescriptionListData`.
-        "networkManagementFeatureDescriptionListData" => NetworkManagementFeatureDescriptionListData(NetworkManagementFeatureDescriptionListData),
+        plain "networkManagementFeatureDescriptionListData" => NetworkManagementFeatureDescriptionListData(NetworkManagementFeatureDescriptionListData),
         /// `networkManagementJoiningModeData`.
-        "networkManagementJoiningModeData" => NetworkManagementJoiningModeData(NetworkManagementJoiningModeData),
+        plain "networkManagementJoiningModeData" => NetworkManagementJoiningModeData(NetworkManagementJoiningModeData),
         /// `networkManagementModifyNodeCall`.
-        "networkManagementModifyNodeCall" => NetworkManagementModifyNodeCall(NetworkManagementModifyNodeCall),
+        plain "networkManagementModifyNodeCall" => NetworkManagementModifyNodeCall(NetworkManagementModifyNodeCall),
         /// `networkManagementProcessStateData`.
-        "networkManagementProcessStateData" => NetworkManagementProcessStateData(NetworkManagementProcessStateData),
+        plain "networkManagementProcessStateData" => NetworkManagementProcessStateData(NetworkManagementProcessStateData),
         /// `networkManagementRemoveNodeCall`.
-        "networkManagementRemoveNodeCall" => NetworkManagementRemoveNodeCall(NetworkManagementRemoveNodeCall),
+        plain "networkManagementRemoveNodeCall" => NetworkManagementRemoveNodeCall(NetworkManagementRemoveNodeCall),
         /// `networkManagementReportCandidateData`.
-        "networkManagementReportCandidateData" => NetworkManagementReportCandidateData(NetworkManagementReportCandidateData),
+        plain "networkManagementReportCandidateData" => NetworkManagementReportCandidateData(NetworkManagementReportCandidateData),
         /// `networkManagementScanNetworkCall`.
-        "networkManagementScanNetworkCall" => NetworkManagementScanNetworkCall(NetworkManagementScanNetworkCall),
+        plain "networkManagementScanNetworkCall" => NetworkManagementScanNetworkCall(NetworkManagementScanNetworkCall),
         /// `nodeManagementBindingData`.
-        "nodeManagementBindingData" => NodeManagementBindingData(NodeManagementBindingData),
+        list "nodeManagementBindingData" => NodeManagementBindingData(NodeManagementBindingData),
         /// `nodeManagementBindingDeleteCall`.
-        "nodeManagementBindingDeleteCall" => NodeManagementBindingDeleteCall(NodeManagementBindingDeleteCall),
+        plain "nodeManagementBindingDeleteCall" => NodeManagementBindingDeleteCall(NodeManagementBindingDeleteCall),
         /// `nodeManagementBindingRequestCall`.
-        "nodeManagementBindingRequestCall" => NodeManagementBindingRequestCall(NodeManagementBindingRequestCall),
+        plain "nodeManagementBindingRequestCall" => NodeManagementBindingRequestCall(NodeManagementBindingRequestCall),
         /// `nodeManagementDestinationListData`.
-        "nodeManagementDestinationListData" => NodeManagementDestinationListData(NodeManagementDestinationListData),
+        plain "nodeManagementDestinationListData" => NodeManagementDestinationListData(NodeManagementDestinationListData),
         /// `nodeManagementDetailedDiscoveryData`.
-        "nodeManagementDetailedDiscoveryData" => NodeManagementDetailedDiscoveryData(NodeManagementDetailedDiscoveryData),
+        plain "nodeManagementDetailedDiscoveryData" => NodeManagementDetailedDiscoveryData(NodeManagementDetailedDiscoveryData),
         /// `nodeManagementSubscriptionData`.
-        "nodeManagementSubscriptionData" => NodeManagementSubscriptionData(NodeManagementSubscriptionData),
+        list "nodeManagementSubscriptionData" => NodeManagementSubscriptionData(NodeManagementSubscriptionData),
         /// `nodeManagementSubscriptionDeleteCall`.
-        "nodeManagementSubscriptionDeleteCall" => NodeManagementSubscriptionDeleteCall(NodeManagementSubscriptionDeleteCall),
+        plain "nodeManagementSubscriptionDeleteCall" => NodeManagementSubscriptionDeleteCall(NodeManagementSubscriptionDeleteCall),
         /// `nodeManagementSubscriptionRequestCall`.
-        "nodeManagementSubscriptionRequestCall" => NodeManagementSubscriptionRequestCall(NodeManagementSubscriptionRequestCall),
+        plain "nodeManagementSubscriptionRequestCall" => NodeManagementSubscriptionRequestCall(NodeManagementSubscriptionRequestCall),
         /// `nodeManagementUseCaseData`.
-        "nodeManagementUseCaseData" => NodeManagementUseCaseData(NodeManagementUseCaseData),
+        plain "nodeManagementUseCaseData" => NodeManagementUseCaseData(NodeManagementUseCaseData),
         /// `operatingConstraintsDurationListData`.
-        "operatingConstraintsDurationListData" => OperatingConstraintsDurationListData(OperatingConstraintsDurationListData),
+        list "operatingConstraintsDurationListData" => OperatingConstraintsDurationListData(OperatingConstraintsDurationListData),
         /// `operatingConstraintsInterruptListData`.
-        "operatingConstraintsInterruptListData" => OperatingConstraintsInterruptListData(OperatingConstraintsInterruptListData),
+        list "operatingConstraintsInterruptListData" => OperatingConstraintsInterruptListData(OperatingConstraintsInterruptListData),
         /// `operatingConstraintsPowerDescriptionListData`.
-        "operatingConstraintsPowerDescriptionListData" => OperatingConstraintsPowerDescriptionListData(OperatingConstraintsPowerDescriptionListData),
+        list "operatingConstraintsPowerDescriptionListData" => OperatingConstraintsPowerDescriptionListData(OperatingConstraintsPowerDescriptionListData),
         /// `operatingConstraintsPowerLevelListData`.
-        "operatingConstraintsPowerLevelListData" => OperatingConstraintsPowerLevelListData(OperatingConstraintsPowerLevelListData),
+        list "operatingConstraintsPowerLevelListData" => OperatingConstraintsPowerLevelListData(OperatingConstraintsPowerLevelListData),
         /// `operatingConstraintsPowerRangeListData`.
-        "operatingConstraintsPowerRangeListData" => OperatingConstraintsPowerRangeListData(OperatingConstraintsPowerRangeListData),
+        list "operatingConstraintsPowerRangeListData" => OperatingConstraintsPowerRangeListData(OperatingConstraintsPowerRangeListData),
         /// `operatingConstraintsResumeImplicationListData`.
-        "operatingConstraintsResumeImplicationListData" => OperatingConstraintsResumeImplicationListData(OperatingConstraintsResumeImplicationListData),
+        list "operatingConstraintsResumeImplicationListData" => OperatingConstraintsResumeImplicationListData(OperatingConstraintsResumeImplicationListData),
         /// `powerSequenceAlternativesRelationListData`.
-        "powerSequenceAlternativesRelationListData" => PowerSequenceAlternativesRelationListData(PowerSequenceAlternativesRelationListData),
+        list "powerSequenceAlternativesRelationListData" => PowerSequenceAlternativesRelationListData(PowerSequenceAlternativesRelationListData),
         /// `powerSequenceDescriptionListData`.
-        "powerSequenceDescriptionListData" => PowerSequenceDescriptionListData(PowerSequenceDescriptionListData),
+        list "powerSequenceDescriptionListData" => PowerSequenceDescriptionListData(PowerSequenceDescriptionListData),
         /// `powerSequenceNodeScheduleInformationData`.
-        "powerSequenceNodeScheduleInformationData" => PowerSequenceNodeScheduleInformationData(PowerSequenceNodeScheduleInformationData),
+        plain "powerSequenceNodeScheduleInformationData" => PowerSequenceNodeScheduleInformationData(PowerSequenceNodeScheduleInformationData),
         /// `powerSequencePriceCalculationRequestCall`.
-        "powerSequencePriceCalculationRequestCall" => PowerSequencePriceCalculationRequestCall(PowerSequencePriceCalculationRequestCall),
+        plain "powerSequencePriceCalculationRequestCall" => PowerSequencePriceCalculationRequestCall(PowerSequencePriceCalculationRequestCall),
         /// `powerSequencePriceListData`.
-        "powerSequencePriceListData" => PowerSequencePriceListData(PowerSequencePriceListData),
+        list "powerSequencePriceListData" => PowerSequencePriceListData(PowerSequencePriceListData),
         /// `powerSequenceScheduleConfigurationRequestCall`.
-        "powerSequenceScheduleConfigurationRequestCall" => PowerSequenceScheduleConfigurationRequestCall(PowerSequenceScheduleConfigurationRequestCall),
+        plain "powerSequenceScheduleConfigurationRequestCall" => PowerSequenceScheduleConfigurationRequestCall(PowerSequenceScheduleConfigurationRequestCall),
         /// `powerSequenceScheduleConstraintsListData`.
-        "powerSequenceScheduleConstraintsListData" => PowerSequenceScheduleConstraintsListData(PowerSequenceScheduleConstraintsListData),
+        list "powerSequenceScheduleConstraintsListData" => PowerSequenceScheduleConstraintsListData(PowerSequenceScheduleConstraintsListData),
         /// `powerSequenceScheduleListData`.
-        "powerSequenceScheduleListData" => PowerSequenceScheduleListData(PowerSequenceScheduleListData),
+        list "powerSequenceScheduleListData" => PowerSequenceScheduleListData(PowerSequenceScheduleListData),
         /// `powerSequenceSchedulePreferenceListData`.
-        "powerSequenceSchedulePreferenceListData" => PowerSequenceSchedulePreferenceListData(PowerSequenceSchedulePreferenceListData),
+        list "powerSequenceSchedulePreferenceListData" => PowerSequenceSchedulePreferenceListData(PowerSequenceSchedulePreferenceListData),
         /// `powerSequenceStateListData`.
-        "powerSequenceStateListData" => PowerSequenceStateListData(PowerSequenceStateListData),
+        list "powerSequenceStateListData" => PowerSequenceStateListData(PowerSequenceStateListData),
         /// `powerTimeSlotScheduleConstraintsListData`.
-        "powerTimeSlotScheduleConstraintsListData" => PowerTimeSlotScheduleConstraintsListData(PowerTimeSlotScheduleConstraintsListData),
+        list "powerTimeSlotScheduleConstraintsListData" => PowerTimeSlotScheduleConstraintsListData(PowerTimeSlotScheduleConstraintsListData),
         /// `powerTimeSlotScheduleListData`.
-        "powerTimeSlotScheduleListData" => PowerTimeSlotScheduleListData(PowerTimeSlotScheduleListData),
+        list "powerTimeSlotScheduleListData" => PowerTimeSlotScheduleListData(PowerTimeSlotScheduleListData),
         /// `powerTimeSlotValueListData`.
-        "powerTimeSlotValueListData" => PowerTimeSlotValueListData(PowerTimeSlotValueListData),
+        list "powerTimeSlotValueListData" => PowerTimeSlotValueListData(PowerTimeSlotValueListData),
         /// `resultData`.
-        "resultData" => ResultData(ResultData),
+        plain "resultData" => ResultData(ResultData),
         /// `sensingDescriptionData`.
-        "sensingDescriptionData" => SensingDescriptionData(SensingDescriptionData),
+        plain "sensingDescriptionData" => SensingDescriptionData(SensingDescriptionData),
         /// `sensingListData`.
-        "sensingListData" => SensingListData(SensingListData),
+        plain "sensingListData" => SensingListData(SensingListData),
         /// `sessionIdentificationListData`.
-        "sessionIdentificationListData" => SessionIdentificationListData(SessionIdentificationListData),
+        list "sessionIdentificationListData" => SessionIdentificationListData(SessionIdentificationListData),
         /// `sessionMeasurementRelationListData`.
-        "sessionMeasurementRelationListData" => SessionMeasurementRelationListData(SessionMeasurementRelationListData),
+        list "sessionMeasurementRelationListData" => SessionMeasurementRelationListData(SessionMeasurementRelationListData),
         /// `setpointConstraintsListData`.
-        "setpointConstraintsListData" => SetpointConstraintsListData(SetpointConstraintsListData),
+        list "setpointConstraintsListData" => SetpointConstraintsListData(SetpointConstraintsListData),
         /// `setpointDescriptionListData`.
-        "setpointDescriptionListData" => SetpointDescriptionListData(SetpointDescriptionListData),
+        list "setpointDescriptionListData" => SetpointDescriptionListData(SetpointDescriptionListData),
         /// `setpointListData`.
-        "setpointListData" => SetpointListData(SetpointListData),
+        list "setpointListData" => SetpointListData(SetpointListData),
         /// `smartEnergyManagementPsConfigurationRequestCall`.
-        "smartEnergyManagementPsConfigurationRequestCall" => SmartEnergyManagementPsConfigurationRequestCall(SmartEnergyManagementPsConfigurationRequestCall),
+        plain "smartEnergyManagementPsConfigurationRequestCall" => SmartEnergyManagementPsConfigurationRequestCall(SmartEnergyManagementPsConfigurationRequestCall),
         /// `smartEnergyManagementPsData`.
-        "smartEnergyManagementPsData" => SmartEnergyManagementPsData(SmartEnergyManagementPsData),
+        plain "smartEnergyManagementPsData" => SmartEnergyManagementPsData(SmartEnergyManagementPsData),
         /// `smartEnergyManagementPsPriceCalculationRequestCall`.
-        "smartEnergyManagementPsPriceCalculationRequestCall" => SmartEnergyManagementPsPriceCalculationRequestCall(SmartEnergyManagementPsPriceCalculationRequestCall),
+        plain "smartEnergyManagementPsPriceCalculationRequestCall" => SmartEnergyManagementPsPriceCalculationRequestCall(SmartEnergyManagementPsPriceCalculationRequestCall),
         /// `smartEnergyManagementPsPriceData`.
-        "smartEnergyManagementPsPriceData" => SmartEnergyManagementPsPriceData(SmartEnergyManagementPsPriceData),
+        list "smartEnergyManagementPsPriceData" => SmartEnergyManagementPsPriceData(SmartEnergyManagementPsPriceData),
         /// `specificationVersionListData`.
-        "specificationVersionListData" => SpecificationVersionListData(SpecificationVersionListData),
+        plain "specificationVersionListData" => SpecificationVersionListData(SpecificationVersionListData),
         /// `stateInformationListData`.
-        "stateInformationListData" => StateInformationListData(StateInformationListData),
+        list "stateInformationListData" => StateInformationListData(StateInformationListData),
         /// `subscriptionManagementDeleteCall`.
-        "subscriptionManagementDeleteCall" => SubscriptionManagementDeleteCall(SubscriptionManagementDeleteCall),
+        plain "subscriptionManagementDeleteCall" => SubscriptionManagementDeleteCall(SubscriptionManagementDeleteCall),
         /// `subscriptionManagementEntryListData`.
-        "subscriptionManagementEntryListData" => SubscriptionManagementEntryListData(SubscriptionManagementEntryListData),
+        list "subscriptionManagementEntryListData" => SubscriptionManagementEntryListData(SubscriptionManagementEntryListData),
         /// `subscriptionManagementRequestCall`.
-        "subscriptionManagementRequestCall" => SubscriptionManagementRequestCall(SubscriptionManagementRequestCall),
+        plain "subscriptionManagementRequestCall" => SubscriptionManagementRequestCall(SubscriptionManagementRequestCall),
         /// `supplyConditionDescriptionListData`.
-        "supplyConditionDescriptionListData" => SupplyConditionDescriptionListData(SupplyConditionDescriptionListData),
+        list "supplyConditionDescriptionListData" => SupplyConditionDescriptionListData(SupplyConditionDescriptionListData),
         /// `supplyConditionListData`.
-        "supplyConditionListData" => SupplyConditionListData(SupplyConditionListData),
+        list "supplyConditionListData" => SupplyConditionListData(SupplyConditionListData),
         /// `supplyConditionThresholdRelationListData`.
-        "supplyConditionThresholdRelationListData" => SupplyConditionThresholdRelationListData(SupplyConditionThresholdRelationListData),
+        list "supplyConditionThresholdRelationListData" => SupplyConditionThresholdRelationListData(SupplyConditionThresholdRelationListData),
         /// `tariffBoundaryRelationListData`.
-        "tariffBoundaryRelationListData" => TariffBoundaryRelationListData(TariffBoundaryRelationListData),
+        list "tariffBoundaryRelationListData" => TariffBoundaryRelationListData(TariffBoundaryRelationListData),
         /// `tariffDescriptionListData`.
-        "tariffDescriptionListData" => TariffDescriptionListData(TariffDescriptionListData),
+        list "tariffDescriptionListData" => TariffDescriptionListData(TariffDescriptionListData),
         /// `tariffListData`.
-        "tariffListData" => TariffListData(TariffListData),
+        list "tariffListData" => TariffListData(TariffListData),
         /// `tariffOverallConstraintsData`.
-        "tariffOverallConstraintsData" => TariffOverallConstraintsData(TariffOverallConstraintsData),
+        plain "tariffOverallConstraintsData" => TariffOverallConstraintsData(TariffOverallConstraintsData),
         /// `tariffTierRelationListData`.
-        "tariffTierRelationListData" => TariffTierRelationListData(TariffTierRelationListData),
+        list "tariffTierRelationListData" => TariffTierRelationListData(TariffTierRelationListData),
         /// `taskManagementJobDescriptionListData`.
-        "taskManagementJobDescriptionListData" => TaskManagementJobDescriptionListData(TaskManagementJobDescriptionListData),
+        list "taskManagementJobDescriptionListData" => TaskManagementJobDescriptionListData(TaskManagementJobDescriptionListData),
         /// `taskManagementJobListData`.
-        "taskManagementJobListData" => TaskManagementJobListData(TaskManagementJobListData),
+        list "taskManagementJobListData" => TaskManagementJobListData(TaskManagementJobListData),
         /// `taskManagementJobRelationListData`.
-        "taskManagementJobRelationListData" => TaskManagementJobRelationListData(TaskManagementJobRelationListData),
+        list "taskManagementJobRelationListData" => TaskManagementJobRelationListData(TaskManagementJobRelationListData),
         /// `taskManagementOverviewData`.
-        "taskManagementOverviewData" => TaskManagementOverviewData(TaskManagementOverviewData),
+        plain "taskManagementOverviewData" => TaskManagementOverviewData(TaskManagementOverviewData),
         /// `thresholdConstraintsListData`.
-        "thresholdConstraintsListData" => ThresholdConstraintsListData(ThresholdConstraintsListData),
+        list "thresholdConstraintsListData" => ThresholdConstraintsListData(ThresholdConstraintsListData),
         /// `thresholdDescriptionListData`.
-        "thresholdDescriptionListData" => ThresholdDescriptionListData(ThresholdDescriptionListData),
+        list "thresholdDescriptionListData" => ThresholdDescriptionListData(ThresholdDescriptionListData),
         /// `thresholdListData`.
-        "thresholdListData" => ThresholdListData(ThresholdListData),
+        list "thresholdListData" => ThresholdListData(ThresholdListData),
         /// `tierBoundaryDescriptionListData`.
-        "tierBoundaryDescriptionListData" => TierBoundaryDescriptionListData(TierBoundaryDescriptionListData),
+        list "tierBoundaryDescriptionListData" => TierBoundaryDescriptionListData(TierBoundaryDescriptionListData),
         /// `tierBoundaryListData`.
-        "tierBoundaryListData" => TierBoundaryListData(TierBoundaryListData),
+        list "tierBoundaryListData" => TierBoundaryListData(TierBoundaryListData),
         /// `tierDescriptionListData`.
-        "tierDescriptionListData" => TierDescriptionListData(TierDescriptionListData),
+        list "tierDescriptionListData" => TierDescriptionListData(TierDescriptionListData),
         /// `tierIncentiveRelationListData`.
-        "tierIncentiveRelationListData" => TierIncentiveRelationListData(TierIncentiveRelationListData),
+        list "tierIncentiveRelationListData" => TierIncentiveRelationListData(TierIncentiveRelationListData),
         /// `tierListData`.
-        "tierListData" => TierListData(TierListData),
+        list "tierListData" => TierListData(TierListData),
         /// `timeDistributorData`.
-        "timeDistributorData" => TimeDistributorData(TimeDistributorData),
+        plain "timeDistributorData" => TimeDistributorData(TimeDistributorData),
         /// `timeDistributorEnquiryCall`.
-        "timeDistributorEnquiryCall" => TimeDistributorEnquiryCall(TimeDistributorEnquiryCall),
+        plain "timeDistributorEnquiryCall" => TimeDistributorEnquiryCall(TimeDistributorEnquiryCall),
         /// `timeInformationData`.
-        "timeInformationData" => TimeInformationData(TimeInformationData),
+        plain "timeInformationData" => TimeInformationData(TimeInformationData),
         /// `timePrecisionData`.
-        "timePrecisionData" => TimePrecisionData(TimePrecisionData),
+        plain "timePrecisionData" => TimePrecisionData(TimePrecisionData),
         /// `timeSeriesConstraintsListData`.
-        "timeSeriesConstraintsListData" => TimeSeriesConstraintsListData(TimeSeriesConstraintsListData),
+        list "timeSeriesConstraintsListData" => TimeSeriesConstraintsListData(TimeSeriesConstraintsListData),
         /// `timeSeriesDescriptionListData`.
-        "timeSeriesDescriptionListData" => TimeSeriesDescriptionListData(TimeSeriesDescriptionListData),
+        list "timeSeriesDescriptionListData" => TimeSeriesDescriptionListData(TimeSeriesDescriptionListData),
         /// `timeSeriesListData`.
-        "timeSeriesListData" => TimeSeriesListData(TimeSeriesListData),
+        list "timeSeriesListData" => TimeSeriesListData(TimeSeriesListData),
         /// `timeTableConstraintsListData`.
-        "timeTableConstraintsListData" => TimeTableConstraintsListData(TimeTableConstraintsListData),
+        plain "timeTableConstraintsListData" => TimeTableConstraintsListData(TimeTableConstraintsListData),
         /// `timeTableDescriptionListData`.
-        "timeTableDescriptionListData" => TimeTableDescriptionListData(TimeTableDescriptionListData),
+        plain "timeTableDescriptionListData" => TimeTableDescriptionListData(TimeTableDescriptionListData),
         /// `timeTableListData`.
-        "timeTableListData" => TimeTableListData(TimeTableListData),
+        list "timeTableListData" => TimeTableListData(TimeTableListData),
         /// `useCaseInformationListData`.
-        "useCaseInformationListData" => UseCaseInformationListData(UseCaseInformationListData),
+        plain "useCaseInformationListData" => UseCaseInformationListData(UseCaseInformationListData),
     }
 }
 
@@ -330,287 +330,287 @@ crate::eebus_choice! {
     /// `DataElementsChoiceGroup`: exactly one alternative.
     pub enum FilterElements {
         /// `actuatorLevelDataElements`.
-        "actuatorLevelDataElements" => ActuatorLevelDataElements(ActuatorLevelDataElements),
+        plain "actuatorLevelDataElements" => ActuatorLevelDataElements(ActuatorLevelDataElements),
         /// `actuatorLevelDescriptionDataElements`.
-        "actuatorLevelDescriptionDataElements" => ActuatorLevelDescriptionDataElements(ActuatorLevelDescriptionDataElements),
+        plain "actuatorLevelDescriptionDataElements" => ActuatorLevelDescriptionDataElements(ActuatorLevelDescriptionDataElements),
         /// `actuatorSwitchDataElements`.
-        "actuatorSwitchDataElements" => ActuatorSwitchDataElements(ActuatorSwitchDataElements),
+        plain "actuatorSwitchDataElements" => ActuatorSwitchDataElements(ActuatorSwitchDataElements),
         /// `actuatorSwitchDescriptionDataElements`.
-        "actuatorSwitchDescriptionDataElements" => ActuatorSwitchDescriptionDataElements(ActuatorSwitchDescriptionDataElements),
+        plain "actuatorSwitchDescriptionDataElements" => ActuatorSwitchDescriptionDataElements(ActuatorSwitchDescriptionDataElements),
         /// `alarmDataElements`.
-        "alarmDataElements" => AlarmDataElements(AlarmDataElements),
+        plain "alarmDataElements" => AlarmDataElements(AlarmDataElements),
         /// `billConstraintsDataElements`.
-        "billConstraintsDataElements" => BillConstraintsDataElements(BillConstraintsDataElements),
+        plain "billConstraintsDataElements" => BillConstraintsDataElements(BillConstraintsDataElements),
         /// `billDataElements`.
-        "billDataElements" => BillDataElements(BillDataElements),
+        plain "billDataElements" => BillDataElements(BillDataElements),
         /// `billDescriptionDataElements`.
-        "billDescriptionDataElements" => BillDescriptionDataElements(BillDescriptionDataElements),
+        plain "billDescriptionDataElements" => BillDescriptionDataElements(BillDescriptionDataElements),
         /// `bindingManagementDeleteCallElements`.
-        "bindingManagementDeleteCallElements" => BindingManagementDeleteCallElements(BindingManagementDeleteCallElements),
+        plain "bindingManagementDeleteCallElements" => BindingManagementDeleteCallElements(BindingManagementDeleteCallElements),
         /// `bindingManagementEntryDataElements`.
-        "bindingManagementEntryDataElements" => BindingManagementEntryDataElements(BindingManagementEntryDataElements),
+        plain "bindingManagementEntryDataElements" => BindingManagementEntryDataElements(BindingManagementEntryDataElements),
         /// `bindingManagementRequestCallElements`.
-        "bindingManagementRequestCallElements" => BindingManagementRequestCallElements(BindingManagementRequestCallElements),
+        plain "bindingManagementRequestCallElements" => BindingManagementRequestCallElements(BindingManagementRequestCallElements),
         /// `commodityDataElements`.
-        "commodityDataElements" => CommodityDataElements(CommodityDataElements),
+        plain "commodityDataElements" => CommodityDataElements(CommodityDataElements),
         /// `dataTunnelingCallElements`.
-        "dataTunnelingCallElements" => DataTunnelingCallElements(DataTunnelingCallElements),
+        plain "dataTunnelingCallElements" => DataTunnelingCallElements(DataTunnelingCallElements),
         /// `deviceClassificationManufacturerDataElements`.
-        "deviceClassificationManufacturerDataElements" => DeviceClassificationManufacturerDataElements(DeviceClassificationManufacturerDataElements),
+        plain "deviceClassificationManufacturerDataElements" => DeviceClassificationManufacturerDataElements(DeviceClassificationManufacturerDataElements),
         /// `deviceClassificationUserDataElements`.
-        "deviceClassificationUserDataElements" => DeviceClassificationUserDataElements(DeviceClassificationUserDataElements),
+        plain "deviceClassificationUserDataElements" => DeviceClassificationUserDataElements(DeviceClassificationUserDataElements),
         /// `deviceConfigurationKeyValueConstraintsDataElements`.
-        "deviceConfigurationKeyValueConstraintsDataElements" => DeviceConfigurationKeyValueConstraintsDataElements(DeviceConfigurationKeyValueConstraintsDataElements),
+        plain "deviceConfigurationKeyValueConstraintsDataElements" => DeviceConfigurationKeyValueConstraintsDataElements(DeviceConfigurationKeyValueConstraintsDataElements),
         /// `deviceConfigurationKeyValueDataElements`.
-        "deviceConfigurationKeyValueDataElements" => DeviceConfigurationKeyValueDataElements(DeviceConfigurationKeyValueDataElements),
+        plain "deviceConfigurationKeyValueDataElements" => DeviceConfigurationKeyValueDataElements(DeviceConfigurationKeyValueDataElements),
         /// `deviceConfigurationKeyValueDescriptionDataElements`.
-        "deviceConfigurationKeyValueDescriptionDataElements" => DeviceConfigurationKeyValueDescriptionDataElements(DeviceConfigurationKeyValueDescriptionDataElements),
+        plain "deviceConfigurationKeyValueDescriptionDataElements" => DeviceConfigurationKeyValueDescriptionDataElements(DeviceConfigurationKeyValueDescriptionDataElements),
         /// `deviceDiagnosisHeartbeatDataElements`.
-        "deviceDiagnosisHeartbeatDataElements" => DeviceDiagnosisHeartbeatDataElements(DeviceDiagnosisHeartbeatDataElements),
+        plain "deviceDiagnosisHeartbeatDataElements" => DeviceDiagnosisHeartbeatDataElements(DeviceDiagnosisHeartbeatDataElements),
         /// `deviceDiagnosisServiceDataElements`.
-        "deviceDiagnosisServiceDataElements" => DeviceDiagnosisServiceDataElements(DeviceDiagnosisServiceDataElements),
+        plain "deviceDiagnosisServiceDataElements" => DeviceDiagnosisServiceDataElements(DeviceDiagnosisServiceDataElements),
         /// `deviceDiagnosisStateDataElements`.
-        "deviceDiagnosisStateDataElements" => DeviceDiagnosisStateDataElements(DeviceDiagnosisStateDataElements),
+        plain "deviceDiagnosisStateDataElements" => DeviceDiagnosisStateDataElements(DeviceDiagnosisStateDataElements),
         /// `directControlActivityDataElements`.
-        "directControlActivityDataElements" => DirectControlActivityDataElements(DirectControlActivityDataElements),
+        plain "directControlActivityDataElements" => DirectControlActivityDataElements(DirectControlActivityDataElements),
         /// `directControlDescriptionDataElements`.
-        "directControlDescriptionDataElements" => DirectControlDescriptionDataElements(DirectControlDescriptionDataElements),
+        plain "directControlDescriptionDataElements" => DirectControlDescriptionDataElements(DirectControlDescriptionDataElements),
         /// `electricalConnectionCharacteristicDataElements`.
-        "electricalConnectionCharacteristicDataElements" => ElectricalConnectionCharacteristicDataElements(ElectricalConnectionCharacteristicDataElements),
+        plain "electricalConnectionCharacteristicDataElements" => ElectricalConnectionCharacteristicDataElements(ElectricalConnectionCharacteristicDataElements),
         /// `electricalConnectionDescriptionDataElements`.
-        "electricalConnectionDescriptionDataElements" => ElectricalConnectionDescriptionDataElements(ElectricalConnectionDescriptionDataElements),
+        plain "electricalConnectionDescriptionDataElements" => ElectricalConnectionDescriptionDataElements(ElectricalConnectionDescriptionDataElements),
         /// `electricalConnectionParameterDescriptionDataElements`.
-        "electricalConnectionParameterDescriptionDataElements" => ElectricalConnectionParameterDescriptionDataElements(ElectricalConnectionParameterDescriptionDataElements),
+        plain "electricalConnectionParameterDescriptionDataElements" => ElectricalConnectionParameterDescriptionDataElements(ElectricalConnectionParameterDescriptionDataElements),
         /// `electricalConnectionPermittedValueSetDataElements`.
-        "electricalConnectionPermittedValueSetDataElements" => ElectricalConnectionPermittedValueSetDataElements(ElectricalConnectionPermittedValueSetDataElements),
+        plain "electricalConnectionPermittedValueSetDataElements" => ElectricalConnectionPermittedValueSetDataElements(ElectricalConnectionPermittedValueSetDataElements),
         /// `electricalConnectionStateDataElements`.
-        "electricalConnectionStateDataElements" => ElectricalConnectionStateDataElements(ElectricalConnectionStateDataElements),
+        plain "electricalConnectionStateDataElements" => ElectricalConnectionStateDataElements(ElectricalConnectionStateDataElements),
         /// `hvacOperationModeDescriptionDataElements`.
-        "hvacOperationModeDescriptionDataElements" => HvacOperationModeDescriptionDataElements(HvacOperationModeDescriptionDataElements),
+        plain "hvacOperationModeDescriptionDataElements" => HvacOperationModeDescriptionDataElements(HvacOperationModeDescriptionDataElements),
         /// `hvacOverrunDataElements`.
-        "hvacOverrunDataElements" => HvacOverrunDataElements(HvacOverrunDataElements),
+        plain "hvacOverrunDataElements" => HvacOverrunDataElements(HvacOverrunDataElements),
         /// `hvacOverrunDescriptionDataElements`.
-        "hvacOverrunDescriptionDataElements" => HvacOverrunDescriptionDataElements(HvacOverrunDescriptionDataElements),
+        plain "hvacOverrunDescriptionDataElements" => HvacOverrunDescriptionDataElements(HvacOverrunDescriptionDataElements),
         /// `hvacSystemFunctionDataElements`.
-        "hvacSystemFunctionDataElements" => HvacSystemFunctionDataElements(HvacSystemFunctionDataElements),
+        plain "hvacSystemFunctionDataElements" => HvacSystemFunctionDataElements(HvacSystemFunctionDataElements),
         /// `hvacSystemFunctionDescriptionDataElements`.
-        "hvacSystemFunctionDescriptionDataElements" => HvacSystemFunctionDescriptionDataElements(HvacSystemFunctionDescriptionDataElements),
+        plain "hvacSystemFunctionDescriptionDataElements" => HvacSystemFunctionDescriptionDataElements(HvacSystemFunctionDescriptionDataElements),
         /// `hvacSystemFunctionOperationModeRelationDataElements`.
-        "hvacSystemFunctionOperationModeRelationDataElements" => HvacSystemFunctionOperationModeRelationDataElements(HvacSystemFunctionOperationModeRelationDataElements),
+        plain "hvacSystemFunctionOperationModeRelationDataElements" => HvacSystemFunctionOperationModeRelationDataElements(HvacSystemFunctionOperationModeRelationDataElements),
         /// `hvacSystemFunctionPowerSequenceRelationDataElements`.
-        "hvacSystemFunctionPowerSequenceRelationDataElements" => HvacSystemFunctionPowerSequenceRelationDataElements(HvacSystemFunctionPowerSequenceRelationDataElements),
+        plain "hvacSystemFunctionPowerSequenceRelationDataElements" => HvacSystemFunctionPowerSequenceRelationDataElements(HvacSystemFunctionPowerSequenceRelationDataElements),
         /// `hvacSystemFunctionSetpointRelationDataElements`.
-        "hvacSystemFunctionSetpointRelationDataElements" => HvacSystemFunctionSetpointRelationDataElements(HvacSystemFunctionSetpointRelationDataElements),
+        plain "hvacSystemFunctionSetpointRelationDataElements" => HvacSystemFunctionSetpointRelationDataElements(HvacSystemFunctionSetpointRelationDataElements),
         /// `identificationDataElements`.
-        "identificationDataElements" => IdentificationDataElements(IdentificationDataElements),
+        plain "identificationDataElements" => IdentificationDataElements(IdentificationDataElements),
         /// `incentiveDataElements`.
-        "incentiveDataElements" => IncentiveDataElements(IncentiveDataElements),
+        plain "incentiveDataElements" => IncentiveDataElements(IncentiveDataElements),
         /// `incentiveDescriptionDataElements`.
-        "incentiveDescriptionDataElements" => IncentiveDescriptionDataElements(IncentiveDescriptionDataElements),
+        plain "incentiveDescriptionDataElements" => IncentiveDescriptionDataElements(IncentiveDescriptionDataElements),
         /// `incentiveTableConstraintsDataElements`.
-        "incentiveTableConstraintsDataElements" => IncentiveTableConstraintsDataElements(IncentiveTableConstraintsDataElements),
+        plain "incentiveTableConstraintsDataElements" => IncentiveTableConstraintsDataElements(IncentiveTableConstraintsDataElements),
         /// `incentiveTableDataElements`.
-        "incentiveTableDataElements" => IncentiveTableDataElements(IncentiveTableDataElements),
+        plain "incentiveTableDataElements" => IncentiveTableDataElements(IncentiveTableDataElements),
         /// `incentiveTableDescriptionDataElements`.
-        "incentiveTableDescriptionDataElements" => IncentiveTableDescriptionDataElements(IncentiveTableDescriptionDataElements),
+        plain "incentiveTableDescriptionDataElements" => IncentiveTableDescriptionDataElements(IncentiveTableDescriptionDataElements),
         /// `loadControlEventDataElements`.
-        "loadControlEventDataElements" => LoadControlEventDataElements(LoadControlEventDataElements),
+        plain "loadControlEventDataElements" => LoadControlEventDataElements(LoadControlEventDataElements),
         /// `loadControlLimitConstraintsDataElements`.
-        "loadControlLimitConstraintsDataElements" => LoadControlLimitConstraintsDataElements(LoadControlLimitConstraintsDataElements),
+        plain "loadControlLimitConstraintsDataElements" => LoadControlLimitConstraintsDataElements(LoadControlLimitConstraintsDataElements),
         /// `loadControlLimitDataElements`.
-        "loadControlLimitDataElements" => LoadControlLimitDataElements(LoadControlLimitDataElements),
+        plain "loadControlLimitDataElements" => LoadControlLimitDataElements(LoadControlLimitDataElements),
         /// `loadControlLimitDescriptionDataElements`.
-        "loadControlLimitDescriptionDataElements" => LoadControlLimitDescriptionDataElements(LoadControlLimitDescriptionDataElements),
+        plain "loadControlLimitDescriptionDataElements" => LoadControlLimitDescriptionDataElements(LoadControlLimitDescriptionDataElements),
         /// `loadControlNodeDataElements`.
-        "loadControlNodeDataElements" => LoadControlNodeDataElements(LoadControlNodeDataElements),
+        plain "loadControlNodeDataElements" => LoadControlNodeDataElements(LoadControlNodeDataElements),
         /// `loadControlStateDataElements`.
-        "loadControlStateDataElements" => LoadControlStateDataElements(LoadControlStateDataElements),
+        plain "loadControlStateDataElements" => LoadControlStateDataElements(LoadControlStateDataElements),
         /// `measurementConstraintsDataElements`.
-        "measurementConstraintsDataElements" => MeasurementConstraintsDataElements(MeasurementConstraintsDataElements),
+        plain "measurementConstraintsDataElements" => MeasurementConstraintsDataElements(MeasurementConstraintsDataElements),
         /// `measurementDataElements`.
-        "measurementDataElements" => MeasurementDataElements(MeasurementDataElements),
+        plain "measurementDataElements" => MeasurementDataElements(MeasurementDataElements),
         /// `measurementDescriptionDataElements`.
-        "measurementDescriptionDataElements" => MeasurementDescriptionDataElements(MeasurementDescriptionDataElements),
+        plain "measurementDescriptionDataElements" => MeasurementDescriptionDataElements(MeasurementDescriptionDataElements),
         /// `measurementSeriesDataElements`.
-        "measurementSeriesDataElements" => MeasurementSeriesDataElements(MeasurementSeriesDataElements),
+        plain "measurementSeriesDataElements" => MeasurementSeriesDataElements(MeasurementSeriesDataElements),
         /// `measurementThresholdRelationDataElements`.
-        "measurementThresholdRelationDataElements" => MeasurementThresholdRelationDataElements(MeasurementThresholdRelationDataElements),
+        plain "measurementThresholdRelationDataElements" => MeasurementThresholdRelationDataElements(MeasurementThresholdRelationDataElements),
         /// `messagingDataElements`.
-        "messagingDataElements" => MessagingDataElements(MessagingDataElements),
+        plain "messagingDataElements" => MessagingDataElements(MessagingDataElements),
         /// `networkManagementAbortCallElements`.
-        "networkManagementAbortCallElements" => NetworkManagementAbortCallElements(NetworkManagementAbortCallElements),
+        plain "networkManagementAbortCallElements" => NetworkManagementAbortCallElements(NetworkManagementAbortCallElements),
         /// `networkManagementAddNodeCallElements`.
-        "networkManagementAddNodeCallElements" => NetworkManagementAddNodeCallElements(NetworkManagementAddNodeCallElements),
+        plain "networkManagementAddNodeCallElements" => NetworkManagementAddNodeCallElements(NetworkManagementAddNodeCallElements),
         /// `networkManagementDeviceDescriptionDataElements`.
-        "networkManagementDeviceDescriptionDataElements" => NetworkManagementDeviceDescriptionDataElements(NetworkManagementDeviceDescriptionDataElements),
+        plain "networkManagementDeviceDescriptionDataElements" => NetworkManagementDeviceDescriptionDataElements(NetworkManagementDeviceDescriptionDataElements),
         /// `networkManagementDiscoverCallElements`.
-        "networkManagementDiscoverCallElements" => NetworkManagementDiscoverCallElements(NetworkManagementDiscoverCallElements),
+        plain "networkManagementDiscoverCallElements" => NetworkManagementDiscoverCallElements(NetworkManagementDiscoverCallElements),
         /// `networkManagementEntityDescriptionDataElements`.
-        "networkManagementEntityDescriptionDataElements" => NetworkManagementEntityDescriptionDataElements(NetworkManagementEntityDescriptionDataElements),
+        plain "networkManagementEntityDescriptionDataElements" => NetworkManagementEntityDescriptionDataElements(NetworkManagementEntityDescriptionDataElements),
         /// `networkManagementFeatureDescriptionDataElements`.
-        "networkManagementFeatureDescriptionDataElements" => NetworkManagementFeatureDescriptionDataElements(NetworkManagementFeatureDescriptionDataElements),
+        plain "networkManagementFeatureDescriptionDataElements" => NetworkManagementFeatureDescriptionDataElements(NetworkManagementFeatureDescriptionDataElements),
         /// `networkManagementJoiningModeDataElements`.
-        "networkManagementJoiningModeDataElements" => NetworkManagementJoiningModeDataElements(NetworkManagementJoiningModeDataElements),
+        plain "networkManagementJoiningModeDataElements" => NetworkManagementJoiningModeDataElements(NetworkManagementJoiningModeDataElements),
         /// `networkManagementModifyNodeCallElements`.
-        "networkManagementModifyNodeCallElements" => NetworkManagementModifyNodeCallElements(NetworkManagementModifyNodeCallElements),
+        plain "networkManagementModifyNodeCallElements" => NetworkManagementModifyNodeCallElements(NetworkManagementModifyNodeCallElements),
         /// `networkManagementProcessStateDataElements`.
-        "networkManagementProcessStateDataElements" => NetworkManagementProcessStateDataElements(NetworkManagementProcessStateDataElements),
+        plain "networkManagementProcessStateDataElements" => NetworkManagementProcessStateDataElements(NetworkManagementProcessStateDataElements),
         /// `networkManagementRemoveNodeCallElements`.
-        "networkManagementRemoveNodeCallElements" => NetworkManagementRemoveNodeCallElements(NetworkManagementRemoveNodeCallElements),
+        plain "networkManagementRemoveNodeCallElements" => NetworkManagementRemoveNodeCallElements(NetworkManagementRemoveNodeCallElements),
         /// `networkManagementReportCandidateDataElements`.
-        "networkManagementReportCandidateDataElements" => NetworkManagementReportCandidateDataElements(NetworkManagementReportCandidateDataElements),
+        plain "networkManagementReportCandidateDataElements" => NetworkManagementReportCandidateDataElements(NetworkManagementReportCandidateDataElements),
         /// `networkManagementScanNetworkCallElements`.
-        "networkManagementScanNetworkCallElements" => NetworkManagementScanNetworkCallElements(NetworkManagementScanNetworkCallElements),
+        plain "networkManagementScanNetworkCallElements" => NetworkManagementScanNetworkCallElements(NetworkManagementScanNetworkCallElements),
         /// `nodeManagementBindingDataElements`.
-        "nodeManagementBindingDataElements" => NodeManagementBindingDataElements(NodeManagementBindingDataElements),
+        plain "nodeManagementBindingDataElements" => NodeManagementBindingDataElements(NodeManagementBindingDataElements),
         /// `nodeManagementBindingDeleteCallElements`.
-        "nodeManagementBindingDeleteCallElements" => NodeManagementBindingDeleteCallElements(NodeManagementBindingDeleteCallElements),
+        plain "nodeManagementBindingDeleteCallElements" => NodeManagementBindingDeleteCallElements(NodeManagementBindingDeleteCallElements),
         /// `nodeManagementBindingRequestCallElements`.
-        "nodeManagementBindingRequestCallElements" => NodeManagementBindingRequestCallElements(NodeManagementBindingRequestCallElements),
+        plain "nodeManagementBindingRequestCallElements" => NodeManagementBindingRequestCallElements(NodeManagementBindingRequestCallElements),
         /// `nodeManagementDestinationDataElements`.
-        "nodeManagementDestinationDataElements" => NodeManagementDestinationDataElements(NodeManagementDestinationDataElements),
+        plain "nodeManagementDestinationDataElements" => NodeManagementDestinationDataElements(NodeManagementDestinationDataElements),
         /// `nodeManagementDetailedDiscoveryDataElements`.
-        "nodeManagementDetailedDiscoveryDataElements" => NodeManagementDetailedDiscoveryDataElements(NodeManagementDetailedDiscoveryDataElements),
+        plain "nodeManagementDetailedDiscoveryDataElements" => NodeManagementDetailedDiscoveryDataElements(NodeManagementDetailedDiscoveryDataElements),
         /// `nodeManagementSubscriptionDataElements`.
-        "nodeManagementSubscriptionDataElements" => NodeManagementSubscriptionDataElements(NodeManagementSubscriptionDataElements),
+        plain "nodeManagementSubscriptionDataElements" => NodeManagementSubscriptionDataElements(NodeManagementSubscriptionDataElements),
         /// `nodeManagementSubscriptionDeleteCallElements`.
-        "nodeManagementSubscriptionDeleteCallElements" => NodeManagementSubscriptionDeleteCallElements(NodeManagementSubscriptionDeleteCallElements),
+        plain "nodeManagementSubscriptionDeleteCallElements" => NodeManagementSubscriptionDeleteCallElements(NodeManagementSubscriptionDeleteCallElements),
         /// `nodeManagementSubscriptionRequestCallElements`.
-        "nodeManagementSubscriptionRequestCallElements" => NodeManagementSubscriptionRequestCallElements(NodeManagementSubscriptionRequestCallElements),
+        plain "nodeManagementSubscriptionRequestCallElements" => NodeManagementSubscriptionRequestCallElements(NodeManagementSubscriptionRequestCallElements),
         /// `nodeManagementUseCaseDataElements`.
-        "nodeManagementUseCaseDataElements" => NodeManagementUseCaseDataElements(NodeManagementUseCaseDataElements),
+        plain "nodeManagementUseCaseDataElements" => NodeManagementUseCaseDataElements(NodeManagementUseCaseDataElements),
         /// `operatingConstraintsDurationDataElements`.
-        "operatingConstraintsDurationDataElements" => OperatingConstraintsDurationDataElements(OperatingConstraintsDurationDataElements),
+        plain "operatingConstraintsDurationDataElements" => OperatingConstraintsDurationDataElements(OperatingConstraintsDurationDataElements),
         /// `operatingConstraintsInterruptDataElements`.
-        "operatingConstraintsInterruptDataElements" => OperatingConstraintsInterruptDataElements(OperatingConstraintsInterruptDataElements),
+        plain "operatingConstraintsInterruptDataElements" => OperatingConstraintsInterruptDataElements(OperatingConstraintsInterruptDataElements),
         /// `operatingConstraintsPowerDescriptionDataElements`.
-        "operatingConstraintsPowerDescriptionDataElements" => OperatingConstraintsPowerDescriptionDataElements(OperatingConstraintsPowerDescriptionDataElements),
+        plain "operatingConstraintsPowerDescriptionDataElements" => OperatingConstraintsPowerDescriptionDataElements(OperatingConstraintsPowerDescriptionDataElements),
         /// `operatingConstraintsPowerLevelDataElements`.
-        "operatingConstraintsPowerLevelDataElements" => OperatingConstraintsPowerLevelDataElements(OperatingConstraintsPowerLevelDataElements),
+        plain "operatingConstraintsPowerLevelDataElements" => OperatingConstraintsPowerLevelDataElements(OperatingConstraintsPowerLevelDataElements),
         /// `operatingConstraintsPowerRangeDataElements`.
-        "operatingConstraintsPowerRangeDataElements" => OperatingConstraintsPowerRangeDataElements(OperatingConstraintsPowerRangeDataElements),
+        plain "operatingConstraintsPowerRangeDataElements" => OperatingConstraintsPowerRangeDataElements(OperatingConstraintsPowerRangeDataElements),
         /// `operatingConstraintsResumeImplicationDataElements`.
-        "operatingConstraintsResumeImplicationDataElements" => OperatingConstraintsResumeImplicationDataElements(OperatingConstraintsResumeImplicationDataElements),
+        plain "operatingConstraintsResumeImplicationDataElements" => OperatingConstraintsResumeImplicationDataElements(OperatingConstraintsResumeImplicationDataElements),
         /// `powerSequenceAlternativesRelationDataElements`.
-        "powerSequenceAlternativesRelationDataElements" => PowerSequenceAlternativesRelationDataElements(PowerSequenceAlternativesRelationDataElements),
+        plain "powerSequenceAlternativesRelationDataElements" => PowerSequenceAlternativesRelationDataElements(PowerSequenceAlternativesRelationDataElements),
         /// `powerSequenceDescriptionDataElements`.
-        "powerSequenceDescriptionDataElements" => PowerSequenceDescriptionDataElements(PowerSequenceDescriptionDataElements),
+        plain "powerSequenceDescriptionDataElements" => PowerSequenceDescriptionDataElements(PowerSequenceDescriptionDataElements),
         /// `powerSequenceNodeScheduleInformationDataElements`.
-        "powerSequenceNodeScheduleInformationDataElements" => PowerSequenceNodeScheduleInformationDataElements(PowerSequenceNodeScheduleInformationDataElements),
+        plain "powerSequenceNodeScheduleInformationDataElements" => PowerSequenceNodeScheduleInformationDataElements(PowerSequenceNodeScheduleInformationDataElements),
         /// `powerSequencePriceCalculationRequestCallElements`.
-        "powerSequencePriceCalculationRequestCallElements" => PowerSequencePriceCalculationRequestCallElements(PowerSequencePriceCalculationRequestCallElements),
+        plain "powerSequencePriceCalculationRequestCallElements" => PowerSequencePriceCalculationRequestCallElements(PowerSequencePriceCalculationRequestCallElements),
         /// `powerSequencePriceDataElements`.
-        "powerSequencePriceDataElements" => PowerSequencePriceDataElements(PowerSequencePriceDataElements),
+        plain "powerSequencePriceDataElements" => PowerSequencePriceDataElements(PowerSequencePriceDataElements),
         /// `powerSequenceScheduleConfigurationRequestCallElements`.
-        "powerSequenceScheduleConfigurationRequestCallElements" => PowerSequenceScheduleConfigurationRequestCallElements(PowerSequenceScheduleConfigurationRequestCallElements),
+        plain "powerSequenceScheduleConfigurationRequestCallElements" => PowerSequenceScheduleConfigurationRequestCallElements(PowerSequenceScheduleConfigurationRequestCallElements),
         /// `powerSequenceScheduleConstraintsDataElements`.
-        "powerSequenceScheduleConstraintsDataElements" => PowerSequenceScheduleConstraintsDataElements(PowerSequenceScheduleConstraintsDataElements),
+        plain "powerSequenceScheduleConstraintsDataElements" => PowerSequenceScheduleConstraintsDataElements(PowerSequenceScheduleConstraintsDataElements),
         /// `powerSequenceScheduleDataElements`.
-        "powerSequenceScheduleDataElements" => PowerSequenceScheduleDataElements(PowerSequenceScheduleDataElements),
+        plain "powerSequenceScheduleDataElements" => PowerSequenceScheduleDataElements(PowerSequenceScheduleDataElements),
         /// `powerSequenceSchedulePreferenceDataElements`.
-        "powerSequenceSchedulePreferenceDataElements" => PowerSequenceSchedulePreferenceDataElements(PowerSequenceSchedulePreferenceDataElements),
+        plain "powerSequenceSchedulePreferenceDataElements" => PowerSequenceSchedulePreferenceDataElements(PowerSequenceSchedulePreferenceDataElements),
         /// `powerSequenceStateDataElements`.
-        "powerSequenceStateDataElements" => PowerSequenceStateDataElements(PowerSequenceStateDataElements),
+        plain "powerSequenceStateDataElements" => PowerSequenceStateDataElements(PowerSequenceStateDataElements),
         /// `powerTimeSlotScheduleConstraintsDataElements`.
-        "powerTimeSlotScheduleConstraintsDataElements" => PowerTimeSlotScheduleConstraintsDataElements(PowerTimeSlotScheduleConstraintsDataElements),
+        plain "powerTimeSlotScheduleConstraintsDataElements" => PowerTimeSlotScheduleConstraintsDataElements(PowerTimeSlotScheduleConstraintsDataElements),
         /// `powerTimeSlotScheduleDataElements`.
-        "powerTimeSlotScheduleDataElements" => PowerTimeSlotScheduleDataElements(PowerTimeSlotScheduleDataElements),
+        plain "powerTimeSlotScheduleDataElements" => PowerTimeSlotScheduleDataElements(PowerTimeSlotScheduleDataElements),
         /// `powerTimeSlotValueDataElements`.
-        "powerTimeSlotValueDataElements" => PowerTimeSlotValueDataElements(PowerTimeSlotValueDataElements),
+        plain "powerTimeSlotValueDataElements" => PowerTimeSlotValueDataElements(PowerTimeSlotValueDataElements),
         /// `sensingDataElements`.
-        "sensingDataElements" => SensingDataElements(SensingDataElements),
+        plain "sensingDataElements" => SensingDataElements(SensingDataElements),
         /// `sensingDescriptionDataElements`.
-        "sensingDescriptionDataElements" => SensingDescriptionDataElements(SensingDescriptionDataElements),
+        plain "sensingDescriptionDataElements" => SensingDescriptionDataElements(SensingDescriptionDataElements),
         /// `sessionIdentificationDataElements`.
-        "sessionIdentificationDataElements" => SessionIdentificationDataElements(SessionIdentificationDataElements),
+        plain "sessionIdentificationDataElements" => SessionIdentificationDataElements(SessionIdentificationDataElements),
         /// `sessionMeasurementRelationDataElements`.
-        "sessionMeasurementRelationDataElements" => SessionMeasurementRelationDataElements(SessionMeasurementRelationDataElements),
+        plain "sessionMeasurementRelationDataElements" => SessionMeasurementRelationDataElements(SessionMeasurementRelationDataElements),
         /// `setpointConstraintsDataElements`.
-        "setpointConstraintsDataElements" => SetpointConstraintsDataElements(SetpointConstraintsDataElements),
+        plain "setpointConstraintsDataElements" => SetpointConstraintsDataElements(SetpointConstraintsDataElements),
         /// `setpointDataElements`.
-        "setpointDataElements" => SetpointDataElements(SetpointDataElements),
+        plain "setpointDataElements" => SetpointDataElements(SetpointDataElements),
         /// `setpointDescriptionDataElements`.
-        "setpointDescriptionDataElements" => SetpointDescriptionDataElements(SetpointDescriptionDataElements),
+        plain "setpointDescriptionDataElements" => SetpointDescriptionDataElements(SetpointDescriptionDataElements),
         /// `smartEnergyManagementPsConfigurationRequestCallElements`.
-        "smartEnergyManagementPsConfigurationRequestCallElements" => SmartEnergyManagementPsConfigurationRequestCallElements(SmartEnergyManagementPsConfigurationRequestCallElements),
+        plain "smartEnergyManagementPsConfigurationRequestCallElements" => SmartEnergyManagementPsConfigurationRequestCallElements(SmartEnergyManagementPsConfigurationRequestCallElements),
         /// `smartEnergyManagementPsDataElements`.
-        "smartEnergyManagementPsDataElements" => SmartEnergyManagementPsDataElements(SmartEnergyManagementPsDataElements),
+        plain "smartEnergyManagementPsDataElements" => SmartEnergyManagementPsDataElements(SmartEnergyManagementPsDataElements),
         /// `smartEnergyManagementPsPriceCalculationRequestCallElements`.
-        "smartEnergyManagementPsPriceCalculationRequestCallElements" => SmartEnergyManagementPsPriceCalculationRequestCallElements(SmartEnergyManagementPsPriceCalculationRequestCallElements),
+        plain "smartEnergyManagementPsPriceCalculationRequestCallElements" => SmartEnergyManagementPsPriceCalculationRequestCallElements(SmartEnergyManagementPsPriceCalculationRequestCallElements),
         /// `smartEnergyManagementPsPriceDataElements`.
-        "smartEnergyManagementPsPriceDataElements" => SmartEnergyManagementPsPriceDataElements(SmartEnergyManagementPsPriceDataElements),
+        plain "smartEnergyManagementPsPriceDataElements" => SmartEnergyManagementPsPriceDataElements(SmartEnergyManagementPsPriceDataElements),
         /// `specificationVersionDataElements`.
-        "specificationVersionDataElements" => SpecificationVersionDataElements(SpecificationVersionDataElements),
+        plain "specificationVersionDataElements" => SpecificationVersionDataElements(SpecificationVersionDataElements),
         /// `stateInformationDataElements`.
-        "stateInformationDataElements" => StateInformationDataElements(StateInformationDataElements),
+        plain "stateInformationDataElements" => StateInformationDataElements(StateInformationDataElements),
         /// `subscriptionManagementDeleteCallElements`.
-        "subscriptionManagementDeleteCallElements" => SubscriptionManagementDeleteCallElements(SubscriptionManagementDeleteCallElements),
+        plain "subscriptionManagementDeleteCallElements" => SubscriptionManagementDeleteCallElements(SubscriptionManagementDeleteCallElements),
         /// `subscriptionManagementEntryDataElements`.
-        "subscriptionManagementEntryDataElements" => SubscriptionManagementEntryDataElements(SubscriptionManagementEntryDataElements),
+        plain "subscriptionManagementEntryDataElements" => SubscriptionManagementEntryDataElements(SubscriptionManagementEntryDataElements),
         /// `subscriptionManagementRequestCallElements`.
-        "subscriptionManagementRequestCallElements" => SubscriptionManagementRequestCallElements(SubscriptionManagementRequestCallElements),
+        plain "subscriptionManagementRequestCallElements" => SubscriptionManagementRequestCallElements(SubscriptionManagementRequestCallElements),
         /// `supplyConditionDataElements`.
-        "supplyConditionDataElements" => SupplyConditionDataElements(SupplyConditionDataElements),
+        plain "supplyConditionDataElements" => SupplyConditionDataElements(SupplyConditionDataElements),
         /// `supplyConditionDescriptionDataElements`.
-        "supplyConditionDescriptionDataElements" => SupplyConditionDescriptionDataElements(SupplyConditionDescriptionDataElements),
+        plain "supplyConditionDescriptionDataElements" => SupplyConditionDescriptionDataElements(SupplyConditionDescriptionDataElements),
         /// `supplyConditionThresholdRelationDataElements`.
-        "supplyConditionThresholdRelationDataElements" => SupplyConditionThresholdRelationDataElements(SupplyConditionThresholdRelationDataElements),
+        plain "supplyConditionThresholdRelationDataElements" => SupplyConditionThresholdRelationDataElements(SupplyConditionThresholdRelationDataElements),
         /// `tariffBoundaryRelationDataElements`.
-        "tariffBoundaryRelationDataElements" => TariffBoundaryRelationDataElements(TariffBoundaryRelationDataElements),
+        plain "tariffBoundaryRelationDataElements" => TariffBoundaryRelationDataElements(TariffBoundaryRelationDataElements),
         /// `tariffDataElements`.
-        "tariffDataElements" => TariffDataElements(TariffDataElements),
+        plain "tariffDataElements" => TariffDataElements(TariffDataElements),
         /// `tariffDescriptionDataElements`.
-        "tariffDescriptionDataElements" => TariffDescriptionDataElements(TariffDescriptionDataElements),
+        plain "tariffDescriptionDataElements" => TariffDescriptionDataElements(TariffDescriptionDataElements),
         /// `tariffOverallConstraintsDataElements`.
-        "tariffOverallConstraintsDataElements" => TariffOverallConstraintsDataElements(TariffOverallConstraintsDataElements),
+        plain "tariffOverallConstraintsDataElements" => TariffOverallConstraintsDataElements(TariffOverallConstraintsDataElements),
         /// `tariffTierRelationDataElements`.
-        "tariffTierRelationDataElements" => TariffTierRelationDataElements(TariffTierRelationDataElements),
+        plain "tariffTierRelationDataElements" => TariffTierRelationDataElements(TariffTierRelationDataElements),
         /// `taskManagementJobDataElements`.
-        "taskManagementJobDataElements" => TaskManagementJobDataElements(TaskManagementJobDataElements),
+        plain "taskManagementJobDataElements" => TaskManagementJobDataElements(TaskManagementJobDataElements),
         /// `taskManagementJobDescriptionDataElements`.
-        "taskManagementJobDescriptionDataElements" => TaskManagementJobDescriptionDataElements(TaskManagementJobDescriptionDataElements),
+        plain "taskManagementJobDescriptionDataElements" => TaskManagementJobDescriptionDataElements(TaskManagementJobDescriptionDataElements),
         /// `taskManagementJobRelationDataElements`.
-        "taskManagementJobRelationDataElements" => TaskManagementJobRelationDataElements(TaskManagementJobRelationDataElements),
+        plain "taskManagementJobRelationDataElements" => TaskManagementJobRelationDataElements(TaskManagementJobRelationDataElements),
         /// `taskManagementOverviewDataElements`.
-        "taskManagementOverviewDataElements" => TaskManagementOverviewDataElements(TaskManagementOverviewDataElements),
+        plain "taskManagementOverviewDataElements" => TaskManagementOverviewDataElements(TaskManagementOverviewDataElements),
         /// `thresholdConstraintsDataElements`.
-        "thresholdConstraintsDataElements" => ThresholdConstraintsDataElements(ThresholdConstraintsDataElements),
+        plain "thresholdConstraintsDataElements" => ThresholdConstraintsDataElements(ThresholdConstraintsDataElements),
         /// `thresholdDataElements`.
-        "thresholdDataElements" => ThresholdDataElements(ThresholdDataElements),
+        plain "thresholdDataElements" => ThresholdDataElements(ThresholdDataElements),
         /// `thresholdDescriptionDataElements`.
-        "thresholdDescriptionDataElements" => ThresholdDescriptionDataElements(ThresholdDescriptionDataElements),
+        plain "thresholdDescriptionDataElements" => ThresholdDescriptionDataElements(ThresholdDescriptionDataElements),
         /// `tierBoundaryDataElements`.
-        "tierBoundaryDataElements" => TierBoundaryDataElements(TierBoundaryDataElements),
+        plain "tierBoundaryDataElements" => TierBoundaryDataElements(TierBoundaryDataElements),
         /// `tierBoundaryDescriptionDataElements`.
-        "tierBoundaryDescriptionDataElements" => TierBoundaryDescriptionDataElements(TierBoundaryDescriptionDataElements),
+        plain "tierBoundaryDescriptionDataElements" => TierBoundaryDescriptionDataElements(TierBoundaryDescriptionDataElements),
         /// `tierDataElements`.
-        "tierDataElements" => TierDataElements(TierDataElements),
+        plain "tierDataElements" => TierDataElements(TierDataElements),
         /// `tierDescriptionDataElements`.
-        "tierDescriptionDataElements" => TierDescriptionDataElements(TierDescriptionDataElements),
+        plain "tierDescriptionDataElements" => TierDescriptionDataElements(TierDescriptionDataElements),
         /// `tierIncentiveRelationDataElements`.
-        "tierIncentiveRelationDataElements" => TierIncentiveRelationDataElements(TierIncentiveRelationDataElements),
+        plain "tierIncentiveRelationDataElements" => TierIncentiveRelationDataElements(TierIncentiveRelationDataElements),
         /// `timeDistributorDataElements`.
-        "timeDistributorDataElements" => TimeDistributorDataElements(TimeDistributorDataElements),
+        plain "timeDistributorDataElements" => TimeDistributorDataElements(TimeDistributorDataElements),
         /// `timeDistributorEnquiryCallElements`.
-        "timeDistributorEnquiryCallElements" => TimeDistributorEnquiryCallElements(TimeDistributorEnquiryCallElements),
+        plain "timeDistributorEnquiryCallElements" => TimeDistributorEnquiryCallElements(TimeDistributorEnquiryCallElements),
         /// `timeInformationDataElements`.
-        "timeInformationDataElements" => TimeInformationDataElements(TimeInformationDataElements),
+        plain "timeInformationDataElements" => TimeInformationDataElements(TimeInformationDataElements),
         /// `timePrecisionDataElements`.
-        "timePrecisionDataElements" => TimePrecisionDataElements(TimePrecisionDataElements),
+        plain "timePrecisionDataElements" => TimePrecisionDataElements(TimePrecisionDataElements),
         /// `timeSeriesConstraintsDataElements`.
-        "timeSeriesConstraintsDataElements" => TimeSeriesConstraintsDataElements(TimeSeriesConstraintsDataElements),
+        plain "timeSeriesConstraintsDataElements" => TimeSeriesConstraintsDataElements(TimeSeriesConstraintsDataElements),
         /// `timeSeriesDataElements`.
-        "timeSeriesDataElements" => TimeSeriesDataElements(TimeSeriesDataElements),
+        plain "timeSeriesDataElements" => TimeSeriesDataElements(TimeSeriesDataElements),
         /// `timeSeriesDescriptionDataElements`.
-        "timeSeriesDescriptionDataElements" => TimeSeriesDescriptionDataElements(TimeSeriesDescriptionDataElements),
+        plain "timeSeriesDescriptionDataElements" => TimeSeriesDescriptionDataElements(TimeSeriesDescriptionDataElements),
         /// `timeTableConstraintsDataElements`.
-        "timeTableConstraintsDataElements" => TimeTableConstraintsDataElements(TimeTableConstraintsDataElements),
+        plain "timeTableConstraintsDataElements" => TimeTableConstraintsDataElements(TimeTableConstraintsDataElements),
         /// `timeTableDataElements`.
-        "timeTableDataElements" => TimeTableDataElements(TimeTableDataElements),
+        plain "timeTableDataElements" => TimeTableDataElements(TimeTableDataElements),
         /// `timeTableDescriptionDataElements`.
-        "timeTableDescriptionDataElements" => TimeTableDescriptionDataElements(TimeTableDescriptionDataElements),
+        plain "timeTableDescriptionDataElements" => TimeTableDescriptionDataElements(TimeTableDescriptionDataElements),
         /// `useCaseInformationDataElements`.
-        "useCaseInformationDataElements" => UseCaseInformationDataElements(UseCaseInformationDataElements),
+        plain "useCaseInformationDataElements" => UseCaseInformationDataElements(UseCaseInformationDataElements),
     }
 }
 
@@ -618,205 +618,205 @@ crate::eebus_choice! {
     /// `DataSelectorsChoiceGroup`: exactly one alternative.
     pub enum FilterSelectors {
         /// `alarmListDataSelectors`.
-        "alarmListDataSelectors" => AlarmListDataSelectors(AlarmListDataSelectors),
+        plain "alarmListDataSelectors" => AlarmListDataSelectors(AlarmListDataSelectors),
         /// `billConstraintsListDataSelectors`.
-        "billConstraintsListDataSelectors" => BillConstraintsListDataSelectors(BillConstraintsListDataSelectors),
+        plain "billConstraintsListDataSelectors" => BillConstraintsListDataSelectors(BillConstraintsListDataSelectors),
         /// `billDescriptionListDataSelectors`.
-        "billDescriptionListDataSelectors" => BillDescriptionListDataSelectors(BillDescriptionListDataSelectors),
+        plain "billDescriptionListDataSelectors" => BillDescriptionListDataSelectors(BillDescriptionListDataSelectors),
         /// `billListDataSelectors`.
-        "billListDataSelectors" => BillListDataSelectors(BillListDataSelectors),
+        plain "billListDataSelectors" => BillListDataSelectors(BillListDataSelectors),
         /// `bindingManagementEntryListDataSelectors`.
-        "bindingManagementEntryListDataSelectors" => BindingManagementEntryListDataSelectors(BindingManagementEntryListDataSelectors),
+        plain "bindingManagementEntryListDataSelectors" => BindingManagementEntryListDataSelectors(BindingManagementEntryListDataSelectors),
         /// `commodityListDataSelectors`.
-        "commodityListDataSelectors" => CommodityListDataSelectors(CommodityListDataSelectors),
+        plain "commodityListDataSelectors" => CommodityListDataSelectors(CommodityListDataSelectors),
         /// `deviceConfigurationKeyValueConstraintsListDataSelectors`.
-        "deviceConfigurationKeyValueConstraintsListDataSelectors" => DeviceConfigurationKeyValueConstraintsListDataSelectors(DeviceConfigurationKeyValueConstraintsListDataSelectors),
+        plain "deviceConfigurationKeyValueConstraintsListDataSelectors" => DeviceConfigurationKeyValueConstraintsListDataSelectors(DeviceConfigurationKeyValueConstraintsListDataSelectors),
         /// `deviceConfigurationKeyValueDescriptionListDataSelectors`.
-        "deviceConfigurationKeyValueDescriptionListDataSelectors" => DeviceConfigurationKeyValueDescriptionListDataSelectors(DeviceConfigurationKeyValueDescriptionListDataSelectors),
+        plain "deviceConfigurationKeyValueDescriptionListDataSelectors" => DeviceConfigurationKeyValueDescriptionListDataSelectors(DeviceConfigurationKeyValueDescriptionListDataSelectors),
         /// `deviceConfigurationKeyValueListDataSelectors`.
-        "deviceConfigurationKeyValueListDataSelectors" => DeviceConfigurationKeyValueListDataSelectors(DeviceConfigurationKeyValueListDataSelectors),
+        plain "deviceConfigurationKeyValueListDataSelectors" => DeviceConfigurationKeyValueListDataSelectors(DeviceConfigurationKeyValueListDataSelectors),
         /// `directControlActivityListDataSelectors`.
-        "directControlActivityListDataSelectors" => DirectControlActivityListDataSelectors(DirectControlActivityListDataSelectors),
+        plain "directControlActivityListDataSelectors" => DirectControlActivityListDataSelectors(DirectControlActivityListDataSelectors),
         /// `electricalConnectionCharacteristicListDataSelectors`.
-        "electricalConnectionCharacteristicListDataSelectors" => ElectricalConnectionCharacteristicListDataSelectors(ElectricalConnectionCharacteristicListDataSelectors),
+        plain "electricalConnectionCharacteristicListDataSelectors" => ElectricalConnectionCharacteristicListDataSelectors(ElectricalConnectionCharacteristicListDataSelectors),
         /// `electricalConnectionDescriptionListDataSelectors`.
-        "electricalConnectionDescriptionListDataSelectors" => ElectricalConnectionDescriptionListDataSelectors(ElectricalConnectionDescriptionListDataSelectors),
+        plain "electricalConnectionDescriptionListDataSelectors" => ElectricalConnectionDescriptionListDataSelectors(ElectricalConnectionDescriptionListDataSelectors),
         /// `electricalConnectionParameterDescriptionListDataSelectors`.
-        "electricalConnectionParameterDescriptionListDataSelectors" => ElectricalConnectionParameterDescriptionListDataSelectors(ElectricalConnectionParameterDescriptionListDataSelectors),
+        plain "electricalConnectionParameterDescriptionListDataSelectors" => ElectricalConnectionParameterDescriptionListDataSelectors(ElectricalConnectionParameterDescriptionListDataSelectors),
         /// `electricalConnectionPermittedValueSetListDataSelectors`.
-        "electricalConnectionPermittedValueSetListDataSelectors" => ElectricalConnectionPermittedValueSetListDataSelectors(ElectricalConnectionPermittedValueSetListDataSelectors),
+        plain "electricalConnectionPermittedValueSetListDataSelectors" => ElectricalConnectionPermittedValueSetListDataSelectors(ElectricalConnectionPermittedValueSetListDataSelectors),
         /// `electricalConnectionStateListDataSelectors`.
-        "electricalConnectionStateListDataSelectors" => ElectricalConnectionStateListDataSelectors(ElectricalConnectionStateListDataSelectors),
+        plain "electricalConnectionStateListDataSelectors" => ElectricalConnectionStateListDataSelectors(ElectricalConnectionStateListDataSelectors),
         /// `hvacOperationModeDescriptionListDataSelectors`.
-        "hvacOperationModeDescriptionListDataSelectors" => HvacOperationModeDescriptionListDataSelectors(HvacOperationModeDescriptionListDataSelectors),
+        plain "hvacOperationModeDescriptionListDataSelectors" => HvacOperationModeDescriptionListDataSelectors(HvacOperationModeDescriptionListDataSelectors),
         /// `hvacOverrunDescriptionListDataSelectors`.
-        "hvacOverrunDescriptionListDataSelectors" => HvacOverrunDescriptionListDataSelectors(HvacOverrunDescriptionListDataSelectors),
+        plain "hvacOverrunDescriptionListDataSelectors" => HvacOverrunDescriptionListDataSelectors(HvacOverrunDescriptionListDataSelectors),
         /// `hvacOverrunListDataSelectors`.
-        "hvacOverrunListDataSelectors" => HvacOverrunListDataSelectors(HvacOverrunListDataSelectors),
+        plain "hvacOverrunListDataSelectors" => HvacOverrunListDataSelectors(HvacOverrunListDataSelectors),
         /// `hvacSystemFunctionDescriptionListDataSelectors`.
-        "hvacSystemFunctionDescriptionListDataSelectors" => HvacSystemFunctionDescriptionListDataSelectors(HvacSystemFunctionDescriptionListDataSelectors),
+        plain "hvacSystemFunctionDescriptionListDataSelectors" => HvacSystemFunctionDescriptionListDataSelectors(HvacSystemFunctionDescriptionListDataSelectors),
         /// `hvacSystemFunctionListDataSelectors`.
-        "hvacSystemFunctionListDataSelectors" => HvacSystemFunctionListDataSelectors(HvacSystemFunctionListDataSelectors),
+        plain "hvacSystemFunctionListDataSelectors" => HvacSystemFunctionListDataSelectors(HvacSystemFunctionListDataSelectors),
         /// `hvacSystemFunctionOperationModeRelationListDataSelectors`.
-        "hvacSystemFunctionOperationModeRelationListDataSelectors" => HvacSystemFunctionOperationModeRelationListDataSelectors(HvacSystemFunctionOperationModeRelationListDataSelectors),
+        plain "hvacSystemFunctionOperationModeRelationListDataSelectors" => HvacSystemFunctionOperationModeRelationListDataSelectors(HvacSystemFunctionOperationModeRelationListDataSelectors),
         /// `hvacSystemFunctionPowerSequenceRelationListDataSelectors`.
-        "hvacSystemFunctionPowerSequenceRelationListDataSelectors" => HvacSystemFunctionPowerSequenceRelationListDataSelectors(HvacSystemFunctionPowerSequenceRelationListDataSelectors),
+        plain "hvacSystemFunctionPowerSequenceRelationListDataSelectors" => HvacSystemFunctionPowerSequenceRelationListDataSelectors(HvacSystemFunctionPowerSequenceRelationListDataSelectors),
         /// `hvacSystemFunctionSetpointRelationListDataSelectors`.
-        "hvacSystemFunctionSetpointRelationListDataSelectors" => HvacSystemFunctionSetpointRelationListDataSelectors(HvacSystemFunctionSetpointRelationListDataSelectors),
+        plain "hvacSystemFunctionSetpointRelationListDataSelectors" => HvacSystemFunctionSetpointRelationListDataSelectors(HvacSystemFunctionSetpointRelationListDataSelectors),
         /// `identificationListDataSelectors`.
-        "identificationListDataSelectors" => IdentificationListDataSelectors(IdentificationListDataSelectors),
+        plain "identificationListDataSelectors" => IdentificationListDataSelectors(IdentificationListDataSelectors),
         /// `incentiveDescriptionListDataSelectors`.
-        "incentiveDescriptionListDataSelectors" => IncentiveDescriptionListDataSelectors(IncentiveDescriptionListDataSelectors),
+        plain "incentiveDescriptionListDataSelectors" => IncentiveDescriptionListDataSelectors(IncentiveDescriptionListDataSelectors),
         /// `incentiveListDataSelectors`.
-        "incentiveListDataSelectors" => IncentiveListDataSelectors(IncentiveListDataSelectors),
+        plain "incentiveListDataSelectors" => IncentiveListDataSelectors(IncentiveListDataSelectors),
         /// `incentiveTableConstraintsDataSelectors`.
-        "incentiveTableConstraintsDataSelectors" => IncentiveTableConstraintsDataSelectors(IncentiveTableConstraintsDataSelectors),
+        plain "incentiveTableConstraintsDataSelectors" => IncentiveTableConstraintsDataSelectors(IncentiveTableConstraintsDataSelectors),
         /// `incentiveTableDataSelectors`.
-        "incentiveTableDataSelectors" => IncentiveTableDataSelectors(IncentiveTableDataSelectors),
+        plain "incentiveTableDataSelectors" => IncentiveTableDataSelectors(IncentiveTableDataSelectors),
         /// `incentiveTableDescriptionDataSelectors`.
-        "incentiveTableDescriptionDataSelectors" => IncentiveTableDescriptionDataSelectors(IncentiveTableDescriptionDataSelectors),
+        plain "incentiveTableDescriptionDataSelectors" => IncentiveTableDescriptionDataSelectors(IncentiveTableDescriptionDataSelectors),
         /// `loadControlEventListDataSelectors`.
-        "loadControlEventListDataSelectors" => LoadControlEventListDataSelectors(LoadControlEventListDataSelectors),
+        plain "loadControlEventListDataSelectors" => LoadControlEventListDataSelectors(LoadControlEventListDataSelectors),
         /// `loadControlLimitConstraintsListDataSelectors`.
-        "loadControlLimitConstraintsListDataSelectors" => LoadControlLimitConstraintsListDataSelectors(LoadControlLimitConstraintsListDataSelectors),
+        plain "loadControlLimitConstraintsListDataSelectors" => LoadControlLimitConstraintsListDataSelectors(LoadControlLimitConstraintsListDataSelectors),
         /// `loadControlLimitDescriptionListDataSelectors`.
-        "loadControlLimitDescriptionListDataSelectors" => LoadControlLimitDescriptionListDataSelectors(LoadControlLimitDescriptionListDataSelectors),
+        plain "loadControlLimitDescriptionListDataSelectors" => LoadControlLimitDescriptionListDataSelectors(LoadControlLimitDescriptionListDataSelectors),
         /// `loadControlLimitListDataSelectors`.
-        "loadControlLimitListDataSelectors" => LoadControlLimitListDataSelectors(LoadControlLimitListDataSelectors),
+        plain "loadControlLimitListDataSelectors" => LoadControlLimitListDataSelectors(LoadControlLimitListDataSelectors),
         /// `loadControlStateListDataSelectors`.
-        "loadControlStateListDataSelectors" => LoadControlStateListDataSelectors(LoadControlStateListDataSelectors),
+        plain "loadControlStateListDataSelectors" => LoadControlStateListDataSelectors(LoadControlStateListDataSelectors),
         /// `measurementConstraintsListDataSelectors`.
-        "measurementConstraintsListDataSelectors" => MeasurementConstraintsListDataSelectors(MeasurementConstraintsListDataSelectors),
+        plain "measurementConstraintsListDataSelectors" => MeasurementConstraintsListDataSelectors(MeasurementConstraintsListDataSelectors),
         /// `measurementDescriptionListDataSelectors`.
-        "measurementDescriptionListDataSelectors" => MeasurementDescriptionListDataSelectors(MeasurementDescriptionListDataSelectors),
+        plain "measurementDescriptionListDataSelectors" => MeasurementDescriptionListDataSelectors(MeasurementDescriptionListDataSelectors),
         /// `measurementListDataSelectors`.
-        "measurementListDataSelectors" => MeasurementListDataSelectors(MeasurementListDataSelectors),
+        plain "measurementListDataSelectors" => MeasurementListDataSelectors(MeasurementListDataSelectors),
         /// `measurementSeriesListDataSelectors`.
-        "measurementSeriesListDataSelectors" => MeasurementSeriesListDataSelectors(MeasurementSeriesListDataSelectors),
+        plain "measurementSeriesListDataSelectors" => MeasurementSeriesListDataSelectors(MeasurementSeriesListDataSelectors),
         /// `measurementThresholdRelationListDataSelectors`.
-        "measurementThresholdRelationListDataSelectors" => MeasurementThresholdRelationListDataSelectors(MeasurementThresholdRelationListDataSelectors),
+        plain "measurementThresholdRelationListDataSelectors" => MeasurementThresholdRelationListDataSelectors(MeasurementThresholdRelationListDataSelectors),
         /// `messagingListDataSelectors`.
-        "messagingListDataSelectors" => MessagingListDataSelectors(MessagingListDataSelectors),
+        plain "messagingListDataSelectors" => MessagingListDataSelectors(MessagingListDataSelectors),
         /// `networkManagementDeviceDescriptionListDataSelectors`.
-        "networkManagementDeviceDescriptionListDataSelectors" => NetworkManagementDeviceDescriptionListDataSelectors(NetworkManagementDeviceDescriptionListDataSelectors),
+        plain "networkManagementDeviceDescriptionListDataSelectors" => NetworkManagementDeviceDescriptionListDataSelectors(NetworkManagementDeviceDescriptionListDataSelectors),
         /// `networkManagementEntityDescriptionListDataSelectors`.
-        "networkManagementEntityDescriptionListDataSelectors" => NetworkManagementEntityDescriptionListDataSelectors(NetworkManagementEntityDescriptionListDataSelectors),
+        plain "networkManagementEntityDescriptionListDataSelectors" => NetworkManagementEntityDescriptionListDataSelectors(NetworkManagementEntityDescriptionListDataSelectors),
         /// `networkManagementFeatureDescriptionListDataSelectors`.
-        "networkManagementFeatureDescriptionListDataSelectors" => NetworkManagementFeatureDescriptionListDataSelectors(NetworkManagementFeatureDescriptionListDataSelectors),
+        plain "networkManagementFeatureDescriptionListDataSelectors" => NetworkManagementFeatureDescriptionListDataSelectors(NetworkManagementFeatureDescriptionListDataSelectors),
         /// `nodeManagementBindingDataSelectors`.
-        "nodeManagementBindingDataSelectors" => NodeManagementBindingDataSelectors(NodeManagementBindingDataSelectors),
+        plain "nodeManagementBindingDataSelectors" => NodeManagementBindingDataSelectors(NodeManagementBindingDataSelectors),
         /// `nodeManagementDestinationListDataSelectors`.
-        "nodeManagementDestinationListDataSelectors" => NodeManagementDestinationListDataSelectors(NodeManagementDestinationListDataSelectors),
+        plain "nodeManagementDestinationListDataSelectors" => NodeManagementDestinationListDataSelectors(NodeManagementDestinationListDataSelectors),
         /// `nodeManagementDetailedDiscoveryDataSelectors`.
-        "nodeManagementDetailedDiscoveryDataSelectors" => NodeManagementDetailedDiscoveryDataSelectors(NodeManagementDetailedDiscoveryDataSelectors),
+        plain "nodeManagementDetailedDiscoveryDataSelectors" => NodeManagementDetailedDiscoveryDataSelectors(NodeManagementDetailedDiscoveryDataSelectors),
         /// `nodeManagementSubscriptionDataSelectors`.
-        "nodeManagementSubscriptionDataSelectors" => NodeManagementSubscriptionDataSelectors(NodeManagementSubscriptionDataSelectors),
+        plain "nodeManagementSubscriptionDataSelectors" => NodeManagementSubscriptionDataSelectors(NodeManagementSubscriptionDataSelectors),
         /// `nodeManagementUseCaseDataSelectors`.
-        "nodeManagementUseCaseDataSelectors" => NodeManagementUseCaseDataSelectors(NodeManagementUseCaseDataSelectors),
+        plain "nodeManagementUseCaseDataSelectors" => NodeManagementUseCaseDataSelectors(NodeManagementUseCaseDataSelectors),
         /// `operatingConstraintsDurationListDataSelectors`.
-        "operatingConstraintsDurationListDataSelectors" => OperatingConstraintsDurationListDataSelectors(OperatingConstraintsDurationListDataSelectors),
+        plain "operatingConstraintsDurationListDataSelectors" => OperatingConstraintsDurationListDataSelectors(OperatingConstraintsDurationListDataSelectors),
         /// `operatingConstraintsInterruptListDataSelectors`.
-        "operatingConstraintsInterruptListDataSelectors" => OperatingConstraintsInterruptListDataSelectors(OperatingConstraintsInterruptListDataSelectors),
+        plain "operatingConstraintsInterruptListDataSelectors" => OperatingConstraintsInterruptListDataSelectors(OperatingConstraintsInterruptListDataSelectors),
         /// `operatingConstraintsPowerDescriptionListDataSelectors`.
-        "operatingConstraintsPowerDescriptionListDataSelectors" => OperatingConstraintsPowerDescriptionListDataSelectors(OperatingConstraintsPowerDescriptionListDataSelectors),
+        plain "operatingConstraintsPowerDescriptionListDataSelectors" => OperatingConstraintsPowerDescriptionListDataSelectors(OperatingConstraintsPowerDescriptionListDataSelectors),
         /// `operatingConstraintsPowerLevelListDataSelectors`.
-        "operatingConstraintsPowerLevelListDataSelectors" => OperatingConstraintsPowerLevelListDataSelectors(OperatingConstraintsPowerLevelListDataSelectors),
+        plain "operatingConstraintsPowerLevelListDataSelectors" => OperatingConstraintsPowerLevelListDataSelectors(OperatingConstraintsPowerLevelListDataSelectors),
         /// `operatingConstraintsPowerRangeListDataSelectors`.
-        "operatingConstraintsPowerRangeListDataSelectors" => OperatingConstraintsPowerRangeListDataSelectors(OperatingConstraintsPowerRangeListDataSelectors),
+        plain "operatingConstraintsPowerRangeListDataSelectors" => OperatingConstraintsPowerRangeListDataSelectors(OperatingConstraintsPowerRangeListDataSelectors),
         /// `operatingConstraintsResumeImplicationListDataSelectors`.
-        "operatingConstraintsResumeImplicationListDataSelectors" => OperatingConstraintsResumeImplicationListDataSelectors(OperatingConstraintsResumeImplicationListDataSelectors),
+        plain "operatingConstraintsResumeImplicationListDataSelectors" => OperatingConstraintsResumeImplicationListDataSelectors(OperatingConstraintsResumeImplicationListDataSelectors),
         /// `powerSequenceAlternativesRelationListDataSelectors`.
-        "powerSequenceAlternativesRelationListDataSelectors" => PowerSequenceAlternativesRelationListDataSelectors(PowerSequenceAlternativesRelationListDataSelectors),
+        plain "powerSequenceAlternativesRelationListDataSelectors" => PowerSequenceAlternativesRelationListDataSelectors(PowerSequenceAlternativesRelationListDataSelectors),
         /// `powerSequenceDescriptionListDataSelectors`.
-        "powerSequenceDescriptionListDataSelectors" => PowerSequenceDescriptionListDataSelectors(PowerSequenceDescriptionListDataSelectors),
+        plain "powerSequenceDescriptionListDataSelectors" => PowerSequenceDescriptionListDataSelectors(PowerSequenceDescriptionListDataSelectors),
         /// `powerSequencePriceListDataSelectors`.
-        "powerSequencePriceListDataSelectors" => PowerSequencePriceListDataSelectors(PowerSequencePriceListDataSelectors),
+        plain "powerSequencePriceListDataSelectors" => PowerSequencePriceListDataSelectors(PowerSequencePriceListDataSelectors),
         /// `powerSequenceScheduleConstraintsListDataSelectors`.
-        "powerSequenceScheduleConstraintsListDataSelectors" => PowerSequenceScheduleConstraintsListDataSelectors(PowerSequenceScheduleConstraintsListDataSelectors),
+        plain "powerSequenceScheduleConstraintsListDataSelectors" => PowerSequenceScheduleConstraintsListDataSelectors(PowerSequenceScheduleConstraintsListDataSelectors),
         /// `powerSequenceScheduleListDataSelectors`.
-        "powerSequenceScheduleListDataSelectors" => PowerSequenceScheduleListDataSelectors(PowerSequenceScheduleListDataSelectors),
+        plain "powerSequenceScheduleListDataSelectors" => PowerSequenceScheduleListDataSelectors(PowerSequenceScheduleListDataSelectors),
         /// `powerSequenceSchedulePreferenceListDataSelectors`.
-        "powerSequenceSchedulePreferenceListDataSelectors" => PowerSequenceSchedulePreferenceListDataSelectors(PowerSequenceSchedulePreferenceListDataSelectors),
+        plain "powerSequenceSchedulePreferenceListDataSelectors" => PowerSequenceSchedulePreferenceListDataSelectors(PowerSequenceSchedulePreferenceListDataSelectors),
         /// `powerSequenceStateListDataSelectors`.
-        "powerSequenceStateListDataSelectors" => PowerSequenceStateListDataSelectors(PowerSequenceStateListDataSelectors),
+        plain "powerSequenceStateListDataSelectors" => PowerSequenceStateListDataSelectors(PowerSequenceStateListDataSelectors),
         /// `powerTimeSlotScheduleConstraintsListDataSelectors`.
-        "powerTimeSlotScheduleConstraintsListDataSelectors" => PowerTimeSlotScheduleConstraintsListDataSelectors(PowerTimeSlotScheduleConstraintsListDataSelectors),
+        plain "powerTimeSlotScheduleConstraintsListDataSelectors" => PowerTimeSlotScheduleConstraintsListDataSelectors(PowerTimeSlotScheduleConstraintsListDataSelectors),
         /// `powerTimeSlotScheduleListDataSelectors`.
-        "powerTimeSlotScheduleListDataSelectors" => PowerTimeSlotScheduleListDataSelectors(PowerTimeSlotScheduleListDataSelectors),
+        plain "powerTimeSlotScheduleListDataSelectors" => PowerTimeSlotScheduleListDataSelectors(PowerTimeSlotScheduleListDataSelectors),
         /// `powerTimeSlotValueListDataSelectors`.
-        "powerTimeSlotValueListDataSelectors" => PowerTimeSlotValueListDataSelectors(PowerTimeSlotValueListDataSelectors),
+        plain "powerTimeSlotValueListDataSelectors" => PowerTimeSlotValueListDataSelectors(PowerTimeSlotValueListDataSelectors),
         /// `sensingListDataSelectors`.
-        "sensingListDataSelectors" => SensingListDataSelectors(SensingListDataSelectors),
+        plain "sensingListDataSelectors" => SensingListDataSelectors(SensingListDataSelectors),
         /// `sessionIdentificationListDataSelectors`.
-        "sessionIdentificationListDataSelectors" => SessionIdentificationListDataSelectors(SessionIdentificationListDataSelectors),
+        plain "sessionIdentificationListDataSelectors" => SessionIdentificationListDataSelectors(SessionIdentificationListDataSelectors),
         /// `sessionMeasurementRelationListDataSelectors`.
-        "sessionMeasurementRelationListDataSelectors" => SessionMeasurementRelationListDataSelectors(SessionMeasurementRelationListDataSelectors),
+        plain "sessionMeasurementRelationListDataSelectors" => SessionMeasurementRelationListDataSelectors(SessionMeasurementRelationListDataSelectors),
         /// `setpointConstraintsListDataSelectors`.
-        "setpointConstraintsListDataSelectors" => SetpointConstraintsListDataSelectors(SetpointConstraintsListDataSelectors),
+        plain "setpointConstraintsListDataSelectors" => SetpointConstraintsListDataSelectors(SetpointConstraintsListDataSelectors),
         /// `setpointDescriptionListDataSelectors`.
-        "setpointDescriptionListDataSelectors" => SetpointDescriptionListDataSelectors(SetpointDescriptionListDataSelectors),
+        plain "setpointDescriptionListDataSelectors" => SetpointDescriptionListDataSelectors(SetpointDescriptionListDataSelectors),
         /// `setpointListDataSelectors`.
-        "setpointListDataSelectors" => SetpointListDataSelectors(SetpointListDataSelectors),
+        plain "setpointListDataSelectors" => SetpointListDataSelectors(SetpointListDataSelectors),
         /// `smartEnergyManagementPsDataSelectors`.
-        "smartEnergyManagementPsDataSelectors" => SmartEnergyManagementPsDataSelectors(SmartEnergyManagementPsDataSelectors),
+        plain "smartEnergyManagementPsDataSelectors" => SmartEnergyManagementPsDataSelectors(SmartEnergyManagementPsDataSelectors),
         /// `smartEnergyManagementPsPriceDataSelectors`.
-        "smartEnergyManagementPsPriceDataSelectors" => SmartEnergyManagementPsPriceDataSelectors(SmartEnergyManagementPsPriceDataSelectors),
+        plain "smartEnergyManagementPsPriceDataSelectors" => SmartEnergyManagementPsPriceDataSelectors(SmartEnergyManagementPsPriceDataSelectors),
         /// `specificationVersionListDataSelectors`.
-        "specificationVersionListDataSelectors" => SpecificationVersionListDataSelectors(SpecificationVersionListDataSelectors),
+        plain "specificationVersionListDataSelectors" => SpecificationVersionListDataSelectors(SpecificationVersionListDataSelectors),
         /// `stateInformationListDataSelectors`.
-        "stateInformationListDataSelectors" => StateInformationListDataSelectors(StateInformationListDataSelectors),
+        plain "stateInformationListDataSelectors" => StateInformationListDataSelectors(StateInformationListDataSelectors),
         /// `subscriptionManagementEntryListDataSelectors`.
-        "subscriptionManagementEntryListDataSelectors" => SubscriptionManagementEntryListDataSelectors(SubscriptionManagementEntryListDataSelectors),
+        plain "subscriptionManagementEntryListDataSelectors" => SubscriptionManagementEntryListDataSelectors(SubscriptionManagementEntryListDataSelectors),
         /// `supplyConditionDescriptionListDataSelectors`.
-        "supplyConditionDescriptionListDataSelectors" => SupplyConditionDescriptionListDataSelectors(SupplyConditionDescriptionListDataSelectors),
+        plain "supplyConditionDescriptionListDataSelectors" => SupplyConditionDescriptionListDataSelectors(SupplyConditionDescriptionListDataSelectors),
         /// `supplyConditionListDataSelectors`.
-        "supplyConditionListDataSelectors" => SupplyConditionListDataSelectors(SupplyConditionListDataSelectors),
+        plain "supplyConditionListDataSelectors" => SupplyConditionListDataSelectors(SupplyConditionListDataSelectors),
         /// `supplyConditionThresholdRelationListDataSelectors`.
-        "supplyConditionThresholdRelationListDataSelectors" => SupplyConditionThresholdRelationListDataSelectors(SupplyConditionThresholdRelationListDataSelectors),
+        plain "supplyConditionThresholdRelationListDataSelectors" => SupplyConditionThresholdRelationListDataSelectors(SupplyConditionThresholdRelationListDataSelectors),
         /// `tariffBoundaryRelationListDataSelectors`.
-        "tariffBoundaryRelationListDataSelectors" => TariffBoundaryRelationListDataSelectors(TariffBoundaryRelationListDataSelectors),
+        plain "tariffBoundaryRelationListDataSelectors" => TariffBoundaryRelationListDataSelectors(TariffBoundaryRelationListDataSelectors),
         /// `tariffDescriptionListDataSelectors`.
-        "tariffDescriptionListDataSelectors" => TariffDescriptionListDataSelectors(TariffDescriptionListDataSelectors),
+        plain "tariffDescriptionListDataSelectors" => TariffDescriptionListDataSelectors(TariffDescriptionListDataSelectors),
         /// `tariffListDataSelectors`.
-        "tariffListDataSelectors" => TariffListDataSelectors(TariffListDataSelectors),
+        plain "tariffListDataSelectors" => TariffListDataSelectors(TariffListDataSelectors),
         /// `tariffTierRelationListDataSelectors`.
-        "tariffTierRelationListDataSelectors" => TariffTierRelationListDataSelectors(TariffTierRelationListDataSelectors),
+        plain "tariffTierRelationListDataSelectors" => TariffTierRelationListDataSelectors(TariffTierRelationListDataSelectors),
         /// `taskManagementJobDescriptionListDataSelectors`.
-        "taskManagementJobDescriptionListDataSelectors" => TaskManagementJobDescriptionListDataSelectors(TaskManagementJobDescriptionListDataSelectors),
+        plain "taskManagementJobDescriptionListDataSelectors" => TaskManagementJobDescriptionListDataSelectors(TaskManagementJobDescriptionListDataSelectors),
         /// `taskManagementJobListDataSelectors`.
-        "taskManagementJobListDataSelectors" => TaskManagementJobListDataSelectors(TaskManagementJobListDataSelectors),
+        plain "taskManagementJobListDataSelectors" => TaskManagementJobListDataSelectors(TaskManagementJobListDataSelectors),
         /// `taskManagementJobRelationListDataSelectors`.
-        "taskManagementJobRelationListDataSelectors" => TaskManagementJobRelationListDataSelectors(TaskManagementJobRelationListDataSelectors),
+        plain "taskManagementJobRelationListDataSelectors" => TaskManagementJobRelationListDataSelectors(TaskManagementJobRelationListDataSelectors),
         /// `thresholdConstraintsListDataSelectors`.
-        "thresholdConstraintsListDataSelectors" => ThresholdConstraintsListDataSelectors(ThresholdConstraintsListDataSelectors),
+        plain "thresholdConstraintsListDataSelectors" => ThresholdConstraintsListDataSelectors(ThresholdConstraintsListDataSelectors),
         /// `thresholdDescriptionListDataSelectors`.
-        "thresholdDescriptionListDataSelectors" => ThresholdDescriptionListDataSelectors(ThresholdDescriptionListDataSelectors),
+        plain "thresholdDescriptionListDataSelectors" => ThresholdDescriptionListDataSelectors(ThresholdDescriptionListDataSelectors),
         /// `thresholdListDataSelectors`.
-        "thresholdListDataSelectors" => ThresholdListDataSelectors(ThresholdListDataSelectors),
+        plain "thresholdListDataSelectors" => ThresholdListDataSelectors(ThresholdListDataSelectors),
         /// `tierBoundaryDescriptionListDataSelectors`.
-        "tierBoundaryDescriptionListDataSelectors" => TierBoundaryDescriptionListDataSelectors(TierBoundaryDescriptionListDataSelectors),
+        plain "tierBoundaryDescriptionListDataSelectors" => TierBoundaryDescriptionListDataSelectors(TierBoundaryDescriptionListDataSelectors),
         /// `tierBoundaryListDataSelectors`.
-        "tierBoundaryListDataSelectors" => TierBoundaryListDataSelectors(TierBoundaryListDataSelectors),
+        plain "tierBoundaryListDataSelectors" => TierBoundaryListDataSelectors(TierBoundaryListDataSelectors),
         /// `tierDescriptionListDataSelectors`.
-        "tierDescriptionListDataSelectors" => TierDescriptionListDataSelectors(TierDescriptionListDataSelectors),
+        plain "tierDescriptionListDataSelectors" => TierDescriptionListDataSelectors(TierDescriptionListDataSelectors),
         /// `tierIncentiveRelationListDataSelectors`.
-        "tierIncentiveRelationListDataSelectors" => TierIncentiveRelationListDataSelectors(TierIncentiveRelationListDataSelectors),
+        plain "tierIncentiveRelationListDataSelectors" => TierIncentiveRelationListDataSelectors(TierIncentiveRelationListDataSelectors),
         /// `tierListDataSelectors`.
-        "tierListDataSelectors" => TierListDataSelectors(TierListDataSelectors),
+        plain "tierListDataSelectors" => TierListDataSelectors(TierListDataSelectors),
         /// `timeSeriesConstraintsListDataSelectors`.
-        "timeSeriesConstraintsListDataSelectors" => TimeSeriesConstraintsListDataSelectors(TimeSeriesConstraintsListDataSelectors),
+        plain "timeSeriesConstraintsListDataSelectors" => TimeSeriesConstraintsListDataSelectors(TimeSeriesConstraintsListDataSelectors),
         /// `timeSeriesDescriptionListDataSelectors`.
-        "timeSeriesDescriptionListDataSelectors" => TimeSeriesDescriptionListDataSelectors(TimeSeriesDescriptionListDataSelectors),
+        plain "timeSeriesDescriptionListDataSelectors" => TimeSeriesDescriptionListDataSelectors(TimeSeriesDescriptionListDataSelectors),
         /// `timeSeriesListDataSelectors`.
-        "timeSeriesListDataSelectors" => TimeSeriesListDataSelectors(TimeSeriesListDataSelectors),
+        plain "timeSeriesListDataSelectors" => TimeSeriesListDataSelectors(TimeSeriesListDataSelectors),
         /// `timeTableConstraintsListDataSelectors`.
-        "timeTableConstraintsListDataSelectors" => TimeTableConstraintsListDataSelectors(TimeTableConstraintsListDataSelectors),
+        plain "timeTableConstraintsListDataSelectors" => TimeTableConstraintsListDataSelectors(TimeTableConstraintsListDataSelectors),
         /// `timeTableDescriptionListDataSelectors`.
-        "timeTableDescriptionListDataSelectors" => TimeTableDescriptionListDataSelectors(TimeTableDescriptionListDataSelectors),
+        plain "timeTableDescriptionListDataSelectors" => TimeTableDescriptionListDataSelectors(TimeTableDescriptionListDataSelectors),
         /// `timeTableListDataSelectors`.
-        "timeTableListDataSelectors" => TimeTableListDataSelectors(TimeTableListDataSelectors),
+        plain "timeTableListDataSelectors" => TimeTableListDataSelectors(TimeTableListDataSelectors),
         /// `useCaseInformationListDataSelectors`.
-        "useCaseInformationListDataSelectors" => UseCaseInformationListDataSelectors(UseCaseInformationListDataSelectors),
+        plain "useCaseInformationListDataSelectors" => UseCaseInformationListDataSelectors(UseCaseInformationListDataSelectors),
     }
 }
 

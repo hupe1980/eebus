@@ -6,12 +6,15 @@ on.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **Status: under construction.** The SPINE model and its wire codec are complete and
-> checked against the specification's own examples; the SHIP handshake, framing,
-> discovery records, QR codes and pairing service are implemented and tested against the
-> official test specification; the LPC state machine implements every transition of the
-> use case together with the 2026 implementation guide's rules. TLS, mDNS and the SPINE
-> engine that connects the two ends are the next milestones. Nothing is published to crates.io yet, and the API will change.
+> **Status: under construction.** The protocol is complete from the SHIP handshake up to
+> a working use case: the SPINE model and its wire codec are checked against the
+> specification's own examples, the handshake, framing, discovery records, QR codes and
+> pairing service are tested against the official test specification, and the SPINE
+> engine carries discovery, bindings, subscriptions, reads, writes and notifications
+> between two nodes. Limitation of Power Consumption runs over it end to end —
+> `cargo run --example grid_limit`. TLS, mDNS-SD and a Tokio runtime adapter are what
+> stand between this and a device on a real network. Nothing is published to crates.io
+> yet, and the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -58,6 +61,22 @@ selectors from the schema, so the merge is written once and applies to all 842 t
 ```rust
 rfe::apply_partial(&mut stored, update);   // merges by identifier, element by element
 rfe::delete_elements(&mut stored, |e| e.limit_id == Some(id), &elements);
+```
+
+**The application decides, not the library.** A limit write is answered by the use case,
+not by a generic setter: the engine hands it out as a `WriteRequested` event with a token
+and waits. That is not a convenience — under §14a EnWG the acknowledgement *is* the
+record that the limit was received and applied, so it has to reflect what the appliance
+actually did with it.
+
+```rust
+match engine.poll_event() {
+    Some(SpineEvent::WriteRequested { token, data, .. }) => match system.on_write(data, now) {
+        WriteOutcome::Accepted => engine.accept_write(token, now),  // ACK
+        WriteOutcome::Rejected(why) => engine.reject_write(token, why.into(), now), // NACK
+    },
+    _ => {}
+}
 ```
 
 **Illegal states are unrepresentable.** A SPINE command carries a payload *choice*, so
@@ -119,12 +138,18 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | SHIP Pairing Service digest and replay guard | ✅ | Pairing Service 1.0.0 §7, §11 |
 | Restricted Function Exchange: partial merge, delete, selectors | ✅ | SPINE §5.3.4 + SPINE IG §3.3 |
 | SPINE acknowledgements, error numbers, message counters | ✅ | SPINE §5.2.4–5.2.5 |
+| SPINE device model: entities, features, operations | ✅ | SPINE §5.1, §7.2 |
+| NodeManagement: detailed discovery, use case data | ✅ | SPINE §7.3.2–7.3.3 |
+| Bindings and subscriptions, single-writer policy | ✅ | SPINE §5.3.5–5.3.6 |
+| SPINE engine: reads, writes, notifies, results, timeouts | ✅ | SPINE 1.3.0 Protocol Specification |
+| Deferred writes: the application answers before the engine does | ✅ | LPC IG §4.1.5 |
+| LPC Controllable System state machine | ✅ | LPC UC TS §2.3 + LPC IG 1.1.0 |
+| LPC Controllable System over the wire | ✅ | LPC UC TS §3.3 scenarios 1–4 |
+| Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
 | TLS 1.2, mutual auth, certificates | ⬜ next | SHIP §9, §12 |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
-| SPINE engine: device model, discovery, bindings, subscriptions | ⬜ | SPINE 1.3.0 Protocol Specification |
-| LPC Controllable System state machine | ✅ | LPC UC TS §2.3 + LPC IG 1.1.0 |
-| Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
-| LPC/LPP/MPC/MGCP over the wire | ⬜ | needs the SPINE engine |
+| Tokio runtime: sockets, timers, connection manager | ⬜ next | |
+| LPP, MPC, MGCP | ⬜ | UC TS, on the engine above |
 | E-mobility, inverter, HVAC use cases | ⬜ | |
 
 Deliberate departures from the reference implementation, each driven by the
@@ -147,11 +172,27 @@ specification text or the 2026 implementation guides:
 
 ## A worked example
 
-`cargo run --example grid_limit` plays out the §14a exchange in miniature: two nodes
-complete the SHIP handshake, the control box sends a heartbeat and then a 3 kW limit as a
-partial write, the heat pump applies it and answers with the acknowledgement that serves
-as evidence, and then the control box goes quiet and the failsafe takes over. Every layer
-is exercised and every message is printed as it appears on the wire.
+`cargo run --example grid_limit` plays out the §14a exchange in miniature. A grid
+operator's control box and a heat pump complete the SHIP handshake; the control box
+discovers that the heat pump plays the Controllable System and where its `LoadControl`
+feature is; it binds and subscribes; then it sends a heartbeat and a 3 kW limit as a
+partial write. The heat pump's state machine decides, the engine answers with the
+acknowledgement that serves as the operator's evidence, and when the control box goes
+quiet the failsafe takes over and holds. Every datagram crosses the SHIP framing and the
+JSON-UTF8 codec on the way, against a virtual clock and without a socket:
+
+```
+1. SHIP handshake complete after 9 frames
+   version 1.1, format JSON-UTF8
+3. Discovery found the heat pump
+   plays     limitationOfPowerConsumption as ControllableSystem
+   scenarios [1, 2, 3, 4]
+6. The heat pump is now in Limited
+   limited to Active(3000.0)
+   answered errorNumber 0 (no error) — the §14a evidence
+7. After two minutes of silence: FailsafeState
+   limited to Failsafe(4200.0)
+```
 
 ## Building
 
