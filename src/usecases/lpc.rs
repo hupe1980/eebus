@@ -1,12 +1,48 @@
-//! The LPC use case as data: actors, scenarios and the SPINE resources each one needs.
+//! Limitation of Power Consumption (LPC).
 //!
-//! Taken from LPC UC TS 1.0.0 Tables 2, 12 and 21, with the entity-type list of §3.10 of
-//! the 1.1.0 implementation guide.
+//! An *Energy Guard* — a grid operator's control box, or an energy manager acting for
+//! one — tells a *Controllable System* how much power it may draw. The use case is the
+//! technical basis for §14a EnWG in Germany, and the first one the EEBUS certification
+//! covers.
+//!
+//! Four scenarios make it up:
+//!
+//! 1. **Control active power consumption limit** — the limit itself, with an optional
+//!    duration, acknowledged or refused by the Controllable System.
+//! 2. **Failsafe values** — what applies when the Energy Guard falls silent, and for how
+//!    long at least.
+//! 3. **Heartbeat** — a message every sixty seconds in each direction, whose absence is
+//!    what triggers the failsafe.
+//! 4. **Constraints** — the nominal maxima, so the Energy Guard knows what it is
+//!    limiting.
+//!
+//! LPC and LPP are the same use case in opposite directions, so the state machine and the
+//! actor live in [`crate::usecases::limitation`] and serve both. This module carries what
+//! is specific to LPC: the descriptors taken from UC TS 1.0.0 Tables 2, 12 and 21 with
+//! the entity-type list of the 1.1.0 implementation guide §3.10, and the [`DIRECTION`] an
+//! actor is built with.
+//!
+//! ```
+//! use core::time::Duration;
+//! use eebus::usecases::{limitation::{ControllableSystem, CsConfig}, lpc};
+//!
+//! // A heat pump that falls back to the 4.2 kW §14a leaves it.
+//! let system = ControllableSystem::new(
+//!     CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)).with_nominal_max(11_000.0),
+//!     Duration::ZERO,
+//! );
+//! assert_eq!(lpc::DIRECTION.failsafe_limit_key().as_str(), "failsafeConsumptionActivePowerLimit");
+//! # let _ = system;
+//! ```
 
 use crate::model::{EntityType, FeatureType, Function};
 use crate::usecases::descriptor::{
     ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor, actors, names,
 };
+use crate::usecases::limitation::Direction;
+
+/// The direction a Controllable System actor is built with for this use case.
+pub const DIRECTION: Direction = Direction::Consumption;
 
 /// Entity types an Energy Guard may live on (LPC §3.2.1.1.1).
 const ENERGY_GUARD_ENTITIES: &[EntityType] = &[EntityType::CEM, EntityType::GridGuard];

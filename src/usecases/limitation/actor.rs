@@ -1,9 +1,13 @@
-//! LPC over the wire: the actors that sit between the state machine and the engine.
+//! LPC and LPP over the wire: the actor between the state machine and the engine.
 //!
-//! [`state`](super::state) decides *what* a Controllable System does with a limit;
-//! this module decides *how* that reaches the wire — which features to build, how to
-//! read a `loadControlLimitListData` write as a [`LimitWrite`], and which acknowledgement
-//! to send back.
+//! [`ControllableSystem`] decides *what* a system does with a limit; this module decides
+//! *how* that reaches the wire — which features to build, how to read a
+//! `loadControlLimitListData` write as a [`LimitWrite`], and which acknowledgement to
+//! send back.
+//!
+//! Everything here serves both use cases. A [`Direction`] is what turns it into one or
+//! the other, and it is a constructor argument rather than a module boundary so that the
+//! two cannot drift apart.
 
 use alloc::vec;
 use core::time::Duration;
@@ -12,36 +16,36 @@ use crate::model::{
     CmdData, DeviceConfigurationKeyId, DeviceConfigurationKeyValueData,
     DeviceConfigurationKeyValueDescriptionData, DeviceConfigurationKeyValueDescriptionListData,
     DeviceConfigurationKeyValueListData, DeviceConfigurationKeyValueValue,
-    DeviceDiagnosisHeartbeatData, EnergyDirection, FeatureAddress, FeatureType, Function,
-    LoadControlCategory, LoadControlLimitData, LoadControlLimitDescriptionData,
-    LoadControlLimitDescriptionListData, LoadControlLimitId, LoadControlLimitListData,
-    LoadControlLimitType, MeasurementId, Role, ScaledNumber, ScopeType, UnitOfMeasurement,
+    DeviceDiagnosisHeartbeatData, FeatureAddress, FeatureType, Function, LoadControlCategory,
+    LoadControlLimitData, LoadControlLimitDescriptionData, LoadControlLimitDescriptionListData,
+    LoadControlLimitId, LoadControlLimitListData, LoadControlLimitType, MeasurementId, Role,
+    ScaledNumber, ScopeType, UnitOfMeasurement,
 };
 use crate::spine::{Engine, ErrorNumber, LocalFeature, Operations, SpineEvent, WriteToken};
 
-use super::config_keys;
 use super::state::{ControllableSystem, LimitWrite, LocalDecision, WriteOutcome};
+use super::{Direction, FAILSAFE_DURATION_MINIMUM_KEY};
 
-/// The `limitId` this implementation uses for the Active Power Consumption Limit.
+/// The `limitId` this implementation uses for the active power limit.
 ///
-/// LPC's placeholder `<l1#1>` leaves the number to the implementation; it only has to be
-/// stable, because the Energy Guard addresses the limit by it.
+/// The specification's placeholder `<l1#1>` leaves the number to the implementation; it
+/// only has to be stable, because the Energy Guard addresses the limit by it.
 pub const LIMIT_ID: LoadControlLimitId = LoadControlLimitId(1);
 
 /// The `measurementId` the limit description points at.
 ///
-/// The LPC implementation guide §3.4 makes this element mandatory whether or not a
+/// The implementation guides §3.4 make this element mandatory whether or not a
 /// matching measurand exists: a description without it is invalid, and where the device
 /// has no `Measurement` feature the guide asks for a high number no measurand uses.
 pub const MEASUREMENT_ID: MeasurementId = MeasurementId(1);
 
-/// The `keyId` of the Failsafe Consumption Active Power Limit.
+/// The `keyId` of the failsafe active power limit.
 pub const FAILSAFE_LIMIT_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(1);
 
 /// The `keyId` of the Failsafe Duration Minimum.
 pub const FAILSAFE_DURATION_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(2);
 
-/// Builds the `LoadControl` feature a Controllable System offers (LPC Table 21).
+/// Builds the `LoadControl` feature a Controllable System offers (LPC/LPP Table 21).
 ///
 /// Writes are deferred: the Controllable System decides whether it can follow a limit,
 /// and that decision is the acknowledgement.
@@ -55,7 +59,7 @@ pub fn load_control_feature(address: u32) -> LocalFeature {
         .with_function(Function::LoadControlLimitListData, Operations::read_write())
 }
 
-/// Builds the `DeviceConfiguration` feature a Controllable System offers (LPC Table 24).
+/// Builds the `DeviceConfiguration` feature a Controllable System offers (LPC/LPP Table 24).
 pub fn device_configuration_feature(address: u32) -> LocalFeature {
     LocalFeature::new(address, FeatureType::DeviceConfiguration, Role::Server)
         .with_deferred_writes()
@@ -69,23 +73,24 @@ pub fn device_configuration_feature(address: u32) -> LocalFeature {
         )
 }
 
-/// Builds the `DeviceDiagnosis` feature that carries the heartbeat (LPC Table 26).
+/// Builds the `DeviceDiagnosis` feature that carries the heartbeat (LPC/LPP Table 26).
 pub fn device_diagnosis_feature(address: u32) -> LocalFeature {
     LocalFeature::new(address, FeatureType::DeviceDiagnosis, Role::Server)
         .with_function(Function::DeviceDiagnosisHeartbeatData, Operations::read())
 }
 
-/// The limit description a Controllable System publishes (LPC Table 22).
+/// The limit description a Controllable System publishes (LPC/LPP Table 22).
 ///
-/// Every element here is fixed by the specification: the limit is an obligation on
-/// consumption, expressed in watts, with a sign-dependent absolute value.
-pub fn limit_description() -> CmdData {
+/// Every element here is fixed by the specification: the limit is an obligation,
+/// expressed in watts, with a sign-dependent absolute value. `direction` is what makes it
+/// a consumption limit or a production one.
+pub fn limit_description(direction: Direction) -> CmdData {
     CmdData::LoadControlLimitDescriptionListData(LoadControlLimitDescriptionListData {
         load_control_limit_description_data: Some(vec![LoadControlLimitDescriptionData {
             limit_id: Some(LIMIT_ID),
             limit_type: Some(LoadControlLimitType::SignDependentAbsValueLimit),
             limit_category: Some(LoadControlCategory::Obligation),
-            limit_direction: Some(EnergyDirection::Consume),
+            limit_direction: Some(direction.energy_direction()),
             measurement_id: Some(MEASUREMENT_ID),
             unit: Some(UnitOfMeasurement::W),
             scope_type: Some(ScopeType::ActivePowerLimit),
@@ -94,7 +99,7 @@ pub fn limit_description() -> CmdData {
     })
 }
 
-/// The current limit, as `loadControlLimitListData` (LPC Table 23).
+/// The current limit, as `loadControlLimitListData` (LPC/LPP Table 23).
 pub fn limit_data(system: &ControllableSystem) -> CmdData {
     CmdData::LoadControlLimitListData(LoadControlLimitListData {
         load_control_limit_data: Some(vec![LoadControlLimitData {
@@ -110,21 +115,21 @@ pub fn limit_data(system: &ControllableSystem) -> CmdData {
     })
 }
 
-/// The failsafe key descriptions (LPC Table 24).
-pub fn failsafe_descriptions() -> CmdData {
+/// The failsafe key descriptions (LPC/LPP Table 24).
+pub fn failsafe_descriptions(direction: Direction) -> CmdData {
     CmdData::DeviceConfigurationKeyValueDescriptionListData(
         DeviceConfigurationKeyValueDescriptionListData {
             device_configuration_key_value_description_data: Some(vec![
                 DeviceConfigurationKeyValueDescriptionData {
                     key_id: Some(FAILSAFE_LIMIT_KEY),
-                    key_name: Some(config_keys::FAILSAFE_CONSUMPTION_ACTIVE_POWER_LIMIT.into()),
+                    key_name: Some(direction.failsafe_limit_key()),
                     value_type: Some(crate::model::DeviceConfigurationKeyValueType::ScaledNumber),
                     unit: Some(UnitOfMeasurement::W),
                     ..Default::default()
                 },
                 DeviceConfigurationKeyValueDescriptionData {
                     key_id: Some(FAILSAFE_DURATION_KEY),
-                    key_name: Some(config_keys::FAILSAFE_DURATION_MINIMUM.into()),
+                    key_name: Some(FAILSAFE_DURATION_MINIMUM_KEY),
                     value_type: Some(crate::model::DeviceConfigurationKeyValueType::Duration),
                     ..Default::default()
                 },
@@ -133,7 +138,7 @@ pub fn failsafe_descriptions() -> CmdData {
     )
 }
 
-/// The current failsafe values (LPC Table 25).
+/// The current failsafe values (LPC/LPP Table 25).
 pub fn failsafe_values(system: &ControllableSystem) -> CmdData {
     CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
         device_configuration_key_value_data: Some(vec![
@@ -159,7 +164,7 @@ pub fn failsafe_values(system: &ControllableSystem) -> CmdData {
     })
 }
 
-/// A heartbeat message (LPC Table 26).
+/// A heartbeat message (LPC/LPP Table 26).
 ///
 /// `heartbeatCounter` increases with every notification but not with a reply, and
 /// `heartbeatTimeout` is at most sixty seconds — LPC uses sixty, and a shorter value is
@@ -216,6 +221,7 @@ pub fn read_heartbeat(data: &CmdData) -> Option<u64> {
 #[derive(Debug)]
 pub struct ControllableSystemActor {
     system: ControllableSystem,
+    direction: Direction,
     load_control: FeatureAddress,
     device_configuration: FeatureAddress,
     device_diagnosis: FeatureAddress,
@@ -223,18 +229,30 @@ pub struct ControllableSystemActor {
 
 impl ControllableSystemActor {
     /// Wires a state machine to the features it serves.
+    ///
+    /// `direction` selects the use case: [`Direction::Consumption`] for LPC,
+    /// [`Direction::Production`] for LPP. It decides what this actor publishes, so it has
+    /// to match the descriptor the device announces — [`crate::usecases::lpc`] and
+    /// [`crate::usecases::lpp`] carry both as a pair.
     pub fn new(
         system: ControllableSystem,
+        direction: Direction,
         load_control: FeatureAddress,
         device_configuration: FeatureAddress,
         device_diagnosis: FeatureAddress,
     ) -> Self {
         Self {
             system,
+            direction,
             load_control,
             device_configuration,
             device_diagnosis,
         }
+    }
+
+    /// Which of the two limitation use cases this actor plays.
+    pub fn direction(&self) -> Direction {
+        self.direction
     }
 
     /// The state machine.
@@ -255,11 +273,11 @@ impl ControllableSystemActor {
         let load_control = self.load_control.clone();
         let configuration = self.device_configuration.clone();
         if let Some(feature) = engine.device_mut().resolve_mut(&load_control) {
-            let _ = feature.set_data(limit_description());
+            let _ = feature.set_data(limit_description(self.direction));
             let _ = feature.set_data(limit_data(&self.system));
         }
         if let Some(feature) = engine.device_mut().resolve_mut(&configuration) {
-            let _ = feature.set_data(failsafe_descriptions());
+            let _ = feature.set_data(failsafe_descriptions(self.direction));
             let _ = feature.set_data(failsafe_values(&self.system));
         }
     }

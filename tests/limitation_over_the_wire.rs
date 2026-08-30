@@ -1,21 +1,29 @@
-//! Limitation of Power Consumption, end to end over SPINE.
+//! Limitation of Power Consumption and Production, end to end over SPINE.
 //!
 //! A control box and a heat pump run the pre-scenario communication of LPC §3.3 —
 //! discovery, binding, subscription — and then scenario 1: a heartbeat, a limit, and the
 //! acknowledgement that answers it. Everything travels as real datagrams, encoded and
 //! decoded on the way, against a virtual clock.
+//!
+//! The last tests run the same exchange as LPP against a PV inverter, because the two use
+//! cases share one implementation: what has to be checked is that the direction reaches
+//! the wire, and that nothing else about the exchange changes.
 
 use core::time::Duration;
 
 use eebus::model::{
-    CmdData, DeviceType, EntityType, FeatureAddress, FeatureType, Function, Role, ScaledNumber,
+    CmdData, DeviceType, EnergyDirection, EntityType, FeatureAddress, FeatureType, Function,
+    LoadControlLimitType, Role, ScaledNumber,
 };
 use eebus::spine::{
     Engine, ErrorNumber, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management,
 };
-use eebus::usecases::lpc::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, EffectiveLimit, LpcState,
+use eebus::usecases::descriptor::UseCaseDescriptor;
+use eebus::usecases::limitation::{
+    self, ControllableSystem, ControllableSystemActor, CsConfig, Direction, EffectiveLimit,
+    LimitationState,
 };
+use eebus::usecases::{lpc, lpp};
 
 const FAILSAFE_WATTS: f64 = 4_200.0;
 
@@ -27,14 +35,39 @@ struct Link {
 }
 
 impl Link {
-    /// A control box and a heat pump, each with the features LPC asks of it.
+    /// A control box and a heat pump, running LPC.
     fn new() -> Self {
+        Self::build(
+            lpc::DIRECTION,
+            &lpc::CONTROLLABLE_SYSTEM,
+            &lpc::ENERGY_GUARD,
+            EntityType::HeatPumpAppliance,
+        )
+    }
+
+    /// A control box and a PV inverter, running LPP.
+    fn producing() -> Self {
+        Self::build(
+            lpp::DIRECTION,
+            &lpp::CONTROLLABLE_SYSTEM,
+            &lpp::ENERGY_GUARD,
+            EntityType::Inverter,
+        )
+    }
+
+    /// Two nodes with the features the limitation use cases ask of them.
+    fn build(
+        direction: Direction,
+        controllable_system: &'static UseCaseDescriptor,
+        energy_guard: &'static UseCaseDescriptor,
+        entity: EntityType,
+    ) -> Self {
         let mut pump_device =
             LocalDevice::new("i:67890", "HeatPump-1", DeviceType::HeatGenerationSystem).unwrap();
-        let appliance = LocalEntity::new([1], EntityType::HeatPumpAppliance)
-            .with_feature(lpc::load_control_feature(1))
-            .with_feature(lpc::device_configuration_feature(2))
-            .with_feature(lpc::device_diagnosis_feature(3));
+        let appliance = LocalEntity::new([1], entity)
+            .with_feature(limitation::load_control_feature(1))
+            .with_feature(limitation::device_configuration_feature(2))
+            .with_feature(limitation::device_diagnosis_feature(3));
         pump_device.add_entity(appliance).unwrap();
 
         let load_control = pump_device.address_of(&[1], 1);
@@ -42,7 +75,7 @@ impl Link {
         let diagnosis = pump_device.address_of(&[1], 3);
 
         let mut pump = Engine::new(pump_device);
-        pump.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
+        pump.add_use_case([1], 1, controllable_system);
 
         let actor = ControllableSystemActor::new(
             ControllableSystem::new(
@@ -50,6 +83,7 @@ impl Link {
                     .with_nominal_max(11_000.0),
                 Duration::ZERO,
             ),
+            direction,
             load_control,
             configuration,
             diagnosis,
@@ -64,13 +98,13 @@ impl Link {
         .unwrap();
         guard_device
             .add_entity(LocalEntity::new([1], EntityType::GridGuard).with_feature(
-                // The LPC implementation guide §3.3 asks an actor to use one `Generic`
-                // client feature for all of its client functionality.
+                // The implementation guides §3.3 ask an actor to use one `Generic` client
+                // feature for all of its client functionality.
                 LocalFeature::new(1, FeatureType::Generic, Role::Client),
             ))
             .unwrap();
         let mut guard = Engine::new(guard_device);
-        guard.add_use_case([1], 1, &lpc::ENERGY_GUARD);
+        guard.add_use_case([1], 1, energy_guard);
 
         Self {
             guard,
@@ -174,7 +208,7 @@ impl Link {
         let server = self.pump_feature(1);
         let data = CmdData::LoadControlLimitListData(eebus::model::LoadControlLimitListData {
             load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
-                limit_id: Some(lpc::LIMIT_ID),
+                limit_id: Some(limitation::LIMIT_ID),
                 is_limit_active: Some(active),
                 value: Some(ScaledNumber::from_f64(watts, 0)),
                 ..Default::default()
@@ -216,7 +250,7 @@ fn a_limit_reaches_the_heat_pump_and_is_acknowledged() {
     let result = link.write_limit(3_000.0, true).expect("an acknowledgement");
 
     assert_eq!(result, ErrorNumber::None, "ACK, [LPC-002/1]");
-    assert_eq!(link.actor.system().state(), LpcState::Limited);
+    assert_eq!(link.actor.system().state(), LimitationState::Limited);
     assert_eq!(
         link.actor.system().effective_limit(),
         EffectiveLimit::Active(3_000.0)
@@ -250,7 +284,7 @@ fn ig_2_14_a_limit_without_a_heartbeat_is_refused_over_the_wire() {
     let result = link.write_limit(3_000.0, true).expect("an acknowledgement");
 
     assert_eq!(result, ErrorNumber::CommandRejected, "NACK, [LPC-003/1]");
-    assert_eq!(link.actor.system().state(), LpcState::Init);
+    assert_eq!(link.actor.system().state(), LimitationState::Init);
     assert_eq!(
         link.actor.system().effective_limit(),
         EffectiveLimit::Failsafe(FAILSAFE_WATTS),
@@ -290,7 +324,7 @@ fn ig_2_15_the_failsafe_values_can_be_written_over_the_wire() {
         eebus::model::DeviceConfigurationKeyValueListData {
             device_configuration_key_value_data: Some(vec![
                 eebus::model::DeviceConfigurationKeyValueData {
-                    key_id: Some(lpc::FAILSAFE_LIMIT_KEY),
+                    key_id: Some(limitation::FAILSAFE_LIMIT_KEY),
                     value: Some(eebus::model::DeviceConfigurationKeyValueValue {
                         scaled_number: Some(ScaledNumber::from_f64(2_000.0, 0)),
                         ..Default::default()
@@ -322,7 +356,7 @@ fn ig_2_15_the_failsafe_values_can_be_written_over_the_wire() {
         .as_ref()
         .unwrap()
         .iter()
-        .find(|e| e.key_id == Some(lpc::FAILSAFE_LIMIT_KEY))
+        .find(|e| e.key_id == Some(limitation::FAILSAFE_LIMIT_KEY))
         .unwrap();
     assert_eq!(
         entry
@@ -346,10 +380,10 @@ fn ig_2_17_silence_reaches_the_failsafe_and_holds() {
     link.commission();
     link.heartbeat();
     link.write_limit(3_000.0, true).unwrap();
-    assert_eq!(link.actor.system().state(), LpcState::Limited);
+    assert_eq!(link.actor.system().state(), LimitationState::Limited);
 
     link.advance(Duration::from_secs(120));
-    assert_eq!(link.actor.system().state(), LpcState::FailsafeState);
+    assert_eq!(link.actor.system().state(), LimitationState::FailsafeState);
     assert_eq!(
         link.actor.system().effective_limit(),
         EffectiveLimit::Failsafe(FAILSAFE_WATTS)
@@ -357,7 +391,7 @@ fn ig_2_17_silence_reaches_the_failsafe_and_holds() {
 
     // Two minutes on — the point at which `init` would have gone unlimited.
     link.advance(Duration::from_secs(120));
-    assert_eq!(link.actor.system().state(), LpcState::FailsafeState);
+    assert_eq!(link.actor.system().state(), LimitationState::FailsafeState);
 }
 
 /// The heartbeat the heat pump sends reaches the control box, which subscribed to it.
@@ -374,7 +408,7 @@ fn the_heat_pumps_heartbeat_reaches_its_subscriber() {
         .guard_events()
         .into_iter()
         .find_map(|e| match e {
-            SpineEvent::DataNotified { data, .. } => lpc::read_heartbeat(&data),
+            SpineEvent::DataNotified { data, .. } => limitation::read_heartbeat(&data),
             _ => None,
         })
         .expect("the heartbeat arrived");
@@ -437,4 +471,117 @@ fn a_second_energy_guard_cannot_take_the_binding() {
         "the first control box holds it"
     );
     assert!(!link.pump.relations().is_bound(&intruder, &server));
+}
+
+/// LPP is the same exchange in the other direction. A control box limits what a PV
+/// inverter may feed in, and the inverter answers exactly as a heat pump would.
+#[test]
+fn a_production_limit_reaches_the_inverter_and_is_acknowledged() {
+    let mut link = Link::producing();
+    link.commission();
+
+    link.heartbeat();
+    let result = link.write_limit(1_500.0, true).expect("an acknowledgement");
+
+    assert_eq!(result, ErrorNumber::None, "ACK, [LPP-002/1]");
+    assert_eq!(link.actor.system().state(), LimitationState::Limited);
+    assert_eq!(
+        link.actor.system().effective_limit(),
+        EffectiveLimit::Active(1_500.0)
+    );
+}
+
+/// What LPP changes is what the Controllable System *publishes*: the direction of the
+/// limit and the name of the failsafe key. Everything else is the same code, so this is
+/// the test that keeps the two use cases from being confused for one another.
+#[test]
+fn the_two_use_cases_publish_their_own_direction_and_key_name() {
+    for (mut link, direction, key) in [
+        (
+            Link::new(),
+            EnergyDirection::Consume,
+            "failsafeConsumptionActivePowerLimit",
+        ),
+        (
+            Link::producing(),
+            EnergyDirection::Produce,
+            "failsafeProductionActivePowerLimit",
+        ),
+    ] {
+        link.commission();
+
+        let load_control = link.pump.device().resolve(&link.pump_feature(1)).unwrap();
+        let CmdData::LoadControlLimitDescriptionListData(descriptions) = load_control
+            .data(&Function::LoadControlLimitDescriptionListData)
+            .expect("the limit description is published")
+        else {
+            panic!("expected the limit descriptions");
+        };
+        let description = &descriptions
+            .load_control_limit_description_data
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(description.limit_direction, Some(direction));
+        assert_eq!(
+            description.limit_type,
+            Some(LoadControlLimitType::SignDependentAbsValueLimit),
+            "both use cases fix the limit type"
+        );
+
+        let configuration = link.pump.device().resolve(&link.pump_feature(2)).unwrap();
+        let CmdData::DeviceConfigurationKeyValueDescriptionListData(keys) = configuration
+            .data(&Function::DeviceConfigurationKeyValueDescriptionListData)
+            .expect("the key descriptions are published")
+        else {
+            panic!("expected the key descriptions");
+        };
+        let keys = keys
+            .device_configuration_key_value_description_data
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            keys[0].key_name.as_ref().map(|k| k.as_str()),
+            Some(key),
+            "the failsafe key names its own use case"
+        );
+        assert_eq!(
+            keys[1].key_name.as_ref().map(|k| k.as_str()),
+            Some("failsafeDurationMinimum"),
+            "the duration key is common to both"
+        );
+    }
+}
+
+/// An Energy Guard discovers which of the two an appliance plays. A device may play
+/// both — a battery limits its charging and its discharging — so the name is what tells
+/// the two apart, not the features, which are identical.
+#[test]
+fn discovery_tells_the_two_use_cases_apart() {
+    let mut consuming = Link::new();
+    consuming.commission();
+    let mut producing = Link::producing();
+    producing.commission();
+
+    let address = consuming.pump.device().address().clone();
+    let peer = consuming.guard.peer(&address).unwrap();
+    assert!(
+        peer.use_case("limitationOfPowerConsumption", "ControllableSystem")
+            .is_some()
+    );
+    assert!(
+        peer.use_case("limitationOfPowerProduction", "ControllableSystem")
+            .is_none(),
+        "a heat pump running LPC does not claim LPP"
+    );
+
+    let address = producing.pump.device().address().clone();
+    let peer = producing.guard.peer(&address).unwrap();
+    assert!(
+        peer.use_case("limitationOfPowerProduction", "ControllableSystem")
+            .is_some()
+    );
+    assert!(
+        peer.use_case("limitationOfPowerConsumption", "ControllableSystem")
+            .is_none()
+    );
 }

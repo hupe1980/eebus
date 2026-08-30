@@ -11,8 +11,8 @@ on.
 > specification's own examples, the handshake, framing, discovery records, QR codes and
 > pairing service are tested against the official test specification, and the SPINE
 > engine carries discovery, bindings, subscriptions, reads, writes and notifications
-> between two nodes. Limitation of Power Consumption runs over it end to end —
-> `cargo run --example grid_limit`. TLS, mDNS-SD and a Tokio runtime adapter are what
+> between two nodes. Limitation of Power Consumption and Production both run over it end
+> to end — `cargo run --example grid_limit`. TLS, mDNS-SD and a Tokio runtime adapter are what
 > stand between this and a device on a real network. Nothing is published to crates.io
 > yet, and the API will change.
 
@@ -21,8 +21,9 @@ on.
 EEBUS is how a heat pump, a wallbox, a battery and an energy manager talk to each other
 and to the grid operator's control box. Since July 2026 four of its use cases —
 limiting and monitoring power consumption and production — are formally certifiable, and
-in Germany they are the mechanism behind §14a EnWG: when the low-voltage grid is
-congested, the distribution operator sends a limit and the building has to honour it.
+in Germany they are the mechanism behind §14a EnWG and EEG §9: when the low-voltage grid
+is congested, the distribution operator sends a limit and the building has to honour it,
+whether it is drawing power or feeding it in.
 
 The reference implementations are Go, Java and C. This crate is the Rust one, built to
 be certifiable rather than merely interoperable.
@@ -78,6 +79,22 @@ match engine.poll_event() {
     _ => {}
 }
 ```
+
+**Two use cases, one implementation.** Limitation of Power Consumption and Limitation of
+Power Production are the same use case pointed in opposite directions, and their
+specifications say so structurally: the same four scenarios, the same table numbers, the
+same thirteen transitions, and requirement identifiers that differ only in the prefix —
+[LPC-901] and [LPP-901] state one rule. So the state machine and the actor are written
+once and pointed by a `Direction`:
+
+```rust
+ControllableSystemActor::new(system, lpc::DIRECTION, load_control, config, diagnosis)
+ControllableSystemActor::new(system, lpp::DIRECTION, load_control, config, diagnosis)
+```
+
+The reference implementations duplicate the two. Here a fix to one is a fix to both, and
+the only thing the direction changes — the `limitDirection` on the wire and the name of
+the failsafe configuration key — is the thing the tests check.
 
 **Illegal states are unrepresentable.** A SPINE command carries a payload *choice*, so
 "two payloads in one command" cannot be built; other implementations model it as two
@@ -143,13 +160,13 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | Bindings and subscriptions, single-writer policy | ✅ | SPINE §5.3.5–5.3.6 |
 | SPINE engine: reads, writes, notifies, results, timeouts | ✅ | SPINE 1.3.0 Protocol Specification |
 | Deferred writes: the application answers before the engine does | ✅ | LPC IG §4.1.5 |
-| LPC Controllable System state machine | ✅ | LPC UC TS §2.3 + LPC IG 1.1.0 |
-| LPC Controllable System over the wire | ✅ | LPC UC TS §3.3 scenarios 1–4 |
+| LPC/LPP Controllable System state machine | ✅ | LPC/LPP UC TS §2.3 + the 2026 IGs |
+| LPC/LPP Controllable System over the wire | ✅ | LPC/LPP UC TS §3.3 scenarios 1–4 |
 | Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
 | TLS 1.2, mutual auth, certificates | ⬜ next | SHIP §9, §12 |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
 | Tokio runtime: sockets, timers, connection manager | ⬜ next | |
-| LPP, MPC, MGCP | ⬜ | UC TS, on the engine above |
+| MPC, MGCP | ⬜ | UC TS, on the engine above |
 | E-mobility, inverter, HVAC use cases | ⬜ | |
 
 Deliberate departures from the reference implementation, each driven by the

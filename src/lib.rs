@@ -65,7 +65,7 @@
 //! # Status
 //!
 //! Under construction, and not yet published. The model, codec, SHIP handshake, SPINE
-//! engine and the Limitation of Power Consumption use case are implemented and tested;
+//! engine and the two limitation use cases — LPC and LPP — are implemented and tested;
 //! TLS, mDNS-SD and a runtime adapter are the remaining milestones. The API will change.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

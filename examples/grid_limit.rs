@@ -27,9 +27,10 @@ use eebus::ship::{
 use eebus::spine::{
     Engine, ErrorNumber, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management,
 };
-use eebus::usecases::lpc::{
+use eebus::usecases::limitation::{
     self, ControllableSystem, ControllableSystemActor, CsConfig, EffectiveLimit,
 };
+use eebus::usecases::lpc;
 
 /// The `protocolId` that marks a SHIP data message as carrying SPINE.
 const SPINE_PROTOCOL_ID: &str = "ee1.0";
@@ -164,7 +165,7 @@ fn main() {
     now += Duration::from_secs(1);
     let limit = CmdData::LoadControlLimitListData(LoadControlLimitListData {
         load_control_limit_data: Some(vec![LoadControlLimitData {
-            limit_id: Some(lpc::LIMIT_ID),
+            limit_id: Some(limitation::LIMIT_ID),
             is_limit_active: Some(true),
             value: Some(ScaledNumber::from_f64(3_000.0, 0)),
             ..Default::default()
@@ -246,9 +247,9 @@ fn build_heat_pump() -> (Engine, ControllableSystemActor) {
     device
         .add_entity(
             LocalEntity::new([1], EntityType::HeatPumpAppliance)
-                .with_feature(lpc::load_control_feature(1))
-                .with_feature(lpc::device_configuration_feature(2))
-                .with_feature(lpc::device_diagnosis_feature(3)),
+                .with_feature(limitation::load_control_feature(1))
+                .with_feature(limitation::device_configuration_feature(2))
+                .with_feature(limitation::device_diagnosis_feature(3)),
         )
         .expect("a fresh entity");
 
@@ -265,6 +266,7 @@ fn build_heat_pump() -> (Engine, ControllableSystemActor) {
                 .with_nominal_max(11_000.0),
             Duration::ZERO,
         ),
+        lpc::DIRECTION,
         load_control,
         configuration,
         diagnosis,
