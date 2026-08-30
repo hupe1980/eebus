@@ -69,11 +69,15 @@
 //! are implemented and tested; TLS, mDNS-SD and a runtime adapter are the remaining
 //! milestones. The API will change.
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 extern crate alloc;
 
+#[cfg(feature = "cert")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cert")))]
+pub mod cert;
 pub mod codec;
 pub mod model;
 pub mod ship;

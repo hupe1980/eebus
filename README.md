@@ -187,7 +187,8 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | LPC/LPP Controllable System state machine | ✅ | LPC/LPP UC TS §2.3 + the 2026 IGs |
 | LPC/LPP Controllable System over the wire | ✅ | LPC/LPP UC TS §3.3 scenarios 1–4 |
 | Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
-| TLS 1.2, mutual auth, certificates | ⬜ next | SHIP §9, §12 |
+| Node certificates: secp256r1, SHA-1 SKI, PEM/DER | ✅ | SHIP §9.3, §12.2 (`cert`) |
+| TLS 1.2, mutual auth | ⬜ next | SHIP §9, §12 |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
 | Tokio runtime: sockets, timers, connection manager | ⬜ next | |
 | MPC/MGCP measurements, descriptions, constraints | ✅ | MPC/MGCP UC TS §3.2.2 |
@@ -267,6 +268,7 @@ committed.
 |---|---|---|
 | `std` | ✅ | Standard library. Without it the crate builds `no_std + alloc`. |
 | `pairing` | ✅ | SHIP Pairing Service (pulls in `hmac` and `sha2`). |
+| `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
 
 ## License
 
