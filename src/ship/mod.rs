@@ -26,5 +26,8 @@ pub use discovery::*;
 mod qr;
 pub use qr::*;
 
+mod spine;
+pub use spine::*;
+
 #[cfg(feature = "pairing")]
 pub mod pairing;

@@ -80,6 +80,9 @@ extern crate alloc;
 pub mod cert;
 pub mod codec;
 pub mod model;
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
+pub mod runtime;
 pub mod ship;
 pub mod spine;
 #[cfg(feature = "tls")]
