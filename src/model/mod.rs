@@ -24,6 +24,9 @@ pub use generated::*;
 mod payload;
 pub use payload::*;
 
+mod result;
+pub use result::*;
+
 mod values;
 pub use values::*;
 

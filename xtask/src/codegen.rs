@@ -53,7 +53,7 @@ pub fn run(root: &Path) -> Result<String, String> {
         xsd_dir: root.join("specs/EEBus_SPINE_V1.3.0/EEBus_SPINE_V1.3.0_Final_hp/XSDs"),
         out_dir: root.join("src/model/generated"),
         single_module: None,
-        handwritten: &["ElementTagType", "CmdType", "FilterType"],
+        handwritten: &["ElementTagType", "CmdType", "FilterType", "ErrorNumberType"],
         skip_groups: &[],
         choices: SPINE_CHOICES,
         inline_choices: &[],

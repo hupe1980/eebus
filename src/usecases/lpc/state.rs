@@ -462,16 +462,16 @@ impl ControllableSystem {
                 self.enter(LpcState::UnlimitedAutonomous, now);
             }
             LpcState::FailsafeState => {
-                // [LPC-922]: the failsafe duration minimum has run out.
-                if now.saturating_sub(self.entered_state_at) >= self.config.failsafe_duration {
-                    self.enter(LpcState::UnlimitedAutonomous, now);
-                }
-                // [LPC-921]: heartbeats resumed but no limit followed, so the Energy
-                // Guard is present but not in control.
-                else if self
+                // Two independent reasons to stop waiting for the Energy Guard:
+                // [LPC-922], the Failsafe Duration Minimum has run out, and [LPC-921],
+                // heartbeats resumed but no limit followed — the Energy Guard is
+                // present but not in control.
+                let minimum_elapsed =
+                    now.saturating_sub(self.entered_state_at) >= self.config.failsafe_duration;
+                let heard_but_not_controlling = self
                     .awaiting_write_since
-                    .is_some_and(|since| now.saturating_sub(since) >= SETTLE_TIMEOUT)
-                {
+                    .is_some_and(|since| now.saturating_sub(since) >= SETTLE_TIMEOUT);
+                if minimum_elapsed || heard_but_not_controlling {
                     self.enter(LpcState::UnlimitedAutonomous, now);
                 }
             }

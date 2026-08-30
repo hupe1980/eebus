@@ -118,9 +118,10 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | Installation QR code | ✅ | Installation requirements §3.1 |
 | SHIP Pairing Service digest and replay guard | ✅ | Pairing Service 1.0.0 §7, §11 |
 | Restricted Function Exchange: partial merge, delete, selectors | ✅ | SPINE §5.3.4 + SPINE IG §3.3 |
+| SPINE acknowledgements, error numbers, message counters | ✅ | SPINE §5.2.4–5.2.5 |
 | TLS 1.2, mutual auth, certificates | ⬜ next | SHIP §9, §12 |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
-| SPINE engine: discovery, bindings, subscriptions, RFE | ⬜ | SPINE 1.3.0 Protocol Specification |
+| SPINE engine: device model, discovery, bindings, subscriptions | ⬜ | SPINE 1.3.0 Protocol Specification |
 | LPC Controllable System state machine | ✅ | LPC UC TS §2.3 + LPC IG 1.1.0 |
 | Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
 | LPC/LPP/MPC/MGCP over the wire | ⬜ | needs the SPINE engine |
@@ -143,6 +144,14 @@ specification text or the 2026 implementation guides:
   cannot be matched by comparison is listed on the generated filter, so the engine can
   answer with SPINE `errorNumber` 8 instead of returning the wrong entries.
 * **The protocol handshake announces version 1.1**, as SHIP 1.1.0 §13.4.4.2.3 requires.
+
+## A worked example
+
+`cargo run --example grid_limit` plays out the §14a exchange in miniature: two nodes
+complete the SHIP handshake, the control box sends a heartbeat and then a 3 kW limit as a
+partial write, the heat pump applies it and answers with the acknowledgement that serves
+as evidence, and then the control box goes quiet and the failsafe takes over. Every layer
+is exercised and every message is printed as it appears on the wire.
 
 ## Building
 

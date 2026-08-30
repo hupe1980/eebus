@@ -405,3 +405,33 @@ pub fn from_json_slice(bytes: &[u8]) -> Result<Datagram, serde_json::Error> {
 pub fn from_json_str(s: &str) -> Result<Datagram, serde_json::Error> {
     from_json_slice(s.as_bytes())
 }
+
+/// Encodes a datagram as the `serde_json::Value` a SHIP `data.payload` carries.
+///
+/// SHIP declares `data.payload` as `xs:anyType` — an opaque document belonging to
+/// whatever protocol `data.header.protocolId` names — so the boundary between the two
+/// layers is exactly this conversion.
+pub fn to_json_value(datagram: &Datagram) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(DatagramRoot(datagram))
+}
+
+/// Decodes a datagram from the `serde_json::Value` of a SHIP `data.payload`.
+///
+/// ```
+/// use eebus::model::{to_json_value, from_json_value, Datagram, Header, MsgCounter};
+///
+/// let datagram = Datagram {
+///     header: Some(Header { msg_counter: Some(MsgCounter(1)), ..Default::default() }),
+///     payload: None,
+/// };
+/// let value = to_json_value(&datagram).unwrap();
+/// assert_eq!(from_json_value(value).unwrap(), datagram);
+/// ```
+pub fn from_json_value(value: serde_json::Value) -> Result<Datagram, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Root {
+        datagram: Datagram,
+    }
+    let root: Root = serde_json::from_value(value)?;
+    Ok(root.datagram)
+}

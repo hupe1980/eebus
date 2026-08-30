@@ -8,11 +8,6 @@ use super::super::*;
 #[allow(unused_imports)]
 use alloc::{string::String, vec::Vec};
 
-crate::eebus_id! {
-    /// `ErrorNumberType`.
-    pub struct ErrorNumber(u32);
-}
-
 crate::eebus_struct! {
     /// `ResultDataType`.
     pub struct ResultData {
