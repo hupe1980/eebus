@@ -9,8 +9,9 @@ on.
 > **Status: under construction.** The SPINE model and its wire codec are complete and
 > checked against the specification's own examples; the SHIP handshake, framing,
 > discovery records, QR codes and pairing service are implemented and tested against the
-> official test specification. TLS, mDNS, the SPINE engine and the use-case layer are
-> the next milestones. Nothing is published to crates.io yet, and the API will change.
+> official test specification; the LPC state machine implements every transition of the
+> use case together with the 2026 implementation guide's rules. TLS, mDNS and the SPINE
+> engine that connects the two ends are the next milestones. Nothing is published to crates.io yet, and the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -120,7 +121,9 @@ assert_eq!(to_json(&datagram)?, message); // byte for byte
 | TLS 1.2, mutual auth, certificates | ⬜ next | SHIP §9, §12 |
 | mDNS-SD announce and browse | ⬜ next | SHIP §5 |
 | SPINE engine: discovery, bindings, subscriptions, RFE | ⬜ | SPINE 1.3.0 Protocol Specification |
-| Use cases: LPC, LPP, MPC, MGCP | ⬜ | UC TS 1.0.0 + LPC IG 1.1.0 |
+| LPC Controllable System state machine | ✅ | LPC UC TS §2.3 + LPC IG 1.1.0 |
+| Use-case descriptors (actors, scenarios, features) | ✅ | UC TS §3 + UC IG General §2.1 |
+| LPC/LPP/MPC/MGCP over the wire | ⬜ | needs the SPINE engine |
 | E-mobility, inverter, HVAC use cases | ⬜ | |
 
 Deliberate departures from the reference implementation, each driven by the

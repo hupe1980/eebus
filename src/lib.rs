@@ -28,3 +28,4 @@ extern crate alloc;
 pub mod codec;
 pub mod model;
 pub mod ship;
+pub mod usecases;
