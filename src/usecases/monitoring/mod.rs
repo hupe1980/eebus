@@ -39,6 +39,8 @@
 mod appliance;
 pub use appliance::*;
 
+pub mod functions;
+
 mod measurand;
 pub use measurand::*;
 

@@ -34,6 +34,26 @@ pub enum Naming {
     Appliance,
     /// `gridConsumption` / `gridFeedIn` — Monitoring of the Grid Connection Point.
     GridConnectionPoint,
+    /// A car being charged — EV Charging Electricity Measurement.
+    ///
+    /// The energies are named from the appliance's side as in MPC; what a car adds is
+    /// [`Quantity::EnergyCharged`](super::Quantity::EnergyCharged), whose scope is
+    /// `charge` in every use case.
+    EvCharging,
+    /// A car's battery — EV State of Charge.
+    EvBattery,
+}
+
+impl Naming {
+    /// The prefix runtime signals are named with: `mpc`, `mgcp`, `evcem` or `evsoc`.
+    pub const fn signal_prefix(self) -> &'static str {
+        match self {
+            Self::Appliance => "mpc",
+            Self::GridConnectionPoint => "mgcp",
+            Self::EvCharging => "evcem",
+            Self::EvBattery => "evsoc",
+        }
+    }
 }
 
 /// One measurement, with the identifiers it was assigned and its latest value.
@@ -180,8 +200,10 @@ impl MonitoredUnit {
 
     fn scope_of(&self, measurand: &Measurand) -> crate::model::ScopeType {
         match self.naming {
-            Naming::Appliance => measurand.scope_type(),
+            // Only a grid connection point renames the two energies; everywhere else,
+            // including a car, the scope follows from the measurand alone.
             Naming::GridConnectionPoint => measurand.grid_scope_type(),
+            Naming::Appliance | Naming::EvCharging | Naming::EvBattery => measurand.scope_type(),
         }
     }
 
@@ -236,7 +258,9 @@ impl MonitoredUnit {
                             parameter_id: Some(slot.parameter_id),
                             measurement_id: Some(slot.measurement_id),
                             voltage_type: Some(ElectricalConnectionVoltageType::Ac),
-                            ac_measured_phases: Some(slot.measurand.phases.clone()),
+                            // Omitted, not defaulted, for a direct-current measurement:
+                            // there are no phases to name.
+                            ac_measured_phases: slot.measurand.phases.clone(),
                             scope_type: Some(self.scope_of(&slot.measurand)),
                             ..Default::default()
                         })
@@ -348,5 +372,40 @@ impl MonitoredUnit {
         if changed {
             engine.notify(&address, &Function::MeasurementListData, now);
         }
+    }
+}
+
+impl crate::usecases::signals::Signals for MonitoredUnit {
+    /// Every measurand this unit publishes, and what it currently reads.
+    ///
+    /// Named `mpc:` or `mgcp:` after [`Naming`], because the same measurand means
+    /// something different at an appliance and at a grid connection point — and the
+    /// abstract test cases for the two are separate lists. A measurand that is not
+    /// `normal` reports its value state instead of its value, which is what
+    /// `ATC_MPC_SCE1_NT_MATotalActivePower_002` and its siblings are looking for.
+    fn signals(&self, _: ()) -> crate::usecases::signals::SignalSet {
+        use crate::usecases::signals::{Signal, SignalSet, SignalValue};
+        use alloc::borrow::Cow;
+        use alloc::format;
+
+        let prefix = self.naming.signal_prefix();
+        self.slots
+            .iter()
+            .map(|slot| {
+                let name = Cow::Owned(format!("{prefix}:{}", slot.measurand.signal_name()));
+                let value = match &slot.state {
+                    MeasurementValueState::Normal => SignalValue::number(slot.value),
+                    MeasurementValueState::OutOfRange => {
+                        SignalValue::Text(Cow::Borrowed("outOfRange"))
+                    }
+                    MeasurementValueState::Error => SignalValue::Text(Cow::Borrowed("error")),
+                    other => {
+                        SignalValue::Text(Cow::Owned(alloc::string::String::from(other.as_str())))
+                    }
+                };
+                Signal::new(name, value)
+                    .in_unit(alloc::string::String::from(slot.measurand.unit().as_str()))
+            })
+            .collect::<SignalSet>()
     }
 }

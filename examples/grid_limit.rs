@@ -304,7 +304,7 @@ fn build_control_box(now: Duration) -> (Engine, EnergyGuardActor) {
     (engine, guard)
 }
 
-/// The heat pump: a Controllable System with the three features LPC asks of it.
+/// The heat pump: a Controllable System with the four features LPC asks of it.
 fn build_heat_pump(now: Duration) -> (Engine, ControllableSystemActor) {
     let mut device = LocalDevice::new("i:67890", "HeatPump-1", DeviceType::HeatGenerationSystem)
         .expect("a valid device address");
@@ -313,13 +313,15 @@ fn build_heat_pump(now: Duration) -> (Engine, ControllableSystemActor) {
             LocalEntity::new([1], EntityType::HeatPumpAppliance)
                 .with_feature(limitation::load_control_feature(1))
                 .with_feature(limitation::device_configuration_feature(2))
-                .with_feature(limitation::device_diagnosis_feature(3)),
+                .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::electrical_connection_feature(4)),
         )
         .expect("a fresh entity");
 
     let load_control = device.address_of(&[1], 1);
     let configuration = device.address_of(&[1], 2);
     let diagnosis = device.address_of(&[1], 3);
+    let electrical = device.address_of(&[1], 4);
 
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
@@ -334,7 +336,9 @@ fn build_heat_pump(now: Duration) -> (Engine, ControllableSystemActor) {
         load_control,
         configuration,
         diagnosis,
-    );
+    )
+    // Scenario 4: the nameplate the Energy Guard needs to turn a percentage into watts.
+    .with_electrical_connection(electrical);
     actor.install(&mut engine, now);
     (engine, actor)
 }

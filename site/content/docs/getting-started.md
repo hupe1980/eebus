@@ -19,16 +19,28 @@ Default features are `std` and `pairing`. Sockets, TLS and certificates are opt-
 [Feature flags](@/docs/architecture.md#feature-flags). Minimum supported Rust version is
 **1.88**.
 
+Anything that touches TLS also needs a cryptography provider, and the crate does not pick
+one for you: add `ring` or `aws-lc-rs`, exactly one, or the build stops with an explanation.
+The choice is process-global in `rustls`, so it belongs to whoever builds the binary — see
+[the security model](@/docs/security.md#the-cryptography-provider-is-the-consumer-s-choice).
+
+```toml
+eebus = { git = "https://github.com/hupe1980/eebus", features = ["runtime", "ring"] }
+```
+
 ## Run the exchange
 
-Two examples ship with the repository, and between them they are the fastest way to
-understand the whole stack.
+Two examples play out the whole stack, and between them they are the fastest way to
+understand it.
 
 ```sh
 git clone https://github.com/hupe1980/eebus && cd eebus
-cargo run --example grid_limit                     # against a virtual clock
-cargo run --example networked --features runtime   # over a real socket
+cargo run --example grid_limit                          # against a virtual clock
+cargo run --example networked --features runtime,ring   # over a real socket
 ```
+
+Two more — `steuerbox` and `heat_pump` — are the same exchange as separate programs on a
+real network; see [On a network](@/docs/networking.md#the-two-simulators).
 
 `grid_limit` plays out §14a in miniature — handshake, discovery, binding, a 3 kW limit,
 its acknowledgement, and the failsafe taking over when the control box goes quiet. Every
@@ -117,3 +129,4 @@ if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
 * [What EEBUS is](@/docs/introduction.md) — the standard, if you have not met it.
 * [LPC and LPP](@/docs/limitation.md) — the §14a use case, both actors.
 * [On a network](@/docs/networking.md) — sockets, mDNS and reconnection.
+* [Certification](@/docs/certification.md) — the laboratory's test cases, and coverage.

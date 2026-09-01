@@ -32,7 +32,7 @@ use core::time::Duration;
 
 use crate::model::{
     AddressDevice, CmdData, DeviceConfigurationKeyValueData, DeviceConfigurationKeyValueListData,
-    DeviceConfigurationKeyValueValue, FeatureAddress, FeatureType, LoadControlLimitData,
+    DeviceConfigurationKeyValueValue, FeatureAddress, FeatureType, Function, LoadControlLimitData,
     LoadControlLimitListData, MsgCounter, Role, ScaledNumber, TimePeriod,
 };
 use crate::spine::{
@@ -41,7 +41,7 @@ use crate::spine::{
 };
 
 use super::Direction;
-use super::actor::{FAILSAFE_DURATION_KEY, FAILSAFE_LIMIT_KEY, LIMIT_ID};
+use super::actor::{FAILSAFE_DURATION_KEY, FAILSAFE_LIMIT_KEY, LIMIT_ID, NominalMax};
 use super::audit::{AuditLog, LimitRecord};
 use super::state::{FAILSAFE_DURATION_RANGE, LimitWrite, NackReason, WriteOutcome};
 
@@ -156,6 +156,18 @@ pub enum GuardEvent {
         /// When the guard will try again.
         retry_at: Duration,
     },
+    /// The Controllable System reported its nominal maximum (scenario 4).
+    ///
+    /// This is what turns a percentage from the grid operator into watts, so an Energy
+    /// Guard that works that way has to wait for it before it can write a limit at all.
+    /// Which of the two kinds arrived matters: a device's nameplate ([LPC/LPP-041]) is a
+    /// physical ceiling, a contractual maximum ([LPC/LPP-042]) is not.
+    ConstraintsLearned {
+        /// The peer.
+        device: AddressDevice,
+        /// What it reported.
+        nominal_max: NominalMax,
+    },
     /// The Controllable System's own heartbeat stopped.
     ///
     /// Informational only: §2.12 forbids letting it change what this actor does.
@@ -198,6 +210,23 @@ struct Tracked {
     attached_at: Duration,
     /// Whether the peer has subscribed to this guard's heartbeat (scenario 3).
     watches_heartbeat: bool,
+    /// What scenario 4 reported, once the read comes back.
+    nominal_max: Option<NominalMax>,
+    /// When this peer was last sent a heartbeat it could actually have received.
+    ///
+    /// Not the same as "when did this guard last beat". A heartbeat is a notification to
+    /// *subscribers*, so one emitted before this peer subscribed reached it no more than
+    /// if it had never been sent — and implementation guide §2.11 is about what the
+    /// Controllable System *received* in the sixty seconds before the write, not about
+    /// what the Energy Guard sent. Tracking it per peer is what stops the guard writing a
+    /// limit that the peer must then refuse for want of a heartbeat it never got.
+    beat_seen_at: Option<Duration>,
+    /// Whether the opening limit write of implementation guide §2.11 has gone out.
+    ///
+    /// Reset by [`EnergyGuardActor::attach`], because a reconnection starts the sequence
+    /// again — the Controllable System on the other end has been through `init` or the
+    /// failsafe state and is waiting for it.
+    opening_write_sent: bool,
 }
 
 impl Tracked {
@@ -218,6 +247,9 @@ impl Tracked {
             pending_bindings: Vec::new(),
             attached_at: now,
             watches_heartbeat: false,
+            nominal_max: None,
+            beat_seen_at: None,
+            opening_write_sent: false,
         }
     }
 
@@ -239,8 +271,7 @@ pub struct EnergyGuardActor {
     client: FeatureAddress,
     diagnosis: FeatureAddress,
     heartbeat: HeartbeatProducer,
-    /// When the last heartbeat went out, for the ordering rule of §2.11.
-    last_beat: Option<Duration>,
+
     peers: Vec<Tracked>,
     audit: AuditLog,
 }
@@ -263,7 +294,6 @@ impl EnergyGuardActor {
             // §2.11: a Controllable System evaluates a limit only after a heartbeat, so
             // the first one goes out immediately rather than a minute from now.
             heartbeat: HeartbeatProducer::new(now).due_at(now),
-            last_beat: None,
             peers: Vec::new(),
             audit: AuditLog::new(),
         }
@@ -334,7 +364,29 @@ impl EnergyGuardActor {
         if let Some(diagnosis) = tracked.peer.device_diagnosis.clone() {
             engine.request_subscription(&self.client, &diagnosis, now);
         }
+        // Scenario 4 is a one-off read, not a subscription: a nameplate does not change
+        // while the device runs, and a contract does not change without someone writing
+        // it. The reply is what [`GuardEvent::ConstraintsLearned`] reports.
+        if let Some(electrical) = tracked.peer.electrical_connection.clone() {
+            engine.read(
+                &electrical,
+                &self.client,
+                Function::ElectricalConnectionCharacteristicListData,
+                now,
+            );
+        }
         self.peers.push(tracked);
+    }
+
+    /// What a peer reported as its nominal maximum in scenario 4, once it has.
+    ///
+    /// [`None`] means the peer has not answered yet, or does not implement scenario 4 —
+    /// which it need not, the specification marking it `R` for a Controllable System.
+    pub fn nominal_max(&self, device: &AddressDevice) -> Option<NominalMax> {
+        self.peers
+            .iter()
+            .find(|t| &t.peer.device == device)
+            .and_then(|t| t.nominal_max)
     }
 
     /// Stops controlling a Controllable System, on disconnection or removal.
@@ -433,8 +485,14 @@ impl EnergyGuardActor {
 
     /// When [`handle_timeout`](Self::handle_timeout) should next be called.
     ///
-    /// The earliest of the heartbeat, a refusal's backoff, the subscription grace period,
-    /// and any limit waiting to go out.
+    /// The earliest of the heartbeat, a refusal's backoff, and any limit waiting to go
+    /// out — an *absolute* instant on the same monotonic scale as the `now` passed in.
+    ///
+    /// Every deadline reported here advances: a heartbeat moves when it fires, a due write
+    /// is cleared when it goes out. A caller sleeps until this value and calls
+    /// [`handle_timeout`](Self::handle_timeout), so an instant that could never be reached
+    /// again would turn that loop into a spin — and in a loop that also owns a socket, a
+    /// spin is a connection that is never read from.
     pub fn poll_timeout(&self) -> Duration {
         let mut next = self.heartbeat.poll_timeout();
         for tracked in &self.peers {
@@ -443,9 +501,6 @@ impl EnergyGuardActor {
             }
             if let Some(retry) = tracked.retry_at {
                 next = next.min(retry);
-            }
-            if tracked.is_ready() && !tracked.watches_heartbeat {
-                next = next.min(tracked.attached_at + SUBSCRIPTION_GRACE);
             }
         }
         next
@@ -461,7 +516,7 @@ impl EnergyGuardActor {
         // §2.12: our heartbeat does not depend on the peer's.
         let diagnosis = self.diagnosis.clone();
         if self.heartbeat.tick(engine, &diagnosis, now) {
-            self.last_beat = Some(now);
+            self.record_beat(now);
         }
 
         for index in 0..self.peers.len() {
@@ -489,7 +544,20 @@ impl EnergyGuardActor {
                 let index = self.peers.iter().position(|t| {
                     t.peer.device_diagnosis.as_ref() == Some(feature)
                         || &t.peer.load_control == feature
+                        || t.peer.electrical_connection.as_ref() == Some(feature)
                 })?;
+                if self.peers[index].peer.electrical_connection.as_ref() == Some(feature) {
+                    let nominal_max = super::actor::read_constraints(data, self.direction)?;
+                    let tracked = &mut self.peers[index];
+                    if tracked.nominal_max == Some(nominal_max) {
+                        return None;
+                    }
+                    tracked.nominal_max = Some(nominal_max);
+                    return Some(GuardEvent::ConstraintsLearned {
+                        device: tracked.peer.device.clone(),
+                        nominal_max,
+                    });
+                }
                 if self.peers[index].monitor.observe_data(data, now) {
                     return None;
                 }
@@ -651,6 +719,17 @@ impl EnergyGuardActor {
 
     /// Whether this peer's required limit differs from what it has acknowledged.
     fn wants_write(tracked: &Tracked) -> bool {
+        // Implementation guide §2.11: "Following a heartbeat, the EG SHALL perform a write
+        // operation on the Active Power Consumption Limit within 60 seconds." That is not
+        // conditional on the grid needing anything — until the write lands, the
+        // Controllable System is not in a controllable state at all, and after two minutes
+        // it stops waiting and runs autonomously. So the first write is owed even when
+        // the application has asked for nothing, and §2.13 says what it carries: the
+        // currently required limit, or a deactivation where the grid genuinely permits
+        // unlimited operation.
+        if !tracked.opening_write_sent {
+            return true;
+        }
         let required = tracked.required.or_else(|| {
             // Nothing required and nothing applied means nothing to say; something
             // applied means an explicit deactivation is owed.
@@ -666,6 +745,13 @@ impl EnergyGuardActor {
     fn write_limit_if_due(&mut self, engine: &mut Engine, index: usize, now: Duration) {
         let tracked = &mut self.peers[index];
         if !tracked.is_ready() || tracked.outstanding.is_some() {
+            // There is nothing to *wait* for here. What unblocks a write held up by a
+            // missing binding is the binding being granted, and what unblocks one held up
+            // by a write already in flight is that write's acknowledgement — both events,
+            // and both come back through here when they arrive. Leaving a deadline
+            // standing would report an instant that can never be reached again, and a
+            // caller that sleeps until `poll_timeout` would spin instead of sleeping.
+            tracked.write_due_at = None;
             return;
         }
         if !Self::wants_write(tracked) {
@@ -697,13 +783,20 @@ impl EnergyGuardActor {
 
         // §2.11 again: the heartbeat goes first, in the same batch, so the write lands
         // inside the sixty-second window it opens.
-        let stale = self
-            .last_beat
+        //
+        // The question is what *this peer* last received, not when this guard last beat.
+        // A heartbeat is a notification to subscribers, so one sent before this peer
+        // subscribed reached it no more than if it had never been sent — and a guard that
+        // counted it would write a limit the peer then has to refuse for want of a
+        // heartbeat it never got. That refusal is indistinguishable, from the operator's
+        // side, from a device declining to be limited.
+        let stale = self.peers[index]
+            .beat_seen_at
             .is_none_or(|at| now.saturating_sub(at) >= HEARTBEAT_FRESHNESS);
         if stale {
             let diagnosis = self.diagnosis.clone();
             self.heartbeat.beat_now(engine, &diagnosis, now);
-            self.last_beat = Some(now);
+            self.record_beat(now);
         }
 
         let limit = self.peers[index]
@@ -713,10 +806,30 @@ impl EnergyGuardActor {
         let counter = engine.write(&target, &self.client, limit_payload(&limit), true, now);
 
         let tracked = &mut self.peers[index];
+        let opening = !tracked.opening_write_sent;
         tracked.outstanding = Some((counter, limit));
-        tracked.last_write = Some(now);
+        // The opening write does not start the five-minute clock of §2.10. That
+        // recommendation is about not churning the limit; the opening write is a protocol
+        // obligation the guard owes whether or not the application has decided anything
+        // yet, and if it went out as a deactivation, §2.13 is explicit that a device may
+        // be unable to come back down again — so the requirement that follows it must not
+        // wait five minutes behind it.
+        tracked.last_write = (!opening).then_some(now);
         tracked.retry_at = None;
         tracked.write_due_at = None;
+        tracked.opening_write_sent = true;
+    }
+
+    /// Notes that a heartbeat has gone out, against every peer that could receive it.
+    ///
+    /// Only the peers that are watching: a notification goes to subscribers, so a peer
+    /// that has not subscribed has not been told anything, whatever the wire saw.
+    fn record_beat(&mut self, now: Duration) {
+        for tracked in &mut self.peers {
+            if tracked.watches_heartbeat {
+                tracked.beat_seen_at = Some(now);
+            }
+        }
     }
 
     fn tracked(&self, device: &AddressDevice) -> Option<&Tracked> {

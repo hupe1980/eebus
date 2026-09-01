@@ -31,6 +31,67 @@ pub enum Quantity {
     Voltage,
     /// Grid frequency, in hertz ([MPC-051], [MGCP-071]).
     Frequency,
+    /// Energy delivered into a car in this charging session, in watt-hours ([EVCEM-003]).
+    ///
+    /// `charge`, not `acEnergyConsumed`: what matters to a car is what went *into the
+    /// battery* this session, and a wallbox's lifetime import is a different number that
+    /// happens to share a unit.
+    EnergyCharged,
+    /// How much of a battery's usable capacity is charged, as a percentage ([EVSOC-001]).
+    StateOfCharge,
+    /// How much of a battery's original capacity it still has, as a percentage
+    /// ([EVSOC-003]).
+    StateOfHealth,
+    /// How far the car can still travel, in **metres** ([EVSOC-004]).
+    ///
+    /// Metres, which is what the specification fixes and not what a dashboard shows. A
+    /// client that read it as kilometres would offer to charge a car that can already get
+    /// home a thousand times over.
+    TravelRange,
+
+    // ---- what an inverter adds on top of MPC (MOI) -----------------------------
+    /// Apparent power, in volt-amperes ([MOI-031], [MOI-032]).
+    ApparentPower,
+    /// Reactive power, in volt-amperes reactive ([MOI-033], [MOI-034]).
+    ReactivePower,
+    /// The power factor, dimensionless ([MOI-035]).
+    PowerFactor,
+    /// Energy produced today, in watt-hours ([MOI-041]).
+    YieldDay,
+    /// Energy produced this month.
+    YieldMonth,
+    /// Energy produced this year.
+    YieldYear,
+    /// Energy produced since the device was installed.
+    YieldTotal,
+    /// A component's temperature, in degrees Celsius.
+    Temperature,
+
+    // ---- the direct-current side (MOB, MPS, MOI) --------------------------------
+    /// Direct-current power, in watts.
+    DcPower,
+    /// Direct current, in amperes.
+    DcCurrent,
+    /// Direct-current voltage, in volts.
+    DcVoltage,
+    /// Energy on the direct-current side, in watt-hours ([MPS-041]).
+    DcEnergy,
+    /// Energy that has gone *into* a battery, in watt-hours ([MOB-061]).
+    DcChargeEnergy,
+    /// Energy that has come *out of* a battery, in watt-hours ([MOB-062]).
+    DcDischargeEnergy,
+    /// The energy currently stored, in watt-hours ([MOB-072]).
+    ///
+    /// `energy` and watt-hours, not a percentage: `stateOfEnergy` is how much is in there,
+    /// where [`StateOfCharge`](Self::StateOfCharge) is what fraction of the capacity that
+    /// is. A client that mixed them up would read 12 000 as a percentage.
+    StateOfEnergy,
+    /// The capacity a battery has actually retained, in watt-hours ([MOB-081]).
+    UsableCapacity,
+    /// How many charge/discharge cycles a battery has been through ([MOB-073]).
+    LoadCycleCount,
+    /// Insulation resistance, in ohms ([MPS-051]).
+    InsulationResistance,
 }
 
 impl Quantity {
@@ -42,6 +103,25 @@ impl Quantity {
             Self::Current => MeasurementType::Current,
             Self::Voltage => MeasurementType::Voltage,
             Self::Frequency => MeasurementType::Frequency,
+            Self::EnergyCharged => MeasurementType::Energy,
+            Self::StateOfCharge | Self::StateOfHealth => MeasurementType::Percentage,
+            Self::TravelRange => MeasurementType::Distance,
+            Self::ApparentPower | Self::ReactivePower | Self::DcPower => MeasurementType::Power,
+            Self::PowerFactor => MeasurementType::PowerFactor,
+            Self::YieldDay
+            | Self::YieldMonth
+            | Self::YieldYear
+            | Self::YieldTotal
+            | Self::DcEnergy
+            | Self::DcChargeEnergy
+            | Self::DcDischargeEnergy
+            | Self::StateOfEnergy => MeasurementType::Energy,
+            Self::Temperature => MeasurementType::Temperature,
+            Self::DcCurrent => MeasurementType::Current,
+            Self::DcVoltage => MeasurementType::Voltage,
+            Self::UsableCapacity => MeasurementType::Capacity,
+            Self::LoadCycleCount => MeasurementType::Count,
+            Self::InsulationResistance => MeasurementType::Resistance,
         }
     }
 
@@ -53,6 +133,42 @@ impl Quantity {
             Self::Current => UnitOfMeasurement::A,
             Self::Voltage => UnitOfMeasurement::V,
             Self::Frequency => UnitOfMeasurement::Hz,
+            Self::EnergyCharged => UnitOfMeasurement::Wh,
+            Self::StateOfCharge | Self::StateOfHealth => UnitOfMeasurement::Pct,
+            Self::TravelRange => UnitOfMeasurement::M,
+            Self::ApparentPower => UnitOfMeasurement::VA,
+            Self::ReactivePower => UnitOfMeasurement::Var,
+            // `1`: a power factor and a cycle count are ratios and counts, and SPINE says
+            // so with a unit rather than by omitting one.
+            Self::PowerFactor | Self::LoadCycleCount => UnitOfMeasurement::V1,
+            Self::YieldDay
+            | Self::YieldMonth
+            | Self::YieldYear
+            | Self::YieldTotal
+            | Self::DcEnergy
+            | Self::DcChargeEnergy
+            | Self::DcDischargeEnergy
+            | Self::StateOfEnergy
+            | Self::UsableCapacity => UnitOfMeasurement::Wh,
+            Self::Temperature => UnitOfMeasurement::DegC,
+            Self::DcPower => UnitOfMeasurement::W,
+            Self::DcCurrent => UnitOfMeasurement::A,
+            Self::DcVoltage => UnitOfMeasurement::V,
+            Self::InsulationResistance => UnitOfMeasurement::Ohm,
+        }
+    }
+
+    /// The range this quantity can meaningfully take, where the specification fixes one.
+    ///
+    /// A percentage is nought to a hundred and a distance is not negative; a power at a
+    /// grid connection point is negative when the building is exporting, so it has none.
+    /// Used as the default constraint a Monitored Unit publishes, and as what makes a
+    /// reading `outOfRange` rather than believed.
+    pub const fn natural_range(self) -> Option<(f64, f64)> {
+        match self {
+            Self::StateOfCharge | Self::StateOfHealth => Some((0.0, 100.0)),
+            Self::TravelRange | Self::EnergyCharged => Some((0.0, f64::MAX)),
+            _ => None,
         }
     }
 }
@@ -66,8 +182,13 @@ impl Quantity {
 pub struct Measurand {
     /// What is measured.
     pub quantity: Quantity,
-    /// Which phases it was measured on.
-    pub phases: ElectricalConnectionPhaseName,
+    /// Which phases it was measured on, or [`None`] for a measurement that has none.
+    ///
+    /// Direct current has no phases, and a battery or a PV string measured on its DC side
+    /// publishes no `acMeasuredPhases` at all. That is a different thing from a
+    /// three-phase total, and conflating the two would have a client looking for phase
+    /// information that is not coming.
+    pub phases: Option<ElectricalConnectionPhaseName>,
 }
 
 impl Measurand {
@@ -75,7 +196,7 @@ impl Measurand {
     pub const fn total(quantity: Quantity) -> Self {
         Self {
             quantity,
-            phases: ElectricalConnectionPhaseName::Abc,
+            phases: Some(ElectricalConnectionPhaseName::Abc),
         }
     }
 
@@ -83,7 +204,20 @@ impl Measurand {
     pub const fn on(quantity: Quantity, phase: ElectricalConnectionPhaseName) -> Self {
         Self {
             quantity,
-            phases: phase,
+            phases: Some(phase),
+        }
+    }
+
+    /// A measurement that has no phases at all.
+    ///
+    /// Everything on a direct-current side — a battery, an inverter's DC input, a PV
+    /// string — and everything that is not an electrical flow in the first place: a state
+    /// of charge, a state of health, a travel range. `acMeasuredPhases` is omitted rather
+    /// than set to anything, which is what tells a client not to wait for it.
+    pub const fn unphased(quantity: Quantity) -> Self {
+        Self {
+            quantity,
+            phases: None,
         }
     }
 
@@ -93,8 +227,16 @@ impl Measurand {
     }
 
     /// True when this covers the whole connection rather than a single phase.
+    ///
+    /// A direct-current measurement counts as total: there is one of it, and nothing to
+    /// break it down by.
     pub const fn is_total(&self) -> bool {
-        matches!(self.phases, ElectricalConnectionPhaseName::Abc)
+        matches!(self.phases, Some(ElectricalConnectionPhaseName::Abc) | None)
+    }
+
+    /// Whether this is measured on a direct-current side.
+    pub const fn is_dc(&self) -> bool {
+        self.phases.is_none()
     }
 
     /// The `commodityType` of the description, which is `electricity` throughout.
@@ -116,6 +258,32 @@ impl Measurand {
             Quantity::Current => ScopeType::AcCurrent,
             Quantity::Voltage => ScopeType::AcVoltage,
             Quantity::Frequency => ScopeType::AcFrequency,
+            Quantity::EnergyCharged => ScopeType::Charge,
+            Quantity::StateOfCharge => ScopeType::StateOfCharge,
+            Quantity::StateOfHealth => ScopeType::StateOfHealth,
+            Quantity::TravelRange => ScopeType::TravelRange,
+            // Apparent and reactive power name the total separately from a phase, exactly
+            // as active power does.
+            Quantity::ApparentPower if self.is_total() => ScopeType::AcPowerApparentTotal,
+            Quantity::ApparentPower => ScopeType::AcPowerApparent,
+            Quantity::ReactivePower if self.is_total() => ScopeType::AcPowerReactiveTotal,
+            Quantity::ReactivePower => ScopeType::AcPowerReactive,
+            Quantity::PowerFactor => ScopeType::AcCosPhi,
+            Quantity::YieldDay => ScopeType::AcYieldDay,
+            Quantity::YieldMonth => ScopeType::AcYieldMonth,
+            Quantity::YieldYear => ScopeType::AcYieldYear,
+            Quantity::YieldTotal => ScopeType::AcYieldTotal,
+            Quantity::Temperature => ScopeType::ComponentTemperature,
+            Quantity::DcPower => ScopeType::DcPower,
+            Quantity::DcCurrent => ScopeType::DcCurrent,
+            Quantity::DcVoltage => ScopeType::DcVoltage,
+            Quantity::DcEnergy => ScopeType::DcEnergy,
+            Quantity::DcChargeEnergy => ScopeType::DcChargeEnergy,
+            Quantity::DcDischargeEnergy => ScopeType::DcDischargeEnergy,
+            Quantity::StateOfEnergy => ScopeType::StateOfEnergy,
+            Quantity::UsableCapacity => ScopeType::UseableCapacity,
+            Quantity::LoadCycleCount => ScopeType::LoadCycleCount,
+            Quantity::InsulationResistance => ScopeType::InsulationResistance,
         }
     }
 
@@ -140,6 +308,59 @@ impl Measurand {
     /// The `measurementType` of the description.
     pub const fn measurement_type(&self) -> MeasurementType {
         self.quantity.measurement_type()
+    }
+}
+
+impl Measurand {
+    /// The name this measurand is reported under in a debug interface.
+    ///
+    /// The quantity in `lowerCamelCase`, with the phases appended where the measurand is
+    /// not the whole connection: `totalActivePower`, `activePowerA`, `voltageAb`.
+    pub fn signal_name(&self) -> alloc::string::String {
+        use alloc::string::ToString;
+
+        let quantity = match self.quantity {
+            Quantity::Power if self.is_total() => "totalActivePower",
+            Quantity::Power => "activePower",
+            Quantity::EnergyConsumed => "energyConsumed",
+            Quantity::EnergyProduced => "energyProduced",
+            Quantity::Current => "current",
+            Quantity::Voltage => "voltage",
+            Quantity::Frequency => "frequency",
+            Quantity::EnergyCharged => "energyCharged",
+            Quantity::StateOfCharge => "stateOfCharge",
+            Quantity::StateOfHealth => "stateOfHealth",
+            Quantity::TravelRange => "travelRange",
+            Quantity::ApparentPower => "apparentPower",
+            Quantity::ReactivePower => "reactivePower",
+            Quantity::PowerFactor => "powerFactor",
+            Quantity::YieldDay => "yieldDay",
+            Quantity::YieldMonth => "yieldMonth",
+            Quantity::YieldYear => "yieldYear",
+            Quantity::YieldTotal => "yieldTotal",
+            Quantity::Temperature => "temperature",
+            Quantity::DcPower => "dcPower",
+            Quantity::DcCurrent => "dcCurrent",
+            Quantity::DcVoltage => "dcVoltage",
+            Quantity::DcEnergy => "dcEnergy",
+            Quantity::DcChargeEnergy => "dcChargeEnergy",
+            Quantity::DcDischargeEnergy => "dcDischargeEnergy",
+            Quantity::StateOfEnergy => "stateOfEnergy",
+            Quantity::UsableCapacity => "usableCapacity",
+            Quantity::LoadCycleCount => "loadCycleCount",
+            Quantity::InsulationResistance => "insulationResistance",
+        };
+        let Some(phases) = self.phases.as_ref().filter(|_| !self.is_total()) else {
+            return quantity.to_string();
+        };
+        let phases = phases.as_str();
+        let mut name = alloc::string::String::from(quantity);
+        let mut chars = phases.chars();
+        if let Some(first) = chars.next() {
+            name.extend(first.to_uppercase());
+            name.push_str(chars.as_str());
+        }
+        name
     }
 }
 

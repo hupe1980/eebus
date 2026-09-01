@@ -22,6 +22,9 @@ use eebus::model::{
     MeasurementData, MeasurementId, MeasurementListData, ScaledNumber,
 };
 use eebus::ship::{ShipMessage, Ski};
+use eebus::usecases::limitation::{
+    ControllableSystem, CsConfig, LimitWrite, LimitationState, LocalDecision, RejectReason,
+};
 use proptest::prelude::*;
 
 // ---- strategies --------------------------------------------------------------
@@ -417,4 +420,165 @@ fn an_unrepresentable_limit_value_is_refused() {
         None,
         "an overflowing value makes the whole write unusable"
     );
+}
+
+// ---- the limitation state machine, driven at random ---------------------------
+
+/// One thing that can happen to a Controllable System.
+#[derive(Clone, Copy, Debug)]
+enum CsStep {
+    Heartbeat,
+    Write {
+        active: bool,
+        watts: f64,
+        duration: Option<u64>,
+    },
+    Reject,
+    Interrupt,
+    FailsafeLimit(f64),
+    FailsafeDuration(u64),
+    Tick,
+    /// Jump to whatever the machine said its next deadline was.
+    Deadline,
+}
+
+fn cs_step() -> impl Strategy<Value = (CsStep, u64)> {
+    let step = prop_oneof![
+        2 => Just(CsStep::Heartbeat),
+        3 => (any::<bool>(), 0.0f64..50_000.0, proptest::option::of(0u64..7_200))
+            .prop_map(|(active, watts, duration)| CsStep::Write { active, watts, duration }),
+        1 => Just(CsStep::Reject),
+        1 => Just(CsStep::Interrupt),
+        1 => (0.0f64..20_000.0).prop_map(CsStep::FailsafeLimit),
+        1 => (0u64..30 * 3_600).prop_map(CsStep::FailsafeDuration),
+        2 => Just(CsStep::Tick),
+        3 => Just(CsStep::Deadline),
+    ];
+    (step, 0u64..400)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// The invariant the whole sans-IO contract rests on: a caller that only ever waits
+    /// for [`ControllableSystem::poll_timeout`] must still reach every timed transition.
+    /// `None` is returned in exactly one state — `unlimited/autonomous`, where nothing is
+    /// pending — so a `None` anywhere else would make the failsafe of [LPC/LPP-911]
+    /// unreachable from a caller that waits on it.
+    #[test]
+    fn poll_timeout_is_none_only_when_nothing_is_pending(
+        steps in proptest::collection::vec(cs_step(), 1..40),
+    ) {
+        let mut cs = ControllableSystem::new(
+            CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)),
+            Duration::ZERO,
+        );
+        let mut now = Duration::ZERO;
+
+        for (step, advance) in steps {
+            now += Duration::from_secs(advance);
+            match step {
+                CsStep::Heartbeat => cs.on_heartbeat(now),
+                CsStep::Write { active, watts, duration } => {
+                    let write = LimitWrite {
+                        is_active: active,
+                        watts,
+                        duration: duration.map(Duration::from_secs),
+                    };
+                    cs.on_limit_write(&write, LocalDecision::Apply, now);
+                }
+                CsStep::Reject => {
+                    cs.on_limit_write(
+                        &LimitWrite::active(1_000.0),
+                        LocalDecision::Reject(RejectReason::SelfProtection),
+                        now,
+                    );
+                }
+                CsStep::Interrupt => {
+                    cs.interrupt(RejectReason::SafetyRelated, now);
+                }
+                CsStep::FailsafeLimit(watts) => {
+                    cs.on_failsafe_limit_write(watts, now);
+                }
+                CsStep::FailsafeDuration(secs) => {
+                    cs.on_failsafe_duration_write(Duration::from_secs(secs), now);
+                }
+                CsStep::Tick => cs.handle_timeout(now),
+                CsStep::Deadline => {
+                    if let Some(deadline) = cs.poll_timeout() {
+                        now = now.max(deadline);
+                        cs.handle_timeout(now);
+                    }
+                }
+            }
+
+            let pending = cs.poll_timeout();
+            let autonomous = cs.state() == LimitationState::UnlimitedAutonomous;
+            prop_assert_eq!(
+                pending.is_none(),
+                autonomous,
+                "state {:?} reported {:?} as its next deadline",
+                cs.state(),
+                pending
+            );
+        }
+    }
+
+    /// Waiting on the deadline, and doing nothing else, always ends somewhere quiet.
+    ///
+    /// This is the shape of every caller: sleep until `poll_timeout`, call
+    /// `handle_timeout`, repeat. It has to terminate — a deadline that reproduces itself
+    /// unchanged would spin a real event loop at full speed.
+    #[test]
+    fn following_the_deadlines_terminates(watts in 0.0f64..20_000.0, hold in 0u64..7_200) {
+        let mut cs = ControllableSystem::new(
+            CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)),
+            Duration::ZERO,
+        );
+        cs.on_heartbeat(Duration::from_secs(1));
+        cs.on_limit_write(
+            &LimitWrite {
+                is_active: true,
+                watts,
+                duration: Some(Duration::from_secs(hold)),
+            },
+            LocalDecision::Apply,
+            Duration::from_secs(2),
+        );
+
+        // Five is generous: limited → unlimited/controlled → failsafe → autonomous.
+        let mut steps = 0;
+        while let Some(deadline) = cs.poll_timeout() {
+            cs.handle_timeout(deadline);
+            steps += 1;
+            prop_assert!(steps <= 8, "the deadlines did not settle: {:?}", cs.state());
+        }
+        prop_assert_eq!(cs.state(), LimitationState::UnlimitedAutonomous);
+    }
+
+    /// The number an appliance acts on is never above the Energy Guard's limit and never
+    /// above the contract ([LPC/LPP-042]) — including when the Energy Guard says nothing.
+    #[test]
+    fn the_power_ceiling_never_exceeds_either_bound(
+        limit in 0.0f64..30_000.0,
+        contract in 0.0f64..30_000.0,
+    ) {
+        let mut cs = ControllableSystem::new(
+            CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600))
+                .with_contractual_max(contract),
+            Duration::ZERO,
+        );
+        cs.on_heartbeat(Duration::from_secs(1));
+        cs.on_limit_write(
+            &LimitWrite::active(limit),
+            LocalDecision::Apply,
+            Duration::from_secs(2),
+        );
+
+        let ceiling = cs.power_ceiling().expect("a contract is always a ceiling");
+        prop_assert!(ceiling <= contract + f64::EPSILON, "{ceiling} above the contract");
+        if let Some(effective) = cs.effective_limit().watts() {
+            prop_assert!(ceiling <= effective + f64::EPSILON, "{ceiling} above the limit");
+        }
+    }
 }

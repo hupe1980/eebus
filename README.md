@@ -15,8 +15,8 @@ alongside the code. [What EEBUS is](https://hupe1980.github.io/eebus/docs/introd
 
 > **Status: under construction.** The stack is complete from the socket to the use case,
 > and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are
-> implemented on **both** sides, as are two of the e-mobility family. Not published to
-> crates.io yet; the API will change.
+> implemented on **both** sides, as are six of the e-mobility family and four more for
+> inverters, PV strings and batteries. Not published to crates.io yet; the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -104,9 +104,10 @@ minutes otherwise (§2.10).
 
 **Two use cases, one implementation.** LPC and LPP are the same use case pointed in opposite
 directions — the same four scenarios, table numbers and thirteen transitions — so the state
-machine and both actors are written once and pointed by a `Direction`. MPC and MGCP share
-theirs the same way. The reference implementations duplicate each pair; here a fix to one is
-a fix to both.
+machine and both actors are written once and pointed by a `Direction`. OPEV and OSCEV are
+the same pair on the e-mobility side, pointed by a `Purpose`; seven use cases share one
+measurement layer. The reference implementations duplicate each; here a fix to one is a fix
+to all.
 
 **Illegal states are unrepresentable.** A SPINE command carries a payload *choice*, so "two
 payloads in one command" cannot be built. Identifiers are distinct types, so a
@@ -123,9 +124,11 @@ reach — SHIP framing, the JSON codec, the QR payload, the TXT record, a whole 
 through the engine — and property tests cover the round trips, the merge laws, and the
 arithmetic above. On a heat-pump controller a panic is a reboot.
 
-**Tests carry the certification's identifiers.** `TC_SHIP_HELLO_002`, `TC_SPINE_COMP_006`,
-`TC_SPINE_RTS_005` and their siblings name the tests that cover them, so `cargo test` is a
-pre-check for the laboratory rather than a separate exercise.
+**Tests carry the certification's identifiers.** `TC_SHIP_HELLO_002`, `TC_SPINE_COMP_006`
+and their siblings name the tests that cover them. For the four certifiable use cases,
+`eebus::conformance` carries all 203 abstract test cases of the High-Level Test
+Specifications as data and `cargo test` prints a coverage number against them — with what it
+cannot cover, such as a factory reset or a power cut, listed with the reason.
 
 ## The wire format
 
@@ -165,12 +168,19 @@ byte. [More on the wire format](https://hupe1980.github.io/eebus/docs/wire-forma
 | | bindings and subscriptions, single-writer policy, group lock | §5.3.5–5.3.6, LPC IG §3.5 |
 | | the binding and subscription tables, served from the live relations | §7.3.2, §7.4.2 |
 | | heartbeat producer and monitor; deferred writes on the merged state | LPC/LPP scenario 3, LPC IG §4.1.5 |
-| **Use cases** | LPC and LPP: state machine, both actors, the §14a record | UC TS §2.3, §3.3 + the 2026 IGs |
-| | MPC and MGCP: both actors, incl. the PV curtailment factor | MPC/MGCP UC TS §3.2.2 |
-| | EVSECC and OPEV: both actors | EVSECC 1.0.1, OPEV 1.0.1b |
+| **Use cases** | 14 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
+| | LPC and LPP: state machine, both actors, the §14a record | UC TS §2.3, §3.3 + the 2026 IGs |
+| | scenario 4 constraints: the nameplate for a device, the contract for a CEM | [LPC/LPP-041], [LPC/LPP-042], UC TS §2.6.4.1 |
+| | MPC and MGCP: both actors, incl. the PV curtailment factor as a ceiling in watts | MPC/MGCP UC TS §3.2.2, [MGCP-011] |
+| | six e-mobility use cases; OPEV and OSCEV as one machine, told apart by `limitCategory` | EVSECC/EVCC/OPEV/OSCEV/EVCEM 1.0.1, EVSOC 1.0.0 |
+| | inverter, PV string and battery monitoring | MOI/MPS/MOB 1.0.0 |
+| | Control of Battery: six states, twenty transitions, both control modes | COB 1.0.0 §2.4 |
+| **Certification** | the 203 abstract test cases of the four HLTS as data, and a coverage number | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
+| | runtime signals for a laboratory's debug interface | the HLTS "e.g. via debug interface" footnote |
 | **Transport** | node certificates, TLS 1.2 with mutual auth | SHIP §9, §12 (`cert`, `tls`) |
 | | mDNS-SD announce and browse | SHIP §5 (`mdns`) |
 | | connection table, keep-alive, reconnection with spread backoff | SHIP §10 (`runtime`) |
+| | persistent trust store, and the "delete all foreign keys" reset | SHIP §12.2.2 (`runtime`) |
 
 Where the crate deliberately departs from the reference implementations — the §12.2.3
 double-connection rule, no session resumption, refusing unsupported selectors rather than
@@ -180,17 +190,35 @@ deliberately *not* here — JSON-UTF16, Brainpool curves, enhanced-mode routing,
 persistence layer — is listed under
 [Scope and non-goals](https://hupe1980.github.io/eebus/docs/scope/).
 
-## Two runnable examples
+## Runnable examples
 
 ```sh
-cargo run --example grid_limit                     # against a virtual clock
-cargo run --example networked --features runtime   # over a real socket
+cargo run --example grid_limit                          # against a virtual clock
+cargo run --example networked --features runtime,ring   # over a real socket
 ```
 
 Both play out the §14a exchange: handshake, discovery, binding, a 3 kW limit, its
 acknowledgement, and the failsafe taking over when the control box goes quiet. `grid_limit`
 does it without a socket; `networked` generates certificates, approves SKIs and completes
 TLS 1.2 with mutual authentication over loopback first.
+
+### The two simulators
+
+A control box and a household appliance, on a real network — one on each side of the §14a
+exchange, so either can be tested without the other's hardware on the desk.
+
+```sh
+# In one terminal. First run prints the SKI and the QR payload, and trusts nobody.
+cargo run --example heat_pump --features full
+
+# In another. Trust each other, then hold the household to 4.2 kW.
+cargo run --example steuerbox --features full -- --trust <the pump's SKI> --limit 4200
+cargo run --example heat_pump --features full -- --trust <the box's SKI>
+```
+
+They announce themselves over mDNS, find each other, persist their identity and their trust
+store between runs, and print the `lpc:` runtime signals a certification laboratory reads.
+`--reset` is the EEBUS reset of SHIP §12.2.2: forget every peer, and the identity with it.
 
 On a network, [`Hub`](https://hupe1980.github.io/eebus/docs/networking/) owns the sockets and
 the clock — it dials and accepts, routes each datagram to the peer it names, keeps idle
@@ -201,7 +229,7 @@ peer's SKI so a building coming back from a power cut does not dial all at once.
 
 ```sh
 cargo build
-cargo test --workspace --all-features
+cargo test --workspace --features eebus/full
 ```
 
 `--workspace` includes the code generator in `xtask/`, which is what produces the committed
@@ -249,6 +277,29 @@ so re-running it when nothing has changed produces no diff.
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the SHIP handshake, the connection table. |
 | `mdns` | — | `_ship._tcp` announcement and discovery (`mdns-sd`). |
+| `ring` | — | `rustls` and `rcgen` backed by `ring`. |
+| `aws-lc-rs` | — | The same, backed by `aws-lc-rs`. |
+| `full` | — | Everything above, on `ring`. |
+
+### The cryptography provider is yours to pick
+
+`cert`, `tls` and `runtime` need one of `ring` or `aws-lc-rs`, and this crate names neither
+by default: `rustls`' provider is process-global, so a library that pulled one in would
+choose for every consumer downstream of it.
+
+```toml
+eebus = { version = "0.2", features = ["runtime", "ring"] }
+# or, for a build that must not contain `ring`:
+eebus = { version = "0.2", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+```
+
+Naming both, or neither, is a `compile_error!` rather than a device that panics on its first
+connection. `eebus::tls::CRYPTO_PROVIDER` says which one a binary got. Nothing here reads
+`rustls`' process default — the provider is built explicitly, with exactly the suites SHIP §9
+permits — so a consumer that installed its own keeps it.
+
+`--all-features` is therefore not a configuration that can exist; `--features full` is
+everything, on `ring`.
 
 Minimum supported Rust version: 1.88.
 

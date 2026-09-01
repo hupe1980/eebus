@@ -83,11 +83,44 @@ guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 Behind that line:
 
 * a heartbeat immediately before the write, and only once the peer has subscribed to it
-  (§2.11);
+  (§2.11) — and the heartbeat that counts is one *this* peer could have received, not
+  merely one this guard sent, because a notification reaches subscribers and nobody else;
+* an opening write on the limit as soon as the bindings settle, whether or not the grid is
+  asking for anything, because until it lands the Controllable System is not in a
+  controllable state at all (§2.11);
 * never a deactivation as the first limit after a reconnection (§2.13);
 * never a zero duration on an activated limit (§2.2);
 * a refusal retried a minute later, and a minute later again, with the device kept (§2.5);
-* and no more than one write every five minutes otherwise (§2.10).
+* and no more than one write every five minutes otherwise (§2.10) — the opening write
+  excepted, since a limit that follows it must not wait five minutes behind a deactivation.
+
+## Scenario 4: what the Energy Guard is limiting
+
+An operator that works in percentages has nothing to multiply until the Controllable System
+says what it is. Scenario 4 is that, and the two values are mutually exclusive:
+
+* **Power Consumption Nominal Max** ([LPC-041]) — the nameplate, what the appliance can
+  physically draw. UC TS §2.6.4.1: for a device, and *not* for an energy manager.
+* **Contractual Consumption Nominal Max** ([LPC-042]) — what the customer's contract
+  allows. For an energy manager, and not for a device.
+
+Which one is published follows from the configuration rather than from a separate call, so
+the pair cannot drift:
+
+```rust
+let device = ControllableSystem::new(
+    CsConfig::new(4_200.0, failsafe_duration).with_nominal_max(11_000.0),
+    now,
+);
+let manager = ControllableSystem::new(
+    CsConfig::new(4_200.0, failsafe_duration).with_contractual_max(30_000.0).on_cem(),
+    now,
+);
+```
+
+An Energy Guard reads it in the pre-scenario exchange and hears about it as
+`GuardEvent::ConstraintsLearned`. LPP names the same two values
+`powerProductionNominalMax` and `contractualProductionNominalMax`.
 
 ## The §14a record
 

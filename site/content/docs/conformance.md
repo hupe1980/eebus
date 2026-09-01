@@ -13,6 +13,11 @@ tests that cover them. `cargo test` is therefore a pre-check for the laboratory 
 a separate exercise, and a failing conformance test says which published test case it
 corresponds to.
 
+For the four certifiable use cases this goes further: all 203 abstract test cases of the
+LPC, LPP, MPC and MGCP High-Level Test Specifications are carried as data, `cargo test`
+prints a coverage number, and what is *not* covered is listed with the reason. See
+[Certification](@/docs/certification.md).
+
 ## Every claim points at a sentence
 
 Citations live next to the code that satisfies them, not in a separate document that drifts.
@@ -84,17 +89,19 @@ certificate authorities and a SHIP node certificate is a leaf, so without this t
 
 | | |
 |---|---|
-| Unit and integration tests | `cargo test --workspace --all-features` |
-| Both examples, end to end | `cargo run --example grid_limit`, `--example networked` |
+| Unit and integration tests | `cargo test --workspace --features eebus/full` |
+| Examples, end to end | `cargo run --example grid_limit`, `--example networked` |
+| Both cryptography providers | `ring` builds and tests; `aws-lc-rs` is type-checked |
 | Property tests | round trips, the RFE merge laws and the wire arithmetic, via `proptest` |
 | Fuzzing | five `cargo fuzz` targets, run nightly; their compilation checked on every push |
-| Lints | `cargo clippy --workspace --all-targets --all-features` with `-D warnings` |
+| Lints | `cargo clippy --workspace --all-targets --features eebus/full` with `-D warnings` |
 | Documentation | `cargo doc` with `RUSTDOCFLAGS=-D warnings` |
 | Documented counts | the generated model's size, held to the number the docs quote |
 | Minimum Rust version | `cargo +1.88.0 check` |
 | Embedded | `cargo build --no-default-features --target thumbv7em-none-eabihf` |
 
 `--workspace` covers the code generator in `xtask/`; the fuzz targets are a workspace of
-their own and are compiled separately.
+their own and are compiled separately. `--all-features` is not used because it cannot be:
+the two cryptography providers are mutually exclusive, and `full` is everything on `ring`.
 
 All of it runs in CI on every push.

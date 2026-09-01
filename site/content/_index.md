@@ -3,7 +3,7 @@ title = "eebus"
 template = "index.html"
 [extra]
 landing = true
-lede = """An unofficial EEBUS implementation in Rust: the SHIP transport, the SPINE information model, and the four grid use cases certifiable since July 2026 — built to pass certification, not merely to interoperate."""
+lede = """An unofficial EEBUS implementation in Rust: the SHIP transport, the SPINE information model, and fourteen use cases on top — built to pass certification, not merely to interoperate."""
 status = "Under construction. The stack is complete from the socket to the use case; the API will change and nothing is published to crates.io yet."
 
 hero_code = """
@@ -27,7 +27,7 @@ match engine.poll_event() {
 value = "830"
 label = "SPINE types, generated"
 [[extra.stats]]
-value = "6"
+value = "14"
 label = "use cases, both actors"
 [[extra.stats]]
 value = "no_std"
@@ -42,7 +42,7 @@ body = "The SHIP handshake and the SPINE engine touch neither sockets nor clocks
 
 [[extra.features]]
 title = "Certifiable, not just interoperable"
-body = "Tests carry the certification's own identifiers — TC_SHIP_HELLO_002, TC_SPINE_COMP_006 and their siblings — so cargo test is a pre-check for the laboratory rather than a separate exercise."
+body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data, and cargo test prints a coverage number against them. What it cannot cover — a factory reset, a power cut — is listed with the reason."
 
 [[extra.features]]
 title = "Illegal states are unrepresentable"
@@ -50,7 +50,7 @@ body = "A command carries a payload choice, so two payloads in one command canno
 
 [[extra.features]]
 title = "One implementation per pair"
-body = "LPC and LPP are the same use case pointed in opposite directions; MPC and MGCP share their measurements. Each pair is written once, so a fix to one is a fix to both."
+body = "LPC and LPP are the same use case pointed in opposite directions, as are OPEV and OSCEV. Seven use cases share one measurement layer. Each is written once, so a fix to one is a fix to all."
 
 [[extra.features]]
 title = "Runs on the controller"

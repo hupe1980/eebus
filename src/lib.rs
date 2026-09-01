@@ -14,12 +14,30 @@
 //! | Layer | Module | Specification |
 //! |---|---|---|
 //! | Use cases | [`usecases`] | `EEBus_UC_TS_*` + the 2026 implementation guides |
-//! | E-mobility | [`usecases::emobility`] | EVSECC 1.0.1, OPEV 1.0.1b |
+//! | E-mobility | [`usecases::emobility`] | EVSECC, EVCC, OPEV, OSCEV, EVCEM, EVSOC |
+//! | Generation, storage | [`usecases::moi`], [`usecases::mps`], [`usecases::mob`], [`usecases::cob`] | MOI, MPS, MOB, COB |
 //! | Protocol | [`spine`] | SPINE 1.3.0 Protocol Specification |
 //! | Information model | [`model`] | SPINE 1.3.0 Resource Specification |
 //! | Transport | [`ship`] | SHIP 1.0.1 / 1.1.0 |
 //! | Wire format | [`codec`] | SHIP 1.1.0 §11.4 (XML→JSON) |
 //! | Sockets | [`runtime`] | TCP, TLS 1.2, WebSocket, the connection table |
+//! | Certification | [`conformance`] | The four High-Level Test Specifications, as data |
+//!
+//! # The cryptography provider is yours to pick
+//!
+//! [`cert`], [`tls`] and [`runtime`] need one of the `ring` or `aws-lc-rs` features, and
+//! **this crate names neither by default**. `rustls`' provider is process-global: a binary
+//! that links both panics the first time anything asks for the default, so the choice
+//! belongs to whoever builds the binary. Naming both, or naming neither, is a
+//! `compile_error!` rather than a device that panics the first time a control box
+//! connects; [`tls::CRYPTO_PROVIDER`] says which one a running binary got.
+//!
+//! Nothing here ever reads `rustls`' process default — the provider is built explicitly,
+//! with exactly the cipher suites and the one key-exchange group SHIP §9 permits — so a
+//! consumer that has installed its own keeps it.
+//!
+//! `--all-features` is therefore not a configuration that can exist. `--features full` is
+//! everything, on `ring`.
 //!
 //! # Sans-IO
 //!
@@ -74,15 +92,27 @@
 //! at the same moment would otherwise both hold.
 //!
 //! See `examples/grid_limit.rs` for the whole §14a exchange against a virtual clock, and
-//! `examples/networked.rs` for the same thing over a socket.
+//! `examples/networked.rs` for the same thing over a socket. `examples/steuerbox.rs` and
+//! `examples/heat_pump.rs` are the two halves as separate programs — a control box and a
+//! household appliance that find each other over mDNS, remember whom they trust, and print
+//! the runtime signals of [`usecases::signals`] as they go.
+//!
+//! # Certification
+//!
+//! [`conformance`] carries the 203 abstract test cases of the LPC, LPP, MPC and MGCP
+//! High-Level Test Specifications as data: what a laboratory will run, which requirement
+//! each covers, and whether it is mandatory. `tests/conformance.rs` runs this crate
+//! against them and prints a coverage number, which is worth having before a slot is
+//! booked rather than after.
 //!
 //! # Status
 //!
 //! Under construction, and not yet published. The model, codec, SHIP handshake and
 //! transport including certificate updates, the SPINE engine, the runtime, and all four
 //! use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are implemented and
-//! tested on both sides of each, as are two of the e-mobility family
-//! ([`usecases::emobility`]). The API will change.
+//! tested on both sides of each, as are six of the e-mobility family
+//! ([`usecases::emobility`]) and four more for inverters, PV strings and batteries. The
+//! API will change.
 //!
 //! EEBUS® is a trademark of EEBus Initiative e.V. This project is not affiliated with or
 //! endorsed by the EEBus Initiative.
@@ -93,10 +123,32 @@
 
 extern crate alloc;
 
+// `rustls` 0.23 and `rcgen` 0.14 can each be backed by `ring` or by `aws-lc-rs`, and the
+// choice is process-global: a binary that links both panics the first time anything asks
+// `rustls` for its default provider. So it is the consumer's to make, and a library that
+// made it silently would be making it for every consumer downstream of it.
+//
+// Hence: `cert`, `tls` and `runtime` require exactly one of the two features, and a build
+// that names both or neither stops here rather than at the first TLS connection.
+#[cfg(all(feature = "cert", feature = "ring", feature = "aws-lc-rs"))]
+compile_error!(
+    "eebus: both `ring` and `aws-lc-rs` are enabled, and rustls' provider is \
+     process-global — a binary linking both panics on its first connection. Enable \
+     exactly one. Note that `--all-features` therefore does not work: use \
+     `--features full` (which is everything, on `ring`) or name the features you want."
+);
+#[cfg(all(feature = "cert", not(feature = "ring"), not(feature = "aws-lc-rs")))]
+compile_error!(
+    "eebus: `cert`, `tls` and `runtime` need a cryptography provider, and this crate does \
+     not choose one for you: enable either `ring` or `aws-lc-rs`. `--features full` is \
+     everything on `ring`."
+);
+
 #[cfg(feature = "cert")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cert")))]
 pub mod cert;
 pub mod codec;
+pub mod conformance;
 #[cfg(feature = "mdns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
 pub mod mdns;

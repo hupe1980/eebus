@@ -18,12 +18,15 @@ players, the layers, and why a German grid regulation made this a certifiable pr
 rather than a hobby one.
 
 If you know the standard and want the code, go straight to
-[Getting started](@/docs/getting-started.md) and then the use case you need —
-[LPC and LPP](@/docs/limitation.md) for limiting power, [MPC and MGCP](@/docs/monitoring.md)
-for measuring it.
+[Getting started](@/docs/getting-started.md) and then the use case you need:
+[LPC and LPP](@/docs/limitation.md) for limiting power,
+[MPC and MGCP](@/docs/monitoring.md) for measuring it,
+[E-mobility](@/docs/e-mobility.md) for wallboxes and cars, and
+[inverters, PV and batteries](@/docs/storage.md) for the generation side.
 
-If you are evaluating the crate, [Architecture](@/docs/architecture.md) and
-[Conformance](@/docs/conformance.md) are the two pages that answer "is this real".
+If you are evaluating the crate, [Architecture](@/docs/architecture.md),
+[Conformance](@/docs/conformance.md) and [Certification](@/docs/certification.md) are the
+pages that answer "is this real".
 
 ## Conventions
 

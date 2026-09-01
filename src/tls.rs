@@ -52,6 +52,14 @@ pub const MAX_RECORD_SIZE: usize = 1024;
 /// The record size the parameter table recommends, and the default here.
 pub const RECOMMENDED_RECORD_SIZE: usize = 512;
 
+// Which backend `rustls` was built with. `src/lib.rs` refuses a build that names both or
+// neither, so exactly one of these arms is ever compiled; the `not(...)` keeps the module
+// well formed while that error is being reported.
+#[cfg(feature = "aws-lc-rs")]
+use rustls::crypto::aws_lc_rs as backend;
+#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+use rustls::crypto::ring as backend;
+
 /// The cipher suite SHIP §9.4 marks as SHALL, which rustls does not implement.
 pub const MANDATORY_SUITE: &str = "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256";
 
@@ -61,7 +69,7 @@ pub const MANDATORY_SUITE: &str = "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256";
 /// suite it mandates. `TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8` is deliberately absent: the
 /// installation requirements Annex A.4 say it SHOULD NOT be used.
 fn ship_cipher_suites() -> Vec<rustls::SupportedCipherSuite> {
-    use rustls::crypto::ring::cipher_suite::*;
+    use backend::cipher_suite::*;
 
     alloc::vec![
         TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -72,20 +80,39 @@ fn ship_cipher_suites() -> Vec<rustls::SupportedCipherSuite> {
 
 /// The key exchange group SHIP §9.3 requires.
 ///
-/// secp256r1 is a SHALL; brainpoolP256r1 and P384r1 are permitted but ring implements
-/// neither, and offering a group a SHIP node may not use only makes failures obscure.
+/// secp256r1 is a SHALL; brainpoolP256r1 and P384r1 are permitted but neither backend
+/// implements them, and offering a group a SHIP node may not use only makes failures
+/// obscure. The post-quantum hybrids `aws-lc-rs` offers by default are dropped for the
+/// same reason: a SHIP node is not allowed to negotiate one.
 fn ship_kx_groups() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
-    alloc::vec![rustls::crypto::ring::kx_group::SECP256R1]
+    alloc::vec![backend::kx_group::SECP256R1]
 }
 
 /// A crypto provider offering exactly what SHIP §9 permits.
+///
+/// Built explicitly rather than taken from the process default, which matters more than
+/// it looks: `rustls`' process default is a global, and a binary that links two providers
+/// panics the first time anything asks for it. Nothing in this crate ever does, so a
+/// consumer that has installed its own default keeps it, and one that has not is not
+/// caught out by us.
 fn ship_provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::CryptoProvider {
         cipher_suites: ship_cipher_suites(),
         kx_groups: ship_kx_groups(),
-        ..rustls::crypto::ring::default_provider()
+        ..backend::default_provider()
     }
 }
+
+/// The cryptography backend this build was compiled against: `ring` or `aws-lc-rs`.
+///
+/// Worth logging at start-up. The choice is the consumer's — see the crate documentation
+/// — and knowing which one a running binary picked up is the difference between a
+/// five-minute diagnosis and an afternoon.
+pub const CRYPTO_PROVIDER: &str = if cfg!(feature = "aws-lc-rs") {
+    "aws-lc-rs"
+} else {
+    "ring"
+};
 
 /// Why a TLS configuration could not be built.
 #[derive(Debug, thiserror::Error)]

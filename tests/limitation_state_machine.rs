@@ -418,8 +418,14 @@ fn lpc_022_4_a_duration_out_of_range_is_refused() {
 /// Implementation guide §3.6: a limit below zero is refused. Sign conventions make a
 /// negative consumption limit meaningless, and accepting one would be indistinguishable
 /// from a limit of zero.
+///
+/// Refusing it is not the whole answer, though. [LPC-TS-018] says a heartbeat followed by
+/// an activated limit that is *not accepted* still moves a system out of `init`, and
+/// [LPC-TS-035/1] makes a negative value one of the things that is not accepted — so the
+/// refusal and the transition go together. `ATC_LPC_COM_PT_CSTransition1_001` is the
+/// laboratory's test for exactly this pair.
 #[test]
-fn ig_3_6_a_negative_limit_is_refused() {
+fn ig_3_6_a_negative_limit_is_refused_and_still_establishes_control() {
     let mut cs = new_cs();
     cs.on_heartbeat(secs(10));
     assert_eq!(
@@ -433,6 +439,56 @@ fn ig_3_6_a_negative_limit_is_refused() {
             secs(11)
         ),
         WriteOutcome::Rejected(NackReason::NegativeValue)
+    );
+    assert_eq!(
+        cs.state(),
+        LimitationState::UnlimitedControlled,
+        "[LPC-TS-018]: a refused limit is still contact with an Energy Guard in control"
+    );
+    assert_eq!(cs.effective_limit(), EffectiveLimit::None);
+}
+
+/// The other half of the same rule: a refusal must *not* disturb a system that is already
+/// under control. `ATC_LPC_COM_NT_CSLimited_001` and `ATC_LPC_COM_NT_CSUnlCntrl_001`.
+#[test]
+fn lpc_907_a_refusal_leaves_the_controlled_states_alone() {
+    let mut cs = new_cs();
+    let now = commission(&mut cs, LimitWrite::active(3_000.0));
+    assert_eq!(cs.state(), LimitationState::Limited);
+
+    let negative = LimitWrite {
+        is_active: true,
+        watts: -1.0,
+        duration: None,
+    };
+    assert_eq!(
+        cs.on_limit_write(&negative, LocalDecision::Apply, now + secs(1)),
+        WriteOutcome::Rejected(NackReason::NegativeValue)
+    );
+    assert_eq!(cs.state(), LimitationState::Limited, "still limited");
+    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(3_000.0));
+}
+
+/// A write with no heartbeat behind it is not evaluated at all, so it is not a refusal
+/// and moves nothing: `ATC_LPC_COM_NT_CSConnection_001`, against the two above. Getting
+/// the order of these two gates wrong is how a system leaves `init` on a message it was
+/// never supposed to read.
+#[test]
+fn lpc_ts_036_an_unevaluated_write_changes_nothing_even_when_its_value_is_invalid() {
+    let mut cs = new_cs();
+    let outcome = cs.on_limit_write(
+        &LimitWrite {
+            is_active: true,
+            watts: -1.0,
+            duration: None,
+        },
+        LocalDecision::Apply,
+        secs(11),
+    );
+    assert_eq!(
+        outcome,
+        WriteOutcome::Rejected(NackReason::NoRecentHeartbeat),
+        "the ordering gate answers before the value is looked at"
     );
     assert_eq!(cs.state(), LimitationState::Init, "still waiting");
 }
@@ -642,4 +698,48 @@ fn lpc_914_a_stale_heartbeat_is_stale_even_if_no_timer_was_run() {
     );
     assert_eq!(cs.state(), LimitationState::FailsafeState);
     assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(4_200.0));
+}
+
+/// [LPC-TS-037] is stated per state, not once per device: losing the Energy Guard means
+/// the heartbeat-then-limit sequence has to be run again before anything else may be
+/// written. `ATC_LPC_COM_PT_CSFS_003` is the laboratory's test for it.
+#[test]
+fn lpc_ts_037_the_ordering_gate_rearms_when_control_is_lost() {
+    let mut cs = new_cs();
+    let now = commission(&mut cs, LimitWrite::deactivated());
+    assert_eq!(cs.state(), LimitationState::UnlimitedControlled);
+
+    // While controlled, a failsafe write goes through.
+    assert_eq!(
+        cs.on_failsafe_limit_write(3_800.0, now + secs(1)),
+        WriteOutcome::Accepted
+    );
+
+    // The Energy Guard falls silent; the system drops into the failsafe state.
+    let lost = now + secs(1) + Duration::from_secs(120);
+    cs.handle_timeout(lost);
+    assert_eq!(cs.state(), LimitationState::FailsafeState);
+
+    // A heartbeat resumes, but the sequence has not: a failsafe write is refused.
+    cs.on_heartbeat(lost + secs(1));
+    assert_eq!(
+        cs.on_failsafe_limit_write(1_000.0, lost + secs(2)),
+        WriteOutcome::Rejected(NackReason::SequenceIncomplete)
+    );
+    assert_eq!(cs.config().failsafe_watts, 3_800.0, "unchanged");
+
+    // The limit write completes it, and the failsafe write is evaluated again.
+    assert_eq!(
+        cs.on_limit_write(
+            &LimitWrite::deactivated(),
+            LocalDecision::Apply,
+            lost + secs(3)
+        ),
+        WriteOutcome::Accepted
+    );
+    assert_eq!(
+        cs.on_failsafe_limit_write(1_000.0, lost + secs(4)),
+        WriteOutcome::Accepted
+    );
+    assert_eq!(cs.config().failsafe_watts, 1_000.0);
 }

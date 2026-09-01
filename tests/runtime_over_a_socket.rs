@@ -549,3 +549,182 @@ async fn a_second_peer_cannot_claim_the_first_peer_s_device_address() {
     hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
         .await;
 }
+
+// ---- the §14a exchange, over a socket -----------------------------------------
+
+/// From a socket to an accepted limit write.
+///
+/// Everything else in this file checks one layer. This checks the thing a consumer
+/// actually wants and cannot assemble from the parts: a control box dials a household
+/// appliance, discovery runs, the bindings and the heartbeat subscription settle, and a
+/// limit is written and *accepted* — not accepted because the test arranged the
+/// preconditions, but because the two actors arranged them between themselves over a real
+/// connection.
+///
+/// It is deliberately the whole path. The in-memory pair in `limitation_both_actors.rs`
+/// checks the same rules with the transport removed; if that passes and this does not,
+/// what is wrong is the wiring, and the wiring is where a subscription silently not
+/// arriving would hide.
+#[tokio::test]
+async fn a_limit_arrives_over_a_socket_and_is_accepted() {
+    use eebus::runtime::{Hub, HubEvent};
+    use eebus::usecases::limitation::{
+        self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, EnergyGuardActor,
+        GuardEvent, LimitWrite, LimitationState,
+    };
+    use eebus::usecases::lpc;
+
+    let (control_box, heat_pump) = pair();
+    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    // ---- the appliance: listens, and applies what it is sent ------------------
+    let appliance = tokio::spawn(async move {
+        let mut device =
+            LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem).unwrap();
+        device
+            .add_entity(
+                LocalEntity::new([1], EntityType::HeatPumpAppliance)
+                    .with_feature(limitation::load_control_feature(1))
+                    .with_feature(limitation::device_configuration_feature(2))
+                    .with_feature(limitation::device_diagnosis_feature(3))
+                    .with_feature(limitation::electrical_connection_feature(4)),
+            )
+            .unwrap();
+        let load_control = device.address_of(&[1], 1);
+        let configuration = device.address_of(&[1], 2);
+        let diagnosis = device.address_of(&[1], 3);
+        let electrical = device.address_of(&[1], 4);
+
+        let mut engine = Engine::new(device);
+        engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
+        let mut actor = ControllableSystemActor::new(
+            ControllableSystem::new(
+                CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)).with_nominal_max(11_000.0),
+                Duration::ZERO,
+            ),
+            lpc::DIRECTION,
+            load_control,
+            configuration,
+            diagnosis,
+        )
+        .with_electrical_connection(electrical);
+
+        let mut hub = Hub::new(heat_pump, engine);
+        let (stream, _) = listener.accept().await.unwrap();
+        hub.accept(stream).await.expect("the handshake");
+        actor.install(hub.engine_mut(), Duration::ZERO);
+
+        let mut decided = None;
+        for _ in 0..256 {
+            hub.wake_at(actor.poll_timeout());
+            let now = hub.now();
+            let Ok(event) = hub.next().await else { break };
+            match event {
+                HubEvent::Spine(event) => {
+                    if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
+                        actor.handle_event(hub.engine_mut(), &event, now)
+                    {
+                        // Deciding is not answering: the acknowledgement is queued on the
+                        // engine, and the loop has to keep going for it to reach the wire.
+                        // Breaking here is how a real application loses an ACK.
+                        decided = Some((write, outcome));
+                    }
+                }
+                HubEvent::Tick => {
+                    actor.handle_timeout(hub.engine_mut(), now);
+                }
+                HubEvent::Disconnected { .. } => break,
+                _ => {}
+            }
+        }
+        (
+            decided,
+            actor.system().state(),
+            actor.system().effective_limit(),
+        )
+    });
+
+    // ---- the control box: dials, and writes the limit -------------------------
+    let mut device = LocalDevice::new(
+        "i:46925",
+        "ControlBox-1",
+        DeviceType::ElectricitySupplySystem,
+    )
+    .unwrap();
+    device
+        .add_entity(
+            LocalEntity::new([1], EntityType::GridGuard)
+                .with_feature(limitation::client_feature(1))
+                .with_feature(limitation::device_diagnosis_feature(2)),
+        )
+        .unwrap();
+    let client = device.address_of(&[1], 1);
+    let diagnosis = device.address_of(&[1], 2);
+    let mut engine = Engine::new(device);
+    engine.add_use_case([1], 1, &lpc::ENERGY_GUARD);
+
+    let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
+    let mut hub = Hub::new(control_box, engine);
+    hub.connect(address).await.expect("the handshake");
+
+    let mut accepted = None;
+    let mut refusals = 0;
+    for _ in 0..256 {
+        hub.wake_at(guard.poll_timeout());
+        let now = hub.now();
+        let Ok(event) = hub.next().await else { break };
+        let mut reports = Vec::new();
+        match event {
+            HubEvent::PeerDiscovered { device, .. } => {
+                let remote = hub.engine().peer(&device).expect("just discovered");
+                let peer =
+                    limitation::locate(remote, lpc::DIRECTION).expect("it plays the use case");
+                guard.attach(hub.engine_mut(), peer, now);
+                guard.require(&device, Some(LimitWrite::active(3_000.0)), now);
+            }
+            HubEvent::Spine(event) => {
+                reports.extend(guard.handle_event(hub.engine_mut(), &event, now))
+            }
+            HubEvent::Tick => reports = guard.handle_timeout(hub.engine_mut(), now),
+            HubEvent::Disconnected { .. } => break,
+            _ => {}
+        }
+        for report in reports {
+            match report {
+                GuardEvent::LimitAccepted { limit, .. } if limit.is_active => {
+                    accepted = Some(limit);
+                }
+                GuardEvent::LimitRefused { .. } => refusals += 1,
+                _ => {}
+            }
+        }
+        if accepted.is_some() {
+            break;
+        }
+    }
+
+    let accepted = accepted.expect("the limit was never accepted over the socket");
+    assert_eq!(accepted.watts, 3_000.0);
+    assert_eq!(
+        refusals, 0,
+        "the actors arrange the heartbeat and the bindings themselves; a refusal here \
+         means one of them wrote before the other could hear it"
+    );
+
+    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
+        .await;
+    let (decided, state, effective) = tokio::time::timeout(Duration::from_secs(5), appliance)
+        .await
+        .expect("the appliance finished")
+        .expect("without panicking");
+
+    let (write, outcome) = decided.expect("the appliance decided a limit");
+    assert_eq!(write.watts, 3_000.0);
+    assert!(outcome.is_accepted());
+    assert_eq!(state, LimitationState::Limited);
+    assert_eq!(
+        effective,
+        eebus::usecases::limitation::EffectiveLimit::Active(3_000.0)
+    );
+}

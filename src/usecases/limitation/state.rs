@@ -77,6 +77,45 @@ pub enum LimitationState {
     UnlimitedAutonomous,
 }
 
+impl LimitationState {
+    /// The state's name as LPC/LPP UC TS §2.3.2 writes it.
+    ///
+    /// A laboratory reads these off a debug interface and compares them against the
+    /// pre-conditions in the abstract test cases, so they are the specification's
+    /// spelling and not this crate's: `unlimited/controlled`, not `UnlimitedControlled`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LimitationState::Init => "init",
+            LimitationState::Limited => "limited",
+            LimitationState::UnlimitedControlled => "unlimited/controlled",
+            LimitationState::FailsafeState => "failsafe state",
+            LimitationState::UnlimitedAutonomous => "unlimited/autonomous",
+        }
+    }
+
+    /// The test configuration the High-Level Test Specifications name this state by.
+    ///
+    /// `CF_CS_Init`, `CF_CS_Limited`, `CF_CS_UnlCntrl`, `CF_CS_FS`, `CF_CS_UnlAuto`: the
+    /// pre-conditions the abstract test cases are written against
+    /// (LPC/LPP HLTS 1.0.2 §6.5.4). `limited` is reported without the specification's
+    /// `_w_dur`/`_wo_dur` suffix, which is a property of the limit rather than the state.
+    pub const fn test_configuration(self) -> &'static str {
+        match self {
+            LimitationState::Init => "CF_CS_Init",
+            LimitationState::Limited => "CF_CS_Limited",
+            LimitationState::UnlimitedControlled => "CF_CS_UnlCntrl",
+            LimitationState::FailsafeState => "CF_CS_FS",
+            LimitationState::UnlimitedAutonomous => "CF_CS_UnlAuto",
+        }
+    }
+}
+
+impl core::fmt::Display for LimitationState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What the system is actually limited to right now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EffectiveLimit {
@@ -235,6 +274,12 @@ pub enum NackReason {
     /// heartbeat and a limit write has completed (implementation guide §2.11).
     #[error("the heartbeat-then-limit sequence has not completed")]
     SequenceIncomplete,
+    /// The write named this system's limit but carried a value that could not be read.
+    ///
+    /// A `scaledNumber` whose `scale` overflows `f64`, most plainly. Refusing is the only
+    /// safe answer: any substitute would be a limit the Energy Guard never sent.
+    #[error("the limit value could not be read")]
+    Unreadable,
     /// The peer refused and did not say why.
     ///
     /// This is what an Energy Guard sees, and it is not a gap in the protocol: [LPC-003]
@@ -412,6 +457,32 @@ impl ControllableSystem {
     }
 
     /// Records a heartbeat from the Energy Guard ([LPC/LPP-031]).
+    ///
+    /// **A heartbeat on its own never establishes control.** It is evidence that the
+    /// Energy Guard is alive, not that it is limiting anything, and the specification is
+    /// deliberate about the difference: control is established by a *write*, and a
+    /// heartbeat only opens the sixty-second window in which one counts (implementation
+    /// guide §2.11 and §2.14). A system in `init` fed heartbeats and nothing else stays
+    /// in `init` until the settle timer expires and then runs autonomously — which is
+    /// right, because an Energy Guard that never writes is not controlling the system.
+    ///
+    /// The one thing a heartbeat does change is a timer: in `failsafe` it starts the
+    /// [LPC/LPP-921] window, after which a guard that is audibly present but silent about
+    /// limits releases the system.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::usecases::limitation::{ControllableSystem, CsConfig, LimitationState};
+    ///
+    /// let mut cs = ControllableSystem::new(
+    ///     CsConfig::new(4_200.0, Duration::from_secs(7_200)),
+    ///     Duration::ZERO,
+    /// );
+    /// for second in 1..=30 {
+    ///     cs.on_heartbeat(Duration::from_secs(second));
+    /// }
+    /// assert_eq!(cs.state(), LimitationState::Init, "heartbeats alone establish nothing");
+    /// ```
     pub fn on_heartbeat(&mut self, now: Duration) {
         self.last_heartbeat = Some(now);
         if self.state == LimitationState::FailsafeState && self.awaiting_write_since.is_none() {
@@ -436,35 +507,36 @@ impl ControllableSystem {
         // on how punctually the caller happened to tick.
         self.handle_timeout(now);
 
-        // [LPC/LPP-001], implementation guide §3.6: a limit below zero is never valid, nor
-        // is one that is not a number. An application can construct a `LimitWrite`
-        // directly, so this does not rely on the wire parser having caught it.
-        if !write.watts.is_finite() {
-            return WriteOutcome::Rejected(NackReason::NotFinite);
-        }
-        if write.watts < 0.0 {
-            return WriteOutcome::Rejected(NackReason::NegativeValue);
-        }
-
         // Implementation guide §2.11 and §2.14: outside the controlled states, a write
         // is evaluated only when a heartbeat arrived within the last 60 seconds. Without
         // one there is no evidence the Energy Guard is still in control, so the failsafe
         // state must not be left.
+        //
+        // This gate comes *first*, and the value checks below come after it, because the
+        // two refusals mean different things. A write with no heartbeat behind it is not
+        // evaluated at all, and changes nothing; a write that is evaluated and found
+        // unusable is a refusal, and a refusal moves the state machine. Checking the
+        // value first would silently turn the second into the first
+        // ([ATC_LPC_COM_NT_CSConnection_001] against [ATC_LPC_COM_PT_CSTransition1_001]).
         if self.needs_recent_heartbeat() && !self.heartbeat_is_recent(now) {
             return WriteOutcome::Rejected(NackReason::NoRecentHeartbeat);
         }
 
-        if let LocalDecision::Reject(reason) = decision {
-            // [LPC/LPP-907]: a rejection leaves the controlled states untouched. From the
-            // failsafe or autonomous states the write still counts as contact, and
-            // [LPC/LPP-918] moves the system to unlimited/controlled.
-            match self.state {
-                LimitationState::Limited | LimitationState::UnlimitedControlled => {}
-                _ => self.enter(LimitationState::UnlimitedControlled, now),
-            }
-            self.sequence_complete = true;
-            self.awaiting_write_since = None;
-            return WriteOutcome::Rejected(NackReason::CannotApply(reason));
+        // [LPC/LPP-001], implementation guide §3.6: a limit below zero is never valid, nor
+        // is one that is not a number. An application can construct a `LimitWrite`
+        // directly, so this does not rely on the wire parser having caught it.
+        let refusal = if !write.watts.is_finite() {
+            Some(NackReason::NotFinite)
+        } else if write.watts < 0.0 {
+            Some(NackReason::NegativeValue)
+        } else if let LocalDecision::Reject(reason) = decision {
+            Some(NackReason::CannotApply(reason))
+        } else {
+            None
+        };
+
+        if let Some(reason) = refusal {
+            return self.refuse(reason, now);
         }
 
         self.sequence_complete = true;
@@ -486,14 +558,57 @@ impl ControllableSystem {
         WriteOutcome::Accepted
     }
 
+    /// Refuses a limit write whose payload could not be read as a limit.
+    ///
+    /// A `loadControlLimitListData` that names this system's limit but carries a value it
+    /// cannot represent — a `scaledNumber` whose `scale` overflows `f64` — is a limit
+    /// write that was evaluated and found unusable, which is a refusal like any other and
+    /// moves the state machine the same way ([LPC/LPP-902], [LPC/LPP-918]). Substituting a
+    /// number the Energy Guard never sent would apply a limit nobody asked for.
+    ///
+    /// A write that does not address this system's limit at all is *not* this: it is not
+    /// a limit write, and does not reach the state machine.
+    pub fn on_unreadable_limit_write(&mut self, now: Duration) -> WriteOutcome {
+        self.handle_timeout(now);
+        if self.needs_recent_heartbeat() && !self.heartbeat_is_recent(now) {
+            return WriteOutcome::Rejected(NackReason::NoRecentHeartbeat);
+        }
+        self.refuse(NackReason::Unreadable, now)
+    }
+
+    /// The state change every refused limit write makes, whatever the reason.
+    ///
+    /// [LPC/LPP-907]: a refusal leaves the controlled states untouched — a limited system
+    /// stays limited, which is the safe answer. From `init`, `failsafe` or
+    /// `unlimited/autonomous` the write is still contact with an Energy Guard that is in
+    /// control, so [LPC/LPP-902] and [LPC/LPP-918] move the system to
+    /// `unlimited/controlled` even though nothing was applied.
+    ///
+    /// A refused write also completes the opening sequence: implementation guide §2.11
+    /// gates the *other* data points on a limit write having been evaluated, not on one
+    /// having been accepted.
+    fn refuse(&mut self, reason: NackReason, now: Duration) -> WriteOutcome {
+        match self.state {
+            LimitationState::Limited | LimitationState::UnlimitedControlled => {}
+            _ => self.enter(LimitationState::UnlimitedControlled, now),
+        }
+        self.sequence_complete = true;
+        self.awaiting_write_since = None;
+        WriteOutcome::Rejected(reason)
+    }
+
     /// Applies a write on the failsafe active power limit ([LPC/LPP-021]).
     pub fn on_failsafe_limit_write(&mut self, watts: f64, now: Duration) -> WriteOutcome {
         self.handle_timeout(now);
+        if let Some(rejection) = self.check_secondary_write(now) {
+            return rejection;
+        }
         if !watts.is_finite() {
             return WriteOutcome::Rejected(NackReason::NotFinite);
         }
-        if let Some(rejection) = self.check_secondary_write(watts, now) {
-            return rejection;
+        // [LPC/LPP-021]: the failsafe limit is a power, and a power below zero is not one.
+        if watts < 0.0 {
+            return WriteOutcome::Rejected(NackReason::NegativeValue);
         }
         self.config.failsafe_watts = watts;
         WriteOutcome::Accepted
@@ -510,7 +625,7 @@ impl ControllableSystem {
         now: Duration,
     ) -> WriteOutcome {
         self.handle_timeout(now);
-        if let Some(rejection) = self.check_secondary_write(0.0, now) {
+        if let Some(rejection) = self.check_secondary_write(now) {
             return rejection;
         }
         if !FAILSAFE_DURATION_RANGE.contains(&duration)
@@ -601,6 +716,42 @@ impl ControllableSystem {
     }
 
     /// When [`handle_timeout`](Self::handle_timeout) should next be called.
+    ///
+    /// # Invariant
+    ///
+    /// **[`None`] is returned in exactly one state, [`LimitationState::UnlimitedAutonomous`].**
+    /// Everywhere else a deadline is pending and the answer is [`Some`] — which matters,
+    /// because a caller that simply waits on this value would otherwise never reach the
+    /// failsafe fallback of [LPC/LPP-911]. In `unlimited/autonomous` there is genuinely
+    /// nothing to wait for: no limit to expire, no guard whose silence is being counted.
+    /// The system leaves that state on a heartbeat followed by a write, and those are
+    /// events, not deadlines.
+    ///
+    /// [`ControllableSystemActor::poll_timeout`] therefore returns a plain [`Duration`]:
+    /// it also has the heartbeat producer's deadline to fold in, and that one is always
+    /// pending.
+    ///
+    /// The value is an *absolute* instant on the same monotonic scale as the `now` passed
+    /// in, not a delay: `deadline.saturating_sub(now)` is how long to sleep. A deadline
+    /// that has already passed means [`handle_timeout`](Self::handle_timeout) is overdue,
+    /// which is why the subtraction saturates rather than panicking.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::usecases::limitation::{ControllableSystem, CsConfig, LimitationState};
+    ///
+    /// let mut cs = ControllableSystem::new(
+    ///     CsConfig::new(4_200.0, Duration::from_secs(7_200)),
+    ///     Duration::ZERO,
+    /// );
+    /// // Waiting on the deadline is enough to drive the machine to its resting state.
+    /// while let Some(deadline) = cs.poll_timeout() {
+    ///     cs.handle_timeout(deadline);
+    /// }
+    /// assert_eq!(cs.state(), LimitationState::UnlimitedAutonomous);
+    /// ```
+    ///
+    /// [`ControllableSystemActor::poll_timeout`]: super::ControllableSystemActor::poll_timeout
     pub fn poll_timeout(&self) -> Option<Duration> {
         let mut next: Option<Duration> = None;
         let mut consider = |deadline: Duration| {
@@ -649,11 +800,13 @@ impl ControllableSystem {
             .is_some_and(|hb| now.saturating_sub(hb) < window)
     }
 
-    /// The shared checks for a write on anything other than the limit.
-    fn check_secondary_write(&self, watts: f64, now: Duration) -> Option<WriteOutcome> {
-        if watts < 0.0 {
-            return Some(WriteOutcome::Rejected(NackReason::NegativeValue));
-        }
+    /// The gates a write on anything other than the limit has to pass first.
+    ///
+    /// Ordering matters here for the same reason it does in
+    /// [`on_limit_write`](Self::on_limit_write): a write that is not evaluated is a
+    /// different answer from one that is evaluated and refused, and the ordering gates
+    /// come before the value.
+    fn check_secondary_write(&self, now: Duration) -> Option<WriteOutcome> {
         // Implementation guide §2.11: until a heartbeat has been followed by a limit
         // write, no other data point may be changed.
         if !self.sequence_complete {
@@ -666,10 +819,140 @@ impl ControllableSystem {
     }
 
     fn enter(&mut self, state: LimitationState, now: Duration) {
-        if self.state != state {
-            self.state = state;
-            self.entered_state_at = now;
-            self.awaiting_write_since = None;
+        if self.state == state {
+            return;
         }
+        self.state = state;
+        self.entered_state_at = now;
+        self.awaiting_write_since = None;
+
+        // [LPC/LPP-TS-037] states the ordering gate per *state*, not once per device: "in
+        // state init, failsafe state or unlimited/autonomous, only after a heartbeat and a
+        // write command from the EG within 60 seconds on the APCL, commands on any other
+        // data point SHALL be evaluated". Falling back into one of those states is losing
+        // the Energy Guard, so the sequence has to be run again before the failsafe values
+        // may be changed — `ATC_LPC_COM_PT_CSFS_003` is the laboratory's test for it, and
+        // a system that kept the flag set would let a stale controller rewrite its
+        // failsafe limit while nobody is in charge.
+        if matches!(
+            state,
+            LimitationState::FailsafeState | LimitationState::UnlimitedAutonomous
+        ) {
+            self.sequence_complete = false;
+        }
+    }
+}
+
+impl crate::usecases::signals::Signals<super::Direction> for ControllableSystem {
+    /// What a certification laboratory reads off the device.
+    ///
+    /// The order is the parameter sheet's: the state first, then the limit and its
+    /// duration, then the failsafe pair, then the constraints. `lpc:effectiveLimit` and
+    /// `lpc:powerCeiling` are not data points of the specification — they are what this
+    /// implementation has concluded from them, and they are here because a tester
+    /// checking `ATC_LPC_COM_PT_CSUnlAuto_002` ("does not consume higher than the nominal
+    /// maximum") is really checking the second one.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::usecases::limitation::{ControllableSystem, CsConfig};
+    /// use eebus::usecases::lpc;
+    /// use eebus::usecases::signals::Signals;
+    ///
+    /// let cs = ControllableSystem::new(
+    ///     CsConfig::new(4_200.0, Duration::from_secs(7_200)),
+    ///     Duration::ZERO,
+    /// );
+    /// // A fresh system is in `init`, limited by the failsafe value and nothing else.
+    /// let signals = cs.signals(lpc::DIRECTION);
+    /// assert_eq!(signals.get("lpc:state").and_then(|v| v.as_str()), Some("init"));
+    /// assert!(signals.get("lpc:limit").is_some_and(|v| v.is_absent()));
+    /// assert_eq!(
+    ///     signals.get("lpc:effectiveLimit").and_then(|v| v.as_f64()),
+    ///     Some(4_200.0),
+    /// );
+    /// ```
+    fn signals(&self, direction: super::Direction) -> crate::usecases::signals::SignalSet {
+        use crate::usecases::signals::{Signal, SignalSet, SignalValue};
+        use alloc::borrow::Cow;
+        use alloc::format;
+
+        let prefix = direction.signal_prefix();
+        let name = |data_point: &str| -> Cow<'static, str> {
+            Cow::Owned(format!("{prefix}:{data_point}"))
+        };
+        let config = &self.config;
+
+        SignalSet::new()
+            .with(Signal::new(
+                name("state"),
+                SignalValue::Text(Cow::Borrowed(self.state.as_str())),
+            ))
+            .with(
+                Signal::new(
+                    name("limit"),
+                    SignalValue::number(
+                        self.limit
+                            .filter(|_| self.state == LimitationState::Limited)
+                            .map(|l| l.watts),
+                    ),
+                )
+                .in_unit("W"),
+            )
+            .with(Signal::new(
+                name("duration"),
+                SignalValue::seconds(self.limit.and_then(|l| l.duration)),
+            ))
+            .with(Signal::new(
+                name("isActive"),
+                SignalValue::Bool(self.is_limit_active()),
+            ))
+            .with(
+                Signal::new(
+                    name("failsafeLimit"),
+                    SignalValue::Number(config.failsafe_watts),
+                )
+                .in_unit("W"),
+            )
+            .with(Signal::new(
+                name("failsafeDuration"),
+                SignalValue::Seconds(config.failsafe_duration.as_secs_f64()),
+            ))
+            .with(
+                Signal::new(
+                    name("nominalMax"),
+                    SignalValue::number(config.nominal_max_watts.filter(|_| !config.on_cem)),
+                )
+                .in_unit("W"),
+            )
+            .with(
+                Signal::new(
+                    name("contractualMax"),
+                    SignalValue::number(config.contractual_max_watts.filter(|_| config.on_cem)),
+                )
+                .in_unit("W"),
+            )
+            .with(
+                Signal::new(
+                    name("effectiveLimit"),
+                    SignalValue::number(self.effective_limit().watts()),
+                )
+                .in_unit("W"),
+            )
+            .with(
+                Signal::new(
+                    name("powerCeiling"),
+                    SignalValue::number(self.power_ceiling()),
+                )
+                .in_unit("W"),
+            )
+            .with(Signal::new(
+                name("lastHeartbeat"),
+                SignalValue::seconds(self.last_heartbeat),
+            ))
+            .with(Signal::new(
+                name("nextDeadline"),
+                SignalValue::seconds(self.poll_timeout()),
+            ))
     }
 }

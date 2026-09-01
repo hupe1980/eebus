@@ -75,12 +75,95 @@ the hub the peer is back, so it keeps asking — backing off from one second to 
 with the delay **jittered by the peer's SKI**, so a building coming back from a power cut
 does not have every device dialling in the same instant.
 
+## `next` is not cancel-safe
+
+The one rule for the event loop: **do not put `hub.next()` in a `tokio::select!` or a
+`timeout`.** It reads from the sockets, and dropping it part-way through a WebSocket frame
+loses what had been read — silently. It comes back minutes later as a subscription that was
+never granted, a heartbeat that never arrived, and a limit refused for want of one.
+
+Everything a caller would reach for `select!` to do has somewhere else to go. Timers go to
+`wake_at`, which the hub folds into its own deadlines and answers with `HubEvent::Tick`.
+Work arriving from elsewhere — a listener accepting connections, an mDNS browse, a command
+channel — is drained *between* calls, on the tick:
+
+```rust
+loop {
+    // Between calls: whatever else has turned up.
+    while let Ok(stream) = inbox.try_recv() {
+        hub.accept(stream).await?;
+    }
+    hub.wake_at(hub.now() + Duration::from_secs(1));
+
+    // And then the one await that owns the sockets, uninterrupted.
+    match hub.next().await? { /* … */ }
+}
+```
+
+`wake_at` takes an instant on the same clock as `hub.now()`, and an instant already in the
+past is not an error: the hub runs its timers and comes straight back rather than reading
+with a zero-length timeout, which would starve the connection it was supposed to be
+watching.
+
+## Deciding is not answering
+
+`hub.next()` sends what the engine has queued on the way *in*, so a loop that keeps calling
+it never has to think about flushing. The two places that are not a loop do: before
+`shutdown` — which flushes for you — and in a test or a one-shot that stops as soon as it
+has seen what it was waiting for. `Hub::flush` is there for the second.
+
+A Controllable System that accepts a limit and then stops driving its hub has left the
+`result` message in the queue, and the Energy Guard is still waiting for it. Under §14a
+that is the difference between a limitation that was honoured and one that cannot be shown
+to have been.
+
+## Owning your own engine
+
+`Hub` owns an `Engine` and runs the opening exchange for you. An application that owns its
+own — a different transport, a test harness, a gateway — needs the same two reads, and
+`Engine::start_discovery` is them:
+
+```rust
+// A connection just opened. Ask what is on the other end of it.
+let [discovery, use_cases] = engine.start_discovery(now);
+```
+
+Both are addressed *without* a device part, which the SPINE implementation guide §2.7
+permits for exactly this message and no other: the peer's device address is what the answer
+contains, so it cannot be in the question. `Engine::discover` is the same pair addressed to
+a peer whose address is already known.
+
 ## Trying it
 
 ```sh
-cargo run --example networked --features runtime
+cargo run --example networked --features runtime,ring
 ```
 
 Two nodes generate certificates, approve each other's SKI, complete TLS 1.2 with mutual
 authentication and the SHIP handshake, and then discover, bind and exchange a limit over
 loopback.
+
+## The two simulators
+
+`networked` is one program playing both sides. The two simulators are the sides as separate
+programs, which is what testing against real hardware needs — a control box with no
+household to limit, or a household appliance with no control box.
+
+```sh
+# In one terminal: the household end. Prints its SKI and its QR payload.
+cargo run --example heat_pump --features full
+
+# In another: the grid end. Trust each other, then hold the household to 4.2 kW.
+cargo run --example steuerbox --features full -- --trust <the pump's SKI> --limit 4200
+cargo run --example heat_pump --features full -- --trust <the box's SKI>
+```
+
+They announce themselves over mDNS and find each other, persist their identity and their
+trust store between runs, and print the `lpc:` runtime signals of
+[Certification](@/docs/certification.md) as the state moves. `--reset` is the EEBUS reset of
+SHIP §12.2.2: forget every peer, and the identity with it.
+
+Between them they cover the parts a single-process example cannot show — an installer
+reading a SKI off one screen and typing it into another, a device that comes back after a
+restart still paired, and a control box that finds a household appliance it has never been
+told the address of.

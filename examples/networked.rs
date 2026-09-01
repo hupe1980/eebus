@@ -153,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for report in reports {
             match report {
                 GuardEvent::Ready { .. } => println!("[box]  bound to the LoadControl feature"),
+                GuardEvent::ConstraintsLearned { nominal_max, .. } => println!(
+                    "[box]  it can draw at most {:.0} W — scenario 4",
+                    nominal_max.watts()
+                ),
                 GuardEvent::LimitAccepted { limit, request, .. } => {
                     println!(
                         "[box]  {:.0} W accepted, answering msgCounter {} — the §14a evidence",
@@ -217,13 +221,15 @@ fn build_heat_pump() -> (Engine, ControllableSystemActor) {
             LocalEntity::new([1], EntityType::HeatPumpAppliance)
                 .with_feature(limitation::load_control_feature(1))
                 .with_feature(limitation::device_configuration_feature(2))
-                .with_feature(limitation::device_diagnosis_feature(3)),
+                .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::electrical_connection_feature(4)),
         )
         .expect("a fresh entity");
 
     let load_control = device.address_of(&[1], 1);
     let configuration = device.address_of(&[1], 2);
     let diagnosis = device.address_of(&[1], 3);
+    let electrical = device.address_of(&[1], 4);
 
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
@@ -238,6 +244,7 @@ fn build_heat_pump() -> (Engine, ControllableSystemActor) {
         load_control,
         configuration,
         diagnosis,
-    );
+    )
+    .with_electrical_connection(electrical);
     (engine, actor)
 }

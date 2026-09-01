@@ -26,3 +26,8 @@ specs/
 
 # Zola output
 site/public
+
+# The two simulators keep their identity and trust store beside the working directory.
+# Real key material, even a simulator's: it does not belong in the repository.
+/.eebus-heatpump/
+/.eebus-steuerbox/

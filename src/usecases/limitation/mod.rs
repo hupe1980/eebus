@@ -16,7 +16,9 @@
 //! Use it through [`crate::usecases::lpc`] or [`crate::usecases::lpp`], which carry the
 //! descriptors and the direction constant for their use case.
 
-use crate::model::{DeviceConfigurationKeyName, EnergyDirection};
+use crate::model::{
+    DeviceConfigurationKeyName, ElectricalConnectionCharacteristicType, EnergyDirection,
+};
 use crate::usecases::descriptor::names;
 
 mod actor;
@@ -68,6 +70,36 @@ impl Direction {
         }
     }
 
+    /// The `characteristicType` of the device's own nominal maximum ([LPC/LPP-041]).
+    ///
+    /// LPC UC TS §2.6.4.1 and LPP §2.6.4.1: this value says what the appliance is
+    /// physically able to draw or feed in, and it is for appliances only. An energy
+    /// manager publishes [`contractual_max_characteristic`](Self::contractual_max_characteristic)
+    /// instead — it has no single nameplate of its own, and the number an Energy Guard
+    /// needs from it is what the customer's contract allows.
+    pub const fn nominal_max_characteristic(self) -> ElectricalConnectionCharacteristicType {
+        match self {
+            Self::Consumption => ElectricalConnectionCharacteristicType::PowerConsumptionNominalMax,
+            Self::Production => ElectricalConnectionCharacteristicType::PowerProductionNominalMax,
+        }
+    }
+
+    /// The `characteristicType` of an energy manager's contractual maximum ([LPC/LPP-042]).
+    ///
+    /// The counterpart of [`nominal_max_characteristic`](Self::nominal_max_characteristic),
+    /// and mutually exclusive with it: the specification says each SHALL only be used by
+    /// the kind of actor it belongs to.
+    pub const fn contractual_max_characteristic(self) -> ElectricalConnectionCharacteristicType {
+        match self {
+            Self::Consumption => {
+                ElectricalConnectionCharacteristicType::ContractualConsumptionNominalMax
+            }
+            Self::Production => {
+                ElectricalConnectionCharacteristicType::ContractualProductionNominalMax
+            }
+        }
+    }
+
     /// The use-case name a device announces in `nodeManagementUseCaseData`.
     pub const fn use_case_name(self) -> &'static str {
         match self {
@@ -81,6 +113,19 @@ impl Direction {
         match self {
             Self::Consumption => "Control active power consumption limit",
             Self::Production => "Control active power production limit",
+        }
+    }
+}
+
+impl Direction {
+    /// The prefix runtime signals are named with: `lpc` or `lpp`.
+    ///
+    /// The abbreviation the test specification uses, lowercased, which is what the
+    /// laboratory's own tooling expects to see in a debug interface.
+    pub const fn signal_prefix(self) -> &'static str {
+        match self {
+            Self::Consumption => "lpc",
+            Self::Production => "lpp",
         }
     }
 }

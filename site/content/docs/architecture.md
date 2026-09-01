@@ -85,6 +85,19 @@ uses. See [Embedded targets](@/docs/embedded.md).
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the handshake, the connection table. |
 | `mdns` | — | `_ship._tcp` announcement and discovery (`mdns-sd`). |
+| `ring` | — | `rustls` and `rcgen` backed by `ring`. |
+| `aws-lc-rs` | — | The same, backed by `aws-lc-rs`. |
+| `full` | — | Everything above, on `ring`. |
 
 `runtime` implies `tls` and `cert`. A device that only parses datagrams — a test harness,
 a gateway, a simulator — pays for none of them.
+
+All three of those also need a cryptography provider, and the crate names neither: exactly
+one of `ring` and `aws-lc-rs` must be selected, or the build stops with a `compile_error!`
+saying so. `rustls`' provider is process-global, so the choice belongs to whoever builds the
+binary rather than to a library in the middle of it —
+[the security model](@/docs/security.md#the-cryptography-provider-is-the-consumer-s-choice)
+has the reasoning.
+
+That makes `--all-features` a configuration that cannot exist. `--features full` is
+everything, on `ring`, and it is what CI and docs.rs build.

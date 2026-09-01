@@ -26,13 +26,34 @@ jobs:
       # `--workspace`, so the code generator in `xtask/` is compiled and its tests run.
       # It is what the committed model is produced by; a generator nothing builds is a
       # generator that has already drifted.
-      - run: cargo test --workspace --all-features
+      #
+      # `--features eebus/full` rather than `--all-features`: `ring` and `aws-lc-rs` are
+      # mutually exclusive, so "everything" is not a configuration that can exist. `full`
+      # is everything plus `ring`.
+      - run: cargo test --workspace --features eebus/full
       # Feature-scoped, so package-scoped: `xtask` has no features to select.
       - run: cargo test -p eebus --no-default-features --features std
+      # The other provider, which is the one a consumer that bans `ring` reaches for.
+      # Building it is what keeps the choice real rather than nominal.
+      - run: cargo check -p eebus --no-default-features --features std,pairing,cert,tls,runtime,mdns,aws-lc-rs
+      # Getting the provider wrong has to fail at build time rather than at the first
+      # connection, which is the whole reason the choice is a feature and not a default.
+      - name: A build with no provider is refused
+        run: |
+          if cargo check -p eebus --no-default-features --features std,tls; then
+            echo "::error::tls without a cryptography provider must not compile"
+            exit 1
+          fi
+      - name: A build with both providers is refused
+        run: |
+          if cargo check -p eebus --no-default-features --features std,tls,ring,aws-lc-rs; then
+            echo "::error::two providers in one binary must not compile"
+            exit 1
+          fi
       # The examples are the end-to-end checks: a control box limits a heat pump,
       # first against a virtual clock and then over a real socket.
       - run: cargo run --example grid_limit
-      - run: cargo run --example networked --features runtime
+      - run: cargo run --example networked --features runtime,ring
 
   lint:
     name: Format and lint
@@ -44,7 +65,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --features eebus/full
       # `fuzz/` is a workspace of its own, so nothing above compiles it — and a change to
       # a public type breaks the fuzz targets silently until the nightly job runs. This
       # catches that in seconds; the fuzzing itself still happens below.
@@ -60,7 +81,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --no-deps --features full
 
   # The crate promises a minimum supported Rust version; a promise nothing checks is a
   # promise that has already been broken.
@@ -73,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The promise is about the published crate, so it is the published crate that is
       # checked: `xtask` is a development tool and never leaves the repository.
-      - run: cargo check -p eebus --all-features --all-targets
+      - run: cargo check -p eebus --features full --all-targets
 
   # Everything the crate parses arrives from the local network, so every parser gets a
   # coverage-guided engine pointed at it. On a pull request this is a short smoke run;

@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 
 use tokio::net::{TcpStream, ToSocketAddrs};
 
-use crate::model::{AddressDevice, Datagram, Function, MsgCounter};
+use crate::model::{AddressDevice, Datagram, MsgCounter};
 use crate::ship::{CURVE_SECP256R1, ConnectionCloseReason, PeerKeys, Resolution, Ski};
 use crate::spine::{Engine, SpineEvent};
 
@@ -253,7 +253,13 @@ impl Hub {
     /// [`HubEvent::Tick`].
     ///
     /// This is how a use case's timers reach the event loop: an actor says when it next
-    /// needs attention, and the hub folds that into its own deadlines.
+    /// needs attention, and the hub folds that into its own deadlines. `at` is an instant
+    /// on the same clock as [`now`](Self::now), not a delay.
+    ///
+    /// The earliest instant asked for wins, and it is cleared once it fires. An instant
+    /// already in the past is not an error and does not starve the connections: the hub
+    /// runs the timers and comes straight back, rather than reading with a zero-length
+    /// timeout.
     pub fn wake_at(&mut self, at: Duration) {
         self.wake_at = Some(match self.wake_at {
             Some(existing) => existing.min(at),
@@ -441,8 +447,29 @@ impl Hub {
         });
     }
 
+    /// Sends everything the engine has queued, without waiting for anything to arrive.
+    ///
+    /// [`next`](Self::next) does this on the way in, so a loop that keeps calling it never
+    /// needs this. It is for the two places that are not a loop: before
+    /// [`shutdown`](Self::shutdown), so that an acknowledgement a use case has just
+    /// decided actually reaches the peer, and in a test that stops as soon as it has seen
+    /// what it was waiting for.
+    ///
+    /// Deciding is not answering. A Controllable System that accepts a limit and then
+    /// stops driving its hub has left the `result` message in the queue, and the Energy
+    /// Guard is still waiting for it — which, under §14a, is the difference between a
+    /// limitation that was honoured and one that cannot be shown to have been.
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
+        self.dispatch().await
+    }
+
     /// Closes every connection and shuts the hub down.
+    ///
+    /// Anything the engine still has queued is sent first: closing on top of an
+    /// unacknowledged write would leave the peer waiting for an answer that was already
+    /// decided.
     pub async fn shutdown(&mut self, reason: ConnectionCloseReason) {
+        let _ = self.dispatch().await;
         for link in core::mem::take(&mut self.links) {
             let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
         }
@@ -453,6 +480,43 @@ impl Hub {
     ///
     /// Everything the engine has queued goes out first, so an application that has just
     /// written a limit does not have to remember to flush.
+    ///
+    /// # This future is not cancel-safe
+    ///
+    /// **Do not put it in a [`tokio::select!`] or a `tokio::time::timeout`.** It reads
+    /// from the sockets, and dropping it part-way through a WebSocket frame loses what
+    /// had been read — which does not fail loudly. It reappears minutes later as a
+    /// subscription that was never granted, a heartbeat that never arrived, and a limit
+    /// refused for want of one.
+    ///
+    /// Everything a caller would reach for `select!` to do has somewhere else to go:
+    ///
+    /// * **Timers** — [`wake_at`](Self::wake_at). The hub folds the instant into its own
+    ///   deadlines and answers with [`HubEvent::Tick`]; the read is never interrupted.
+    /// * **Work arriving from elsewhere** — a listener accepting connections, an mDNS
+    ///   browse, a command channel — is drained *between* calls, on the tick. Ask for a
+    ///   tick a second from now, and each one is a chance to look:
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     mut hub: eebus::runtime::Hub,
+    /// #     mut inbox: tokio::sync::mpsc::Receiver<tokio::net::TcpStream>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// use core::time::Duration;
+    ///
+    /// loop {
+    ///     // Between calls: whatever else has turned up.
+    ///     while let Ok(stream) = inbox.try_recv() {
+    ///         hub.accept(stream).await?;
+    ///     }
+    ///     hub.wake_at(hub.now() + Duration::from_secs(1));
+    ///
+    ///     // And then the one await that owns the sockets, uninterrupted.
+    ///     let event = hub.next().await?;
+    ///     # let _ = event;
+    /// }
+    /// # }
+    /// ```
     pub async fn next(&mut self) -> Result<HubEvent, ConnectionError> {
         loop {
             if !self.pending.is_empty() {
@@ -483,6 +547,19 @@ impl Hub {
                 if deadline.is_none() && self.links.is_empty() {
                     return Ok(HubEvent::Tick);
                 }
+                continue;
+            }
+
+            // A deadline that has already passed is dealt with *before* the sockets are
+            // touched, and not by reading with a zero-length timeout. A zero timeout
+            // cancels the read immediately, and a caller that keeps handing back a stale
+            // instant — an actor whose timers have not caught up, most easily — would
+            // spin here forever and never read a byte. The connection would look alive
+            // and carry nothing.
+            if deadline.is_some_and(|at| at <= now) {
+                self.fire_timers(now);
+                self.keepalive().await?;
+                self.redial().await;
                 continue;
             }
 
@@ -596,16 +673,7 @@ impl Hub {
     /// Both are addressed without a device part, which §2.7 permits for exactly this
     /// message: the peer's address is what the answer contains.
     fn start_discovery(&mut self, index: usize, now: Duration) {
-        let source = crate::spine::node_management(self.engine.device().address());
-        let destination = crate::spine::node_management_without_device();
-        let mut counters = Vec::new();
-        for function in [
-            Function::NodeManagementDetailedDiscoveryData,
-            Function::NodeManagementUseCaseData,
-        ] {
-            counters.push(self.engine.read(&destination, &source, function, now));
-        }
-        self.links[index].bootstrap = counters;
+        self.links[index].bootstrap = self.engine.start_discovery(now).to_vec();
     }
 
     /// Takes a datagram off one connection into the engine, learning who is on it.

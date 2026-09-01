@@ -16,10 +16,13 @@ use crate::model::{
     CmdData, DeviceConfigurationKeyId, DeviceConfigurationKeyValueData,
     DeviceConfigurationKeyValueDescriptionData, DeviceConfigurationKeyValueDescriptionListData,
     DeviceConfigurationKeyValueListData, DeviceConfigurationKeyValueValue,
-    DeviceDiagnosisHeartbeatData, FeatureAddress, FeatureType, Function, LoadControlCategory,
-    LoadControlLimitData, LoadControlLimitDescriptionData, LoadControlLimitDescriptionListData,
-    LoadControlLimitId, LoadControlLimitListData, LoadControlLimitType, MeasurementId, Role,
-    ScaledNumber, ScopeType, UnitOfMeasurement,
+    DeviceDiagnosisHeartbeatData, ElectricalConnectionCharacteristicContext,
+    ElectricalConnectionCharacteristicData, ElectricalConnectionCharacteristicId,
+    ElectricalConnectionCharacteristicListData, ElectricalConnectionCharacteristicType,
+    ElectricalConnectionId, ElectricalConnectionParameterId, FeatureAddress, FeatureType, Function,
+    LoadControlCategory, LoadControlLimitData, LoadControlLimitDescriptionData,
+    LoadControlLimitDescriptionListData, LoadControlLimitId, LoadControlLimitListData,
+    LoadControlLimitType, MeasurementId, Role, ScaledNumber, ScopeType, UnitOfMeasurement,
 };
 use crate::spine::{
     Engine, ErrorNumber, HeartbeatProducer, LocalFeature, Operations, SpineEvent, WriteToken,
@@ -48,6 +51,21 @@ pub const FAILSAFE_LIMIT_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyI
 /// The `keyId` of the Failsafe Duration Minimum.
 pub const FAILSAFE_DURATION_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(2);
 
+/// The `electricalConnectionId` the constraints of scenario 4 are published under.
+///
+/// LPC/LPP Table 27 requires this to be the *same* identifier the device uses for MPC's
+/// `<ec1#1>`, where it implements MPC as well, so that an Energy Guard reading both sees
+/// one electrical connection rather than two. [`crate::usecases::monitoring`] numbers
+/// its connection the same way.
+pub const ELECTRICAL_CONNECTION_ID: ElectricalConnectionId = ElectricalConnectionId(1);
+
+/// The `parameterId` of the constraints, likewise shared with MPC.
+pub const PARAMETER_ID: ElectricalConnectionParameterId = ElectricalConnectionParameterId(1);
+
+/// The `characteristicId` of the nominal maximum.
+pub const CHARACTERISTIC_ID: ElectricalConnectionCharacteristicId =
+    ElectricalConnectionCharacteristicId(1);
+
 /// Builds the `LoadControl` feature a Controllable System offers (LPC/LPP Table 21).
 ///
 /// Writes are deferred: the Controllable System decides whether it can follow a limit,
@@ -74,6 +92,17 @@ pub fn device_configuration_feature(address: u32) -> LocalFeature {
             Function::DeviceConfigurationKeyValueListData,
             Operations::read_write(),
         )
+}
+
+/// Builds the `ElectricalConnection` feature scenario 4 is served from (LPC/LPP Table 27).
+///
+/// Reads only: the nominal maxima are what the device *is*, and no Energy Guard may write
+/// them.
+pub fn electrical_connection_feature(address: u32) -> LocalFeature {
+    LocalFeature::new(address, FeatureType::ElectricalConnection, Role::Server).with_function(
+        Function::ElectricalConnectionCharacteristicListData,
+        Operations::read(),
+    )
 }
 
 /// Builds the `DeviceDiagnosis` feature that carries the heartbeat (LPC/LPP Table 26).
@@ -121,6 +150,106 @@ pub fn limit_data(system: &ControllableSystem) -> CmdData {
             ..Default::default()
         }]),
     })
+}
+
+/// The nominal maximum a Controllable System publishes in scenario 4.
+///
+/// The two are mutually exclusive, and which one applies is not a matter of taste: LPC
+/// UC TS §2.6.4.1 says [LPC/LPP-041] "SHALL only be used if the CS is an energy consuming
+/// device … not an energy manager", and [LPC/LPP-042] "SHALL only be used if the CS is an
+/// energy manager … not a single device". A heat pump has a nameplate; an energy manager
+/// has a contract. Publishing the wrong one tells the Energy Guard it is limiting
+/// something other than what it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NominalMax {
+    /// [LPC/LPP-041]: the most this appliance can physically draw or feed in.
+    Device(f64),
+    /// [LPC/LPP-042]: the most this energy manager's customer contract allows.
+    Contractual(f64),
+}
+
+impl NominalMax {
+    /// The value in watts, whichever kind it is.
+    pub fn watts(self) -> f64 {
+        match self {
+            NominalMax::Device(watts) | NominalMax::Contractual(watts) => watts,
+        }
+    }
+
+    /// The `characteristicType` this value is published under.
+    pub fn characteristic(self, direction: Direction) -> ElectricalConnectionCharacteristicType {
+        match self {
+            NominalMax::Device(_) => direction.nominal_max_characteristic(),
+            NominalMax::Contractual(_) => direction.contractual_max_characteristic(),
+        }
+    }
+}
+
+/// Which nominal maximum this configuration should publish, if any.
+///
+/// An energy manager publishes its contract and a device publishes its nameplate; a
+/// configuration that carries the value belonging to the *other* kind of actor publishes
+/// nothing, rather than publishing it under a name the specification reserves.
+pub fn nominal_max(system: &ControllableSystem) -> Option<NominalMax> {
+    let config = system.config();
+    if config.on_cem {
+        config.contractual_max_watts.map(NominalMax::Contractual)
+    } else {
+        config.nominal_max_watts.map(NominalMax::Device)
+    }
+}
+
+/// The constraints of scenario 4, as `electricalConnectionCharacteristicListData`
+/// (LPC/LPP Table 27).
+///
+/// Empty when the device has no nominal maximum to publish — scenario 4 is `R` for a
+/// Controllable System, and a device that does not know its own nameplate publishes
+/// nothing rather than a guess.
+pub fn constraints(system: &ControllableSystem, direction: Direction) -> CmdData {
+    let entries = nominal_max(system)
+        .map(|max| {
+            vec![ElectricalConnectionCharacteristicData {
+                electrical_connection_id: Some(ELECTRICAL_CONNECTION_ID),
+                parameter_id: Some(PARAMETER_ID),
+                characteristic_id: Some(CHARACTERISTIC_ID),
+                characteristic_context: Some(ElectricalConnectionCharacteristicContext::Entity),
+                characteristic_type: Some(max.characteristic(direction)),
+                value: Some(ScaledNumber::from_f64(max.watts(), 0)),
+                unit: Some(UnitOfMeasurement::W),
+            }]
+        })
+        .unwrap_or_default();
+    CmdData::ElectricalConnectionCharacteristicListData(
+        ElectricalConnectionCharacteristicListData {
+            electrical_connection_characteristic_data: Some(entries),
+        },
+    )
+}
+
+/// Reads the nominal maximum out of an `electricalConnectionCharacteristicListData`.
+///
+/// This is what an Energy Guard needs to turn a percentage from the grid operator into
+/// watts. It reports which of the two it found, because the two mean different things:
+/// exceeding a nameplate is impossible, and exceeding a contract is merely expensive.
+pub fn read_constraints(data: &CmdData, direction: Direction) -> Option<NominalMax> {
+    let CmdData::ElectricalConnectionCharacteristicListData(list) = data else {
+        return None;
+    };
+    list.electrical_connection_characteristic_data
+        .iter()
+        .flatten()
+        .find_map(|entry| {
+            let watts = entry.value.as_ref().and_then(ScaledNumber::to_f64)?;
+            match entry.characteristic_type.as_ref() {
+                Some(kind) if *kind == direction.nominal_max_characteristic() => {
+                    Some(NominalMax::Device(watts))
+                }
+                Some(kind) if *kind == direction.contractual_max_characteristic() => {
+                    Some(NominalMax::Contractual(watts))
+                }
+                _ => None,
+            }
+        })
 }
 
 /// The failsafe key descriptions (LPC/LPP Table 24).
@@ -252,6 +381,19 @@ pub enum CsEvent {
         /// What was answered.
         outcome: WriteOutcome,
     },
+    /// A write on the LoadControl feature could not be read as a limit, and was refused.
+    ///
+    /// Either the payload named a limit this system does not serve, or it named the right
+    /// one and carried a value that cannot be represented. The two are told apart by the
+    /// state: only the second reaches the state machine, because only the second is a
+    /// limit write. Neither carries a [`LimitWrite`], which is why this is its own event
+    /// rather than a [`CsEvent::LimitDecided`] with a value nobody sent.
+    LimitUnreadable {
+        /// The `msgCounter` of the write, which the refusal references.
+        request: crate::model::MsgCounter,
+        /// The refusal, which is always a [`WriteOutcome::Rejected`].
+        outcome: WriteOutcome,
+    },
     /// A write on one of the failsafe values was decided.
     FailsafeDecided {
         /// The `msgCounter` of the write.
@@ -291,6 +433,8 @@ pub struct ControllableSystemActor {
     load_control: FeatureAddress,
     device_configuration: FeatureAddress,
     device_diagnosis: FeatureAddress,
+    /// Where scenario 4's constraints are served from, for a device that publishes them.
+    electrical_connection: Option<FeatureAddress>,
     heartbeat: HeartbeatProducer,
     /// The Energy Guard entities holding each of the two bindings (§3.8).
     bound_load_control: Option<FeatureAddress>,
@@ -324,6 +468,7 @@ impl ControllableSystemActor {
             load_control,
             device_configuration,
             device_diagnosis,
+            electrical_connection: None,
             heartbeat: HeartbeatProducer::new(Duration::ZERO),
             bound_load_control: None,
             bound_configuration: None,
@@ -333,6 +478,23 @@ impl ControllableSystemActor {
             guard_discovery_asked: false,
             audit: AuditLog::new(),
         }
+    }
+
+    /// Serves scenario 4's constraints from an `ElectricalConnection` feature.
+    ///
+    /// Scenario 4 is `R` for a Controllable System, and the Energy Guard's side of it is
+    /// `M`: without the nominal maximum, an operator that works in percentages has no way
+    /// to turn one into watts ([LPC/LPP-041], [LPC/LPP-042]). Which of the two values is
+    /// published follows from [`CsConfig`](super::CsConfig) — the nameplate for an
+    /// appliance, the contract for an energy manager — and a device that has set neither
+    /// publishes an empty list rather than a guess.
+    ///
+    /// The address must be a feature built by
+    /// [`electrical_connection_feature`](super::electrical_connection_feature).
+    #[must_use]
+    pub fn with_electrical_connection(mut self, address: FeatureAddress) -> Self {
+        self.electrical_connection = Some(address);
+        self
     }
 
     /// Which of the two limitation use cases this actor plays.
@@ -408,6 +570,14 @@ impl ControllableSystemActor {
             failsafe_changed = feature
                 .set_data(failsafe_values(&self.system))
                 .unwrap_or(false);
+        }
+
+        if let Some(address) = self.electrical_connection.as_ref()
+            && let Some(feature) = engine.device_mut().resolve_mut(address)
+        {
+            // The nominal maxima do not change while the device runs, so nothing is
+            // notified for them: a peer reads them once, in the pre-scenario exchange.
+            let _ = feature.set_data(constraints(&self.system, self.direction));
         }
 
         // Implementation guide §2.4: only what changed is notified.
@@ -633,16 +803,27 @@ impl ControllableSystemActor {
         // `resolved` says what that limit becomes, with anything the partial write left
         // out filled in from what is stored (SPINE IG §3.3).
         let addressed = read_limit_write(data).is_some();
-        let Some(write) = addressed.then(|| read_limit_write(resolved)).flatten() else {
-            engine.reject_write(token, ErrorNumber::CommandRejected, now);
-            let write = LimitWrite::deactivated();
-            let outcome = WriteOutcome::Rejected(super::state::NackReason::NegativeValue);
-            self.log(request, write, outcome, peer, now);
-            return CsEvent::LimitDecided {
-                request,
-                write,
-                outcome,
+        let write = if addressed {
+            read_limit_write(resolved)
+        } else {
+            None
+        };
+        let Some(write) = write else {
+            // Two different refusals share this path, and they differ in one way that
+            // matters: whether the state machine hears about it. A write that never named
+            // this system's limit is not a limit write, so it does not; one that named it
+            // and carried a value too large to represent *is*, and a refused limit write
+            // moves the machine ([LPC/LPP-902], [LPC/LPP-918]).
+            let outcome = if addressed {
+                self.system.on_unreadable_limit_write(now)
+            } else {
+                WriteOutcome::Rejected(super::state::NackReason::Unreadable)
             };
+            engine.reject_write(token, outcome.error_number(), now);
+            let mut record = super::audit::LimitRecord::unreadable(now, request, outcome);
+            record.peer = peer;
+            self.audit.record(record);
+            return CsEvent::LimitUnreadable { request, outcome };
         };
 
         // A real device asks its controller here whether it can follow the limit; the
@@ -757,4 +938,41 @@ impl ControllableSystemActor {
 /// Whether two addresses name features of the same entity.
 fn same_entity_address(a: &FeatureAddress, b: &FeatureAddress) -> bool {
     crate::spine::same_entity(a, b)
+}
+
+impl crate::usecases::signals::Signals for ControllableSystemActor {
+    /// The state machine's signals, plus what only the actor knows.
+    ///
+    /// `…:guard` is the Energy Guard entity that holds both bindings (implementation
+    /// guide §3.8) — the answer to "which of these energy managers is in charge?", which
+    /// a laboratory driving a device with two of them has to be able to see.
+    fn signals(&self, _: ()) -> crate::usecases::signals::SignalSet {
+        use crate::usecases::signals::{Signal, SignalValue};
+        use alloc::borrow::Cow;
+        use alloc::format;
+
+        let prefix = self.direction.signal_prefix();
+        self.system
+            .signals(self.direction)
+            .with(Signal::new(
+                Cow::Owned(format!("{prefix}:guard")),
+                match self.guard.as_ref() {
+                    Some(guard) => SignalValue::Text(Cow::Owned(format!(
+                        "{} entity {:?} feature {}",
+                        guard
+                            .device
+                            .as_ref()
+                            .map(|device| device.as_str())
+                            .unwrap_or("(local)"),
+                        guard.entity.as_deref().unwrap_or(&[]),
+                        guard.feature.map_or(0, |f| f.0),
+                    ))),
+                    None => SignalValue::Absent,
+                },
+            ))
+            .with(Signal::new(
+                Cow::Owned(format!("{prefix}:auditRecords")),
+                SignalValue::Number(self.audit.len() as f64),
+            ))
+    }
 }

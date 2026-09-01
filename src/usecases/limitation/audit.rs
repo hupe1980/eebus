@@ -65,8 +65,15 @@ pub struct LimitRecord {
     pub peer: Option<AddressDevice>,
     /// The `msgCounter` of the write, which the answer references.
     pub request: MsgCounter,
-    /// What was written.
-    pub write: LimitWrite,
+    /// What was written, where it could be read.
+    ///
+    /// [`None`] records a write on the limit that could not be read as one — a value the
+    /// device cannot represent, or a payload naming a limit it does not serve. It is
+    /// deliberately not a zeroed [`LimitWrite`]: this log is evidence, and a record
+    /// saying an Energy Guard asked for nought watts when it asked for something
+    /// unintelligible would be evidence of something that did not happen.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub write: Option<LimitWrite>,
     /// What was answered.
     pub outcome: WriteOutcome,
     /// What the decision was based on, where it was not a device's own answer.
@@ -91,7 +98,24 @@ impl LimitRecord {
             timestamp: None,
             peer: None,
             request,
-            write,
+            write: Some(write),
+            outcome,
+            basis: None,
+        }
+    }
+
+    /// A record of a write on the limit that could not be read as one.
+    pub fn unreadable(
+        at: core::time::Duration,
+        request: MsgCounter,
+        outcome: WriteOutcome,
+    ) -> Self {
+        Self {
+            at,
+            timestamp: None,
+            peer: None,
+            request,
+            write: None,
             outcome,
             basis: None,
         }

@@ -50,8 +50,8 @@ that no observed device requires, is not worth it. `ShipTls::mandatory_suite_ava
 reports the gap rather than hiding it.
 
 **Persistence.** Everything that must survive a restart is `serde`-serialisable and
-reachable — `TrustStore::all`, `Hub::peer_keys`, `AuditLog::drain`, `CsConfig`. Where it is
-kept, and how long a regulator requires it to be kept, only the application knows.
+reachable — `TrustStore::to_json`, `Hub::peer_keys`, `AuditLog::drain`, `CsConfig`. Where it
+is kept, and how long a regulator requires it to be kept, only the application knows.
 
 **A telemetry module, a CLI, C FFI, language bindings.** Each is a product of its own, and
 none of them is this crate.

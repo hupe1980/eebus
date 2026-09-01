@@ -106,8 +106,8 @@ pub fn curtailment_value(percent: f64) -> CmdData {
 
 /// Reads the limitation factor out of a `deviceConfigurationKeyValueListData`.
 ///
-/// Returns the percentage, which a Monitoring Appliance multiplies by the building's
-/// cumulated nominal PV peak power to get the maximum feed-in ([MGCP-011]).
+/// Returns the percentage. On its own a percentage is not actionable — see
+/// [`FeedInLimit`] for the value an inverter or an energy manager can hold itself to.
 pub fn read_curtailment(data: &CmdData) -> Option<f64> {
     let CmdData::DeviceConfigurationKeyValueListData(list) = data else {
         return None;
@@ -119,6 +119,91 @@ pub fn read_curtailment(data: &CmdData) -> Option<f64> {
         .and_then(|entry| entry.value.as_ref())
         .and_then(|value| value.scaled_number.as_ref())
         .and_then(ScaledNumber::to_f64)
+}
+
+/// The ceiling scenario 1 puts on feed-in, in watts.
+///
+/// [MGCP-011] states the rule as an equation rather than a value:
+///
+/// ```text
+/// P_PV,feed-in  ≤  PLF_PV,feed-in,max,pct  ×  Σ P_PV,AC,nom
+/// ```
+///
+/// The factor is what crosses the wire; the sum of the installed PV systems' nominal peak
+/// power is a property of the building that no EEBUS message carries. Only the two
+/// together are a number of watts, and it is the watts that an energy manager acts on —
+/// in Germany, as the export ceiling of EEG §9. Keeping both terms in one value is what
+/// stops a caller acting on a percentage as though it were a power.
+///
+/// ```
+/// use eebus::usecases::mgcp::FeedInLimit;
+///
+/// // 70 % of a 12 kWp array: the classic §9 configuration.
+/// let limit = FeedInLimit::new(70.0, 12_000.0);
+/// assert_eq!(limit.watts(), 8_400.0);
+/// assert!(limit.permits(8_000.0));
+/// assert!(!limit.permits(9_000.0));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FeedInLimit {
+    factor_percent: f64,
+    nominal_peak_watts: f64,
+}
+
+impl FeedInLimit {
+    /// A ceiling from the factor and the building's cumulated nominal PV peak power.
+    ///
+    /// The factor is clamped to [`CURTAILMENT_RANGE`], as
+    /// [`curtailment_value`] clamps it on the way out: a factor above 100 % would
+    /// otherwise permit more feed-in than the array can produce, which is not a
+    /// limitation at all.
+    pub fn new(factor_percent: f64, nominal_peak_watts: f64) -> Self {
+        Self {
+            factor_percent: factor_percent
+                .clamp(*CURTAILMENT_RANGE.start(), *CURTAILMENT_RANGE.end()),
+            nominal_peak_watts: nominal_peak_watts.max(0.0),
+        }
+    }
+
+    /// A ceiling read straight off a `deviceConfigurationKeyValueListData`.
+    ///
+    /// [`None`] when the payload carries no factor — which is not the same as a factor of
+    /// zero, and must not be treated as one: an unread message is not a curtailment.
+    pub fn from_data(data: &CmdData, nominal_peak_watts: f64) -> Option<Self> {
+        read_curtailment(data).map(|factor| Self::new(factor, nominal_peak_watts))
+    }
+
+    /// The factor as it crossed the wire, as a percentage.
+    pub fn factor_percent(self) -> f64 {
+        self.factor_percent
+    }
+
+    /// The building's cumulated nominal PV peak power, in watts.
+    pub fn nominal_peak_watts(self) -> f64 {
+        self.nominal_peak_watts
+    }
+
+    /// The most that may be fed in, in watts.
+    pub fn watts(self) -> f64 {
+        self.factor_percent / 100.0 * self.nominal_peak_watts
+    }
+
+    /// Whether feeding in this much is within the ceiling.
+    pub fn permits(self, watts: f64) -> bool {
+        watts <= self.watts()
+    }
+
+    /// The ceiling as a [`LimitWrite`] an Energy Guard can hand to LPP.
+    ///
+    /// This is the join between the two use cases, and it is the ordinary way a §9
+    /// installation is built: MGCP scenario 1 says what the connection point permits, and
+    /// LPP is how an inverter is told. The limit carries no duration — the factor is a
+    /// standing configuration, not an event — so it holds until the next one arrives.
+    ///
+    /// [`LimitWrite`]: crate::usecases::limitation::LimitWrite
+    pub fn as_production_limit(self) -> crate::usecases::limitation::LimitWrite {
+        crate::usecases::limitation::LimitWrite::active(self.watts())
+    }
 }
 
 /// Entity types a Grid Connection Point may live on (MGCP §3.2.2.1.1).
@@ -317,6 +402,41 @@ mod tests {
 
         // A fraction of a percent survives, which whole-number rounding would lose.
         assert_eq!(read_curtailment(&curtailment_value(62.5)), Some(62.5));
+    }
+
+    /// The equation of [MGCP-011], with the numbers a German §9 installation uses.
+    #[test]
+    fn mgcp_011_the_ceiling_is_the_factor_times_the_installed_peak_power() {
+        let published = curtailment_value(70.0);
+        let limit = FeedInLimit::from_data(&published, 12_000.0).expect("a factor");
+        assert_eq!(limit.watts(), 8_400.0);
+        assert_eq!(limit.factor_percent(), 70.0);
+        assert_eq!(limit.nominal_peak_watts(), 12_000.0);
+
+        // And the value LPP is written with, which is how an inverter hears about it.
+        assert_eq!(limit.as_production_limit().watts, 8_400.0);
+        assert!(limit.as_production_limit().is_active);
+    }
+
+    /// A payload with no factor in it yields no ceiling. Reading it as zero would curtail
+    /// a building to nothing on a message that said nothing at all.
+    #[test]
+    fn a_payload_without_a_factor_is_not_a_ceiling_of_zero() {
+        let empty =
+            CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
+                device_configuration_key_value_data: Some(vec![]),
+            });
+        assert_eq!(FeedInLimit::from_data(&empty, 12_000.0), None);
+    }
+
+    /// A building with no PV has no feed-in to limit, and a negative array is not a
+    /// building.
+    #[test]
+    fn the_terms_of_the_equation_stay_inside_their_ranges() {
+        assert_eq!(FeedInLimit::new(70.0, 0.0).watts(), 0.0);
+        assert_eq!(FeedInLimit::new(70.0, -1.0).nominal_peak_watts(), 0.0);
+        assert_eq!(FeedInLimit::new(140.0, 10_000.0).factor_percent(), 100.0);
+        assert_eq!(FeedInLimit::new(-5.0, 10_000.0).watts(), 0.0);
     }
 
     #[test]

@@ -11,6 +11,12 @@ the Grid Connection Point** reports the same quantities at the building's bounda
 grid. They are the same measurements named from two sides, and they share their
 implementation here.
 
+This machinery is not only MPC and MGCP. The same "describe a measurement twice and read it
+back" serves seven use cases: those two, [EVCEM and EVSOC](@/docs/e-mobility.md) for a car,
+and [MOI, MPS and MOB](@/docs/storage.md) for an inverter, a PV string and a battery. Each
+added vocabulary — charged energy, state of charge, DC power, yields, insulation
+resistance — and none of them added mechanism.
+
 ## A measurement without its description means nothing
 
 This is the whole difficulty of the use case. A notification looks like this:
@@ -41,6 +47,36 @@ Two rules the crate enforces rather than leaving to the caller:
 
 ## Curtailment
 
-MGCP carries the photovoltaic curtailment factor: how much of what the plant could produce
-it is currently allowed to. It is the measurement that closes the loop with
+MGCP scenario 1 carries the photovoltaic curtailment factor: how much of what the plant
+could produce it is currently allowed to. It is the measurement that closes the loop with
 [LPP](@/docs/limitation.md) — a limit was sent, and this is what actually happened.
+
+[MGCP-011] states it as an equation rather than a value:
+
+```text
+P_PV,feed-in  ≤  PLF_PV,feed-in,max,pct  ×  Σ P_PV,AC,nom
+```
+
+The factor is what crosses the wire. The sum of the installed systems' nominal peak power
+is a property of the building that no EEBUS message carries, so only the two together are a
+number of watts — and it is the watts an energy manager acts on. In Germany that number is
+the export ceiling of EEG §9.
+
+`FeedInLimit` keeps both terms, which is what stops a caller acting on a percentage as
+though it were a power:
+
+```rust
+use eebus::usecases::mgcp::FeedInLimit;
+
+// 70 % of a 12 kWp array: the classic §9 configuration.
+let limit = FeedInLimit::new(70.0, 12_000.0);
+assert_eq!(limit.watts(), 8_400.0);
+assert!(!limit.permits(9_000.0));
+
+// And the value LPP is written with, which is how an inverter hears about it.
+let write = limit.as_production_limit();
+```
+
+`FeedInLimit::from_data` reads the factor straight off a `deviceConfigurationKeyValueListData`
+and returns `None` when the payload carries none — which is not the same as a factor of
+zero, and must not be treated as one. An unread message is not a curtailment.

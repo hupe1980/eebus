@@ -1,6 +1,6 @@
 //! A node on the network: what it will accept, and whom it will dial.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use std::sync::Mutex;
@@ -19,14 +19,95 @@ use crate::tls::{PeerObserver, ShipTls};
 
 use super::connection::{ConnectionError, ShipConnection, check_subprotocol, run_handshake};
 
-/// The SKIs a node is willing to exchange data with.
+/// One remembered peer.
+///
+/// The SKI is what the trust decision is made on; everything else is what SHIP §12.2.2.1
+/// calls optional storage, and is here because a store that can only say "40 hex digits"
+/// is a store a user cannot audit. A person deciding whether to revoke something needs to
+/// see which box it was.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrustedPeer {
+    /// The Subject Key Identifier, which is the identity SHIP trusts.
+    pub ski: Ski,
+    /// What the user calls it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+    /// The SHIP ID it announced over mDNS, `<IANA PEN>_<vendor product ID>`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ship_id: Option<String>,
+    /// When trust was established, ISO 8601, where the device had a clock to read.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trusted_at: Option<String>,
+}
+
+impl TrustedPeer {
+    /// A peer known only by its SKI, which is all trust actually requires.
+    ///
+    /// There is deliberately no [`Default`]: a trust record with no SKI in it is not a
+    /// record of trusting anything.
+    pub fn new(ski: Ski) -> Self {
+        Self {
+            ski,
+            name: None,
+            ship_id: None,
+            trusted_at: None,
+        }
+    }
+
+    /// Names it, so a user can tell one line of the store from the next.
+    #[must_use]
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Records the SHIP ID it announced.
+    #[must_use]
+    pub fn with_ship_id(mut self, ship_id: impl Into<String>) -> Self {
+        self.ship_id = Some(ship_id.into());
+        self
+    }
+
+    /// Records when trust was established.
+    #[must_use]
+    pub fn at_time(mut self, timestamp: impl Into<String>) -> Self {
+        self.trusted_at = Some(timestamp.into());
+        self
+    }
+}
+
+/// The peers a node is willing to exchange data with.
 ///
 /// SHIP's whole trust model is this list. A peer whose SKI is not in it may still connect
 /// and complete TLS — it has to, so that its SKI can be shown to a user — but the SHIP
 /// handshake will hold it in the pending state rather than open the data phase.
+///
+/// # Persistence
+///
+/// SHIP §12.2.2 is emphatic that this list should survive a restart: "to avoid
+/// re-verification by user interaction, persistent storage of mandatory key material is
+/// STRONGLY RECOMMENDED". Nothing here writes to disk — where a device keeps its state is
+/// the device's business — but [`to_json`](Self::to_json) and
+/// [`from_json`](Self::from_json) are the two calls that make saving it a one-liner:
+///
+/// ```no_run
+/// use eebus::runtime::TrustStore;
+///
+/// let store = TrustStore::from_json(&std::fs::read_to_string("trust.json")?)?;
+/// // … a user approves another box …
+/// std::fs::write("trust.json", store.to_json()?)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Resetting
+///
+/// SHIP §12.2.2 also states a hard requirement: "a SHIP node SHALL offer a possibility to
+/// delete all stored foreign public keys (e.g. via factory reset)". That is
+/// [`forget_all`](Self::forget_all), and it is what an "EEBUS reset" on a device's user
+/// interface has to reach.
 #[derive(Clone, Debug, Default)]
 pub struct TrustStore {
-    trusted: Arc<Mutex<BTreeSet<Ski>>>,
+    trusted: Arc<Mutex<BTreeMap<Ski, TrustedPeer>>>,
 }
 
 impl TrustStore {
@@ -44,10 +125,27 @@ impl TrustStore {
         store
     }
 
+    /// A store holding these records, as loaded from disk at start-up.
+    pub fn restored(peers: impl IntoIterator<Item = TrustedPeer>) -> Self {
+        let store = Self::new();
+        for peer in peers {
+            store.remember(peer);
+        }
+        store
+    }
+
     /// Adds a peer, which is what a user approving a SKI amounts to.
     pub fn trust(&self, ski: Ski) {
+        self.remember(TrustedPeer::new(ski));
+    }
+
+    /// Adds a peer, with whatever else is known about it.
+    ///
+    /// Replaces an existing record for the same SKI: re-approving a peer is a fresh
+    /// decision, and the details that come with it are the current ones.
+    pub fn remember(&self, peer: TrustedPeer) {
         if let Ok(mut trusted) = self.trusted.lock() {
-            trusted.insert(ski);
+            trusted.insert(peer.ski, peer);
         }
     }
 
@@ -58,20 +156,83 @@ impl TrustStore {
         }
     }
 
+    /// Forgets every peer: the "delete all stored foreign public keys" of SHIP §12.2.2.
+    ///
+    /// This is half of an EEBUS reset. The other half is the device's own — restoring the
+    /// original certificate and private key, so that the SKI printed on the label is the
+    /// one the node presents again (SHIP §12.1.1) — and this crate cannot do that for it,
+    /// because it never chose where the identity was stored.
+    ///
+    /// Returns how many were forgotten, for the log entry a user-initiated reset deserves.
+    /// Existing connections are not torn down: SHIP re-checks trust on the next handshake,
+    /// and dropping a live limitation exchange mid-reset would be its own hazard. A device
+    /// that means to disconnect as well should say so through its [`Hub`](super::Hub).
+    pub fn forget_all(&self) -> usize {
+        match self.trusted.lock() {
+            Ok(mut trusted) => {
+                let count = trusted.len();
+                trusted.clear();
+                count
+            }
+            Err(_) => 0,
+        }
+    }
+
     /// Whether a peer is trusted.
     pub fn is_trusted(&self, ski: &Ski) -> bool {
         self.trusted
             .lock()
-            .map(|trusted| trusted.contains(ski))
+            .map(|trusted| trusted.contains_key(ski))
             .unwrap_or(false)
     }
 
-    /// Every trusted SKI, for persisting.
+    /// What is known about one trusted peer.
+    pub fn get(&self, ski: &Ski) -> Option<TrustedPeer> {
+        self.trusted
+            .lock()
+            .ok()
+            .and_then(|trusted| trusted.get(ski).cloned())
+    }
+
+    /// How many peers are trusted.
+    pub fn len(&self) -> usize {
+        self.trusted
+            .lock()
+            .map(|trusted| trusted.len())
+            .unwrap_or(0)
+    }
+
+    /// Whether nothing is trusted — a node fresh out of the box, or freshly reset.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every trusted SKI.
     pub fn all(&self) -> alloc::vec::Vec<Ski> {
         self.trusted
             .lock()
-            .map(|trusted| trusted.iter().copied().collect())
+            .map(|trusted| trusted.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Every record, in SKI order, for persisting or for showing a user.
+    pub fn peers(&self) -> alloc::vec::Vec<TrustedPeer> {
+        self.trusted
+            .lock()
+            .map(|trusted| trusted.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The store as JSON, for writing to disk.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.peers())
+    }
+
+    /// A store read back from [`to_json`](Self::to_json).
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        Ok(Self::restored(serde_json::from_str::<
+            alloc::vec::Vec<TrustedPeer>,
+        >(json)?))
     }
 }
 
@@ -169,6 +330,29 @@ impl Node {
     /// The trust store, for approving a peer a user has just confirmed.
     pub fn trust_store(&self) -> &TrustStore {
         &self.trust
+    }
+
+    /// The part of an "EEBUS reset" this crate can perform: forgetting every peer.
+    ///
+    /// SHIP §12.2.2 requires a node to offer this — "at least the SHIP node SHALL offer a
+    /// possibility to delete all stored foreign public keys" — and the installation
+    /// process test specification treats it as a prerequisite, because an installer
+    /// removing a control box has no other way to undo the pairing.
+    ///
+    /// Returns how many peers were forgotten. What it deliberately does *not* do:
+    ///
+    /// * **Restore the node's own identity.** SHIP §12.1.1 asks that a factory reset bring
+    ///   back the original certificate and key, so that the SKI printed on the label is
+    ///   the one presented again. Only the device knows where that was stored.
+    /// * **Delete anything from disk.** [`TrustStore::to_json`] is what persists the
+    ///   store; writing the now-empty store back out is the caller's step, and doing it
+    ///   for them would mean guessing at a path.
+    /// * **Close open connections.** Trust is re-checked on the next handshake. Tearing
+    ///   down a live limitation exchange in the middle of a reset would be its own
+    ///   hazard; [`Hub::shutdown`](super::Hub::shutdown) is there for a device that means
+    ///   to.
+    pub fn eebus_reset(&self) -> usize {
+        self.trust.forget_all()
     }
 
     /// Dials a peer and runs the whole stack: TCP, TLS, WebSocket, SHIP handshake.

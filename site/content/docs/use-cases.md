@@ -47,11 +47,23 @@ display that merely watches.
 | **MPC** — Monitoring of Power Consumption | Monitored Unit, Monitoring Appliance | UC TS 1.0.0 |
 | **MGCP** — Monitoring of Grid Connection Point | Monitored Unit, Monitoring Appliance | UC TS 1.0.0 |
 | **EVSECC** — EVSE Commissioning and Configuration | EVSE, CEM | EVSECC 1.0.1 |
+| **EVCC** — EV Commissioning and Configuration | EV, CEM | EVCC 1.0.1 |
 | **OPEV** — Overload Protection by EV Charging Current Curtailment | EV, CEM | OPEV 1.0.1b |
+| **OSCEV** — Optimization of Self-Consumption During EV Charging | EV, CEM | OSCEV 1.0.1b |
+| **EVCEM** — EV Charging Electricity Measurement | EV, Energy Guard | EVCEM 1.0.1 |
+| **EVSOC** — EV State of Charge | EV, Monitoring Appliance | EVSOC 1.0.0 |
+| **MOI** — Monitoring of Inverter | Inverter, Monitoring Appliance | MOI 1.0.0 |
+| **MPS** — Monitoring of PV String | PVString, Monitoring Appliance | MPS 1.0.0 |
+| **MOB** — Monitoring of Battery | Battery, Monitoring Appliance | MOB 1.0.0 |
+| **COB** — Control of Battery | Inverter, CEM | COB 1.0.0 |
 
 The first four are the ones certifiable since July 2026. Every one of them is implemented
 on **both** sides — the appliance's and the manager's — which is where most of the
 implementation guides' pages actually go.
+
+Not implemented: **CEVC** (Coordinated EV Charging), which is a different shape from
+everything above — three actors, power sequences, incentive tables, and a charging plan
+negotiated rather than a ceiling imposed.
 
 ## Two use cases, one implementation
 
@@ -65,6 +77,16 @@ ControllableSystemActor::new(system, lpc::DIRECTION, load_control, config, diagn
 ControllableSystemActor::new(system, lpp::DIRECTION, load_control, config, diagnosis)
 ```
 
-MPC and MGCP share their implementation the same way. The reference implementations
-duplicate each pair; here a fix to one is a fix to both, and the only thing the direction
-changes is what the tests assert.
+Three more pairs work the same way:
+
+* **MPC and MGCP** are the same measurements named from the appliance's side or the grid's.
+* **OPEV and OSCEV** are the same per-phase current ceiling for opposite reasons, pointed
+  by a `Purpose`: `obligation`/`overloadProtection` against
+  `recommendation`/`selfConsumption`. Two words, and a car that confuses them charges on
+  solar only.
+* **EVCEM, EVSOC, MOI, MPS and MOB** are built on the same `monitoring` machinery as MPC
+  and MGCP — one implementation of "describe a measurement twice and read it back", serving
+  seven use cases. What each of them added was vocabulary, not mechanism.
+
+The reference implementations duplicate each pair; here a fix to one is a fix to both, and
+the only thing the direction changes is what the tests assert.

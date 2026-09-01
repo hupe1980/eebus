@@ -15,15 +15,36 @@
 //! * [`limitation`] serves [`lpc`] and [`lpp`], the same state machine pointed in
 //!   opposite directions.
 //! * [`monitoring`] serves [`mpc`] and [`mgcp`], the same measurements named from the
-//!   appliance's side or the grid's.
+//!   appliance's side or the grid's — and [`moi`], [`mob`], [`mps`] and two of the
+//!   [`emobility`] family besides, which are the same "describe a measurement twice and
+//!   read it back" with a wider vocabulary.
+//! * [`emobility::charging`] serves [`emobility::opev`] and [`emobility::oscev`], the same
+//!   per-phase current ceiling for opposite reasons.
+//!
+//! # What is here
+//!
+//! | | Use case | Actors |
+//! |---|---|---|
+//! | **Grid** | [`lpc`], [`lpp`] | Controllable System, Energy Guard |
+//! | | [`mpc`], [`mgcp`] | Monitored Unit / Grid Connection Point, Monitoring Appliance |
+//! | **E-mobility** | [`emobility`] | six use cases: the wallbox, the car, its ceiling, its surplus, and what it measured |
+//! | **Generation and storage** | [`moi`] | Inverter, Monitoring Appliance |
+//! | | [`mps`] | PV String, Monitoring Appliance |
+//! | | [`mob`] | Battery, Monitoring Appliance |
+//! | | [`cob`] | Inverter, CEM — the only *control* use case outside the grid pair |
 
+pub mod cob;
 pub mod descriptor;
 pub mod emobility;
 pub mod limitation;
 pub mod lpc;
 pub mod lpp;
 pub mod mgcp;
+pub mod mob;
+pub mod moi;
 pub mod monitoring;
 pub mod mpc;
+pub mod mps;
+pub mod signals;
 
 pub use descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};

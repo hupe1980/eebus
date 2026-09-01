@@ -8,210 +8,16 @@
 //! Everything runs against a virtual clock, so a two-hour failsafe duration costs
 //! nothing to test.
 
+mod common;
+
 use core::time::Duration;
 
-use eebus::model::{Datagram, DeviceType, EntityType, Function};
-use eebus::spine::{Engine, LocalDevice, LocalEntity, SpineEvent, node_management};
+use common::*;
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, EffectiveLimit,
-    EnergyGuardActor, GuardEvent, LimitWrite, LimitationState, MIN_WRITE_INTERVAL,
-    RETRY_BACKOFF_STEP,
+    self, ControllableSystem, CsConfig, CsEvent, EffectiveLimit, GuardEvent, LimitWrite,
+    LimitationState, MIN_WRITE_INTERVAL, NominalMax, RETRY_BACKOFF_STEP,
 };
 use eebus::usecases::lpc;
-
-const FAILSAFE_WATTS: f64 = 4_200.0;
-
-/// A control box and a heat pump, each driven by its own actor.
-struct Pair {
-    guard_engine: Engine,
-    guard: EnergyGuardActor,
-    pump_engine: Engine,
-    pump: ControllableSystemActor,
-    now: Duration,
-    /// Everything the Energy Guard has reported.
-    reports: Vec<GuardEvent>,
-    /// Everything the Controllable System has reported.
-    decisions: Vec<CsEvent>,
-}
-
-impl Pair {
-    fn new() -> Self {
-        let now = Duration::ZERO;
-
-        let mut guard_device = LocalDevice::new(
-            "i:12345",
-            "ControlBox-1",
-            DeviceType::ElectricitySupplySystem,
-        )
-        .unwrap();
-        guard_device
-            .add_entity(
-                LocalEntity::new([1], EntityType::GridGuard)
-                    .with_feature(limitation::client_feature(1))
-                    .with_feature(limitation::device_diagnosis_feature(2)),
-            )
-            .unwrap();
-        let client = guard_device.address_of(&[1], 1);
-        let guard_diagnosis = guard_device.address_of(&[1], 2);
-        let mut guard_engine = Engine::new(guard_device);
-        guard_engine.add_use_case([1], 1, &lpc::ENERGY_GUARD);
-        let guard = EnergyGuardActor::new(lpc::DIRECTION, client, guard_diagnosis, now);
-
-        let mut pump_device =
-            LocalDevice::new("i:67890", "HeatPump-1", DeviceType::HeatGenerationSystem).unwrap();
-        pump_device
-            .add_entity(
-                LocalEntity::new([1], EntityType::HeatPumpAppliance)
-                    .with_feature(limitation::load_control_feature(1))
-                    .with_feature(limitation::device_configuration_feature(2))
-                    .with_feature(limitation::device_diagnosis_feature(3)),
-            )
-            .unwrap();
-        let load_control = pump_device.address_of(&[1], 1);
-        let configuration = pump_device.address_of(&[1], 2);
-        let diagnosis = pump_device.address_of(&[1], 3);
-        let mut pump_engine = Engine::new(pump_device);
-        pump_engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
-        let pump = ControllableSystemActor::new(
-            ControllableSystem::new(
-                CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600)),
-                now,
-            ),
-            lpc::DIRECTION,
-            load_control,
-            configuration,
-            diagnosis,
-        );
-        pump.install(&mut pump_engine, now);
-
-        Self {
-            guard_engine,
-            guard,
-            pump_engine,
-            pump,
-            now,
-            reports: Vec::new(),
-            decisions: Vec::new(),
-        }
-    }
-
-    /// Discovery both ways, and the Energy Guard taking control.
-    fn commission(&mut self) {
-        let guard_nm = node_management(self.guard_engine.device().address());
-        let pump_nm = node_management(self.pump_engine.device().address());
-        for function in [
-            Function::NodeManagementDetailedDiscoveryData,
-            Function::NodeManagementUseCaseData,
-        ] {
-            self.guard_engine
-                .read(&pump_nm, &guard_nm, function.clone(), self.now);
-            self.pump_engine
-                .read(&guard_nm, &pump_nm, function, self.now);
-        }
-        self.settle();
-
-        let device = self.pump_engine.device().address().clone();
-        let remote = self.guard_engine.peer(&device).expect("the heat pump");
-        let peer = limitation::locate(remote, lpc::DIRECTION).expect("a Controllable System");
-        self.guard.attach(&mut self.guard_engine, peer, self.now);
-        self.settle();
-    }
-
-    /// Carries datagrams both ways until neither side has anything left to say.
-    fn settle(&mut self) {
-        for _ in 0..128 {
-            let mut moved = false;
-            while let Some(datagram) = self.guard_engine.poll_transmit() {
-                self.pump_engine
-                    .handle_datagram(&round_trip(&datagram), self.now);
-                moved = true;
-            }
-            while let Some(datagram) = self.pump_engine.poll_transmit() {
-                self.guard_engine
-                    .handle_datagram(&round_trip(&datagram), self.now);
-                moved = true;
-            }
-            let events: Vec<SpineEvent> =
-                core::iter::from_fn(|| self.pump_engine.poll_event()).collect();
-            for event in &events {
-                if let Some(decision) =
-                    self.pump
-                        .handle_event(&mut self.pump_engine, event, self.now)
-                {
-                    self.decisions.push(decision);
-                    moved = true;
-                }
-            }
-            let events: Vec<SpineEvent> =
-                core::iter::from_fn(|| self.guard_engine.poll_event()).collect();
-            for event in &events {
-                if let Some(report) =
-                    self.guard
-                        .handle_event(&mut self.guard_engine, event, self.now)
-                {
-                    self.reports.push(report);
-                    moved = true;
-                }
-            }
-            if !moved {
-                return;
-            }
-        }
-        panic!("the exchange did not settle");
-    }
-
-    /// Fires both actors' timers, then settles.
-    fn advance(&mut self, by: Duration) {
-        self.now += by;
-        let reports = self.guard.handle_timeout(&mut self.guard_engine, self.now);
-        self.reports.extend(reports);
-        if let Some(decision) = self.pump.handle_timeout(&mut self.pump_engine, self.now) {
-            self.decisions.push(decision);
-        }
-        self.guard_engine.handle_timeout(self.now);
-        self.pump_engine.handle_timeout(self.now);
-        self.settle();
-    }
-
-    fn device(&self) -> eebus::model::AddressDevice {
-        self.pump_engine.device().address().clone()
-    }
-
-    fn guard_client(&self) -> eebus::model::FeatureAddress {
-        self.guard_engine.device().address_of(&[1], 1)
-    }
-
-    fn pump_load_control(&self) -> eebus::model::FeatureAddress {
-        self.pump_engine.device().address_of(&[1], 1)
-    }
-
-    fn accepted(&self) -> Vec<LimitWrite> {
-        self.reports
-            .iter()
-            .filter_map(|r| match r {
-                GuardEvent::LimitAccepted { limit, .. } => Some(*limit),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn refused(&self) -> Vec<LimitWrite> {
-        self.reports
-            .iter()
-            .filter_map(|r| match r {
-                GuardEvent::LimitRefused { limit, .. } => Some(*limit),
-                _ => None,
-            })
-            .collect()
-    }
-}
-
-fn round_trip(datagram: &Datagram) -> Datagram {
-    let wire = eebus::model::to_json(datagram).expect("encode");
-    let decoded = eebus::model::from_json_str(&wire).expect("decode");
-    assert_eq!(&decoded, datagram, "the datagram survives the wire");
-    decoded
-}
 
 /// The whole exchange: the guard takes control, sets a limit, and the pump applies it.
 #[test]
@@ -231,11 +37,17 @@ fn the_two_actors_run_the_use_case_between_them() {
             .any(|d| matches!(d, CsEvent::GuardIdentified { .. })),
         "and the pump knows which entity holds them (implementation guide §3.8)"
     );
+    // Commissioning is not silent: §2.11 makes the guard owe an opening write on the
+    // limit as soon as it is bound, and until that lands the pump is not in a controllable
+    // state at all. Nothing has been *required* of it, so what goes out is a deactivation
+    // — which §2.13 permits precisely because the grid is asking for nothing.
     assert_eq!(
-        pair.pump.system().effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS),
-        "[LPC-901]: nothing has been asked of it yet"
+        pair.pump.system().state(),
+        LimitationState::UnlimitedControlled
     );
+    assert_eq!(pair.pump.system().effective_limit(), EffectiveLimit::None);
+    assert_eq!(pair.accepted().len(), 1, "the opening deactivation");
+    pair.forget_history();
 
     let device = pair.device();
     pair.guard
@@ -263,6 +75,7 @@ fn the_two_actors_run_the_use_case_between_them() {
 fn the_guard_sends_a_heartbeat_before_its_first_limit() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
 
     let device = pair.device();
     pair.guard
@@ -281,6 +94,7 @@ fn the_guard_sends_a_heartbeat_before_its_first_limit() {
 fn an_unchanged_limit_is_not_rewritten() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
 
     let device = pair.device();
     pair.guard
@@ -305,6 +119,7 @@ fn an_unchanged_limit_is_not_rewritten() {
 fn a_refused_limit_is_retried_and_the_peer_is_kept() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
 
     let device = pair.device();
 
@@ -339,6 +154,7 @@ fn a_refused_limit_is_retried_and_the_peer_is_kept() {
 fn an_activated_limit_never_carries_a_zero_duration() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
 
     let device = pair.device();
     pair.guard.require(
@@ -371,6 +187,7 @@ fn an_activated_limit_never_carries_a_zero_duration() {
 fn the_guard_can_change_the_failsafe_values() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
 
     let device = pair.device();
     pair.guard
@@ -400,6 +217,7 @@ fn the_guard_can_change_the_failsafe_values() {
 fn an_out_of_range_failsafe_duration_is_refused_locally() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
     let device = pair.device();
 
     assert!(
@@ -435,6 +253,7 @@ fn an_out_of_range_failsafe_duration_is_refused_locally() {
 fn a_new_requirement_is_due_at_once() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
     pair.advance(Duration::from_secs(1));
 
     let quiet = pair.guard.poll_timeout();
@@ -465,6 +284,7 @@ fn a_new_requirement_is_due_at_once() {
 fn a_write_held_back_by_the_five_minute_ceiling_goes_out_when_it_lifts() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
     let device = pair.device();
 
     pair.guard
@@ -498,6 +318,7 @@ fn a_write_held_back_by_the_five_minute_ceiling_goes_out_when_it_lifts() {
 fn a_limit_the_system_dropped_is_written_again() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
     let device = pair.device();
 
     // A limit with a duration: the Controllable System will deactivate it when it runs
@@ -538,6 +359,7 @@ fn a_limit_the_system_dropped_is_written_again() {
 fn both_sides_keep_the_record_section_14a_asks_for() {
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
     let device = pair.device();
 
     pair.guard
@@ -545,13 +367,13 @@ fn both_sides_keep_the_record_section_14a_asks_for() {
     pair.advance(Duration::from_secs(1));
 
     let written = pair.guard.audit().last().expect("the guard kept a record");
-    assert_eq!(written.write.watts, 3_000.0);
+    assert_eq!(written.write.expect("a readable limit").watts, 3_000.0);
     assert!(written.outcome.is_accepted());
     assert_eq!(written.peer.as_ref(), Some(&device));
 
     let applied = pair.pump.audit().last().expect("the system kept one too");
     assert!(applied.outcome.is_accepted());
-    assert_eq!(applied.write.watts, 3_000.0);
+    assert_eq!(applied.write.expect("a readable limit").watts, 3_000.0);
 
     assert_eq!(
         written.request, applied.request,
@@ -567,6 +389,7 @@ fn a_refusal_is_recorded_without_inventing_a_reason() {
 
     let mut pair = Pair::new();
     pair.commission();
+    pair.forget_history();
     let device = pair.device();
 
     // Drive the system into the failsafe state, where §2.14 refuses a limit that arrives
@@ -640,4 +463,165 @@ fn a_refusal_is_recorded_without_inventing_a_reason() {
         pair.guard.audit().len() >= accepted,
         "the guard's own record only grows"
     );
+}
+
+/// Scenario 4, both halves. The Controllable System publishes the nominal maximum it can
+/// draw and the Energy Guard reads it in the pre-scenario exchange — which is the whole
+/// point of the scenario, because an operator that works in percentages has nothing to
+/// multiply until it arrives ([LPC-041], LPC Table 27).
+#[test]
+fn lpc_041_the_guard_learns_the_nominal_maximum_before_it_writes() {
+    let mut pair = Pair::new();
+    pair.commission();
+
+    let device = pair.device();
+    assert_eq!(
+        pair.guard.nominal_max(&device),
+        Some(NominalMax::Device(NOMINAL_MAX_WATTS)),
+        "an appliance publishes its nameplate, not a contract"
+    );
+    assert!(
+        pair.reports
+            .iter()
+            .any(|report| matches!(report, GuardEvent::ConstraintsLearned { .. })),
+        "the guard reports it, so an application can act on it: {:?}",
+        pair.reports
+    );
+}
+
+/// The other half of [LPC-041]/[LPC-042]: an energy manager publishes what its contract
+/// allows and *not* a nameplate, because it has none. LPC UC TS §2.6.4.1 says SHALL for
+/// both halves of that, and getting it wrong tells the Energy Guard it is limiting a
+/// single appliance when it is limiting a household.
+#[test]
+fn lpc_042_an_energy_manager_publishes_its_contract_and_not_a_nameplate() {
+    let device = ControllableSystem::new(
+        CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
+            .with_nominal_max(11_000.0)
+            .with_contractual_max(30_000.0)
+            .on_cem(),
+        Duration::ZERO,
+    );
+    assert_eq!(
+        limitation::nominal_max(&device),
+        Some(NominalMax::Contractual(30_000.0)),
+        "on a CEM the contract wins, even with a nameplate configured"
+    );
+
+    let appliance = ControllableSystem::new(
+        CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
+            .with_nominal_max(11_000.0)
+            .with_contractual_max(30_000.0),
+        Duration::ZERO,
+    );
+    assert_eq!(
+        limitation::nominal_max(&appliance),
+        Some(NominalMax::Device(11_000.0)),
+        "off a CEM the nameplate wins"
+    );
+
+    // And each publishes under the name its own use case reserves.
+    let published = limitation::constraints(&device, lpc::DIRECTION);
+    assert_eq!(
+        limitation::read_constraints(&published, lpc::DIRECTION),
+        Some(NominalMax::Contractual(30_000.0))
+    );
+    let produced = limitation::constraints(&appliance, eebus::usecases::lpp::DIRECTION);
+    assert_eq!(
+        limitation::read_constraints(&produced, eebus::usecases::lpp::DIRECTION),
+        Some(NominalMax::Device(11_000.0)),
+        "LPP names the same value powerProductionNominalMax"
+    );
+    assert_eq!(
+        limitation::read_constraints(&produced, lpc::DIRECTION),
+        None,
+        "and an LPC guard must not read an LPP characteristic as its own"
+    );
+}
+
+/// A device that knows neither value publishes an empty list rather than a guess:
+/// scenario 4 is `R` for a Controllable System, and a wrong nameplate is worse than none.
+#[test]
+fn a_device_without_a_nameplate_publishes_nothing_rather_than_zero() {
+    let bare = ControllableSystem::new(
+        CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600)),
+        Duration::ZERO,
+    );
+    assert_eq!(limitation::nominal_max(&bare), None);
+    assert_eq!(
+        limitation::read_constraints(
+            &limitation::constraints(&bare, lpc::DIRECTION),
+            lpc::DIRECTION
+        ),
+        None
+    );
+}
+
+/// The invariant a caller's event loop rests on: the instant the guard asks to be woken
+/// at always moves.
+///
+/// A deadline that could never be reached again is not a slow loop, it is a spin — and in
+/// a loop that also owns a socket it is a connection that is never read from, which looks
+/// exactly like a peer that has gone quiet.
+#[test]
+fn the_guards_deadline_always_advances() {
+    let mut pair = Pair::new();
+
+    // Before anything is attached: the first heartbeat, which §2.11 wants immediately.
+    let mut seen = pair.guard.poll_timeout();
+    assert_eq!(seen, Duration::ZERO, "due at once, not a minute from now");
+
+    pair.commission();
+    let device = pair.device();
+
+    // Through the whole exchange, and past every point where a write is held back.
+    for step in 0..40 {
+        let due = pair.guard.poll_timeout();
+        assert!(
+            due >= pair.now || due >= seen,
+            "step {step}: the guard asked to be woken at {due:?}, which is behind both \
+             the clock ({:?}) and the last answer ({seen:?})",
+            pair.now
+        );
+        seen = due;
+
+        // Drive to whatever it asked for, exactly as a caller would.
+        let target = due.max(pair.now + Duration::from_millis(1));
+        pair.advance(target - pair.now);
+
+        match step {
+            5 => pair
+                .guard
+                .require(&device, Some(LimitWrite::active(3_000.0)), pair.now),
+            20 => pair.guard.require(&device, None, pair.now),
+            _ => {}
+        }
+    }
+}
+
+/// Implementation guide §2.11 is about what the Controllable System *received* in the
+/// sixty seconds before the write, not about what the Energy Guard sent.
+///
+/// A heartbeat is a notification to subscribers, so one emitted before the peer subscribed
+/// reached nobody. A guard that counted it would write a limit the peer must then refuse
+/// for want of a heartbeat it never got — and from the operator's side that refusal is
+/// indistinguishable from a device declining to be limited.
+#[test]
+fn ig_2_11_the_heartbeat_that_counts_is_one_the_peer_could_receive() {
+    let mut pair = Pair::new();
+    pair.commission();
+    pair.forget_history();
+
+    let device = pair.device();
+    pair.guard
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+    pair.advance(Duration::from_secs(1));
+
+    assert!(
+        pair.refused().is_empty(),
+        "the limit was refused: {:?}",
+        pair.refused()
+    );
+    assert_eq!(pair.accepted().len(), 1);
+    assert_eq!(pair.pump.system().state(), LimitationState::Limited);
 }

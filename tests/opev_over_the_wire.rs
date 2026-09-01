@@ -14,10 +14,11 @@ use eebus::model::{
     Function, Role,
 };
 use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management};
-use eebus::usecases::emobility::opev::{
+use eebus::usecases::emobility::charging::{
     self, ChargingCurrents, CurrentSource, EvActor, EvCharging, EvEvent, GuardEvent,
     OverloadGuardActor,
 };
+use eebus::usecases::emobility::opev;
 
 /// What the car can charge at: six amperes minimum, sixteen maximum.
 const RANGE: (f64, f64) = (6.0, 16.0);
@@ -65,8 +66,8 @@ impl Pair {
         car_device
             .add_entity(
                 LocalEntity::new([1, 1], EntityType::EV)
-                    .with_feature(opev::load_control_feature(1))
-                    .with_feature(opev::electrical_connection_feature(2)),
+                    .with_feature(charging::load_control_feature(1))
+                    .with_feature(charging::electrical_connection_feature(2)),
             )
             .unwrap();
         let load_control = car_device.address_of(&[1, 1], 1);
@@ -75,10 +76,11 @@ impl Pair {
         car.add_use_case([1, 1], 1, &opev::EV);
 
         let ev = EvActor::new(
+            opev::PURPOSE,
             EvCharging::new(ChargingCurrents::same(RANGE.0), now).with_range(RANGE.0, RANGE.1),
             load_control,
             electrical_connection,
-            opev::PHASES,
+            charging::PHASES,
             RANGE,
         );
         ev.publish(&mut car, now);
@@ -111,12 +113,13 @@ impl Pair {
 
         let car_device = self.car.device().address().clone();
         let remote = self.manager.peer(&car_device).expect("the car");
-        let peer = opev::locate(remote).expect("it plays the EV actor");
+        let peer = charging::locate(remote, opev::PURPOSE).expect("it plays the EV actor");
         self.guard.attach(&mut self.manager, peer, self.now);
 
         let manager_device = self.manager.device().address().clone();
         let remote = self.car.peer(&manager_device).expect("the manager");
-        let guard_diagnosis = opev::locate_guard(remote).expect("its DeviceDiagnosis");
+        let guard_diagnosis =
+            charging::locate_guard(remote, opev::PURPOSE).expect("its DeviceDiagnosis");
         self.ev.watch(&mut self.car, guard_diagnosis, self.now);
         self.settle();
     }
@@ -352,7 +355,7 @@ fn the_heartbeat_keeps_the_car_curtailed_through_normal_operation() {
     }
 
     // And the period really is at most half the watchdog.
-    assert!(opev::HEARTBEAT_TIMEOUT / 2 >= Duration::from_secs(2));
+    assert!(charging::HEARTBEAT_TIMEOUT / 2 >= Duration::from_secs(2));
 }
 
 /// Only the Energy Guard the car subscribed to keeps it curtailed.

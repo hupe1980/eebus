@@ -30,6 +30,45 @@ actually completed the handshake.
 * The cipher suites are those §9.1 mandates; a peer offering only CBC suites will not
   connect.
 
+## The cryptography provider is the consumer's choice
+
+`rustls` 0.23 can be backed by `ring` or by `aws-lc-rs`, and this crate names neither.
+`cert`, `tls` and `runtime` require exactly one of the `ring` and `aws-lc-rs` features, and
+a build that names both — or neither — stops with a `compile_error!` that says why.
+
+The reason is not tidiness. `rustls`' provider is *process-global*: a binary that links both
+panics the first time anything asks for the default. A library that quietly pulled one in
+would be making that choice for every consumer downstream of it, including one whose
+`deny.toml` bans it — and the result is not a compile error but a household box that panics
+the first time a control box connects.
+
+```toml
+eebus = { version = "0.1", features = ["runtime", "ring"] }
+# or, for a build that must not contain `ring`:
+eebus = { version = "0.1", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+```
+
+Nothing here ever reads the process default. The provider is built explicitly, with exactly
+the three cipher suites and the one key-exchange group §9 permits — the post-quantum hybrids
+`aws-lc-rs` offers by default are dropped, because a SHIP node may not negotiate one — so a
+consumer that has installed its own default keeps it. `eebus::tls::CRYPTO_PROVIDER` says
+which backend a running binary got, which is worth a line in the start-up log.
+
+## Forgetting a peer
+
+SHIP §12.2.2 states two things about the trust list, and this crate serves both.
+Persisting it is "STRONGLY RECOMMENDED", because the alternative is asking a user to compare
+forty hex digits again after every power cut — `TrustStore::to_json` and `from_json` are the
+two calls that make saving it a one-liner, and `TrustedPeer` carries the name and SHIP ID a
+person needs to tell one line of the store from the next.
+
+Being able to delete all of it is a SHALL: *"at least the SHIP node SHALL offer a possibility
+to delete all stored foreign public keys (e.g. via factory reset)."* That is
+`Node::eebus_reset`, and it is what an "EEBUS reset" on a device's user interface has to
+reach. It returns how many peers were forgotten, and it deliberately does not restore the
+node's own certificate — §12.1.1 asks a factory reset to bring back the identity printed on
+the label, and only the device knows where that was stored.
+
 ## Rotating a certificate
 
 Replacing a certificate changes the node's name, so SHIP §12.1.3 defines a procedure rather

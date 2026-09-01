@@ -33,7 +33,9 @@ use crate::model::{
 };
 
 use super::ack::{DEFAULT_MAX_RESPONSE_DELAY, ErrorNumber, owes_ack};
-use super::address::{self, is_node_management, same_feature};
+use super::address::{
+    self, is_node_management, node_management, node_management_without_device, same_feature,
+};
 use super::counter::{MsgCounterSource, MsgCounterTracker};
 use super::device::{LocalDevice, WriteApproval};
 use super::discovery::{RemoteDevice, SPINE_VERSION, detailed_discovery, use_case_data};
@@ -365,6 +367,77 @@ impl Engine {
     }
 
     // ---- sending ---------------------------------------------------------------
+
+    /// Runs the opening exchange of a fresh connection: who are you, and what do you do?
+    ///
+    /// Every SHIP connection starts the same way, and it is the same two reads every time:
+    /// `nodeManagementDetailedDiscoveryData` for the peer's device, entities and features,
+    /// and `nodeManagementUseCaseData` for the actors it plays. Until both have come back
+    /// there is nothing to bind to and nothing to subscribe to — the addresses a use case
+    /// needs are in the first reply and the use case itself is in the second.
+    ///
+    /// [`runtime::Hub`](crate::runtime::Hub) calls this for you when a connection opens.
+    /// This is the same call, for an application that owns its own [`Engine`] and drives
+    /// the transport itself.
+    ///
+    /// Both reads are addressed *without* a device part, which the SPINE implementation
+    /// guide §2.7 permits for exactly this message and no other: the peer's device address
+    /// is what the answer contains, so it cannot be in the question. That makes it
+    /// meaningful only on a connection whose far end is a single peer — which is what a
+    /// SHIP connection is. Use [`discover`](Self::discover) where the address is already
+    /// known, as it is on a reconnection.
+    ///
+    /// Returns the two `msgCounter`s, in that order, so a caller can tell the replies from
+    /// anything else it has outstanding.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::prelude::*;
+    ///
+    /// let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)?;
+    /// device.add_entity(LocalEntity::new([1], EntityType::HeatPumpAppliance))?;
+    /// let mut engine = Engine::new(device);
+    ///
+    /// // A connection just opened. Ask what is on the other end of it.
+    /// let [discovery, use_cases] = engine.start_discovery(Duration::ZERO);
+    /// assert_ne!(discovery, use_cases);
+    ///
+    /// // Two datagrams to put on the wire, and nothing else queued.
+    /// assert!(engine.poll_transmit().is_some());
+    /// assert!(engine.poll_transmit().is_some());
+    /// assert!(engine.poll_transmit().is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn start_discovery(&mut self, now: Duration) -> [MsgCounter; 2] {
+        self.discovery_reads(&node_management_without_device(), now)
+    }
+
+    /// The opening exchange, addressed to a peer whose device address is already known.
+    ///
+    /// The same two reads as [`start_discovery`](Self::start_discovery), for the case the
+    /// guide's §2.7 exception does not cover: re-reading a peer that announced a change,
+    /// or a transport that carries more than one peer.
+    pub fn discover(&mut self, peer: &AddressDevice, now: Duration) -> [MsgCounter; 2] {
+        self.discovery_reads(&node_management(peer), now)
+    }
+
+    fn discovery_reads(&mut self, destination: &FeatureAddress, now: Duration) -> [MsgCounter; 2] {
+        let source = node_management(self.device().address());
+        [
+            self.read(
+                destination,
+                &source,
+                Function::NodeManagementDetailedDiscoveryData,
+                now,
+            ),
+            self.read(
+                destination,
+                &source,
+                Function::NodeManagementUseCaseData,
+                now,
+            ),
+        ]
+    }
 
     /// Reads a function from a peer.
     pub fn read(

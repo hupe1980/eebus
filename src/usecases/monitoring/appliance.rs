@@ -58,7 +58,11 @@ impl Reading {
 struct Known {
     id: MeasurementId,
     quantity: Quantity,
-    phases: Option<ElectricalConnectionPhaseName>,
+    /// The phases, once they are known. `Some(None)` is a direct-current measurement,
+    /// which *has* no phases; the outer `None` is one whose parameter description has not
+    /// arrived yet. A client that treated the two the same would report a per-phase
+    /// current as soon as its measurement description arrived, before knowing which phase.
+    phases: Option<Option<ElectricalConnectionPhaseName>>,
 }
 
 /// What a Monitoring Appliance has learned about one Monitored Unit.
@@ -94,11 +98,7 @@ impl Readings {
                     let Some(quantity) = quantity_of(scope) else {
                         continue;
                     };
-                    // A scope that covers the whole connection says its own phases; one
-                    // that does not waits for the parameter description.
-                    let phases =
-                        covers_everything(scope).then_some(ElectricalConnectionPhaseName::Abc);
-                    self.learn(id, quantity, phases);
+                    self.learn(id, quantity, phasing_of(scope));
                 }
                 true
             }
@@ -115,7 +115,9 @@ impl Readings {
                     let Some(quantity) = quantity_of(scope) else {
                         continue;
                     };
-                    self.learn(id, quantity, entry.ac_measured_phases.clone());
+                    // The parameter description is where `acMeasuredPhases` lives, so its
+                    // absence here is authoritative: a direct-current measurement.
+                    self.learn(id, quantity, Some(entry.ac_measured_phases.clone()));
                 }
                 true
             }
@@ -128,7 +130,7 @@ impl Readings {
         &mut self,
         id: MeasurementId,
         quantity: Quantity,
-        phases: Option<ElectricalConnectionPhaseName>,
+        phases: Option<Option<ElectricalConnectionPhaseName>>,
     ) {
         match self.known.iter_mut().find(|k| k.id == id) {
             Some(known) => {
@@ -413,11 +415,36 @@ impl MonitoringApplianceActor {
 ///
 /// `acPower`, `acCurrent` and `acVoltage` are the phase-specific ones; everything else
 /// these two use cases publish is a total.
-fn covers_everything(scope: &ScopeType) -> bool {
-    !matches!(
-        scope,
-        ScopeType::AcPower | ScopeType::AcCurrent | ScopeType::AcVoltage
-    )
+/// What a measurement description alone says about a measurand's phases.
+///
+/// Three answers, and the distinction matters. `Some(Some(abc))`: a scope that covers the
+/// whole connection names its own phases. `None`: a phase-specific AC scope, whose phase
+/// is in the *parameter* description and is not known yet. `Some(None)`: a direct-current
+/// scope, which has no phases and never will — waiting for a parameter description that is
+/// not coming would leave the measurand undescribed forever.
+fn phasing_of(scope: &ScopeType) -> Option<Option<ElectricalConnectionPhaseName>> {
+    match scope {
+        ScopeType::AcPower | ScopeType::AcCurrent | ScopeType::AcVoltage => None,
+        ScopeType::DcPower
+        | ScopeType::DcCurrent
+        | ScopeType::DcVoltage
+        | ScopeType::DcEnergy
+        | ScopeType::DcChargeEnergy
+        | ScopeType::DcDischargeEnergy
+        | ScopeType::Charge
+        | ScopeType::StateOfCharge
+        | ScopeType::StateOfHealth
+        | ScopeType::StateOfEnergy
+        | ScopeType::UseableCapacity
+        | ScopeType::LoadCycleCount
+        | ScopeType::InsulationResistance
+        | ScopeType::ComponentTemperature
+        | ScopeType::TravelRange => Some(None),
+        // Apparent and reactive power split into a total and a per-phase scope, like
+        // active power: the phase-specific ones wait for the parameter description.
+        ScopeType::AcPowerApparent | ScopeType::AcPowerReactive => None,
+        _ => Some(Some(ElectricalConnectionPhaseName::Abc)),
+    }
 }
 
 /// The quantity a scope names, in either use case's vocabulary.
@@ -429,6 +456,30 @@ fn quantity_of(scope: &ScopeType) -> Option<Quantity> {
         ScopeType::AcCurrent => Quantity::Current,
         ScopeType::AcVoltage => Quantity::Voltage,
         ScopeType::AcFrequency => Quantity::Frequency,
+        // The e-mobility scopes. `charge` is EVCEM scenario 3; the other three are EVSOC.
+        ScopeType::Charge => Quantity::EnergyCharged,
+        ScopeType::StateOfCharge => Quantity::StateOfCharge,
+        ScopeType::StateOfHealth => Quantity::StateOfHealth,
+        ScopeType::TravelRange => Quantity::TravelRange,
+        // Inverter, battery and PV-string vocabulary.
+        ScopeType::AcPowerApparentTotal | ScopeType::AcPowerApparent => Quantity::ApparentPower,
+        ScopeType::AcPowerReactiveTotal | ScopeType::AcPowerReactive => Quantity::ReactivePower,
+        ScopeType::AcCosPhi => Quantity::PowerFactor,
+        ScopeType::AcYieldDay => Quantity::YieldDay,
+        ScopeType::AcYieldMonth => Quantity::YieldMonth,
+        ScopeType::AcYieldYear => Quantity::YieldYear,
+        ScopeType::AcYieldTotal => Quantity::YieldTotal,
+        ScopeType::ComponentTemperature => Quantity::Temperature,
+        ScopeType::DcPower => Quantity::DcPower,
+        ScopeType::DcCurrent => Quantity::DcCurrent,
+        ScopeType::DcVoltage => Quantity::DcVoltage,
+        ScopeType::DcEnergy => Quantity::DcEnergy,
+        ScopeType::DcChargeEnergy => Quantity::DcChargeEnergy,
+        ScopeType::DcDischargeEnergy => Quantity::DcDischargeEnergy,
+        ScopeType::StateOfEnergy => Quantity::StateOfEnergy,
+        ScopeType::UseableCapacity => Quantity::UsableCapacity,
+        ScopeType::LoadCycleCount => Quantity::LoadCycleCount,
+        ScopeType::InsulationResistance => Quantity::InsulationResistance,
         _ => return None,
     })
 }

@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -24,7 +24,15 @@ default = ["std", "pairing"]
 std = ["serde/std", "serde_json/std", "thiserror/std"]
 # The SHIP Pairing Service: automated trust establishment from a QR-code secret.
 pairing = ["dep:hmac", "dep:sha2"]
+
+# The cryptography provider. `rustls`' is process-global, so the choice belongs to whoever
+# builds the binary: `cert`, `tls` and `runtime` require exactly one of these two, and
+# `src/lib.rs` refuses a build that names both or neither.
+ring = ["rustls?/ring", "tokio-rustls?/ring", "rcgen?/ring"]
+aws-lc-rs = ["rustls?/aws_lc_rs", "tokio-rustls?/aws_lc_rs", "rcgen?/aws_lc_rs"]
+
 # Certificates: generating a node's own, and reading a peer's SKI out of one.
+# Needs a provider: `--features cert,ring` or `--features cert,aws-lc-rs`.
 cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:time"]
 # TLS 1.2 as SHIP §9 mandates, with the trust decision deferred to the SHIP handshake.
 tls = ["cert", "dep:rustls"]
@@ -33,19 +41,24 @@ runtime = ["tls", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep
 # mDNS-SD: announcing `_ship._tcp` and finding the peers that announce it.
 mdns = ["std", "dep:mdns-sd"]
 
+# Everything, on `ring`. `--all-features` cannot work — the two providers are mutually
+# exclusive — so this is what CI and docs.rs build.
+full = ["std", "pairing", "cert", "tls", "runtime", "mdns", "ring"]
+
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
 hmac = { version = "0.12", default-features = false, optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"], optional = true }
+# No provider here: `crypto` comes with whichever of `ring`/`aws_lc_rs` the consumer picks.
+rcgen = { version = "0.14", default-features = false, features = ["pem"], optional = true }
 x509-parser = { version = "0.18", optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 time = { version = "0.3", default-features = false, optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
 tokio = { version = "1", default-features = false, features = ["net", "rt", "time", "macros", "sync", "io-util"], optional = true }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
 mdns-sd = { version = "0.21", default-features = false, optional = true }
@@ -63,8 +76,19 @@ name = "grid_limit"
 name = "networked"
 required-features = ["runtime"]
 
+# The two simulators: a control box and a household appliance, on a real network.
+[[example]]
+name = "steuerbox"
+required-features = ["runtime", "mdns"]
+
+[[example]]
+name = "heat_pump"
+required-features = ["runtime", "mdns"]
+
 [package.metadata.docs.rs]
-all-features = true
+# Not `all-features`: `ring` and `aws-lc-rs` are mutually exclusive by design, so
+# "everything" is not a valid configuration. This is everything plus one provider.
+features = ["full"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
