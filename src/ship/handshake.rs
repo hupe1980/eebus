@@ -47,6 +47,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use super::constant_time_eq;
 use super::{
     AccessMethods, AccessMethodsDnsSdMDns, ConnectionClose, ConnectionClosePhase,
     ConnectionCloseReason, ConnectionHello, ConnectionHelloKeyMaterialState, ConnectionHelloPhase,
@@ -87,7 +88,7 @@ pub enum Trust {
 /// certification exercises: the SHIP test specification fixes the device under test's
 /// PIN requirement to `none`, and the specification itself warns that a node cannot
 /// know whether its peer has any way to enter a PIN.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum PinRequirement {
     /// This node has no PIN and grants unrestricted data exchange.
     #[default]
@@ -98,11 +99,59 @@ pub enum PinRequirement {
     Optional(String),
 }
 
+/// Prints which requirement this is, never the PIN itself.
+///
+/// A PIN's whole defence is the escalating penalty of §13.4.4.3.4, so one that has reached
+/// a log has no defence left. Redacting here rather than at the call site is what makes
+/// every type that *holds* a requirement — [`HandshakeConfig`], [`Handshake`], and whatever
+/// a runtime wraps them in — safe to print without anybody having to know.
+impl core::fmt::Debug for PinRequirement {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Required(_) => f.write_str("Required(<redacted>)"),
+            Self::Optional(_) => f.write_str("Optional(<redacted>)"),
+        }
+    }
+}
+
+/// A SHIP protocol version, as `protocolHandshake` carries it (§13.4.4.2).
+///
+/// A tuple of two numbers is what the wire holds and the wrong thing for an API to hand
+/// back: `(1, 1)` says nothing about which number is the major, and a consumer comparing
+/// it against the certification minimum has to know. This orders the way versions order,
+/// prints the way people write them, and names the two that matter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShipVersion {
+    /// The major version. SHIP has only ever had 1.
+    pub major: u16,
+    /// The minor version.
+    pub minor: u16,
+}
+
+impl ShipVersion {
+    /// SHIP 1.0 — what the certification suite requires as a minimum.
+    pub const V1_0: Self = Self::new(1, 0);
+    /// SHIP 1.1 — what this crate implements and announces as `announceMax`.
+    pub const V1_1: Self = Self::new(1, 1);
+
+    /// A version from its two numbers.
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+}
+
+impl core::fmt::Display for ShipVersion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
 /// Timers and capabilities of one SHIP node.
 ///
 /// The defaults are the specification's recommended values (SHIP §4.2, Table 1), not
 /// the minimum of each permitted range.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HandshakeConfig {
     /// `CmiTimeout`, permitted 10–30 s, recommended 30 s.
     pub cmi_timeout: Duration,
@@ -111,7 +160,10 @@ pub struct HandshakeConfig {
     /// The generic `Wait-Timer` of the protocol handshake, PIN and access phases: 10 s.
     pub wait_timer: Duration,
     /// The highest SHIP version this node speaks; announced as `announceMax`.
-    pub max_version: (u16, u16),
+    ///
+    /// §13.4.4.2.2 requires a node to support every version from 1.0 up to this one, so
+    /// lowering it is how a device is pinned to the certification minimum.
+    pub max_version: ShipVersion,
     /// Message formats this node supports, most preferred first.
     pub formats: Vec<String>,
     /// This node's PIN requirement.
@@ -128,13 +180,30 @@ pub struct HandshakeConfig {
     pub key_material: Option<super::OwnKeys>,
 }
 
+/// Prints everything except the peer's PIN, which [`PinRequirement`] explains.
+impl core::fmt::Debug for HandshakeConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HandshakeConfig")
+            .field("cmi_timeout", &self.cmi_timeout)
+            .field("hello_init", &self.hello_init)
+            .field("wait_timer", &self.wait_timer)
+            .field("max_version", &self.max_version)
+            .field("formats", &self.formats)
+            .field("pin", &self.pin)
+            .field("peer_pin", &self.peer_pin.as_ref().map(|_| "<redacted>"))
+            .field("ship_id", &self.ship_id)
+            .field("key_material", &self.key_material)
+            .finish()
+    }
+}
+
 impl Default for HandshakeConfig {
     fn default() -> Self {
         Self {
             cmi_timeout: Duration::from_secs(30),
             hello_init: Duration::from_secs(120),
             wait_timer: Duration::from_secs(10),
-            max_version: (1, 1),
+            max_version: ShipVersion::V1_1,
             formats: vec![FORMAT_JSON_UTF8.to_string()],
             pin: PinRequirement::None,
             peer_pin: None,
@@ -218,7 +287,7 @@ pub enum Event {
     /// The handshake finished; data exchange is open.
     Ready {
         /// The SHIP version both sides settled on.
-        version: (u16, u16),
+        version: ShipVersion,
         /// The message format both sides settled on.
         format: String,
     },
@@ -306,7 +375,7 @@ pub struct Handshake {
 
     /// What the server offered, kept to compare against the client's confirmation.
     proposed: Option<MessageProtocolHandshake>,
-    negotiated: Option<((u16, u16), String)>,
+    negotiated: Option<(ShipVersion, String)>,
 
     /// When the outstanding `keyMaterialState` was sent, for the resend of §12.1.3.2.
     key_material_sent_at: Option<Duration>,
@@ -414,8 +483,13 @@ impl Handshake {
     }
 
     /// The SHIP version and message format both sides agreed on.
-    pub fn negotiated(&self) -> Option<&((u16, u16), String)> {
+    pub fn negotiated(&self) -> Option<&(ShipVersion, String)> {
         self.negotiated.as_ref()
+    }
+
+    /// The SHIP version both sides settled on, once the handshake has got that far.
+    pub fn ship_version(&self) -> Option<ShipVersion> {
+        self.negotiated.as_ref().map(|(version, _)| *version)
     }
 
     /// The peer's PIN requirement, once it has reported one.
@@ -901,7 +975,7 @@ impl Handshake {
         self.phase = Phase::ProtocolHandshake;
         self.timers.wait = Some(now + self.config.wait_timer);
         if self.role == Role::Client {
-            let (major, minor) = self.config.max_version;
+            let ShipVersion { major, minor } = self.config.max_version;
             self.outbox.push_back(ShipMessage::Control(
                 ControlMessage::MessageProtocolHandshake(MessageProtocolHandshake {
                     handshake_type: Some(ProtocolHandshakeType::AnnounceMax),
@@ -950,8 +1024,8 @@ impl Handshake {
                 let selection = MessageProtocolHandshake {
                     handshake_type: Some(ProtocolHandshakeType::Select),
                     version: Some(MessageProtocolHandshakeVersion {
-                        major: Some(version.0),
-                        minor: Some(version.1),
+                        major: Some(version.major),
+                        minor: Some(version.minor),
                     }),
                     formats: Some(MessageProtocolFormats {
                         format: Some(vec![MessageProtocolFormat(format.clone())]),
@@ -982,7 +1056,7 @@ impl Handshake {
                 let Some(version) = msg
                     .version
                     .as_ref()
-                    .and_then(|v| Some((v.major?, v.minor?)))
+                    .and_then(|v| Some(ShipVersion::new(v.major?, v.minor?)))
                     .filter(|v| self.supports_version(*v))
                 else {
                     self.send_protocol_error(3);
@@ -1019,18 +1093,18 @@ impl Handshake {
     ///
     /// SHIP §13.4.4.2.2 requires every node to support all versions from 1.0 up to its
     /// own maximum, so the common maximum is simply the lower of the two.
-    fn select_version(&self, msg: &MessageProtocolHandshake) -> Option<(u16, u16)> {
+    fn select_version(&self, msg: &MessageProtocolHandshake) -> Option<ShipVersion> {
         let peer = msg
             .version
             .as_ref()
-            .and_then(|v| Some((v.major?, v.minor?)))?;
+            .and_then(|v| Some(ShipVersion::new(v.major?, v.minor?)))?;
         let ours = self.config.max_version;
-        let chosen = if peer <= ours { peer } else { ours };
-        (chosen.0 >= 1).then_some(chosen)
+        let chosen = peer.min(ours);
+        (chosen.major >= 1).then_some(chosen)
     }
 
-    fn supports_version(&self, version: (u16, u16)) -> bool {
-        version.0 >= 1 && version <= self.config.max_version
+    fn supports_version(&self, version: ShipVersion) -> bool {
+        version.major >= 1 && version <= self.config.max_version
     }
 
     /// The first format this node prefers that the peer also offers.
@@ -1292,16 +1366,4 @@ fn expired(slot: &mut Option<Duration>, now: Duration) -> bool {
         }
         _ => false,
     }
-}
-
-/// Compares two byte strings without leaking their contents through timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }

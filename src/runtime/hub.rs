@@ -60,6 +60,24 @@ pub const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a peer is given to confirm a `connectionClose` (§13.4.8).
 pub const CLOSE_MAX_TIME: Duration = Duration::from_secs(2);
 
+/// How many connections one hub holds at once, unless told otherwise.
+///
+/// SHIP puts no cap on this, and the omission is the problem: nothing in the protocol
+/// stops a malfunctioning — or hostile — device on the LAN from dialling in a thousand
+/// times and taking the memory of every node that answers. A household has a handful of
+/// EEBUS devices, and a node that has run out of room is a node that keeps serving the
+/// peers it already had.
+///
+/// Raise it with [`Hub::set_max_connections`] on a gateway that really does serve more.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
+
+/// How many connections to the *same* peer a hub tolerates.
+///
+/// Two is not a mistake: SHIP §12.2.3 exists precisely because two nodes that discover
+/// each other at the same moment both dial, and the second connection is legitimate
+/// until arbitration settles it. A third is not something the protocol produces.
+pub const MAX_CONNECTIONS_PER_PEER: usize = 2;
+
 /// How long a hub with nothing to wait for sleeps before reporting a tick.
 ///
 /// A hub with no connections and no timers has nothing that can happen to it. Returning
@@ -91,6 +109,14 @@ pub enum Disconnect {
     AddressConflict,
     /// This node closed it.
     Local,
+    /// A [`Hub::next`] future was dropped while it was writing to this connection.
+    ///
+    /// Cancelling `next` mid-write leaves a partial WebSocket frame on the wire, which
+    /// puts the *peer's* parser out of step with the stream — every message after it is
+    /// misread, and nothing on this side can tell. The hub notices on its next call and
+    /// closes the connection rather than carrying on: a reconnection costs a second, and
+    /// a corrupted stream costs the session.
+    InterruptedWrite,
 }
 
 /// Something that happened on one of the hub's connections.
@@ -103,6 +129,11 @@ pub enum HubEvent {
     Connected {
         /// Its SKI.
         ski: Ski,
+        /// The SHIP version the handshake settled on.
+        ///
+        /// Worth a line in a start-up log: the difference between 1.0 and 1.1 decides
+        /// whether `accessMethods.id` is there to dial back with.
+        version: Option<crate::ship::ShipVersion>,
     },
     /// A peer answered the opening discovery, so its device address and its use cases
     /// are now known.
@@ -167,6 +198,21 @@ struct Link {
     asked_for_keys: bool,
 }
 
+/// A peer holding more than one connection, mid-arbitration (SHIP §12.2.3).
+#[derive(Clone, Copy, Debug)]
+struct Duplicate {
+    ski: Ski,
+    /// When more than one connection to this peer was first seen — what the
+    /// three-second grace period is measured from.
+    since: Duration,
+    /// Whether this node has already put a ping down every connection.
+    ///
+    /// Without this the smaller-SKI side livelocks: it pings, both connections answer,
+    /// and it has nothing left to do but ping again. §12.2.3 says it closes the older
+    /// one itself, and this is what remembers that the round has been run.
+    probed: bool,
+}
+
 /// A peer this hub is expected to stay connected to.
 #[derive(Clone, Debug)]
 struct Known {
@@ -192,13 +238,22 @@ pub struct Hub {
     clock: Instant,
     /// When the application asked to be woken.
     wake_at: Option<Duration>,
-    /// When a peer was first seen holding more than one connection.
-    duplicates_since: Vec<(Ski, Duration)>,
+    /// Peers seen holding more than one connection, and how far arbitration has got.
+    duplicates: Vec<Duplicate>,
+    /// The most connections this hub will hold at once.
+    max_connections: usize,
     /// Peers to dial back when the connection to them drops.
     known: Vec<Known>,
     /// What is known about each peer's key material (SHIP §12.1.3).
     peer_keys: Vec<(Ski, PeerKeys)>,
     pending: Vec<HubEvent>,
+    /// The connection a write is in flight on, if one is.
+    ///
+    /// Set immediately before an `await` that puts bytes on a socket and cleared after it,
+    /// so that a `next` future dropped in between leaves a mark. Finding it set at the top
+    /// of the next call is proof the previous one was cancelled mid-write — the one hazard
+    /// `Hub::next` cannot defend against, made detectable instead of silent.
+    writing: Option<usize>,
 }
 
 impl Hub {
@@ -210,10 +265,12 @@ impl Hub {
             links: Vec::new(),
             clock: Instant::now(),
             wake_at: None,
-            duplicates_since: Vec::new(),
+            duplicates: Vec::new(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             known: Vec::new(),
             peer_keys: Vec::new(),
             pending: Vec::new(),
+            writing: None,
         }
     }
 
@@ -277,6 +334,18 @@ impl Hub {
         self.links.iter().find(|l| &l.ski == ski)?.device.as_ref()
     }
 
+    /// The SHIP version negotiated with a connected peer.
+    ///
+    /// [`None`] when nothing is connected to that SKI, or when the handshake has not
+    /// reached the protocol phase.
+    pub fn ship_version(&self, ski: &Ski) -> Option<crate::ship::ShipVersion> {
+        self.links
+            .iter()
+            .find(|l| &l.ski == ski)?
+            .connection
+            .ship_version()
+    }
+
     /// The SKI a device address belongs to.
     pub fn ski_of(&self, device: &AddressDevice) -> Option<Ski> {
         self.links
@@ -286,9 +355,21 @@ impl Hub {
     }
 
     /// Dials a peer and adds the connection.
+    ///
+    /// Subject to the same cap as [`accept`](Self::accept): a hub with no room closes the
+    /// connection it just opened and reports
+    /// [`ConnectionError::TooManyConnections`].
     pub async fn connect(&mut self, address: impl ToSocketAddrs) -> Result<Ski, ConnectionError> {
         let connection = self.node.connect(address).await?;
-        Ok(self.adopt(connection))
+        match self.adopt(connection) {
+            Ok(ski) => Ok(ski),
+            Err(refused) => {
+                let _ = refused
+                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                    .await;
+                Err(ConnectionError::TooManyConnections)
+            }
+        }
     }
 
     /// What this node has stored about a peer's key material.
@@ -401,21 +482,65 @@ impl Hub {
         self.known.iter().map(|k| (k.ski, k.address))
     }
 
+    /// The most connections this hub will hold at once.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Changes how many connections this hub will hold at once.
+    ///
+    /// [`DEFAULT_MAX_CONNECTIONS`] suits a household. A gateway serving a whole building
+    /// raises it; a controller with a few kilobytes to spare lowers it. Connections
+    /// already held are never dropped to meet a lowered limit — the cap decides what is
+    /// *accepted*, and closing a working session to satisfy a setting would be worse
+    /// than being over it.
+    pub fn set_max_connections(&mut self, limit: usize) {
+        self.max_connections = limit;
+    }
+
     /// Runs the server side of the stack on an accepted socket and adds the connection.
+    ///
+    /// A connection the hub has no room for is closed with a `connectionClose` rather
+    /// than dropped on the floor, and reported as
+    /// [`ConnectionError::TooManyConnections`].
     pub async fn accept(&mut self, stream: TcpStream) -> Result<Ski, ConnectionError> {
         let connection = self.node.accept(stream).await?;
-        Ok(self.adopt(connection))
+        match self.adopt(connection) {
+            Ok(ski) => Ok(ski),
+            Err(refused) => {
+                let _ = refused
+                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                    .await;
+                Err(ConnectionError::TooManyConnections)
+            }
+        }
     }
 
     /// Adds a connection the caller established itself.
-    pub fn adopt(&mut self, connection: ShipConnection) -> Ski {
+    ///
+    /// # Errors
+    ///
+    /// Hands the connection back when the hub is already holding
+    /// [`max_connections`](Self::max_connections), or a second connection to this peer
+    /// already exists and is being arbitrated. The caller owns the refused connection and
+    /// decides how to end it; [`accept`](Self::accept) closes it politely. It comes back
+    /// boxed because a `ShipConnection` is two kilobytes and every ordinary call would
+    /// otherwise carry that on the stack.
+    pub fn adopt(&mut self, connection: ShipConnection) -> Result<Ski, Box<ShipConnection>> {
         let ski = connection.peer();
         let now = self.now();
 
-        if self.links.iter().any(|l| l.ski == ski)
-            && !self.duplicates_since.iter().any(|(s, _)| *s == ski)
-        {
-            self.duplicates_since.push((ski, now));
+        let to_this_peer = self.links.iter().filter(|l| l.ski == ski).count();
+        if self.links.len() >= self.max_connections || to_this_peer >= MAX_CONNECTIONS_PER_PEER {
+            return Err(Box::new(connection));
+        }
+
+        if to_this_peer > 0 && !self.duplicates.iter().any(|d| d.ski == ski) {
+            self.duplicates.push(Duplicate {
+                ski,
+                since: now,
+                probed: false,
+            });
         }
 
         self.links.push(Link {
@@ -429,9 +554,13 @@ impl Hub {
             announced: false,
             asked_for_keys: false,
         });
-        self.pending.push(HubEvent::Connected { ski });
+        let version = self
+            .links
+            .last()
+            .and_then(|link| link.connection.ship_version());
+        self.pending.push(HubEvent::Connected { ski, version });
         self.start_discovery(self.links.len() - 1, now);
-        ski
+        Ok(ski)
     }
 
     /// Closes one peer's connections, telling it why.
@@ -473,7 +602,57 @@ impl Hub {
         for link in core::mem::take(&mut self.links) {
             let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
         }
-        self.duplicates_since.clear();
+        self.duplicates.clear();
+    }
+
+    /// Runs the hub's loop, handing every event to `handler`, until `handler` says stop.
+    ///
+    /// **This is the shape to reach for**, because [`next`](Self::next) is not cancel-safe
+    /// and this loop cannot cancel it. `handler` returns [`ControlFlow::Break`](core::ops::ControlFlow::Break) to end the
+    /// loop, and gets `&mut Hub` so that it can do anything the loop could — accept a
+    /// socket, write a limit, ask for a tick.
+    ///
+    /// Work arriving from elsewhere goes where it goes in a hand-written loop: ask for a
+    /// tick with [`wake_at`](Self::wake_at) and drain it when [`HubEvent::Tick`] arrives.
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     mut hub: eebus::runtime::Hub,
+    /// #     mut inbox: tokio::sync::mpsc::Receiver<tokio::net::TcpStream>,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// use core::ops::ControlFlow;
+    /// use core::time::Duration;
+    /// use eebus::runtime::HubEvent;
+    ///
+    /// hub.wake_at(hub.now() + Duration::from_secs(1));
+    /// hub.run(|hub, event| {
+    ///     if let HubEvent::Tick = event {
+    ///         while let Ok(stream) = inbox.try_recv() {
+    ///             let _ = stream; // `hub.accept(stream)` — `run`'s handler is synchronous
+    ///         }
+    ///         hub.wake_at(hub.now() + Duration::from_secs(1));
+    ///     }
+    ///     ControlFlow::Continue(())
+    /// })
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The handler is synchronous on purpose: an `async` one would be a second place a
+    /// caller could hold the hub across an await, which is the thing this method exists to
+    /// prevent. Anything that has to await belongs after `run` returns, or behind a
+    /// channel the handler writes to.
+    pub async fn run<F>(&mut self, mut handler: F) -> Result<(), ConnectionError>
+    where
+        F: FnMut(&mut Self, HubEvent) -> core::ops::ControlFlow<()>,
+    {
+        loop {
+            let event = self.next().await?;
+            if handler(self, event).is_break() {
+                return Ok(());
+            }
+        }
     }
 
     /// Waits for the next thing to happen.
@@ -483,11 +662,24 @@ impl Hub {
     ///
     /// # This future is not cancel-safe
     ///
-    /// **Do not put it in a [`tokio::select!`] or a `tokio::time::timeout`.** It reads
-    /// from the sockets, and dropping it part-way through a WebSocket frame loses what
-    /// had been read — which does not fail loudly. It reappears minutes later as a
-    /// subscription that was never granted, a heartbeat that never arrived, and a limit
-    /// refused for want of one.
+    /// **Do not put it in a [`tokio::select!`] or a `tokio::time::timeout`.**
+    /// [`run`](Self::run) is the loop that cannot get this wrong.
+    ///
+    /// The hazard is the *sending* half, not the reading half. Reading is cancel-safe —
+    /// `WebSocketStream`'s `Stream` implementation buffers a partial frame and resumes
+    /// where it left off — but this future flushes the engine's queue before it reads,
+    /// and `Sink::send` carries no such guarantee. Dropped part-way through, it leaves
+    /// **half a frame on the wire**: the peer's parser is then out of step with the
+    /// stream, and every datagram after it is misread.
+    ///
+    /// **The hub notices, which is the one thing it can do about it.** A write in flight
+    /// is marked before the `await` and unmarked after, so a future dropped in between
+    /// leaves the mark set; the next call finds it, closes that connection with
+    /// [`Disconnect::InterruptedWrite`] and redials. A reconnection costs a second. The
+    /// alternative — carrying on over a stream the peer can no longer parse — reappears
+    /// minutes later as a subscription that was never granted, a heartbeat that never
+    /// arrived, and a limit refused for want of one, with nothing in any log to connect
+    /// them to a `select!` written weeks earlier.
     ///
     /// Everything a caller would reach for `select!` to do has somewhere else to go:
     ///
@@ -518,6 +710,15 @@ impl Hub {
     /// # }
     /// ```
     pub async fn next(&mut self) -> Result<HubEvent, ConnectionError> {
+        // A write was in flight when the last `next` future was dropped, so a partial
+        // frame is on that socket and the peer's parser is out of step with it. Nothing
+        // can repair that from this side; the connection goes, and `Hub` redials it.
+        if let Some(index) = self.writing.take()
+            && index < self.links.len()
+        {
+            self.drop_link(index, Disconnect::InterruptedWrite);
+        }
+
         loop {
             if !self.pending.is_empty() {
                 return Ok(self.pending.remove(0));
@@ -582,7 +783,9 @@ impl Hub {
                         self.drop_link(index, Disconnect::Remote);
                         continue;
                     }
+                    self.writing = Some(index);
                     let _ = self.links[index].connection.flush().await;
+                    self.writing = None;
 
                     match message {
                         crate::ship::ShipMessage::Data(data) => {
@@ -638,7 +841,10 @@ impl Hub {
                 // out, which is what the application acts on.
                 continue;
             };
-            if self.links[index].connection.send(&datagram).await.is_err() {
+            self.writing = Some(index);
+            let sent = self.links[index].connection.send(&datagram).await;
+            self.writing = None;
+            if sent.is_err() {
                 self.drop_link(index, Disconnect::Remote);
             }
         }
@@ -689,6 +895,12 @@ impl Hub {
             .as_ref()
             .and_then(|h| h.address_source.as_ref())
             .and_then(|a| a.device.clone());
+
+        // The same rule the engine applies, one layer earlier: this is the value the
+        // connection is *bound* to, so an address that cannot be keyed on must not reach
+        // the table at all.
+        let peer_device =
+            peer_device.filter(|device| crate::spine::is_usable_device_address(device.as_str()));
 
         if let Some(device) = peer_device {
             match self.links[index].device.as_ref() {
@@ -806,9 +1018,10 @@ impl Hub {
     /// going to sleep on a decision it has just taken.
     async fn arbitrate(&mut self) -> Result<bool, ConnectionError> {
         let now = self.now();
-        let Some((ski, since)) = self.duplicates_since.first().copied() else {
+        let Some(duplicate) = self.duplicates.first().copied() else {
             return Ok(false);
         };
+        let Duplicate { ski, since, probed } = duplicate;
 
         let opened: Vec<Duration> = self
             .links
@@ -818,9 +1031,9 @@ impl Hub {
             .collect();
         let local = self.node.ski();
 
-        match crate::ship::resolve(&local, &ski, &opened, since, now) {
+        match crate::ship::resolve(&local, &ski, &opened, since, probed, now) {
             Resolution::Settled => {
-                self.duplicates_since.retain(|(s, _)| *s != ski);
+                self.duplicates.retain(|d| d.ski != ski);
                 Ok(false)
             }
             Resolution::KeepNewest => {
@@ -831,9 +1044,22 @@ impl Hub {
                 self.wake_at(until);
                 Ok(false)
             }
-            Resolution::PingThenClose => {
-                // Anything that failed to answer the last ping is gone; anything that
-                // did is a candidate, and the older of those is the one to drop.
+            Resolution::Probe => {
+                // The peer had the bigger SKI and did not act. One ping round, and one
+                // only — `Resolution` is what remembers that, so the decision below can
+                // be reached from a unit test with no socket in it.
+                for index in 0..self.links.len() {
+                    if self.links[index].ski == ski {
+                        let _ = self.links[index].connection.ping().await;
+                    }
+                }
+                if let Some(entry) = self.duplicates.iter_mut().find(|d| d.ski == ski) {
+                    entry.probed = true;
+                }
+                self.wake_at(now + PONG_TIMEOUT);
+                Ok(false)
+            }
+            Resolution::CloseAfterProbe => {
                 let unanswered: Vec<usize> = self
                     .links
                     .iter()
@@ -841,18 +1067,11 @@ impl Hub {
                     .filter(|(_, l)| l.ski == ski && l.connection.awaiting_pong())
                     .map(|(index, _)| index)
                     .collect();
-                if unanswered.is_empty() {
-                    for index in 0..self.links.len() {
-                        if self.links[index].ski == ski {
-                            let _ = self.links[index].connection.ping().await;
-                        }
-                    }
-                    self.wake_at(now + PONG_TIMEOUT);
-                    return Ok(false);
-                }
                 for index in unanswered.into_iter().rev() {
                     self.drop_link(index, Disconnect::Unresponsive);
                 }
+                // Whatever answered, keep the most recent of it — the same choice
+                // §12.2.3 gives the other side, so the two agree on the survivor.
                 self.close_duplicates(&ski, now).await;
                 Ok(true)
             }
@@ -869,7 +1088,7 @@ impl Hub {
             .max_by_key(|(index, l)| (l.opened, *index))
             .map(|(index, _)| index);
         let Some(keep) = keep else {
-            self.duplicates_since.retain(|(s, _)| s != ski);
+            self.duplicates.retain(|d| &d.ski != ski);
             return;
         };
 
@@ -889,7 +1108,7 @@ impl Hub {
                 .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
                 .await;
         }
-        self.duplicates_since.retain(|(s, _)| s != ski);
+        self.duplicates.retain(|d| &d.ski != ski);
         self.pending
             .retain(|e| !matches!(e, HubEvent::Disconnected { ski: s, .. } if s == ski));
     }
@@ -973,11 +1192,18 @@ impl Hub {
     }
 
     fn forget(&mut self, ski: &Ski) {
-        self.duplicates_since.retain(|(s, _)| s != ski);
+        self.duplicates.retain(|d| &d.ski != ski);
     }
 
     /// Dials a remembered peer that is not connected and whose backoff has expired.
     ///
+    /// Counts a failed attempt against a remembered peer and schedules the next one.
+    fn defer_redial(&mut self, index: usize, now: Duration) {
+        let known = &mut self.known[index];
+        known.attempts = known.attempts.saturating_add(1);
+        known.next_attempt = now + reconnect_delay_for(&known.ski, known.attempts);
+    }
+
     /// Returns `true` when something changed, so the caller re-runs the loop rather than
     /// going to sleep on a connection it has just made.
     async fn redial(&mut self) -> bool {
@@ -993,25 +1219,36 @@ impl Hub {
         let attempt = tokio::time::timeout(CONNECT_TIMEOUT, self.node.connect(address)).await;
         match attempt.unwrap_or(Err(ConnectionError::Closed)) {
             Ok(connection) if connection.peer() == ski => {
-                self.known[index].attempts = 0;
-                self.known[index].next_attempt = now;
-                self.adopt(connection);
+                match self.adopt(connection) {
+                    Ok(_) => {
+                        self.known[index].attempts = 0;
+                        self.known[index].next_attempt = now;
+                    }
+                    // No room. Backing off is what stops a full hub redialling in a
+                    // tight loop, and the peer keeps its place in the schedule.
+                    Err(refused) => {
+                        let _ = refused
+                            .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                            .await;
+                        self.defer_redial(index, now);
+                    }
+                }
                 true
             }
             Ok(connection) => {
                 // Somebody else answered at that address. Adopting it is still right —
                 // the peer proved an identity and the trust store decided about it — but
                 // the peer we were looking for is not there.
-                self.known[index].attempts = self.known[index].attempts.saturating_add(1);
-                self.known[index].next_attempt =
-                    now + reconnect_delay_for(&ski, self.known[index].attempts);
-                self.adopt(connection);
+                self.defer_redial(index, now);
+                if let Err(refused) = self.adopt(connection) {
+                    let _ = refused
+                        .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                        .await;
+                }
                 true
             }
             Err(_) => {
-                let known = &mut self.known[index];
-                known.attempts = known.attempts.saturating_add(1);
-                known.next_attempt = now + reconnect_delay_for(&ski, known.attempts);
+                self.defer_redial(index, now);
                 true
             }
         }
@@ -1027,7 +1264,9 @@ impl Hub {
             let link = &self.links[index];
             if link.pinged_at.is_none() && now.saturating_sub(link.last_seen) >= KEEPALIVE_INTERVAL
             {
+                self.writing = Some(index);
                 let _ = self.links[index].connection.ping().await;
+                self.writing = None;
                 self.links[index].pinged_at = Some(now);
             }
         }
@@ -1038,7 +1277,9 @@ impl Hub {
 /// Reads whichever connection speaks first.
 ///
 /// Every future here is a single cancel-safe socket read, so dropping the losers costs
-/// nothing — which is the property [`ShipConnection::next_message`] exists to provide.
+/// nothing — which is the property [`ShipConnection::next_message`] exists to provide, and
+/// which holds for a more specific reason than "it does not write": the WebSocket layer
+/// does answer a ping while reading, and never blocks doing it.
 async fn read_any(
     links: &mut [Link],
 ) -> (usize, Result<crate::ship::ShipMessage, ConnectionError>) {
@@ -1061,6 +1302,7 @@ impl core::fmt::Display for Disconnect {
             Disconnect::Duplicate => "duplicate connection",
             Disconnect::AddressConflict => "claimed another peer's device address",
             Disconnect::Local => "closed locally",
+            Disconnect::InterruptedWrite => "a write was interrupted by a cancelled `next`",
         })
     }
 }

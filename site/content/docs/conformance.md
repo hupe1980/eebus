@@ -14,8 +14,9 @@ a separate exercise, and a failing conformance test says which published test ca
 corresponds to.
 
 For the four certifiable use cases this goes further: all 203 abstract test cases of the
-LPC, LPP, MPC and MGCP High-Level Test Specifications are carried as data, `cargo test`
-prints a coverage number, and what is *not* covered is listed with the reason. See
+LPC, LPP, MPC and MGCP High-Level Test Specifications are carried as data **and driven**,
+`cargo test` prints 189/203, and the fourteen that are not covered are exactly the
+device-level ones — listed with the reason, and held to that by a test. See
 [Certification](@/docs/certification.md).
 
 ## Every claim points at a sentence
@@ -36,7 +37,20 @@ specification text or the 2026 implementation guides.
 
 **Double connections follow §12.2.3 as written**: the larger SKI keeps the *most recent*
 connection, and the smaller one waits three seconds and then pings. `ship-go` keeps the
-initiator's connection instead.
+initiator's connection instead — a deliberate deviation, because "most recent" is a local
+judgement two nodes can disagree about, and disagreeing can leave both with nothing. The
+rule is followed here and the hazard bounded instead: one ping round, then a decision, and a
+redial if it does go wrong. [More](@/docs/ship.md#two-nodes-that-dial-each-other-at-once).
+
+**Every table a peer can grow is capped.** Connections, tracked device addresses, and
+writes waiting on the application. SHIP and SPINE cap none of them; a peer that reaches a
+cap is told so — `errorNumber` 3 for a write, a `connectionClose` for a connection — rather
+than served until the memory runs out.
+
+**A write the application never decides is abandoned** once §5.2.5's maximum response delay
+has passed, and reported as `SpineEvent::WriteAbandoned`. An answer after that would reach a
+peer that has already given up, and under §14a a limit that was never decided is worth a
+log line rather than a silent disappearance.
 
 **`accessMethods.id` is populated**, which SHIP 1.1.0 makes mandatory and which a peer needs
 in order to dial back in the other direction.
@@ -85,6 +99,42 @@ subscriptions affordable.
 certificate authorities and a SHIP node certificate is a leaf, so without this the extension
 §12.2 expects is absent and a peer cannot identify the node.
 
+## Interoperability, measured
+
+Conformance to a specification and interoperability with the implementations that also
+claim it are different properties, and only one of them can be checked by reading. Round
+trips over fixtures a crate produced itself prove that its encoder agrees with its decoder,
+which is not the question.
+
+**Recorded traffic.** `tests/fixtures/devices` carries fifteen datagrams captured from
+eight devices by seven manufacturers — Elli, evcc, Kostal, Porsche, SMA, Spelsberg,
+Vaillant and Viessmann — recorded with `eebus-go` and published as MIT-licensed
+[`enbility/devices`](https://github.com/enbility/devices). Every one must parse, carry a
+header this crate would accept off a socket, and resolve into a device model; between them
+they name a dozen use cases and exercise eight feature types. They seed the fuzz corpora
+too, so the fuzzers explore shapes real hardware produces rather than shapes this crate
+produces.
+
+**A live peer, in both directions.** An opt-in suite runs `eebus-go`'s own examples in a
+container at a **pinned** revision and drives the whole §14a exchange against them:
+
+| Their example | Their role | This crate's role |
+|---|---|---|
+| `examples/controlbox` | Energy Guard | Controllable System |
+| `examples/evse` | Controllable System | Energy Guard |
+
+Each run asserts the lot — TLS 1.2 with mutual authentication, the five-phase SHIP
+handshake, SPINE discovery, the binding and the subscription, and a limit written, accepted
+and recorded.
+
+```sh
+cargo test --features interop,full --test interop -- --nocapture
+```
+
+It is behind `required-features` and runs as its own CI job, so an ordinary `cargo test`
+stays hermetic, needs no Docker and finishes in seconds. Pinning the peer is what makes a
+failure legible: it means *this crate* changed, not that the other one did.
+
 ## How the crate is checked
 
 | | |
@@ -93,10 +143,13 @@ certificate authorities and a SHIP node certificate is a leaf, so without this t
 | Examples, end to end | `cargo run --example grid_limit`, `--example networked` |
 | Both cryptography providers | `ring` builds and tests; `aws-lc-rs` is type-checked |
 | Property tests | round trips, the RFE merge laws and the wire arithmetic, via `proptest` |
-| Fuzzing | five `cargo fuzz` targets, run nightly; their compilation checked on every push |
+| Real devices | fifteen datagrams from eight devices by seven manufacturers, parsed and resolved |
+| A live peer, both ways | `eebus-go`'s own control box and EVSE in a container, at a pinned revision, doing the §14a exchange in each direction — opt-in, `--features interop` |
+| Fuzzing | five `cargo fuzz` targets, run nightly, seeded from the specification's examples **and** the device captures; their compilation checked on every push |
 | Lints | `cargo clippy --workspace --all-targets --features eebus/full` with `-D warnings` |
 | Documentation | `cargo doc` with `RUSTDOCFLAGS=-D warnings` |
 | Documented counts | the generated model's size, held to the number the docs quote |
+| Wire arithmetic | `cargo xtask check-floats` — no hand-rolled powers of ten or float casts where the wire meets a number |
 | Minimum Rust version | `cargo +1.88.0 check` |
 | Embedded | `cargo build --no-default-features --target thumbv7em-none-eabihf` |
 

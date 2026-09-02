@@ -155,10 +155,19 @@ impl Identity {
     }
 }
 
-/// Generates a self-signed certificate and the key that signs it.
+/// Generates a **new identity**: a fresh key, and a self-signed certificate over it.
 ///
 /// The result satisfies everything SHIP asks of a node certificate: secp256r1, a SHA-1
 /// Subject Key Identifier, and the SHIP ID as the common name.
+///
+/// # A device needs [`self_signed_with`] more than this
+///
+/// A node's SKI is derived from its public key, so generating a *fresh* key generates a
+/// new identity: every peer that had approved the old one no longer recognises the
+/// device, and an installer has to walk the building comparing forty hex digits again.
+/// [`self_signed_with`] re-issues from a key that already exists, which is what keeps a
+/// SKI stable across a restart and across a certificate renewal. Use this one once, at
+/// first boot; use that one every time after.
 pub fn self_signed(params: CertParams) -> Result<Identity, CertError> {
     let key = rcgen::KeyPair::generate_for(ALGORITHM)?;
     self_signed_with(params, key)

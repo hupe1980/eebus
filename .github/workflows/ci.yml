@@ -34,8 +34,12 @@ jobs:
       # Feature-scoped, so package-scoped: `xtask` has no features to select.
       - run: cargo test -p eebus --no-default-features --features std
       # The other provider, which is the one a consumer that bans `ring` reaches for.
-      # Building it is what keeps the choice real rather than nominal.
-      - run: cargo check -p eebus --no-default-features --features std,pairing,cert,tls,runtime,mdns,aws-lc-rs
+      # The whole suite runs on it, not just a type-check: the provider decides which cipher
+      # suites and key-exchange groups a SHIP handshake offers, and `ship_provider` drops
+      # `aws-lc-rs`' post-quantum hybrids because a SHIP node may not negotiate one. A
+      # behaviour difference there is a handshake that fails against one vendor's firmware
+      # and nobody else's, which is exactly what a type-check cannot find.
+      - run: cargo test -p eebus --no-default-features --features std,pairing,conformance,cert,tls,runtime,mdns,aws-lc-rs
       # Getting the provider wrong has to fail at build time rather than at the first
       # connection, which is the whole reason the choice is a feature and not a default.
       - name: A build with no provider is refused
@@ -66,6 +70,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --features eebus/full
+      # Two defects reached the wire conversion and both were hand-rolled float
+      # arithmetic — a power of ten built by multiplication, and an `as i64` that
+      # saturated. Every test passed; the arithmetic was what was wrong. This bans the
+      # shape from the two directories where the wire meets a number.
+      - run: cargo run -p xtask -- check-floats
+      # The Restricted Function Exchange table is what `possibleOperations` is derived from
+      # and the first thing an integrator asks about, so it is published as a page — and a
+      # published page generated from committed source is only true while it is current.
+      - name: The published RFE table is current
+        run: |
+          cargo run -p xtask -- rfe-table
+          git diff --exit-code -- site/content/docs/functions.md
       # `fuzz/` is a workspace of its own, so nothing above compiles it — and a change to
       # a public type breaks the fuzz targets silently until the nightly job runs. This
       # catches that in seconds; the fuzzing itself still happens below.
@@ -107,11 +123,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-fuzz --locked
-      - name: Seed the corpora from the specification's own examples
+      # Two sources, and both matter. The specification's examples are the shapes a
+      # conforming peer produces; the device captures are the shapes real hardware
+      # actually produces, which is not the same set.
+      - name: Seed the corpora from the specification and from real devices
         run: |
           mkdir -p fuzz/corpus/spine_datagram fuzz/corpus/spine_engine
           cp tests/fixtures/spine/*.json fuzz/corpus/spine_datagram/
           cp tests/fixtures/spine/*.json fuzz/corpus/spine_engine/
+          cp tests/fixtures/devices/*.json fuzz/corpus/spine_datagram/
+          cp tests/fixtures/devices/*.json fuzz/corpus/spine_engine/
       - name: Fuzz
         run: |
           seconds=$([ "${{ github.event_name }}" = "schedule" ] && echo 600 || echo 60)
@@ -124,6 +145,19 @@ jobs:
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
+
+  # The one test that talks to something this project did not write. Its own job, because
+  # it needs Docker and pulls a Go toolchain: a contributor without either is not blocked,
+  # and a registry outage does not redden an unrelated pull request. The peer's revision is
+  # pinned, so a failure here means "we broke" rather than "they changed".
+  interop:
+    name: Against eebus-go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features interop,full --test interop -- --nocapture
 
   # The protocol core carries no dependency on an operating system, so it has to keep
   # building for a bare-metal target.

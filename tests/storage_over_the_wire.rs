@@ -141,8 +141,15 @@ fn a_manager_finds_every_actor_the_inverter_plays() {
         .filter(|uc| uc.name.as_str() == mps::NAME && uc.actor.as_str() == mps::PV_STRING_ACTOR)
         .collect();
     assert_eq!(strings.len(), 2);
+    let entity_of = |uc: &&eebus::spine::RemoteUseCase| {
+        uc.address
+            .as_ref()
+            .and_then(|a| a.entity.clone())
+            .expect("this crate always anchors a use case on an entity")
+    };
     assert_ne!(
-        strings[0].address.entity, strings[1].address.entity,
+        entity_of(&strings[0]),
+        entity_of(&strings[1]),
         "each on its own entity, or the manager could not tell them apart"
     );
 }

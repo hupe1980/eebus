@@ -384,3 +384,35 @@ h2 > a.zola-anchor:hover::after, h3 > a.zola-anchor:hover::after {
 .code-wrap:hover .copy, .copy:focus-visible { opacity: 1; }
 .copy:hover { color: var(--accent); border-color: var(--accent); }
 @media (hover: none) { .copy { opacity: 1; } }
+
+/* ---- diagrams ------------------------------------------------------------ */
+
+.diagram {
+  margin: 1.75rem 0;
+  text-align: center;
+}
+
+.diagram pre.mermaid {
+  /* Until mermaid has run, the source would otherwise flash as a code block. */
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  overflow-x: auto;
+  visibility: hidden;
+}
+
+.diagram pre.mermaid[data-processed] {
+  visibility: visible;
+}
+
+.diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.diagram figcaption {
+  margin-top: 0.6rem;
+  font-size: 0.86rem;
+  color: var(--text-dim);
+}

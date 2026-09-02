@@ -380,8 +380,16 @@ impl MonitoringApplianceActor {
         use crate::spine::SpineEvent;
 
         let (feature, data) = match event {
-            SpineEvent::ReplyReceived { feature, data }
-            | SpineEvent::DataNotified { feature, data } => (feature, data),
+            // `resolved`, not `data`. A Monitored Unit is asked to notify rather than be
+            // polled (SPINE IG §3.2.2), and a notification may be partial — a measurement
+            // whose `scale` is omitted keeps the one already sent, so reading the fragment
+            // alone is off by a power of ten.
+            SpineEvent::ReplyReceived {
+                feature, resolved, ..
+            }
+            | SpineEvent::DataNotified {
+                feature, resolved, ..
+            } => (feature, resolved),
             _ => return None,
         };
         let device = feature.device.as_ref()?;

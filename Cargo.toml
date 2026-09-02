@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -20,10 +20,19 @@ readme = "README.md"
 exclude = ["specs/", "site/", "xtask/"]
 
 [features]
-default = ["std", "pairing"]
+default = ["std", "pairing", "conformance"]
 std = ["serde/std", "serde_json/std", "thiserror/std"]
 # The SHIP Pairing Service: automated trust establishment from a QR-code secret.
 pairing = ["dep:hmac", "dep:sha2"]
+# The four High-Level Test Specifications as data: 203 abstract test cases with their
+# descriptions and requirements. A few tens of kilobytes of static strings that a device
+# in the field never reads, so a firmware build leaves it out — `--no-default-features`
+# already does. Certification work, and `tests/conformance.rs`, need it.
+conformance = []
+# Cross-implementation tests against a containerised `eebus-go` peer. Off by default and
+# behind `required-features` on the test target: an ordinary `cargo test` stays hermetic,
+# needs no Docker and no network, and finishes in seconds.
+interop = []
 
 # The cryptography provider. `rustls`' is process-global, so the choice belongs to whoever
 # builds the binary: `cert`, `tls` and `runtime` require exactly one of these two, and
@@ -43,7 +52,7 @@ mdns = ["std", "dep:mdns-sd"]
 
 # Everything, on `ring`. `--all-features` cannot work — the two providers are mutually
 # exclusive — so this is what CI and docs.rs build.
-full = ["std", "pairing", "cert", "tls", "runtime", "mdns", "ring"]
+full = ["std", "pairing", "conformance", "cert", "tls", "runtime", "mdns", "ring"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
@@ -69,6 +78,13 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 
 # The sans-IO example needs nothing; the networked one needs a socket.
+# The cross-implementation suite. `required-features` is what keeps it out of an
+# ordinary `cargo test`; it is not part of `full`, because "everything" should not mean
+# "needs Docker".
+[[test]]
+name = "interop"
+required-features = ["interop", "runtime", "ring"]
+
 [[example]]
 name = "grid_limit"
 

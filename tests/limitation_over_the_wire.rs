@@ -20,8 +20,8 @@ use eebus::spine::{
 };
 use eebus::usecases::descriptor::UseCaseDescriptor;
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, Direction, EffectiveLimit,
-    LimitationState,
+    self, ControllableSystem, ControllableSystemActor, CsConfig, CsFeatures, Direction,
+    EffectiveLimit, LimitationState,
 };
 use eebus::usecases::{lpc, lpp};
 
@@ -67,28 +67,33 @@ impl Link {
         let appliance = LocalEntity::new([1], entity)
             .with_feature(limitation::load_control_feature(1))
             .with_feature(limitation::device_configuration_feature(2))
-            .with_feature(limitation::device_diagnosis_feature(3));
+            .with_feature(limitation::device_diagnosis_feature(3))
+            .with_feature(limitation::device_diagnosis_client_feature(5));
         pump_device.add_entity(appliance).unwrap();
 
         let load_control = pump_device.address_of(&[1], 1);
         let configuration = pump_device.address_of(&[1], 2);
         let diagnosis = pump_device.address_of(&[1], 3);
+        let diagnosis_client = pump_device.address_of(&[1], 5);
 
         let mut pump = Engine::new(pump_device);
         pump.add_use_case([1], 1, controllable_system);
 
-        let actor = ControllableSystemActor::new(
+        let actor = ControllableSystemActor::builder(
             ControllableSystem::new(
                 CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
                     .with_nominal_max(11_000.0),
                 Duration::ZERO,
             ),
             direction,
-            load_control,
-            configuration,
-            diagnosis,
-        );
-        actor.install(&mut pump, Duration::ZERO);
+            CsFeatures {
+                load_control,
+                device_configuration: configuration,
+                device_diagnosis: diagnosis,
+                device_diagnosis_client: diagnosis_client,
+            },
+        )
+        .install(&mut pump, Duration::ZERO);
 
         let mut guard_device = LocalDevice::new(
             "i:12345",

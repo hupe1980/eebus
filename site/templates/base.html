@@ -131,6 +131,54 @@
 </footer>
 
 <script>window.SEARCH_INDEX_URL = "{{ get_url(path='search_index.en.json') | safe }}";</script>
+<script type="module">
+  // ```mermaid fences become diagrams. They are rendered only on the pages that carry
+  // one, and follow the theme the reader chose rather than the library's default.
+  const fences = document.querySelectorAll('pre > code[data-lang="mermaid"]');
+  if (fences.length) {
+    const figures = [...fences].map((code) => {
+      const figure = document.createElement("figure");
+      figure.className = "diagram";
+      const target = document.createElement("pre");
+      target.className = "mermaid";
+      target.textContent = code.textContent;
+      figure.appendChild(target);
+      code.parentElement.replaceWith(figure);
+      return target;
+    });
+    const source = figures.map((f) => f.textContent);
+    const { default: mermaid } = await import(
+      "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+    );
+    const dark = () => {
+      const set = document.documentElement.getAttribute("data-theme");
+      if (set === "dark") return true;
+      if (set === "light") return false;
+      return window.matchMedia("(prefers-color-scheme: dark)").matches;
+    };
+    const draw = () => {
+      figures.forEach((f, i) => {
+        f.removeAttribute("data-processed");
+        f.textContent = source[i];
+      });
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: dark() ? "dark" : "neutral",
+        fontFamily: "inherit",
+        themeVariables: { primaryColor: "#e6f5ef", primaryBorderColor: "#0b8f63", lineColor: "#7b8595" },
+        flowchart: { curve: "basis", useMaxWidth: true },
+        sequence: { useMaxWidth: true, actorMargin: 36 },
+      });
+      mermaid.run({ nodes: figures });
+    };
+    draw();
+    // The header's theme toggle rewrites `data-theme`; redraw when it does.
+    new MutationObserver(draw).observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+  }
+</script>
 <script src="{{ get_url(path='app.js') | safe }}" defer></script>
 {% block scripts %}{% endblock %}
 </body>

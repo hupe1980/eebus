@@ -599,6 +599,17 @@ macro_rules! eebus_choice {
                 }
             }
 
+            /// How many list entries this payload carries; zero for a non-list function.
+            ///
+            /// The engine uses it to keep a peer from growing a stored list without
+            /// bound, one identified entry at a time.
+            pub fn entry_count(&self) -> usize {
+                match self {
+                    $( $name::$variant(__v) =>
+                        $crate::eebus_choice!(@entry_count $kind __v), )*
+                }
+            }
+
             /// Applies `update` to this alternative with the semantics `partial` asks for.
             ///
             /// A partial update merges into what is stored: for a list, entry by entry
@@ -756,6 +767,15 @@ macro_rules! eebus_choice {
     (@identified plain $value:ident) => {{
         let _ = $value;
         true
+    }};
+
+    (@entry_count list $value:ident) => {{
+        use $crate::model::rfe::ListData as _;
+        $value.entries().unwrap_or_default().len()
+    }};
+    (@entry_count plain $value:ident) => {{
+        let _ = $value;
+        0
     }};
 
     (@apply list $stored:ident $update:ident $partial:ident) => {
@@ -1022,8 +1042,142 @@ macro_rules! eebus_restrict {
                     ),
                 }
             }
+
+            /// Applies one `cmdControl: delete` filter to the stored data.
+            ///
+            /// SPINE §5.3.4.3 gives a delete the same two filters a read has, and they
+            /// mean the same things: the selectors say *which entries*, and the elements
+            /// say *which parts of them*. With an elements filter the entries survive and
+            /// only the named elements go — LPC UC TS §3.4.1.4 withdraws a limit's
+            /// `endTime` that way, and removing the whole entry instead would lift the
+            /// curtailment rather than shorten it. Without one the addressed entries go.
+            ///
+            /// `update` is the command's own payload, which addresses entries by their
+            /// identifiers when the filter carries no selectors.
+            #[allow(unreachable_patterns, unused_variables)]
+            pub fn delete_restricted(
+                &mut self,
+                update: &Self,
+                selectors: $crate::codec::__private::Option<&$sels>,
+                elements: $crate::codec::__private::Option<&$els>,
+            ) -> $crate::codec::__private::Result<(), $crate::model::rfe::RestrictError> {
+                if self.key() != update.key() {
+                    return $crate::codec::__private::Err(
+                        $crate::model::rfe::RestrictError::Mismatch
+                    );
+                }
+                if selectors.is_none() && elements.is_none() {
+                    return self.delete(update).map_err(|_| {
+                        $crate::model::rfe::RestrictError::Mismatch
+                    });
+                }
+                match (self, update) {
+                    $(
+                        ($data::$variant(__stored), $data::$variant(__update)) =>
+                            $crate::eebus_restrict!(
+                                @delete $kind __stored __update selectors elements $sels $els
+                                $(sel $sel)? $(el $el)?
+                            ),
+                    )*
+                    _ => $crate::codec::__private::Err(
+                        $crate::model::rfe::RestrictError::Unsupported
+                    ),
+                }
+            }
         }
     };
+
+    // A list with both a selectors and an elements filter: the ordinary case.
+    (@delete list $stored:ident $update:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident sel $sel:ident el $el:ident) => {{
+        let __s = $crate::eebus_restrict!(@pick $selectors $sels $sel);
+        let __e = $crate::eebus_restrict!(@pick $elements $els $el);
+        if __s.is_some_and($crate::model::rfe::Selectors::uses_unsupported) {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        let __named = $crate::model::rfe::ListData::entries($update).unwrap_or_default();
+        match (__s, __e) {
+            ($crate::codec::__private::Some(__s), $crate::codec::__private::Some(__e)) =>
+                $crate::model::rfe::clear_addressed(
+                    $stored, $crate::model::rfe::addresses_selected(__s), __e,
+                ),
+            ($crate::codec::__private::Some(__s), $crate::codec::__private::None) =>
+                $crate::model::rfe::delete_addressed(
+                    $stored, $crate::model::rfe::addresses_selected(__s),
+                ),
+            ($crate::codec::__private::None, $crate::codec::__private::Some(__e)) =>
+                $crate::model::rfe::clear_addressed(
+                    $stored, $crate::model::rfe::addresses_named(__named), __e,
+                ),
+            // Neither filter narrows anything, which `delete_restricted` answered before
+            // it got here.
+            ($crate::codec::__private::None, $crate::codec::__private::None) => {}
+        }
+        $crate::codec::__private::Ok(())
+    }};
+
+    // A list the schemas give selectors but no per-entry elements filter: there is
+    // nothing to delete *within* an entry, so an elements filter is refused rather than
+    // quietly widened into "delete the entry".
+    (@delete list $stored:ident $update:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident sel $sel:ident) => {{
+        if $elements.is_some() {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        let __s = $crate::eebus_restrict!(@pick $selectors $sels $sel);
+        if __s.is_some_and($crate::model::rfe::Selectors::uses_unsupported) {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        if let $crate::codec::__private::Some(__s) = __s {
+            $crate::model::rfe::delete_addressed(
+                $stored,
+                $crate::model::rfe::addresses_selected(__s),
+            );
+        }
+        $crate::codec::__private::Ok(())
+    }};
+
+    // A list the schemas give no selectors filter: the payload's identifiers say which
+    // entries, and the elements filter applies to each of them.
+    (@delete list $stored:ident $update:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident el $el:ident) => {{
+        if $selectors.is_some() {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        let __named = $crate::model::rfe::ListData::entries($update).unwrap_or_default();
+        let __addressed = $crate::model::rfe::addresses_named(__named);
+        match $crate::eebus_restrict!(@pick $elements $els $el) {
+            $crate::codec::__private::Some(__e) =>
+                $crate::model::rfe::clear_addressed($stored, __addressed, __e),
+            $crate::codec::__private::None =>
+                $crate::model::rfe::delete_addressed($stored, __addressed),
+        }
+        $crate::codec::__private::Ok(())
+    }};
+
+    // A function that is not a list: no entries to select, only elements to clear.
+    (@delete plain $stored:ident $update:ident $selectors:ident $elements:ident
+     $sels:ident $els:ident el $el:ident) => {{
+        if $selectors.is_some() {
+            return $crate::codec::__private::Err(
+                $crate::model::rfe::RestrictError::Unsupported
+            );
+        }
+        if let $crate::codec::__private::Some(__e) =
+            $crate::eebus_restrict!(@pick $elements $els $el)
+        {
+            $crate::model::rfe::Elements::clear_from(__e, $stored);
+        }
+        $crate::codec::__private::Ok(())
+    }};
 
     // A list with both a selectors and an elements filter: the ordinary case.
     (@arm list $data:ident $variant:ident $value:ident $selectors:ident $elements:ident

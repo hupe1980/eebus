@@ -42,7 +42,7 @@ body = "The SHIP handshake and the SPINE engine touch neither sockets nor clocks
 
 [[extra.features]]
 title = "Certifiable, not just interoperable"
-body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data, and cargo test prints a coverage number against them. What it cannot cover — a factory reset, a power cut — is listed with the reason."
+body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data and every one is driven; cargo test prints 189/203. The fourteen missing are exactly the device-level cases — a factory reset, a power cut — each listed with its reason."
 
 [[extra.features]]
 title = "Illegal states are unrepresentable"
@@ -57,8 +57,12 @@ title = "Runs on the controller"
 body = "Everything below the runtime builds for no_std + alloc, checked in CI against thumbv7em-none-eabihf. Five fuzz targets cover everything the network can reach, because on a heat-pump controller a panic is a reboot."
 
 [[extra.features]]
+title = "Checked against other implementations"
+body = "Fifteen datagrams captured from eight real devices by seven manufacturers are driven through an engine, resolved into a device model, and used to seed the fuzzers. An opt-in suite runs eebus-go's own examples in a container and drives the whole §14a exchange against them, in both directions."
+
+[[extra.features]]
 title = "The wire format, directly"
-body = "EEBUS JSON-UTF8 is encoded through serde in a single streaming pass — no intermediate tree to rewrite, no allocation for field names. Round trips are byte for byte."
+body = "EEBUS JSON-UTF8 is encoded through serde in a single streaming pass — no intermediate tree to rewrite, no allocation for field names. A schema-valid message round-trips byte for byte."
 +++
 
 ## The exchange, end to end
@@ -67,10 +71,31 @@ A distribution grid operator's control box tells a heat pump how much power it m
 Under §14a EnWG the building has to honour that limit, and the acknowledgement it sends
 back is the record that it did. Every layer below is in this crate.
 
-```text
-mDNS-SD  ──▶  TCP  ──▶  TLS 1.2  ──▶  WebSocket  ──▶  SHIP  ──▶  SPINE  ──▶  use case
- find it     connect    mutual auth    framing      handshake    model      the decision
+```mermaid
+flowchart LR
+  mdns["mDNS-SD<br><small>find it</small>"]
+  tcp["TCP<br><small>connect</small>"]
+  tls["TLS 1.2<br><small>mutual auth</small>"]
+  ws["WebSocket<br><small>framing</small>"]
+  ship["SHIP<br><small>handshake, trust</small>"]
+  spine["SPINE<br><small>model, bindings</small>"]
+  uc["use case<br><small>the decision</small>"]
+
+  mdns --> tcp --> tls --> ws --> ship --> spine --> uc
+
+  classDef s fill:#e6f5ef,stroke:#0b8f63,color:#101620;
+  classDef d fill:#0b8f63,stroke:#0b8f63,color:#fff;
+  class mdns,tcp,tls,ws,ship,spine s
+  class uc d
 ```
+
+## Who it is for
+
+| You are building | You need | Start at |
+|---|---|---|
+| A heat pump, wallbox, battery or inverter that must accept a §14a limit | the Controllable System actors, the tester hooks, `no_std` | [Getting started](@/docs/getting-started.md), then [LPC and LPP](@/docs/limitation.md) |
+| An energy manager or grid control box that issues limits | the Energy Guard and Monitoring Appliance actors, `Hub` | [On a network](@/docs/networking.md) |
+| A gateway, simulator or test harness | the sans-IO core, without sockets | [Architecture](@/docs/architecture.md) |
 
 ## Both sides, not just the appliance
 
@@ -89,6 +114,20 @@ guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 830 SPINE types and 47 SHIP messages are emitted from the XML Schemas the specifications
 ship, so the model cannot drift from the standard. The generated Rust is committed:
 building the crate never needs the specifications.
+
+## Checked against implementations it did not write
+
+Round trips over fixtures a crate wrote itself prove that its encoder agrees with its
+decoder, which is not the question anyone is asking. Two things answer the real one.
+
+**Recorded traffic.** Fifteen datagrams captured from eight real devices by seven
+manufacturers — Elli, evcc, Kostal, Porsche, SMA, Spelsberg, Vaillant, Viessmann — are
+driven through an engine, resolved into a device model, and used to seed the fuzzers, so the
+corpus explores the shapes real hardware produces.
+
+**A live peer.** An opt-in suite runs `eebus-go`'s own examples in a container at a pinned
+revision and drives the whole §14a exchange against them in both directions: their control
+box against this crate's Controllable System, their EVSE against its Energy Guard.
 
 ## One rule you cannot get wrong twice
 

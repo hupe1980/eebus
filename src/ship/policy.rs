@@ -15,10 +15,32 @@
 //! SKI puts it, and a stack that implements only the first half will sit forever holding
 //! a duplicate against a peer that expects it to act.
 //!
-//! Note the deviation worth knowing about: `ship-go`, the reference implementation, keeps
-//! the *initiator's* connection instead. The two rules converge on one connection anyway
-//! — the smaller-SKI side's three-second fallback closes whatever the other end left
-//! open — which is why interoperating with it works without a compatibility switch.
+//! # The rule is racy, and this is what is done about it
+//!
+//! "The most recent connection" is a judgement each node makes from its own clock, about
+//! two events that happen a few milliseconds apart on two machines. Nothing in the
+//! protocol makes the two judgements agree, and `enbility`'s 2025 analysis of the SHIP
+//! specification calls the mechanism out for it: followed literally by two peers whose
+//! views differ, it can end with **both connections closed and none left** — connection
+//! starvation. `ship-go` deviates deliberately, keeping the *initiator's* connection,
+//! which is a judgement both ends can make identically.
+//!
+//! This module follows §12.2.3, because a certification laboratory tests the
+//! specification and not a reference implementation, and closes the hazard from the other
+//! end instead:
+//!
+//! * The fallback is **bounded**. [`Resolution::Probe`] runs exactly one ping round;
+//!   [`Resolution::CloseAfterProbe`] then decides, whatever came back. The earlier shape
+//!   pinged again whenever every connection answered, which against a peer that had
+//!   stopped arbitrating — crashed, or reading the rule the way `ship-go` does — never
+//!   terminated.
+//! * Losing every connection is recoverable rather than fatal:
+//!   [`runtime::Hub`](crate::runtime::Hub) redials a remembered peer, so starvation costs
+//!   a reconnection rather than the relationship.
+//!
+//! Interoperating with `ship-go` works without a compatibility switch: whichever rule the
+//! far end applies, one side closes something, and the other side's bounded fallback
+//! settles what is left.
 
 use core::time::Duration;
 
@@ -71,21 +93,31 @@ pub enum Resolution {
     },
     /// The peer had the bigger SKI and did not act within three seconds.
     ///
-    /// Ping every connection, close the ones that do not answer, and — if more than one
-    /// still does — close the older.
-    PingThenClose,
+    /// Ping every connection and look again after the pong timeout. Exactly one round:
+    /// the answer to "they all replied" is [`CloseAfterProbe`](Self::CloseAfterProbe),
+    /// never another ping.
+    Probe,
+    /// The ping round has been run. Drop whatever did not answer, and keep the newest of
+    /// what did.
+    ///
+    /// This is the step that makes the fallback terminate. A peer that has stopped
+    /// arbitrating leaves both connections perfectly healthy, and a node that only ever
+    /// pings would sit on the duplicate for as long as the peer stayed up.
+    CloseAfterProbe,
 }
 
 /// Decides what to do about the connections held to one peer.
 ///
 /// `opened` is when each connection was established, on the same monotonic clock as
 /// `now`. `duplicates_since` is when this node first saw more than one, which is what the
-/// three-second grace period of §12.2.3 is measured from.
+/// three-second grace period of §12.2.3 is measured from. `probed` says whether the ping
+/// round has already gone out, and is what stops the fallback from repeating itself.
 pub fn resolve(
     local: &Ski,
     peer: &Ski,
     opened: &[Duration],
     duplicates_since: Duration,
+    probed: bool,
     now: Duration,
 ) -> Resolution {
     if opened.len() < 2 {
@@ -97,8 +129,10 @@ pub fn resolve(
             let deadline = duplicates_since + ARBITRATION_DELAY;
             if now < deadline {
                 Resolution::Wait { until: deadline }
+            } else if probed {
+                Resolution::CloseAfterProbe
             } else {
-                Resolution::PingThenClose
+                Resolution::Probe
             }
         }
     }
@@ -136,6 +170,7 @@ mod tests {
                 &ski(0x01),
                 &opened,
                 Duration::from_secs(5),
+                false,
                 Duration::from_secs(5)
             ),
             Resolution::KeepNewest
@@ -153,6 +188,7 @@ mod tests {
                 &ski(0xFF),
                 &opened,
                 Duration::from_secs(5),
+                false,
                 Duration::from_secs(6)
             ),
             Resolution::Wait {
@@ -165,9 +201,37 @@ mod tests {
                 &ski(0xFF),
                 &opened,
                 Duration::from_secs(5),
+                false,
                 Duration::from_secs(8)
             ),
-            Resolution::PingThenClose
+            Resolution::Probe
+        );
+    }
+
+    /// The fallback runs one ping round and then decides, whatever came back.
+    ///
+    /// This is the case that used to livelock. Against a peer that has stopped
+    /// arbitrating — crashed, or applying `ship-go`'s rule instead — every connection
+    /// answers every ping, and a node that answered "all alive" with another ping would
+    /// hold the duplicate for as long as the peer stayed up.
+    #[test]
+    fn the_fallback_terminates_even_when_every_connection_answers() {
+        let opened = vec![Duration::from_secs(1), Duration::from_secs(5)];
+        let after = |probed| {
+            resolve(
+                &ski(0x01),
+                &ski(0xFF),
+                &opened,
+                Duration::from_secs(5),
+                probed,
+                Duration::from_secs(30),
+            )
+        };
+        assert_eq!(after(false), Resolution::Probe, "one round goes out");
+        assert_eq!(
+            after(true),
+            Resolution::CloseAfterProbe,
+            "and then it is decided, not pinged again"
         );
     }
 
@@ -179,6 +243,7 @@ mod tests {
                 &ski(0xFF),
                 &[Duration::from_secs(1)],
                 Duration::ZERO,
+                false,
                 Duration::from_secs(60)
             ),
             Resolution::Settled

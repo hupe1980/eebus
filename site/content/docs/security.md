@@ -43,9 +43,9 @@ would be making that choice for every consumer downstream of it, including one w
 the first time a control box connects.
 
 ```toml
-eebus = { version = "0.1", features = ["runtime", "ring"] }
+eebus = { version = "0.3", features = ["runtime", "ring"] }
 # or, for a build that must not contain `ring`:
-eebus = { version = "0.1", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+eebus = { version = "0.3", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
 ```
 
 Nothing here ever reads the process default. The provider is built explicitly, with exactly
@@ -100,8 +100,20 @@ datagrams and bad certificates at any node.
   presenting the SKI without the key fails the handshake.
 * **Replay** — SPINE message counters are monotonic per source; the Pairing Service has its
   own guard.
-* **Resource exhaustion** — the connection table is bounded, as is the peer table in the
-  engine.
+* **A timing oracle on a short secret** — the two comparisons that matter, a SHIP PIN and a
+  pairing secret, go through one constant-time equality rather than stopping at the first
+  differing byte. A PIN's whole defence is the escalating penalty of SHIP §13.4.4.3.4, and
+  that penalty counts *attempts*: an equality that leaks a byte at a time turns eight hex
+  digits into thirty-two guesses, and the penalty never notices.
+* **Resource exhaustion** — every table a peer can grow is bounded. The hub holds at most
+  `DEFAULT_MAX_CONNECTIONS` connections and two per peer, refusing the rest with a
+  `connectionClose`; the engine tracks at most `MAX_PEERS` device addresses, evicting the one
+  that has told it least, and at most `MAX_REMOTE_FUNCTIONS` of each peer's functions; at
+  most `MAX_DEFERRED_WRITES` writes may be waiting on the application, and one function holds
+  at most `MAX_LIST_ENTRIES` — after any of which a peer is answered `errorNumber` 3,
+  overload, rather than served. A device address is bounded and printable or the datagram is
+  discarded. SHIP itself caps none of this, and the omission is exploitable: a device that
+  dials in a thousand times takes the memory of every node that answers.
 
 What is *not* defended: an attacker with the private key is the node, and an attacker who
 can make the user approve their SKI is paired. Both are the intended semantics of the

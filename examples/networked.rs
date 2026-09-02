@@ -6,7 +6,7 @@
 //! datagrams carrying a limit and the acknowledgement that answers it.
 //!
 //! ```sh
-//! cargo run --example networked --features runtime
+//! cargo run --example networked --features runtime,ring
 //! ```
 //!
 //! Both sides are a [`Hub`] driving a [`Engine`](eebus::spine::Engine) and one use-case
@@ -26,8 +26,8 @@ use eebus::runtime::{Hub, HubEvent, Node, TrustStore};
 use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::tls::ShipTls;
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, EnergyGuardActor,
-    GuardEvent, LimitWrite,
+    self, ControllableSystem, ControllableSystemActor, ControllableSystemBuilder, CsConfig,
+    CsEvent, CsFeatures, EnergyGuardActor, GuardEvent, LimitWrite,
 };
 use eebus::usecases::lpc;
 
@@ -66,13 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- The heat pump: applies limits, and answers for them ----------------
     let appliance = tokio::spawn(async move {
-        let (engine, mut actor) = build_heat_pump();
+        let (engine, actor) = build_heat_pump();
         let mut hub = Hub::new(heat_pump, engine);
 
         let (stream, from) = listener.accept().await.expect("a caller");
         let ski = hub.accept(stream).await.expect("the SHIP handshake");
         println!("[pump] {from} completed the handshake as {ski}");
-        actor.install(hub.engine_mut(), Duration::ZERO);
+        let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
 
         loop {
             let now = hub.now();
@@ -124,19 +124,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..64 {
         let now = hub.now();
-        let event = tokio::time::timeout(Duration::from_secs(5), hub.next()).await??;
+        // Not `tokio::time::timeout(.., hub.next())`: `Hub::next` is not cancel-safe, and
+        // dropping it mid-write leaves half a frame on the wire. A deadline goes to
+        // `wake_at`, which the hub folds into its own and answers with a `Tick` — so the
+        // loop still cannot hang, and the read is never interrupted.
+        hub.wake_at(now + Duration::from_secs(5));
+        let event = hub.next().await?;
         let mut reports = Vec::new();
 
         match event {
             HubEvent::PeerDiscovered { device, .. } => {
                 let remote = hub.engine().peer(&device).expect("the peer we just heard");
-                let peer = limitation::locate(remote, lpc::DIRECTION)
-                    .expect("it plays the Controllable System");
+                assert!(
+                    limitation::locate(remote, lpc::DIRECTION).is_some(),
+                    "it plays the Controllable System"
+                );
                 println!(
                     "[box]  discovered {} playing the Controllable System",
                     device.as_str()
                 );
-                guard.attach(hub.engine_mut(), peer, now);
+                // The guard has already attached itself: §2.11's opening write goes out
+                // as soon as the bindings settle, and waiting to be told would leave a
+                // conformant appliance in `init`.
                 if let Some(limit) = required.take() {
                     guard.require(&device, Some(limit), now);
                 }
@@ -213,7 +222,7 @@ fn build_control_box() -> (
 }
 
 /// The heat pump: a Controllable System with the features LPC asks of it.
-fn build_heat_pump() -> (Engine, ControllableSystemActor) {
+fn build_heat_pump() -> (Engine, ControllableSystemBuilder) {
     let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)
         .expect("a valid address");
     device
@@ -222,6 +231,7 @@ fn build_heat_pump() -> (Engine, ControllableSystemActor) {
                 .with_feature(limitation::load_control_feature(1))
                 .with_feature(limitation::device_configuration_feature(2))
                 .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::device_diagnosis_client_feature(5))
                 .with_feature(limitation::electrical_connection_feature(4)),
         )
         .expect("a fresh entity");
@@ -229,21 +239,25 @@ fn build_heat_pump() -> (Engine, ControllableSystemActor) {
     let load_control = device.address_of(&[1], 1);
     let configuration = device.address_of(&[1], 2);
     let diagnosis = device.address_of(&[1], 3);
+    let diagnosis_client = device.address_of(&[1], 5);
     let electrical = device.address_of(&[1], 4);
 
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
 
-    let actor = ControllableSystemActor::new(
+    let actor = ControllableSystemActor::builder(
         ControllableSystem::new(
             CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
                 .with_nominal_max(11_000.0),
             Duration::ZERO,
         ),
         lpc::DIRECTION,
-        load_control,
-        configuration,
-        diagnosis,
+        CsFeatures {
+            load_control,
+            device_configuration: configuration,
+            device_diagnosis: diagnosis,
+            device_diagnosis_client: diagnosis_client,
+        },
     )
     .with_electrical_connection(electrical);
     (engine, actor)

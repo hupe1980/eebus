@@ -52,18 +52,19 @@ Guard toward the heat pump and a Controllable System toward the grid operator.
 EEBUS is not one protocol but a stack of four documents, and this crate implements the
 whole of it.
 
-```text
-┌──────────────────────────────────────────────────────────┐
-│  Use cases   LPC · LPP · MPC · MGCP · EVSECC · OPEV       │  what the device is for
-├──────────────────────────────────────────────────────────┤
-│  SPINE       device model, discovery, bindings,           │  what the device says
-│              subscriptions, partial reads and writes      │
-├──────────────────────────────────────────────────────────┤
-│  SHIP        mDNS-SD, TLS 1.2, WebSocket, handshake,      │  how the bytes travel
-│              trust establishment by SKI                   │
-├──────────────────────────────────────────────────────────┤
-│  Transport   TCP/IP over the building's LAN               │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+  uc["<b>Use cases</b> — what the device is <i>for</i><br><small>LPC · LPP · MPC · MGCP · e-mobility · inverters and batteries</small>"]
+  spine["<b>SPINE</b> — what the device <i>says</i><br><small>device model · discovery · bindings · subscriptions · partial reads and writes</small>"]
+  ship["<b>SHIP</b> — how the bytes <i>travel</i><br><small>mDNS-SD · TLS 1.2 · WebSocket · five-phase handshake · trust by SKI</small>"]
+  tcp["<b>Transport</b><br><small>TCP/IP over the building's LAN</small>"]
+
+  uc --- spine --- ship --- tcp
+
+  classDef layer fill:#e6f5ef,stroke:#0b8f63,color:#101620,text-align:left;
+  classDef base fill:transparent,stroke:#7b8595,color:#55606f;
+  class uc,spine,ship layer
+  class tcp base
 ```
 
 **SHIP** — *Smart Home IP* — is the transport. It finds peers with mDNS-SD, connects over

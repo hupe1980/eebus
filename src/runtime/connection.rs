@@ -48,6 +48,12 @@ pub enum ConnectionError {
     /// The peer sent a text frame, which SHIP §10.3 forbids.
     #[error("SHIP carries binary frames only")]
     NotBinary,
+    /// The hub is already holding as many connections as it will.
+    ///
+    /// Not a protocol error: the peer completed the handshake and was then turned away,
+    /// so that a device dialling in repeatedly cannot displace the peers already served.
+    #[error("the hub is already holding as many connections as it will")]
+    TooManyConnections,
     /// The TLS configuration was refused.
     #[error("{0}")]
     Tls(#[from] crate::tls::TlsError),
@@ -87,6 +93,33 @@ impl ShipConnection {
     /// the peer proved it holds the key to.
     pub fn peer(&self) -> Ski {
         self.peer
+    }
+
+    /// The SHIP version this connection settled on, once the handshake reached it.
+    ///
+    /// A consumer that has to know whether it is speaking the certification minimum or
+    /// something later can ask, instead of inferring it from behaviour. `Node`'s
+    /// [`handshake_config`](super::Node::handshake_config) is where the ceiling is set;
+    /// this is what came of it.
+    ///
+    /// ```no_run
+    /// # fn example(connection: &eebus::runtime::ShipConnection) {
+    /// use eebus::ship::ShipVersion;
+    ///
+    /// if connection.ship_version() == Some(ShipVersion::V1_0) {
+    ///     // The peer is a 1.0 node; `accessMethods.id` will not be there.
+    /// }
+    /// # }
+    /// ```
+    pub fn ship_version(&self) -> Option<crate::ship::ShipVersion> {
+        self.handshake.ship_version()
+    }
+
+    /// The message format both sides agreed on — `JSON-UTF8` in practice.
+    pub fn message_format(&self) -> Option<&str> {
+        self.handshake
+            .negotiated()
+            .map(|(_, format)| format.as_str())
     }
 
     /// The SHIP ID the peer announced, once it has.
@@ -155,16 +188,26 @@ impl ShipConnection {
         }
     }
 
-    /// Reads one SHIP message off the socket, and nothing else.
+    /// Reads one SHIP message off the socket, and sends nothing of its own.
     ///
-    /// Cancel-safe, which is what lets a caller select over several connections at once:
-    /// it awaits a single read and performs no writes, so dropping the future in favour
-    /// of another loses nothing but the wait. Whatever it returns has to be passed to
-    /// [`handle_message`](Self::handle_message) — the state machine has not seen it yet.
+    /// Cancel-safe, which is what lets a caller select over several connections at once —
+    /// [`Hub`](crate::runtime::Hub) reads every link this way and drops the losers on
+    /// every turn of its loop. Whatever it returns has to be passed to
+    /// [`handle_message`](Self::handle_message); the state machine has not seen it yet.
+    ///
+    /// **It is not that nothing is written.** The WebSocket layer answers a ping with a
+    /// pong and a close with a close while reading, so bytes can leave here — what makes
+    /// that safe is that `tungstenite` "never blocks on write" for them and carries an
+    /// unflushed one forward to the next read, so a dropped future leaves no half-written
+    /// frame. Two things follow, and both are why this is worth stating rather than
+    /// glossing: an inbound partial frame is buffered and resumed on the next call, which
+    /// is a documented guarantee of `WebSocketStream`; and nothing the *caller* queued is
+    /// ever fed here, which is the half [`Hub::next`](crate::runtime::Hub::next) cannot
+    /// promise.
     ///
     /// A frame SHIP §10.3 forbids comes back as an error rather than being answered here,
-    /// because answering means writing and writing is what would make this unsafe to
-    /// cancel. The answer is [`reject`](Self::reject).
+    /// because that answer is a close frame this node composes rather than one the
+    /// WebSocket layer owes. The answer is [`reject`](Self::reject).
     pub async fn next_message(&mut self) -> Result<ShipMessage, ConnectionError> {
         self.read_frame().await
     }
@@ -346,7 +389,8 @@ impl ShipConnection {
                 Message::Text(_) => return Err(ConnectionError::NotBinary),
                 Message::Close(_) => return Err(ConnectionError::Closed),
                 Message::Pong(_) => self.awaiting_pong = false,
-                // Tungstenite answers a ping itself; nothing is owed here.
+                // Tungstenite queues the pong itself while reading, and never blocks on
+                // writing it — so a ping costs this loop nothing but another turn.
                 Message::Ping(_) | Message::Frame(_) => {}
             }
         }

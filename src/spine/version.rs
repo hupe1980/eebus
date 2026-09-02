@@ -198,4 +198,20 @@ mod tests {
     fn a_component_long_enough_to_overflow_is_not_a_version() {
         assert_eq!(SpecVersion::parse("1.3.99999999999999999999"), None);
     }
+
+    /// The version in every datagram header is the version discovery announces.
+    ///
+    /// They are two constants — [`SUPPORTED`] here and `SPINE_VERSION` in
+    /// [`discovery`](super::super::discovery), which is a string because that is what the
+    /// wire carries. Changing one and not the other gives a node that claims 1.3.0 in its
+    /// headers and something else in its `specificationVersionList`, which nothing else
+    /// would notice.
+    #[test]
+    fn the_announced_version_and_the_header_version_are_one_version() {
+        assert_eq!(
+            SpecVersion::parse(super::super::discovery::SPINE_VERSION),
+            Some(SUPPORTED),
+            "`SPINE_VERSION` and `SUPPORTED` have drifted apart"
+        );
+    }
 }

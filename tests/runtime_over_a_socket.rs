@@ -262,13 +262,13 @@ async fn the_hub_discovers_a_peer_and_routes_to_it() {
     let ski = hub.connect(address).await.expect("a connection");
 
     let device = loop {
-        match tokio::time::timeout(Duration::from_secs(5), hub.next())
-            .await
-            .expect("no timeout")
-            .expect("no error")
-        {
+        // A deadline goes to `wake_at`, not around `hub.next()`: `next` is not
+        // cancel-safe, and a test that models the misuse is a test people copy.
+        hub.wake_at(hub.now() + Duration::from_secs(5));
+        match hub.next().await.expect("no error") {
             HubEvent::PeerDiscovered { device, .. } => break device,
             HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+            HubEvent::Tick => panic!("no peer was discovered within five seconds"),
             _ => {}
         }
     };
@@ -301,7 +301,8 @@ fn pump_engine() -> Engine {
             LocalEntity::new([1], EntityType::HeatPumpAppliance)
                 .with_feature(limitation::load_control_feature(1))
                 .with_feature(limitation::device_configuration_feature(2))
-                .with_feature(limitation::device_diagnosis_feature(3)),
+                .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::device_diagnosis_client_feature(5)),
         )
         .unwrap();
     let mut engine = Engine::new(device);
@@ -366,8 +367,13 @@ async fn a_remembered_peer_is_dialled_and_redialled() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while connections < 2 && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline, hub.next()).await {
-            Ok(Ok(HubEvent::Connected { ski })) => {
+            Ok(Ok(HubEvent::Connected { ski, version })) => {
                 assert_eq!(ski, pump_ski);
+                assert_eq!(
+                    version,
+                    Some(eebus::ship::ShipVersion::V1_1),
+                    "a reconnection reports the version it settled on"
+                );
                 connections += 1;
             }
             Ok(Ok(HubEvent::Disconnected { .. })) => disconnections += 1,
@@ -428,13 +434,13 @@ async fn a_certificate_renewal_updates_the_trust_store() {
     hub.connect(address).await.expect("a connection");
 
     let updated = loop {
-        match tokio::time::timeout(Duration::from_secs(5), hub.next())
-            .await
-            .expect("no timeout")
-            .expect("no error")
-        {
+        // A deadline goes to `wake_at`, not around `hub.next()`: `next` is not
+        // cancel-safe, and a test that models the misuse is a test people copy.
+        hub.wake_at(hub.now() + Duration::from_secs(5));
+        match hub.next().await.expect("no error") {
             HubEvent::PeerKeysUpdated { ski, trusted, .. } => break (ski, trusted),
             HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+            HubEvent::Tick => panic!("no key material arrived within five seconds"),
             _ => {}
         }
     };
@@ -514,15 +520,18 @@ async fn a_second_peer_cannot_claim_the_first_peer_s_device_address() {
         if !discovered.is_empty() && !conflicted.is_empty() {
             break;
         }
-        match tokio::time::timeout(Duration::from_secs(2), hub.next()).await {
-            Ok(Ok(HubEvent::PeerDiscovered { ski, device })) => discovered.push((ski, device)),
-            Ok(Ok(HubEvent::Disconnected { ski, reason })) => {
+        hub.wake_at(hub.now() + Duration::from_secs(2));
+        match hub.next().await {
+            Ok(HubEvent::PeerDiscovered { ski, device }) => discovered.push((ski, device)),
+            Ok(HubEvent::Disconnected { ski, reason }) => {
                 if reason == Disconnect::AddressConflict {
                     conflicted.push(ski);
                 }
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) | Err(_) => break,
+            // The deadline, arriving as a tick rather than as a cancelled read.
+            Ok(HubEvent::Tick) => break,
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
 
@@ -569,8 +578,8 @@ async fn a_second_peer_cannot_claim_the_first_peer_s_device_address() {
 async fn a_limit_arrives_over_a_socket_and_is_accepted() {
     use eebus::runtime::{Hub, HubEvent};
     use eebus::usecases::limitation::{
-        self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, EnergyGuardActor,
-        GuardEvent, LimitWrite, LimitationState,
+        self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures,
+        EnergyGuardActor, GuardEvent, LimitWrite, LimitationState,
     };
     use eebus::usecases::lpc;
 
@@ -588,32 +597,37 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
                     .with_feature(limitation::load_control_feature(1))
                     .with_feature(limitation::device_configuration_feature(2))
                     .with_feature(limitation::device_diagnosis_feature(3))
+                    .with_feature(limitation::device_diagnosis_client_feature(5))
                     .with_feature(limitation::electrical_connection_feature(4)),
             )
             .unwrap();
         let load_control = device.address_of(&[1], 1);
         let configuration = device.address_of(&[1], 2);
         let diagnosis = device.address_of(&[1], 3);
+        let diagnosis_client = device.address_of(&[1], 5);
         let electrical = device.address_of(&[1], 4);
 
         let mut engine = Engine::new(device);
         engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
-        let mut actor = ControllableSystemActor::new(
+        let actor = ControllableSystemActor::builder(
             ControllableSystem::new(
                 CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)).with_nominal_max(11_000.0),
                 Duration::ZERO,
             ),
             lpc::DIRECTION,
-            load_control,
-            configuration,
-            diagnosis,
+            CsFeatures {
+                load_control,
+                device_configuration: configuration,
+                device_diagnosis: diagnosis,
+                device_diagnosis_client: diagnosis_client,
+            },
         )
         .with_electrical_connection(electrical);
 
         let mut hub = Hub::new(heat_pump, engine);
         let (stream, _) = listener.accept().await.unwrap();
         hub.accept(stream).await.expect("the handshake");
-        actor.install(hub.engine_mut(), Duration::ZERO);
+        let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
 
         let mut decided = None;
         for _ in 0..256 {
@@ -678,9 +692,10 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
         match event {
             HubEvent::PeerDiscovered { device, .. } => {
                 let remote = hub.engine().peer(&device).expect("just discovered");
-                let peer =
-                    limitation::locate(remote, lpc::DIRECTION).expect("it plays the use case");
-                guard.attach(hub.engine_mut(), peer, now);
+                assert!(
+                    limitation::locate(remote, lpc::DIRECTION).is_some(),
+                    "it plays the use case"
+                );
                 guard.require(&device, Some(LimitWrite::active(3_000.0)), now);
             }
             HubEvent::Spine(event) => {
@@ -727,4 +742,147 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
         effective,
         eebus::usecases::limitation::EffectiveLimit::Active(3_000.0)
     );
+}
+
+/// A hub with no room turns a connection away instead of taking it.
+///
+/// SHIP puts no cap on connections, and the omission is exploitable: a device on the LAN
+/// that dials in repeatedly takes the memory of every node that answers, and the node
+/// that runs out is the one that stops serving the peers it already had. The refusal is a
+/// `connectionClose` rather than a dropped socket, so the peer is told rather than left
+/// guessing.
+#[tokio::test]
+async fn a_full_hub_refuses_a_connection_rather_than_growing() {
+    use eebus::runtime::{ConnectionError, Hub};
+    use eebus::ship::ConnectionCloseReason;
+
+    let (control_box, heat_pump) = pair();
+    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let mut hub = Hub::new(heat_pump, pump_engine());
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let _ = hub.accept(stream).await;
+        }
+        hub
+    });
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.set_max_connections(1);
+    assert_eq!(hub.max_connections(), 1);
+
+    hub.connect(address).await.expect("the first connection");
+
+    // The second is refused by this side, and the peer is closed politely.
+    let refused = hub.connect(address).await;
+    assert!(
+        matches!(refused, Err(ConnectionError::TooManyConnections)),
+        "a full hub took a second connection: {refused:?}"
+    );
+    assert_eq!(
+        hub.peers().count(),
+        1,
+        "the refused connection was still adopted"
+    );
+
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
+    let _ = server.await;
+}
+
+/// A `next` future cancelled mid-write is noticed, and the connection goes.
+///
+/// This is D33's hazard made deterministic. Cancelling `Hub::next` while it is writing
+/// leaves a partial WebSocket frame on the wire; the peer's parser is then out of step
+/// with the stream and every message after it is misread, invisibly from this side. The
+/// hub cannot repair that — but it can *know*, and closing the connection turns a session
+/// that quietly stops working into a reconnection.
+///
+/// The peer here answers discovery and then stops reading, so the socket buffers fill and
+/// the write is genuinely parked at an `await` rather than racing to completion.
+#[tokio::test]
+async fn a_write_interrupted_by_a_cancelled_next_closes_the_connection() {
+    use eebus::runtime::{Disconnect, Hub, HubEvent};
+
+    let (control_box, heat_pump) = pair();
+    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    // A peer that answers discovery and then stops reading entirely. The connection stays
+    // open — it is the *reading* that stops, which is what fills the buffers.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
+    let server = tokio::spawn(async move {
+        let mut hub = Hub::new(heat_pump, pump_engine());
+        let (stream, _) = listener.accept().await.expect("a caller");
+        hub.accept(stream).await.expect("the handshake");
+        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            hub.wake_at(hub.now() + Duration::from_millis(20));
+            if hub.next().await.is_err() {
+                break;
+            }
+        }
+        core::future::pending::<()>().await;
+    });
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.connect(address).await.expect("a connection");
+
+    let device = loop {
+        // A deadline goes to `wake_at`, not around `hub.next()`: `next` is not
+        // cancel-safe, and a test that models the misuse is a test people copy.
+        hub.wake_at(hub.now() + Duration::from_secs(5));
+        match hub.next().await.expect("no error") {
+            HubEvent::PeerDiscovered { device, .. } => break device,
+            HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+            HubEvent::Tick => panic!("no peer was discovered within five seconds"),
+            _ => {}
+        }
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Enough traffic that the kernel and TLS buffers cannot swallow it all.
+    let target = eebus::spine::feature_address(&device, &[1], 1);
+    let source = hub.engine().device().address_of(&[1], 1);
+    for _ in 0..50_000 {
+        let now = hub.now();
+        hub.engine_mut().read(
+            &target,
+            &source,
+            eebus::model::Function::LoadControlLimitListData,
+            now,
+        );
+    }
+
+    // Cancel `next` while it is parked in that write. The peer is not reading, so this is
+    // not a race: the future cannot make progress and the timeout must win.
+    let cancelled = tokio::time::timeout(Duration::from_millis(500), hub.next()).await;
+    assert!(
+        cancelled.is_err(),
+        "the write completed, so nothing was cancelled and the test proves nothing"
+    );
+
+    // The very next call has to report it rather than carry on over a stream the peer can
+    // no longer parse.
+    let event = tokio::time::timeout(Duration::from_secs(5), hub.next())
+        .await
+        .expect("the hub answered")
+        .expect("no transport error");
+    assert!(
+        matches!(
+            event,
+            HubEvent::Disconnected {
+                reason: Disconnect::InterruptedWrite,
+                ..
+            }
+        ),
+        "expected the interrupted write to be reported, saw {event:?}"
+    );
+    assert_eq!(hub.peers().count(), 0, "and the connection is gone");
+
+    server.abort();
 }

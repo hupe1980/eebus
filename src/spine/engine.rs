@@ -55,6 +55,24 @@ pub enum SpineEvent {
         /// The peer.
         device: AddressDevice,
     },
+    /// A deferred write went unanswered long enough that the peer has stopped waiting.
+    ///
+    /// The application was handed a [`WriteRequest`] and never called
+    /// [`accept_write`](Engine::accept_write) or
+    /// [`reject_write`](Engine::reject_write). Its token no longer resolves, and nothing
+    /// further will go to the peer — §5.2.5's maximum response delay has passed, so an
+    /// answer now would arrive after the peer gave up.
+    ///
+    /// Under §14a EnWG this is worth logging rather than ignoring: a limit that was never
+    /// decided is a limit that cannot be shown to have been honoured.
+    WriteAbandoned {
+        /// The token that will no longer resolve.
+        token: WriteToken,
+        /// The feature the write addressed.
+        feature: FeatureAddress,
+        /// The peer that is no longer waiting.
+        from: FeatureAddress,
+    },
     /// A peer wrote to one of this device's features, and the engine applied it.
     DataWritten {
         /// The feature that was written.
@@ -74,18 +92,34 @@ pub enum SpineEvent {
     /// queued behind it would otherwise be sized for it.
     WriteRequested(Box<WriteRequest>),
     /// A peer notified data this device is subscribed to.
+    ///
+    /// **Read [`resolved`](Self::DataNotified::resolved), not `data`**, for the same
+    /// reason [`WriteRequested`](Self::WriteRequested) hands over both: a notification may
+    /// be *partial*, and an omitted element then means *unchanged* rather than absent
+    /// (SPINE IG §3.3). A measurement notified as a bare `number` with its `scale` left
+    /// out is off by whatever the stored scale was.
     DataNotified {
         /// The feature the data came from.
         feature: FeatureAddress,
-        /// The payload.
+        /// The payload, exactly as it arrived — a fragment, if the notification was
+        /// partial.
         data: CmdData,
+        /// What that function now holds: `data` merged into what this peer had sent
+        /// before.
+        resolved: CmdData,
     },
     /// A reply to one of this device's reads arrived.
+    ///
+    /// A reply to a *partial* read is a fragment too (§5.3.4.5), so this carries both
+    /// payloads for the same reason [`DataNotified`](Self::DataNotified) does.
     ReplyReceived {
         /// The feature that replied.
         feature: FeatureAddress,
-        /// The payload.
+        /// The payload, exactly as it arrived.
         data: CmdData,
+        /// What that function now holds: `data` merged into what this peer had sent
+        /// before.
+        resolved: CmdData,
     },
     /// A request this device sent was acknowledged, positively or not.
     ResultReceived {
@@ -195,10 +229,86 @@ struct DeferredWrite {
     feature: FeatureAddress,
     peer: FeatureAddress,
     data: CmdData,
-    partial: bool,
-    delete: bool,
+    ops: WriteOps,
     reference: MsgCounter,
     ack_request: bool,
+    /// When the peer stops waiting for an answer (§5.2.5, the maximum response delay).
+    deadline: Duration,
+}
+
+/// What one write command asks for, read off its filters.
+///
+/// A command may carry **several** filters (SPINE §5.3.4.2), and LPC UC TS §3.4.1.4 is
+/// built on it: one filter deletes a limit's `endTime`, the next writes the new value —
+/// in a single command, so a Controllable System never observes the limit without one or
+/// the other. Collapsing that into "is this a delete?" and "is this partial?" answers
+/// both yes, and then does only the delete: the limit is removed and the value that was
+/// meant to replace it is dropped.
+#[derive(Clone, Debug, PartialEq)]
+struct WriteOps {
+    /// The delete filters, in the order the command gives them.
+    deletes: Vec<Filter>,
+    /// Whether a filter asked for a partial update.
+    partial: bool,
+    /// Whether the payload is data to store, rather than only the identity of what a
+    /// delete addresses.
+    stores: bool,
+}
+
+impl WriteOps {
+    fn of(cmd: &Cmd) -> Self {
+        let deletes: Vec<Filter> = cmd
+            .filter
+            .iter()
+            .flatten()
+            .filter(|f| f.is_delete())
+            .cloned()
+            .collect();
+        let partial = cmd.is_partial();
+        Self {
+            // A command of nothing but deletes carries its payload as identity. Anything
+            // else — no filter at all, or one that asks for a partial update — stores it.
+            stores: deletes.is_empty() || partial,
+            partial,
+            deletes,
+        }
+    }
+
+    /// Runs the deletes, then the update, on `feature`.
+    fn apply_to(
+        &self,
+        feature: &mut super::device::LocalFeature,
+        data: CmdData,
+    ) -> Result<(), super::device::FeatureError> {
+        for filter in &self.deletes {
+            feature.delete_filtered(&data, filter)?;
+        }
+        if self.stores {
+            feature.apply(data, self.partial)?;
+        }
+        Ok(())
+    }
+
+    /// The same sequence against a detached copy of the stored data.
+    fn resolve(&self, resolved: &mut CmdData, update: &CmdData) -> Result<(), RestrictError> {
+        for filter in &self.deletes {
+            let elements = filter.elements.as_ref();
+            match filter.selectors.as_deref().unwrap_or_default() {
+                [] => resolved.delete_restricted(update, None, elements)?,
+                many => {
+                    for selector in many {
+                        resolved.delete_restricted(update, Some(selector), elements)?;
+                    }
+                }
+            }
+        }
+        if self.stores {
+            resolved
+                .apply(update.clone(), self.partial)
+                .map_err(|_| RestrictError::Mismatch)?;
+        }
+        Ok(())
+    }
 }
 
 /// A request this device sent and is still waiting on.
@@ -214,7 +324,27 @@ struct Pending {
 struct Peer {
     remote: RemoteDevice,
     counters: MsgCounterTracker,
+    /// The merged state of every function this peer has sent, newest last.
+    ///
+    /// A partial notification is a fragment, and reading a fragment needs the value it is
+    /// a fragment *of*. See [`MAX_REMOTE_FUNCTIONS`].
+    data: Vec<(FeatureAddress, CmdData)>,
 }
+
+/// How many of a peer's functions one engine keeps the merged state of.
+///
+/// SPINE lets a server notify a *partial* update, and the implementation guide §3.2.2 asks
+/// clients to subscribe rather than poll — so a fragment is the normal shape a measurement
+/// arrives in, and an omitted `scale` means "the one you already have". Somebody has to
+/// hold that value, and holding it once in the engine is what stops every use case holding
+/// it differently.
+///
+/// The peer chooses how many functions it sends, so the table is bounded and the
+/// least-recently-updated entry is evicted. A function whose state has been evicted starts
+/// its next merge from empty, which is the same position the very first notification is in;
+/// the number is far above what a real device notifies — the largest use case here watches
+/// four functions on two features.
+pub const MAX_REMOTE_FUNCTIONS: usize = 32;
 
 /// How many peers one engine tracks.
 ///
@@ -223,6 +353,20 @@ struct Peer {
 /// allocated an entry for each one it was told about would grow without bound on the word
 /// of whoever is on the wire. SHIP's own connection limit is ten.
 pub const MAX_PEERS: usize = 32;
+
+/// How many writes may be waiting on the application at once.
+///
+/// A deferred write is memory the *peer* allocates: it writes, the engine raises
+/// [`SpineEvent::WriteRequested`], and the entry lives until the application answers. An
+/// application that is slow — or a peer that writes faster than any application could
+/// answer — must not be able to grow that queue without bound on a device with a few
+/// kilobytes to spare.
+///
+/// Sixteen is far more than a use case produces: LPC writes one limit at a time, and the
+/// implementation guide's own rate limit is one write per five minutes. Reaching this cap
+/// means something is wrong on the wire, and the answer is `errorNumber` 3 — overload —
+/// which is exactly what §5.2.5 defines it for.
+pub const MAX_DEFERRED_WRITES: usize = 16;
 
 /// The SPINE engine of one device.
 #[derive(Debug)]
@@ -349,8 +493,19 @@ impl Engine {
     }
 
     /// When [`handle_timeout`](Self::handle_timeout) should next be called.
+    ///
+    /// Both kinds of deadline are folded in: a request this device is waiting on, and a
+    /// write it has put to the application and not been answered about. The second one
+    /// matters more than it looks — a device that only ever *serves* writes has no
+    /// requests outstanding, so leaving the deferred writes out reported "no deadline",
+    /// nothing ever called [`handle_timeout`](Self::handle_timeout), and the queue that
+    /// [`MAX_DEFERRED_WRITES`] bounds filled up and stayed full.
     pub fn poll_timeout(&self) -> Option<Duration> {
-        self.pending.iter().map(|p| p.deadline).min()
+        self.pending
+            .iter()
+            .map(|p| p.deadline)
+            .chain(self.deferred.iter().map(|w| w.deadline))
+            .min()
     }
 
     /// Expires requests that went unanswered.
@@ -362,6 +517,22 @@ impl Engine {
             self.events.push_back(SpineEvent::RequestTimedOut {
                 request: request.counter,
                 destination: request.destination,
+            });
+        }
+
+        // A write the application never decided. The peer stopped waiting a long time
+        // ago — §5.2.5's maximum response delay is ten seconds — so holding the entry
+        // buys nothing and holding all of them is how a queue grows without bound. The
+        // application is told the decision is no longer wanted, and the token it holds
+        // stops resolving.
+        let (stale, live): (Vec<_>, Vec<_>) =
+            self.deferred.drain(..).partition(|w| now >= w.deadline);
+        self.deferred = live;
+        for write in stale {
+            self.events.push_back(SpineEvent::WriteAbandoned {
+                token: write.token,
+                feature: write.feature,
+                from: write.peer,
             });
         }
     }
@@ -377,8 +548,10 @@ impl Engine {
     /// needs are in the first reply and the use case itself is in the second.
     ///
     /// [`runtime::Hub`](crate::runtime::Hub) calls this for you when a connection opens.
-    /// This is the same call, for an application that owns its own [`Engine`] and drives
-    /// the transport itself.
+    /// **This is the supported way for an application that owns its own [`Engine`]** —
+    /// a driver that has to be testable without a socket, a different transport, a
+    /// gateway — to run the same opening exchange. There is nothing else to reproduce:
+    /// call it once per connection, and route the two replies back in.
     ///
     /// Both reads are addressed *without* a device part, which the SPINE implementation
     /// guide §2.7 permits for exactly this message and no other: the peer's device address
@@ -514,12 +687,20 @@ impl Engine {
     /// engine sends what it is told to; the rate limiting belongs to the caller, which
     /// knows what "changed enough" means for its data.
     pub fn notify(&mut self, feature: &FeatureAddress, function: &Function, now: Duration) {
-        let Some(data) = self
-            .device
-            .resolve(feature)
-            .and_then(|f| f.data(function))
-            .cloned()
-        else {
+        // NodeManagement's own functions are computed rather than stored — the same
+        // rule [`handle_read`](Self::handle_read) follows. Reading only the stored data
+        // here made a subscription to NodeManagement unserviceable: it is granted, the
+        // peer waits for the entity list to change, and no notification can ever be
+        // built for it (§7.1.3, §7.3.2, §7.4.2).
+        let computed = is_node_management(feature)
+            .then(|| self.node_management_data(function))
+            .flatten();
+        let Some(data) = computed.or_else(|| {
+            self.device
+                .resolve(feature)
+                .and_then(|f| f.data(function))
+                .cloned()
+        }) else {
             return;
         };
         let subscribers: Vec<FeatureAddress> =
@@ -644,13 +825,32 @@ impl Engine {
         now: Duration,
     ) {
         if let Some((destination, counter)) = awaiting {
+            let deadline = now + self.response_delay_of(&destination);
             self.pending.push(Pending {
                 counter,
                 destination,
-                deadline: now + self.max_response_delay,
+                deadline,
             });
         }
         self.outbox.push_back(datagram);
+    }
+
+    /// How long to wait for an answer from `destination`.
+    ///
+    /// §5.2.5.3 lets a feature announce a `maxResponseDelay` longer than the ten-second
+    /// default in its detailed discovery, and a client is meant to honour it. Ignoring it
+    /// reports a conformant peer as unresponsive — which the implementation guide §2.6.1
+    /// distinguishes from a refusal precisely because §2.6.2's staggered retry follows the
+    /// first and not the second. So the guess would not merely be wrong; it would retry
+    /// against a peer that is answering as fast as it said it would.
+    fn response_delay_of(&self, destination: &FeatureAddress) -> Duration {
+        destination
+            .device
+            .as_ref()
+            .and_then(|device| self.peer(device))
+            .and_then(|remote| remote.feature_at(destination))
+            .and_then(|feature| feature.max_response_delay)
+            .unwrap_or(self.max_response_delay)
     }
 
     /// Fills in the device part of a local address.
@@ -709,6 +909,19 @@ impl Engine {
         let Some(destination) = header.address_destination.as_ref() else {
             return false;
         };
+
+        // An address this node cannot key on is a header it cannot answer: every reply
+        // goes back to `source`, and the peer record, the routing and the § 14a audit
+        // entry are all filed under it. The implementation guide §2.1 says a header that
+        // cannot be trusted is discarded in silence rather than answered, and this is
+        // that case: there is nowhere for an error to go.
+        if source
+            .device
+            .as_ref()
+            .is_some_and(|device| !address::is_usable_device_address(device.as_str()))
+        {
+            return false;
+        }
 
         // Implementation guide §2.5: a version string that does not match the pattern,
         // or a major this implementation does not speak, is refused. `TC_SPINE_COMP_006`
@@ -805,11 +1018,11 @@ impl Engine {
             }
             CmdClassifier::Call => CmdOutcome::Answer(self.handle_call(cmd, source)),
             CmdClassifier::Reply | CmdClassifier::Notify => {
-                self.resolve_pending(reference);
+                self.resolve_pending(reference, source);
                 CmdOutcome::Answer(self.handle_incoming_data(cmd, source, classifier))
             }
             CmdClassifier::Result => {
-                self.handle_result(cmd, reference);
+                self.handle_result(cmd, reference, source);
                 CmdOutcome::Answer(ErrorNumber::None)
             }
         }
@@ -819,9 +1032,27 @@ impl Engine {
     ///
     /// `msgCounterReference` is what ties the two together (`TC_SPINE_DATA_004`); a
     /// response without one cannot be matched and leaves the request to expire.
-    fn resolve_pending(&mut self, reference: Option<MsgCounter>) -> Option<Pending> {
+    ///
+    /// **And it has to come from the peer the request went to.** `msgCounter` is
+    /// allocated per *engine*, not per peer, so a device on the same LAN — paired but
+    /// misbehaving, or simply confused — can otherwise name a counter belonging to a
+    /// conversation with somebody else and have its answer filed under that request.
+    /// Under §14a EnWG that is an acknowledgement attributed to a limit it never
+    /// answered. The one address that may be absent is the opening discovery read's,
+    /// which §2.7 permits precisely because a SHIP connection has one peer on it.
+    fn resolve_pending(
+        &mut self,
+        reference: Option<MsgCounter>,
+        from: &FeatureAddress,
+    ) -> Option<Pending> {
         let reference = reference?;
-        let index = self.pending.iter().position(|p| p.counter == reference)?;
+        let index = self.pending.iter().position(|p| {
+            p.counter == reference
+                && p.destination
+                    .device
+                    .as_ref()
+                    .is_none_or(|peer| Some(peer) == from.device.as_ref())
+        })?;
         Some(self.pending.remove(index))
     }
 
@@ -833,8 +1064,15 @@ impl Engine {
         counter: MsgCounter,
         now: Duration,
     ) -> ErrorNumber {
-        let Some(function) = cmd.function.clone() else {
-            return ErrorNumber::General;
+        // A read names the function it wants in either of two ways: the explicit `function`
+        // element, or an empty instance of the data element. `spine-go`, and therefore most
+        // of the deployed base, sends only the second.
+        let function = match cmd.function.clone() {
+            Some(function) => function,
+            None => match &cmd.data {
+                Some(data) => Function::from(data.key()),
+                None => return ErrorNumber::General,
+            },
         };
 
         // §5.3.4.4: a read considers at most one filter. Two would have to be combined,
@@ -939,17 +1177,30 @@ impl Engine {
         }
 
         let function = Function::from(data.key());
-        let delete = cmd.is_delete();
-        let partial = cmd.is_partial();
+        let ops = WriteOps::of(cmd);
+        let (delete, partial) = (!ops.deletes.is_empty(), ops.partial);
 
         // A write the feature would refuse regardless is refused now, rather than put to
-        // the application only to be turned down.
-        if let Err(e) = feature.check_write(&data, partial) {
+        // the application only to be turned down. A delete is a restricted exchange as
+        // much as a partial update is, and `possibleOperations` has one flag for both.
+        if let Err(e) = feature.check_write(&data, partial || delete) {
             return CmdOutcome::Answer(e.error_number());
         }
 
         if feature.write_approval() == WriteApproval::Deferred {
-            let resolved = resolve_write(feature.data(&function), &data, partial, delete);
+            // The queue is the peer's to fill and the application's to drain. A peer that
+            // writes faster than the application answers is told it is being turned away
+            // rather than silently costing memory.
+            if self.deferred.len() >= MAX_DEFERRED_WRITES {
+                return CmdOutcome::Answer(ErrorNumber::Overload);
+            }
+            // The peer waits as long as this feature announced it might take, which is
+            // the same figure §5.2.5.3 put in discovery — so a feature that said it needs
+            // a minute is not abandoned after ten seconds.
+            let decision_window = feature
+                .max_response_delay()
+                .unwrap_or(self.max_response_delay);
+            let resolved = resolve_write(feature.data(&function), &data, &ops);
             let token = WriteToken(self.next_token);
             self.next_token += 1;
             self.deferred.push(DeferredWrite {
@@ -957,10 +1208,10 @@ impl Engine {
                 feature: destination.clone(),
                 peer: source.clone(),
                 data: data.clone(),
-                partial,
-                delete,
+                ops: ops.clone(),
                 reference: counter,
                 ack_request,
+                deadline: now + decision_window,
             });
             self.events
                 .push_back(SpineEvent::WriteRequested(Box::new(WriteRequest {
@@ -980,11 +1231,7 @@ impl Engine {
             .device
             .resolve_mut(destination)
             .expect("resolved a moment ago");
-        let outcome = if delete {
-            feature.delete(&data)
-        } else {
-            feature.apply(data, partial)
-        };
+        let outcome = ops.apply_to(feature, data);
 
         match outcome {
             Ok(()) => {
@@ -1021,8 +1268,7 @@ impl Engine {
         let function = Function::from(write.data.key());
         let outcome = match self.device.resolve_mut(&write.feature) {
             None => Err(super::device::FeatureError::UnknownFunction),
-            Some(feature) if write.delete => feature.delete(&write.data),
-            Some(feature) => feature.apply(write.data, write.partial),
+            Some(feature) => write.ops.apply_to(feature, write.data),
         };
 
         let error = match outcome {
@@ -1183,8 +1429,16 @@ impl Engine {
             return ErrorNumber::General;
         };
 
-        // Discovery data updates what we know about the peer.
-        match &data {
+        // The peer may have sent a *fragment*: a partial notification, a partial reply, or
+        // a delete. What the application needs is the value that fragment is a fragment
+        // of, and computing it once here is the same rule the write path follows — the
+        // reference implementations pass the fragment alone, and every consumer then
+        // reimplements the merge.
+        let resolved = self.resolve_remote(source, &data, &WriteOps::of(cmd));
+
+        // Discovery data updates what we know about the peer — from the merged document,
+        // since §7.1.5's re-send may itself be partial.
+        match &resolved {
             CmdData::NodeManagementDetailedDiscoveryData(discovery) => {
                 let device = discovery
                     .device_information
@@ -1215,16 +1469,85 @@ impl Engine {
             CmdClassifier::Reply => SpineEvent::ReplyReceived {
                 feature: source.clone(),
                 data,
+                resolved,
             },
             _ => SpineEvent::DataNotified {
                 feature: source.clone(),
                 data,
+                resolved,
             },
         });
         ErrorNumber::None
     }
 
-    fn handle_result(&mut self, cmd: &Cmd, reference: Option<MsgCounter>) {
+    /// Merges an incoming payload into what this peer has sent before, and answers with
+    /// the result.
+    ///
+    /// The table is per peer and bounded by [`MAX_REMOTE_FUNCTIONS`], with the
+    /// least-recently-updated entry evicted — the peer decides how many functions it
+    /// sends, so this is memory it would otherwise allocate on this device.
+    fn resolve_remote(
+        &mut self,
+        source: &FeatureAddress,
+        data: &CmdData,
+        ops: &WriteOps,
+    ) -> CmdData {
+        let Some(device) = source.device.clone() else {
+            // Nothing to file it under. The opening discovery read is the one message
+            // §2.7 lets through without a device part, and it is never partial.
+            return data.clone();
+        };
+        let key = data.key();
+        let peer = self.peer_entry(&device);
+
+        let position = peer
+            .data
+            .iter()
+            .position(|(feature, held)| same_feature(feature, source) && held.key() == key);
+
+        let mut resolved = match position {
+            Some(index) => peer.data.remove(index).1,
+            None => match CmdData::empty(key) {
+                Some(empty) => empty,
+                // A function with no empty value cannot be merged into; the fragment is
+                // all there is to report.
+                None => return data.clone(),
+            },
+        };
+        if ops.resolve(&mut resolved, data).is_err() {
+            return data.clone();
+        }
+        // A peer that notifies a list can grow it one entry at a time, exactly as a peer
+        // with a binding can grow a stored one, so the same bound applies.
+        if resolved.entry_count() > super::device::MAX_LIST_ENTRIES {
+            return data.clone();
+        }
+
+        if peer.data.len() >= MAX_REMOTE_FUNCTIONS {
+            peer.data.remove(0);
+        }
+        peer.data.push((source.clone(), resolved.clone()));
+        resolved
+    }
+
+    /// The merged state of one of a peer's functions, as far as this engine has seen it.
+    ///
+    /// This is what [`SpineEvent::DataNotified`] reports as `resolved`, kept so that an
+    /// application can ask again rather than having to hold the last event.
+    pub fn remote_data(&self, feature: &FeatureAddress, function: &Function) -> Option<&CmdData> {
+        let device = feature.device.as_ref()?;
+        self.peers
+            .iter()
+            .find(|p| p.remote.address.as_ref() == Some(device))?
+            .data
+            .iter()
+            .find(|(held, data)| {
+                same_feature(held, feature) && &Function::from(data.key()) == function
+            })
+            .map(|(_, data)| data)
+    }
+
+    fn handle_result(&mut self, cmd: &Cmd, reference: Option<MsgCounter>, from: &FeatureAddress) {
         let error = match &cmd.data {
             Some(CmdData::ResultData(ResultData { error_number, .. })) => {
                 error_number.unwrap_or(ErrorNumber::None)
@@ -1234,7 +1557,7 @@ impl Engine {
         // `msgCounterReference` says which request this answers. A result that names
         // none cannot be attributed — and under §14a, an acknowledgement that cannot be
         // attributed to a limit is no evidence at all — so it is dropped.
-        let Some(request) = self.resolve_pending(reference) else {
+        let Some(request) = self.resolve_pending(reference, from) else {
             return;
         };
         self.events.push_back(SpineEvent::ResultReceived {
@@ -1360,17 +1683,37 @@ impl Engine {
                 ..RemoteDevice::default()
             },
             counters: MsgCounterTracker::new(),
+            data: Vec::new(),
         });
         self.peers.last_mut().expect("just pushed")
     }
 
     /// Forgets a peer and everything that belonged to it.
+    ///
+    /// A write that peer had put to the application goes with it: the answer had nowhere
+    /// to go the moment the connection did, and holding the slot would spend one of
+    /// [`MAX_DEFERRED_WRITES`] on a peer that is gone. The application is told, so a
+    /// decision it is still holding a token for is not simply lost — under §14a EnWG a
+    /// limit that was never decided is worth a line in the record.
     pub fn remove_peer(&mut self, device: &AddressDevice) {
         self.relations.remove_device(device);
         self.peers
             .retain(|p| p.remote.address.as_ref() != Some(device));
         self.pending
             .retain(|p| p.destination.device.as_ref() != Some(device));
+
+        let (gone, live): (Vec<_>, Vec<_>) = self
+            .deferred
+            .drain(..)
+            .partition(|w| w.peer.device.as_ref() == Some(device));
+        self.deferred = live;
+        for write in gone {
+            self.events.push_back(SpineEvent::WriteAbandoned {
+                token: write.token,
+                feature: write.feature,
+                from: write.peer,
+            });
+        }
     }
 
     /// Grants a binding locally, without a request having arrived.
@@ -1392,12 +1735,7 @@ impl Engine {
 /// A partial write says only what changed, so the state the peer is asking for is that
 /// update merged into what is stored (SPINE IG §3.3) — an application deciding whether it
 /// can follow the request has to see that, not the fragment that arrived.
-fn resolve_write(
-    stored: Option<&CmdData>,
-    update: &CmdData,
-    partial: bool,
-    delete: bool,
-) -> CmdData {
+fn resolve_write(stored: Option<&CmdData>, update: &CmdData, ops: &WriteOps) -> CmdData {
     let mut resolved = match stored {
         Some(stored) => stored.clone(),
         // Nothing stored yet: the merge starts from this function's empty value, so a
@@ -1407,15 +1745,10 @@ fn resolve_write(
             None => return update.clone(),
         },
     };
-    let outcome = if delete {
-        resolved.delete(update)
-    } else {
-        resolved.apply(update.clone(), partial)
-    };
-    match outcome {
+    match ops.resolve(&mut resolved, update) {
         Ok(()) => resolved,
-        // The payload names a different function than the stored data. The write is
-        // refused either way, so report what actually arrived.
+        // The payload names a different function than the stored data, or a filter this
+        // node cannot serve. The write is refused either way, so report what arrived.
         Err(_) => update.clone(),
     }
 }
@@ -1463,14 +1796,4 @@ fn restrict_for_read(data: &CmdData, filter: &Filter) -> Result<CmdData, Restric
             Ok(union.expect("`many` holds at least two selectors"))
         }
     }
-}
-
-/// True when `address` names the local device's own NodeManagement instance.
-pub fn addresses_node_management(address: &FeatureAddress) -> bool {
-    is_node_management(address)
-}
-
-/// True when two feature addresses are the same, ignoring an absent device part.
-pub fn addresses_match(a: &FeatureAddress, b: &FeatureAddress) -> bool {
-    same_feature(a, b)
 }

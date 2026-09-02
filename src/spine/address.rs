@@ -60,11 +60,18 @@ pub fn device_address(vendor: &str, unique: &str) -> Result<AddressDevice, Addre
     Ok(AddressDevice::from(address))
 }
 
-/// Checks a device address against the pattern of §7.1.1.2.
+/// Checks a device address against the pattern of §7.1.1.2, in full.
 ///
-/// Devices in the field are the ones sending these, so the check is used to reject a
-/// peer's address rather than to be lenient about it: §7.1.1.5.1 requires terminating a
-/// connection outright when two devices claim the same address.
+/// **This is the rule for an address this node *builds*, not for one it receives.**
+/// [`device_address`] applies it, so nothing this crate puts on the wire can be
+/// non-conformant. A peer's address goes through [`is_usable_device_address`] instead, and
+/// the reason is one line of evidence: `evcc` — which is `eebus-go`, which is much of the
+/// deployed base — announces itself as `d:_i:EVCC_HEMS-…`, using the `i:` marker that
+/// §7.1.1.2 reserves for an IANA Private Enterprise Number without having one. Refusing
+/// that means refusing to talk to it.
+///
+/// Call it on a peer's address to *report* the deviation, which is worth a line in a
+/// commissioning log; do not call it to decide whether to talk.
 pub fn validate_device_address(address: &str) -> Result<(), AddressError> {
     if address.chars().count() > MAX_DEVICE_ADDRESS_LEN {
         return Err(AddressError::TooLong(address.chars().count()));
@@ -86,6 +93,43 @@ pub fn validate_device_address(address: &str) -> Result<(), AddressError> {
     }
     let _ = vendor;
     Ok(())
+}
+
+/// Whether a peer's device address can be taken up at all.
+///
+/// A device address is a *routing key* and a stored identity: the hub binds a connection to
+/// it, the engine allocates a peer record per distinct one, and every § 14a audit record
+/// names it. So the rule here is not "is this conformant" — that is
+/// [`validate_device_address`], which two of the eight devices in
+/// `tests/fixtures/devices` fail — but "is this safe to key on":
+///
+/// * **At most [`MAX_DEVICE_ADDRESS_LEN`] characters**, which §7.1.1.2 fixes and which is
+///   the difference between a bounded table and a peer that can spend this device's memory
+///   from the header of every datagram.
+/// * **No control or whitespace characters**, the general categories §7.1.1.2 excludes.
+///   These are what make an address safe to store, compare and print.
+/// * **Not empty.**
+///
+/// Everything else — the `d:_` prefix, the shape of the vendor part — is *reported* rather
+/// than enforced: getting it wrong is a peer's conformance problem, and refusing it is this
+/// node's interoperability problem.
+///
+/// ```
+/// use eebus::spine::{is_usable_device_address, validate_device_address};
+///
+/// // What `eebus-go` and evcc actually send: usable, and not conformant.
+/// let evcc = "d:_i:EVCC_HEMS-0123456789abcdef";
+/// assert!(is_usable_device_address(evcc));
+/// assert!(validate_device_address(evcc).is_err());
+///
+/// // What cannot be used as a key, whatever it claims to be.
+/// assert!(!is_usable_device_address(""));
+/// assert!(!is_usable_device_address("d:_i:1_a b"));
+/// ```
+pub fn is_usable_device_address(address: &str) -> bool {
+    !address.is_empty()
+        && address.chars().count() <= MAX_DEVICE_ADDRESS_LEN
+        && !address.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// Splits `i:46925_HeatPump-1` into its vendor and unique parts.

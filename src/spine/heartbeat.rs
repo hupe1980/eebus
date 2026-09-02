@@ -118,9 +118,8 @@ impl HeartbeatProducer {
     /// Takes the next heartbeat, advancing the counter and the schedule.
     ///
     /// `timestamp` is absent because nothing in this crate reads a clock. A device with
-    /// a real-time clock adds it with [`with_timestamp`]; the
-    /// implementation guide §3.7 asks a server to set it, and equally says a client need
-    /// not check it.
+    /// a real-time clock sets the field itself; the implementation guide §3.7 asks a
+    /// server to, and equally says a client need not check it.
     pub fn beat(&mut self, now: Duration) -> DeviceDiagnosisHeartbeatData {
         self.counter = self.counter.wrapping_add(1);
         self.next = now + self.period;
@@ -159,18 +158,6 @@ impl HeartbeatProducer {
         }
         engine.notify(&address, &Function::DeviceDiagnosisHeartbeatData, now);
     }
-}
-
-/// Adds a wall-clock timestamp to a heartbeat.
-///
-/// Kept separate from [`HeartbeatProducer::beat`] because the producer has no clock: a
-/// device that has one formats the current time as ISO 8601 and passes it through here.
-pub fn with_timestamp(
-    mut beat: DeviceDiagnosisHeartbeatData,
-    timestamp: impl Into<alloc::string::String>,
-) -> DeviceDiagnosisHeartbeatData {
-    beat.timestamp = Some(crate::model::AbsoluteOrRelativeTime::from(timestamp.into()));
-    beat
 }
 
 /// Watches a peer's heartbeats and reports when they stop.
@@ -231,9 +218,14 @@ impl HeartbeatMonitor {
     }
 
     /// Whether the peer has been heard from recently enough.
+    ///
+    /// The boundary belongs to *silence*: at exactly [`poll_timeout`](Self::poll_timeout)
+    /// the peer is already lost, so waiting until the published instant is enough. LPC
+    /// reads it the same way — the failsafe state is entered *at* 120 seconds of silence,
+    /// not after them.
     pub fn is_alive(&self, now: Duration) -> bool {
         self.last
-            .is_some_and(|last| now.saturating_sub(last) <= self.timeout)
+            .is_some_and(|last| now.saturating_sub(last) < self.timeout)
     }
 
     /// Reports the loss once, the first time the deadline passes.

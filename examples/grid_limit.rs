@@ -26,8 +26,8 @@ use eebus::ship::{
 };
 use eebus::spine::{Engine, LocalDevice, LocalEntity, SpineEvent, node_management};
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, EffectiveLimit, EnergyGuardActor,
-    GuardEvent, LimitWrite, LimitationState,
+    self, ControllableSystem, ControllableSystemActor, CsConfig, CsFeatures, EffectiveLimit,
+    EnergyGuardActor, GuardEvent, LimitWrite, LimitationState,
 };
 use eebus::usecases::lpc;
 
@@ -67,10 +67,10 @@ fn main() {
         now += Duration::from_millis(1);
     }
 
-    let ((major, minor), format) = control_link.negotiated().cloned().expect("negotiated");
+    let (version, format) = control_link.negotiated().cloned().expect("negotiated");
     assert!(control_link.is_ready_for_data() && pump_link.is_ready_for_data());
     println!("1. SHIP handshake complete after {frames} frames");
-    println!("   version {major}.{minor}, format {format}\n");
+    println!("   SHIP {version}, format {format}\n");
 
     // ---- 2. The two SPINE nodes and their use-case actors -----------------------
 
@@ -123,7 +123,7 @@ fn main() {
     // what makes it unambiguous which of an energy manager's entities is in charge.
 
     now += Duration::from_secs(1);
-    link.guard.attach(&mut box_engine, peer, now);
+    assert_eq!(peer.device, pump_engine.device().address().clone());
     link.exchange(&mut box_engine, &mut pump_engine, now);
 
     let guarded = link
@@ -314,6 +314,7 @@ fn build_heat_pump(now: Duration) -> (Engine, ControllableSystemActor) {
                 .with_feature(limitation::load_control_feature(1))
                 .with_feature(limitation::device_configuration_feature(2))
                 .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::device_diagnosis_client_feature(5))
                 .with_feature(limitation::electrical_connection_feature(4)),
         )
         .expect("a fresh entity");
@@ -321,25 +322,29 @@ fn build_heat_pump(now: Duration) -> (Engine, ControllableSystemActor) {
     let load_control = device.address_of(&[1], 1);
     let configuration = device.address_of(&[1], 2);
     let diagnosis = device.address_of(&[1], 3);
+    let diagnosis_client = device.address_of(&[1], 5);
     let electrical = device.address_of(&[1], 4);
 
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
 
-    let actor = ControllableSystemActor::new(
+    let actor = ControllableSystemActor::builder(
         ControllableSystem::new(
             CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
                 .with_nominal_max(11_000.0),
             now,
         ),
         lpc::DIRECTION,
-        load_control,
-        configuration,
-        diagnosis,
+        CsFeatures {
+            load_control,
+            device_configuration: configuration,
+            device_diagnosis: diagnosis,
+            device_diagnosis_client: diagnosis_client,
+        },
     )
     // Scenario 4: the nameplate the Energy Guard needs to turn a percentage into watts.
-    .with_electrical_connection(electrical);
-    actor.install(&mut engine, now);
+    .with_electrical_connection(electrical)
+    .install(&mut engine, now);
     (engine, actor)
 }
 

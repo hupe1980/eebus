@@ -10,13 +10,17 @@
 
 use core::time::Duration;
 
-use eebus::model::{Datagram, DeviceType, EntityType, Function};
-use eebus::spine::{Engine, LocalDevice, LocalEntity, SpineEvent, node_management};
+use eebus::model::ElectricalConnectionPhaseName as Phase;
+use eebus::model::{Datagram, DeviceType, EntityType, FeatureAddress, FeatureType, Function, Role};
+use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management};
+use eebus::usecases::descriptor::UseCaseDescriptor;
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, EnergyGuardActor,
-    GuardEvent, LimitWrite,
+    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures,
+    EnergyGuardActor, GuardEvent, LimitWrite,
 };
 use eebus::usecases::lpc;
+use eebus::usecases::monitoring::{Measurand, MonitoredUnit, Quantity, Readings};
+use eebus::usecases::{mgcp, mpc};
 
 pub const FAILSAFE_WATTS: f64 = 4_200.0;
 pub const NOMINAL_MAX_WATTS: f64 = 11_000.0;
@@ -70,28 +74,33 @@ impl Pair {
                     .with_feature(limitation::load_control_feature(1))
                     .with_feature(limitation::device_configuration_feature(2))
                     .with_feature(limitation::device_diagnosis_feature(3))
+                    .with_feature(limitation::device_diagnosis_client_feature(5))
                     .with_feature(limitation::electrical_connection_feature(4)),
             )
             .unwrap();
         let load_control = pump_device.address_of(&[1], 1);
         let configuration = pump_device.address_of(&[1], 2);
         let diagnosis = pump_device.address_of(&[1], 3);
+        let diagnosis_client = pump_device.address_of(&[1], 5);
         let electrical = pump_device.address_of(&[1], 4);
         let mut pump_engine = Engine::new(pump_device);
         pump_engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
-        let pump = ControllableSystemActor::new(
+        let pump = ControllableSystemActor::builder(
             ControllableSystem::new(
                 CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
                     .with_nominal_max(NOMINAL_MAX_WATTS),
                 now,
             ),
             lpc::DIRECTION,
-            load_control,
-            configuration,
-            diagnosis,
+            CsFeatures {
+                load_control,
+                device_configuration: configuration,
+                device_diagnosis: diagnosis,
+                device_diagnosis_client: diagnosis_client,
+            },
         )
-        .with_electrical_connection(electrical);
-        pump.install(&mut pump_engine, now);
+        .with_electrical_connection(electrical)
+        .install(&mut pump_engine, now);
 
         Self {
             guard_engine,
@@ -120,10 +129,13 @@ impl Pair {
         }
         self.settle();
 
+        // No `attach` here: the guard attaches itself to a peer that announces the
+        // Controllable System, which is what implementation guide §2.11 needs — the
+        // opening limit write has to go out as soon as the bindings settle, whether or
+        // not anybody has asked for a limit.
         let device = self.pump_engine.device().address().clone();
         let remote = self.guard_engine.peer(&device).expect("the heat pump");
-        let peer = limitation::locate(remote, lpc::DIRECTION).expect("a Controllable System");
-        self.guard.attach(&mut self.guard_engine, peer, self.now);
+        limitation::locate(remote, lpc::DIRECTION).expect("a Controllable System");
         self.settle();
     }
 
@@ -248,6 +260,268 @@ pub fn round_trip(datagram: &Datagram) -> Datagram {
     decoded
 }
 /// One traced datagram as a line: who sent it, and exactly what went out.
+///
+/// The column is four wide because every label is: `box`/`pump` for the limitation pair,
+/// `cem`/`unit` for the monitoring one. Widening it would re-indent every line of every
+/// recorded exchange, and a golden vector whose diff is mostly whitespace is a golden
+/// vector nobody reads.
 fn alloc_format(from: &str, json: &str) -> String {
     format!("{from:>4} | {json}")
+}
+
+// ---- MPC / MGCP: a monitored unit and the appliance reading it --------------------
+//
+// Shared by `monitoring_over_the_wire.rs` and `conformance.rs`. The second is the reason
+// this moved here: driving 101 abstract test cases needs the same commissioning sequence
+// the ordinary tests use, and a second copy of it would be a second thing to keep in step.
+
+pub struct MonitoringPair {
+    pub manager: Engine,
+    pub unit_engine: Engine,
+    pub unit: MonitoredUnit,
+    pub readings: Readings,
+    pub now: Duration,
+    /// Every datagram that crossed, in order, for the golden vector.
+    pub trace: Vec<(&'static str, Datagram)>,
+}
+
+impl MonitoringPair {
+    /// An energy manager and a heat pump running MPC.
+    pub fn consuming() -> Self {
+        let unit = MonitoredUnit::new(1)
+            .with(Measurand::total_power())
+            .with(Measurand::on(Quantity::Power, Phase::A))
+            .with(Measurand::total(Quantity::EnergyConsumed))
+            .with(Measurand::on(Quantity::Current, Phase::A))
+            .with(Measurand::total(Quantity::Frequency));
+        // Power, energy, current and frequency — everything but voltage.
+        Self::build(
+            unit,
+            EntityType::HeatPumpAppliance,
+            &mpc::MONITORED_UNIT,
+            &mpc::MONITORING_APPLIANCE,
+            &[1, 2, 3, 5],
+        )
+    }
+
+    /// An energy manager and a grid connection point running MGCP.
+    pub fn at_the_grid() -> Self {
+        let unit = MonitoredUnit::new(1)
+            .naming(mgcp::NAMING)
+            .with(Measurand::total_power())
+            .with(Measurand::total(Quantity::EnergyConsumed))
+            .with(Measurand::total(Quantity::EnergyProduced));
+        // Power and the two energies: scenarios 2, 3 and 4.
+        Self::build(
+            unit,
+            EntityType::GridConnectionPointOfPremises,
+            &mgcp::GRID_CONNECTION_POINT,
+            &mgcp::MONITORING_APPLIANCE,
+            &[2, 3, 4],
+        )
+    }
+
+    pub fn build(
+        unit: MonitoredUnit,
+        entity: EntityType,
+        server: &'static UseCaseDescriptor,
+        client: &'static UseCaseDescriptor,
+        scenarios: &[u32],
+    ) -> Self {
+        Self::build_with(unit, entity, server, client, scenarios, false)
+    }
+
+    /// The same, with MGCP scenario 1's PV curtailment factor served from feature 3.
+    ///
+    /// It is a `DeviceConfiguration` key rather than a measurement, which is why it needs
+    /// a feature of its own and why it is the one row of the MGCP catalogue that does not
+    /// go through the measurement layer.
+    pub fn build_with(
+        unit: MonitoredUnit,
+        entity: EntityType,
+        server: &'static UseCaseDescriptor,
+        client: &'static UseCaseDescriptor,
+        scenarios: &[u32],
+        curtailment: bool,
+    ) -> Self {
+        assert!(
+            server.permits_entity(&entity),
+            "the specification permits this actor on this entity"
+        );
+
+        let mut device = LocalDevice::new("i:67890", "Meter-1", DeviceType::SubMeter).unwrap();
+        let mut local = LocalEntity::new([1], entity)
+            .with_feature(unit.electrical_connection_feature(1))
+            .with_feature(unit.measurement_feature(2));
+        if curtailment {
+            local = local.with_feature(mgcp::curtailment_feature(3));
+        }
+        device.add_entity(local).unwrap();
+        let electrical_connection = device.address_of(&[1], 1);
+        let measurement = device.address_of(&[1], 2);
+
+        let mut unit_engine = Engine::new(device);
+        // The device announces every scenario it actually implements, not only the ones
+        // the specification refuses to leave optional.
+        unit_engine.add_use_case_scenarios([1], 1, server, scenarios);
+        unit.publish(&mut unit_engine, &electrical_connection, &measurement);
+        if curtailment {
+            let feature = unit_engine.device().address_of(&[1], 3);
+            if let Some(f) = unit_engine.device_mut().resolve_mut(&feature) {
+                let _ = f.set_data(mgcp::curtailment_description());
+            }
+        }
+
+        let mut manager_device =
+            LocalDevice::new("i:12345", "Manager-1", DeviceType::EnergyManagementSystem).unwrap();
+        manager_device
+            .add_entity(
+                LocalEntity::new([1], EntityType::CEM).with_feature(LocalFeature::new(
+                    1,
+                    FeatureType::Generic,
+                    Role::Client,
+                )),
+            )
+            .unwrap();
+        let mut manager = Engine::new(manager_device);
+        manager.add_use_case([1], 1, client);
+
+        Self {
+            manager,
+            unit_engine,
+            unit,
+            readings: Readings::new(),
+            now: Duration::ZERO,
+            trace: Vec::new(),
+        }
+    }
+
+    /// The recorded exchange, one line per datagram.
+    pub fn wire(&self) -> Vec<String> {
+        self.trace
+            .iter()
+            .map(|(from, datagram)| {
+                let json = eebus::model::to_json(datagram).expect("encodable");
+                alloc_format(from, &json)
+            })
+            .collect()
+    }
+
+    pub fn manager_client(&self) -> FeatureAddress {
+        self.manager.device().address_of(&[1], 1)
+    }
+
+    pub fn unit_feature(&self, feature: u32) -> FeatureAddress {
+        self.unit_engine.device().address_of(&[1], feature)
+    }
+
+    /// Carries datagrams both ways, resolving everything the manager receives.
+    pub fn exchange(&mut self) {
+        for _ in 0..64 {
+            let mut moved = false;
+            while let Some(datagram) = self.manager.poll_transmit() {
+                self.trace.push(("cem", datagram.clone()));
+                self.unit_engine
+                    .handle_datagram(&round_trip(&datagram), self.now);
+                moved = true;
+            }
+            while let Some(datagram) = self.unit_engine.poll_transmit() {
+                self.trace.push(("unit", datagram.clone()));
+                self.manager
+                    .handle_datagram(&round_trip(&datagram), self.now);
+                moved = true;
+            }
+            while let Some(event) = self.manager.poll_event() {
+                // `resolved`, not `data`: what a peer notified may be a fragment, and
+                // this harness stands in for a Monitoring Appliance, which reads the
+                // merged value.
+                if let SpineEvent::ReplyReceived { resolved, .. }
+                | SpineEvent::DataNotified { resolved, .. } = &event
+                {
+                    self.readings.describe(resolved);
+                    self.readings.apply(resolved);
+                }
+                moved = true;
+            }
+            while self.unit_engine.poll_event().is_some() {
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("the exchange did not settle");
+    }
+
+    /// Discovery, then the two descriptions and a subscription, as §3.3 asks.
+    pub fn commission(&mut self) {
+        let client_nm = node_management(self.manager.device().address());
+        let unit_nm = node_management(self.unit_engine.device().address());
+        self.manager.read(
+            &unit_nm,
+            &client_nm,
+            Function::NodeManagementDetailedDiscoveryData,
+            self.now,
+        );
+        self.manager.read(
+            &unit_nm,
+            &client_nm,
+            Function::NodeManagementUseCaseData,
+            self.now,
+        );
+        self.exchange();
+
+        let client = self.manager_client();
+        let electrical_connection = self.unit_feature(1);
+        let measurement = self.unit_feature(2);
+        self.manager.read(
+            &electrical_connection,
+            &client,
+            Function::ElectricalConnectionParameterDescriptionListData,
+            self.now,
+        );
+        self.manager.read(
+            &measurement,
+            &client,
+            Function::MeasurementDescriptionListData,
+            self.now,
+        );
+        self.manager
+            .request_subscription(&client, &measurement, self.now);
+        self.exchange();
+    }
+
+    /// The grid connection point publishes MGCP scenario 1's curtailment factor.
+    pub fn report_curtailment(&mut self, percent: f64) {
+        let feature = self.unit_engine.device().address_of(&[1], 3);
+        if let Some(f) = self.unit_engine.device_mut().resolve_mut(&feature) {
+            let _ = f.set_data(mgcp::curtailment_value(percent));
+        }
+        self.unit_engine.notify(
+            &feature,
+            &Function::DeviceConfigurationKeyValueListData,
+            self.now,
+        );
+        self.exchange();
+    }
+
+    /// The manager reads the curtailment factor it has been told about.
+    pub fn curtailment(&self) -> Option<f64> {
+        let feature = self.unit_engine.device().address_of(&[1], 3);
+        let data = self
+            .unit_engine
+            .device()
+            .resolve(&feature)?
+            .data(&Function::DeviceConfigurationKeyValueListData)?;
+        mgcp::read_curtailment(data)
+    }
+
+    /// The unit takes a reading and notifies its subscribers.
+    pub fn report(&mut self, measurand: &Measurand, value: f64) {
+        self.unit.set(measurand, value, self.now);
+        let measurement = self.unit_feature(2);
+        self.unit
+            .notify(&mut self.unit_engine, &measurement, self.now);
+        self.exchange();
+    }
 }

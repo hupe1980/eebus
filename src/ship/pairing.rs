@@ -18,6 +18,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use hmac::{Hmac, Mac};
+
+use super::constant_time_eq;
 use sha2::Sha256;
 
 /// The DNS-SD service type of the pairing service.
@@ -38,9 +40,24 @@ pub const CURVE_SECP256R1: &str = "secp256r1";
 /// A pairing secret, printed with the QR code as `SPSEC`.
 ///
 /// The type refuses to print itself and zeroes its storage when dropped, so a secret
-/// cannot reach a log through a stray `{:?}`.
-#[derive(Clone, PartialEq, Eq)]
+/// cannot reach a log through a stray `{:?}`, and it compares in constant time so that
+/// `a == b` cannot be turned into a search.
+#[derive(Clone)]
 pub struct PairingSecret(Vec<u8>);
+
+impl PartialEq for PairingSecret {
+    /// Constant time over the shared prefix, and no earlier exit than the length check.
+    ///
+    /// A derived comparison stops at the first differing byte, which turns equality into
+    /// an oracle: an attacker who can ask "is the secret this?" learns it one byte at a
+    /// time. That the secret is short is what makes it worth defending rather than what
+    /// makes it safe.
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PairingSecret {}
 
 impl PairingSecret {
     /// Wraps raw secret bytes.
@@ -356,13 +373,6 @@ fn encode_hex_upper(bytes: &[u8]) -> String {
         out.push(ALPHABET[usize::from(b & 0x0f)] as char);
     }
     out
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]

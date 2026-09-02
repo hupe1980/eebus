@@ -166,9 +166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HubEvent::PeerDiscovered { device, .. } => {
                 let remote = hub.engine().peer(&device).expect("just discovered");
                 match limitation::locate(remote, lpc::DIRECTION) {
-                    Some(peer) => {
+                    // The guard attaches itself; this is only what to print.
+                    Some(_) => {
                         println!("[box]  {} plays the Controllable System", device.as_str());
-                        guard.attach(hub.engine_mut(), peer, now);
                         if let Some(limit) = required {
                             guard.require(&device, Some(limit), now);
                         }

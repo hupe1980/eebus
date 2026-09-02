@@ -8,9 +8,22 @@ group = "Foundations"
 
 ## One crate, layered
 
-```text
-codec  ──▶  model  ──▶  ship  ──▶  spine  ──▶  usecases
-                                      └────────▶  runtime   (sockets, clock)
+```mermaid
+flowchart LR
+  codec["codec<br><small>JSON-UTF8 · ScaledNumber</small>"]
+  model["model<br><small>830 generated types</small>"]
+  ship["ship<br><small>framing · handshake · trust</small>"]
+  spine["spine<br><small>device model · engine · RFE</small>"]
+  uc["usecases<br><small>14, both actors</small>"]
+  rt["runtime<br><small>sockets and clock</small>"]
+
+  codec --> model --> ship --> spine --> uc
+  spine -. drives .-> rt
+
+  classDef core fill:#e6f5ef,stroke:#0b8f63,color:#101620;
+  classDef io fill:transparent,stroke:#7b8595,stroke-dasharray:4 3,color:#55606f;
+  class codec,model,ship,spine,uc core
+  class rt io
 ```
 
 Each layer depends only on those to its left. `runtime` is the only module that opens a
@@ -81,12 +94,14 @@ uses. See [Embedded targets](@/docs/embedded.md).
 |---|---|---|
 | `std` | ✅ | Standard library. Without it the crate builds `no_std + alloc`. |
 | `pairing` | ✅ | SHIP Pairing Service (`hmac`, `sha2`). |
+| `conformance` | ✅ | The 203 abstract test cases as data. Tens of kilobytes of static strings a device in the field never reads, so a firmware build leaves it out. |
 | `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the handshake, the connection table. |
 | `mdns` | — | `_ship._tcp` announcement and discovery (`mdns-sd`). |
 | `ring` | — | `rustls` and `rcgen` backed by `ring`. |
 | `aws-lc-rs` | — | The same, backed by `aws-lc-rs`. |
+| `interop` | — | The cross-implementation test suite. Needs Docker; nothing in the library depends on it, and `full` deliberately excludes it. |
 | `full` | — | Everything above, on `ring`. |
 
 `runtime` implies `tls` and `cert`. A device that only parses datagrams — a test harness,

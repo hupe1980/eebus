@@ -116,6 +116,19 @@ pub fn device_diagnosis_feature(address: u32) -> LocalFeature {
         .with_function(Function::DeviceDiagnosisHeartbeatData, Operations::read())
 }
 
+/// Builds the **client**-role `DeviceDiagnosis` feature a Controllable System subscribes
+/// from.
+///
+/// A subscription runs from a client feature to a server one (SPINE §5.3.6), and the
+/// Controllable System is on the client end of exactly one relationship: the Energy
+/// Guard's heartbeat. Subscribing from the server feature that carries its *own* heartbeat
+/// is a role mismatch, which `spine-go` refuses; real devices carry a `DeviceDiagnosis`
+/// server and client side by side for this reason.
+///
+pub fn device_diagnosis_client_feature(address: u32) -> LocalFeature {
+    LocalFeature::new(address, FeatureType::DeviceDiagnosis, Role::Client)
+}
+
 /// The limit description a Controllable System publishes (LPC/LPP Table 22).
 ///
 /// Every element here is fixed by the specification: the limit is an obligation,
@@ -433,6 +446,9 @@ pub struct ControllableSystemActor {
     load_control: FeatureAddress,
     device_configuration: FeatureAddress,
     device_diagnosis: FeatureAddress,
+    /// The client-role `DeviceDiagnosis` this system subscribes to the guard's heartbeat
+    /// from (SPINE §5.3.6: a subscription runs client → server).
+    device_diagnosis_client: FeatureAddress,
     /// Where scenario 4's constraints are served from, for a device that publishes them.
     electrical_connection: Option<FeatureAddress>,
     heartbeat: HeartbeatProducer,
@@ -448,38 +464,60 @@ pub struct ControllableSystemActor {
     audit: AuditLog,
 }
 
-impl ControllableSystemActor {
-    /// Wires a state machine to the features it serves.
+/// Where a Controllable System serves each of its three features.
+///
+/// A struct rather than three arguments, because all three are a [`FeatureAddress`] and
+/// nothing but the order says which is which. Passing the heartbeat's address where the
+/// limit's belongs compiles, runs, and produces a device that answers a grid operator's
+/// limit write on the wrong feature — which is precisely the class of mistake the rest of
+/// this crate spends distinct newtypes to prevent.
+///
+/// ```
+/// use eebus::prelude::*;
+/// use eebus::usecases::limitation::CsFeatures;
+///
+/// # fn wire(device: &LocalDevice) -> CsFeatures {
+/// CsFeatures {
+///     load_control: device.address_of(&[1], 1),
+///     device_configuration: device.address_of(&[1], 2),
+///     device_diagnosis: device.address_of(&[1], 3),
+///     device_diagnosis_client: device.address_of(&[1], 5),
+/// }
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct CsFeatures {
+    /// `LoadControl`, where the active power limit is written.
+    pub load_control: FeatureAddress,
+    /// `DeviceConfiguration`, where the failsafe values live.
+    pub device_configuration: FeatureAddress,
+    /// `DeviceDiagnosis`, where this system's own heartbeat is published.
+    pub device_diagnosis: FeatureAddress,
+    /// The **client**-role `DeviceDiagnosis` this system subscribes to the guard's
+    /// heartbeat from.
     ///
-    /// `direction` selects the use case: [`Direction::Consumption`] for LPC,
-    /// [`Direction::Production`] for LPP. It decides what this actor publishes, so it has
-    /// to match the descriptor the device announces — [`crate::usecases::lpc`] and
-    /// [`crate::usecases::lpp`] carry both as a pair.
-    pub fn new(
-        system: ControllableSystem,
-        direction: Direction,
-        load_control: FeatureAddress,
-        device_configuration: FeatureAddress,
-        device_diagnosis: FeatureAddress,
-    ) -> Self {
-        Self {
-            system,
-            direction,
-            load_control,
-            device_configuration,
-            device_diagnosis,
-            electrical_connection: None,
-            heartbeat: HeartbeatProducer::new(Duration::ZERO),
-            bound_load_control: None,
-            bound_configuration: None,
-            guard: None,
-            guard_diagnosis: None,
-            subscribed: false,
-            guard_discovery_asked: false,
-            audit: AuditLog::new(),
-        }
-    }
+    /// A subscription runs client → server, so the system's own server feature cannot be
+    /// the near end of it: `spine-go` refuses that with a role mismatch, and the heartbeat
+    /// it would have carried is what LPC IG §2.11 gates every limit on. Build it with
+    /// [`device_diagnosis_client_feature`].
+    pub device_diagnosis_client: FeatureAddress,
+}
 
+/// Builds a [`ControllableSystemActor`], ending at [`install`](Self::install).
+///
+/// **There is no other way to make one**, and that is the point. The previous shape was a
+/// constructor and a separate `install` call, and forgetting the second produced no
+/// symptom at all: the device answers discovery, grants the bindings and the subscription,
+/// exchanges heartbeats — and publishes no limit description, so the Energy Guard reads an
+/// empty list, finds no `limitId` to write to, and **never sends a limit**. Nothing on the
+/// wire says why. Under §14a EnWG that is an installation that looks commissioned and
+/// silently is not.
+#[derive(Debug)]
+pub struct ControllableSystemBuilder {
+    actor: ControllableSystemActor,
+}
+
+impl ControllableSystemBuilder {
     /// Serves scenario 4's constraints from an `ElectricalConnection` feature.
     ///
     /// Scenario 4 is `R` for a Controllable System, and the Energy Guard's side of it is
@@ -493,8 +531,111 @@ impl ControllableSystemActor {
     /// [`electrical_connection_feature`](super::electrical_connection_feature).
     #[must_use]
     pub fn with_electrical_connection(mut self, address: FeatureAddress) -> Self {
-        self.electrical_connection = Some(address);
+        self.actor.electrical_connection = Some(address);
         self
+    }
+
+    /// Replaces the § 14a record, for a device that keeps more or less history.
+    #[must_use]
+    pub fn with_audit_log(mut self, audit: AuditLog) -> Self {
+        self.actor.audit = audit;
+        self
+    }
+
+    /// Publishes what the actor serves, tells the engine what belongs together, and hands
+    /// the actor back.
+    ///
+    /// Besides the descriptions and current values, it locks `LoadControl` and
+    /// `DeviceConfiguration` to one binding partner: the LPC implementation guide §3.5
+    /// (1.1.0) asks for that because the use case needs both, and two energy managers
+    /// coming up together can otherwise win one each.
+    #[must_use]
+    pub fn install(self, engine: &mut Engine, now: Duration) -> ControllableSystemActor {
+        let actor = self.actor;
+        engine.bind_features_together([
+            actor.load_control.clone(),
+            actor.device_configuration.clone(),
+        ]);
+        actor.publish(engine, now);
+        actor
+    }
+}
+
+impl ControllableSystemActor {
+    /// Begins wiring a state machine to the features it serves.
+    ///
+    /// `direction` selects the use case: [`Direction::Consumption`] for LPC,
+    /// [`Direction::Production`] for LPP. It decides what this actor publishes, so it has
+    /// to match the descriptor the device announces — [`crate::usecases::lpc`] and
+    /// [`crate::usecases::lpp`] carry both as a pair.
+    ///
+    /// The builder ends at [`ControllableSystemBuilder::install`], which is the only way
+    /// to obtain an actor — see that type for why.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::prelude::*;
+    /// use eebus::usecases::limitation::{
+    ///     self, ControllableSystem, ControllableSystemActor, CsConfig, CsFeatures,
+    /// };
+    /// use eebus::usecases::lpc;
+    ///
+    /// # fn build() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)?;
+    /// device.add_entity(
+    ///     LocalEntity::new([1], EntityType::HeatPumpAppliance)
+    ///         .with_feature(limitation::load_control_feature(1))
+    ///         .with_feature(limitation::device_configuration_feature(2))
+    ///         .with_feature(limitation::device_diagnosis_feature(3))
+    ///         .with_feature(limitation::device_diagnosis_client_feature(4)),
+    /// )?;
+    /// let mut engine = Engine::new(device);
+    /// let features = CsFeatures {
+    ///     load_control: engine.device().address_of(&[1], 1),
+    ///     device_configuration: engine.device().address_of(&[1], 2),
+    ///     device_diagnosis: engine.device().address_of(&[1], 3),
+    ///     device_diagnosis_client: engine.device().address_of(&[1], 4),
+    /// };
+    ///
+    /// let system = ControllableSystem::new(CsConfig::new(4_200.0, Duration::from_secs(7_200)),
+    ///                                      Duration::ZERO);
+    /// let actor = ControllableSystemActor::builder(system, lpc::DIRECTION, features)
+    ///     .install(&mut engine, Duration::ZERO);
+    /// # let _ = actor;
+    /// # Ok(())
+    /// # }
+    /// # build().unwrap();
+    /// ```
+    pub fn builder(
+        system: ControllableSystem,
+        direction: Direction,
+        features: CsFeatures,
+    ) -> ControllableSystemBuilder {
+        let CsFeatures {
+            load_control,
+            device_configuration,
+            device_diagnosis,
+            device_diagnosis_client,
+        } = features;
+        ControllableSystemBuilder {
+            actor: Self {
+                system,
+                direction,
+                load_control,
+                device_configuration,
+                device_diagnosis,
+                device_diagnosis_client,
+                electrical_connection: None,
+                heartbeat: HeartbeatProducer::new(Duration::ZERO),
+                bound_load_control: None,
+                bound_configuration: None,
+                guard: None,
+                guard_diagnosis: None,
+                subscribed: false,
+                guard_discovery_asked: false,
+                audit: AuditLog::new(),
+            },
+        }
     }
 
     /// Which of the two limitation use cases this actor plays.
@@ -526,35 +667,17 @@ impl ControllableSystemActor {
         &mut self.audit
     }
 
-    /// Replaces the record, for a device that keeps more or less history.
-    #[must_use]
-    pub fn with_audit_log(mut self, audit: AuditLog) -> Self {
-        self.audit = audit;
-        self
-    }
-
     /// The Energy Guard entity in control, once its bindings have settled (§3.8).
     pub fn guard(&self) -> Option<&FeatureAddress> {
         self.guard.as_ref()
     }
 
-    /// Publishes what this actor serves, and tells the engine what belongs together.
-    ///
-    /// Call once the device is built. Besides the descriptions and current values, it
-    /// locks `LoadControl` and `DeviceConfiguration` to one binding partner: the LPC
-    /// implementation guide §3.5 (1.1.0) asks for that because the use case needs both,
-    /// and two energy managers coming up together can otherwise win one each.
-    pub fn install(&self, engine: &mut Engine, now: Duration) {
-        engine
-            .bind_features_together([self.load_control.clone(), self.device_configuration.clone()]);
-        self.publish(engine, now);
-    }
-
     /// Publishes the descriptions and current values this actor serves, and notifies
     /// anyone subscribed to them.
     ///
-    /// Called by [`install`](Self::install), and again whenever the state machine's view
-    /// changes, so that a peer reading — or watching — gets what it actually holds.
+    /// Called by [`ControllableSystemBuilder::install`], and again whenever the state
+    /// machine's view changes, so that a peer reading — or watching — gets what it
+    /// actually holds.
     pub fn publish(&self, engine: &mut Engine, now: Duration) {
         let load_control = self.load_control.clone();
         let configuration = self.device_configuration.clone();
@@ -652,9 +775,12 @@ impl ControllableSystemActor {
         now: Duration,
     ) -> Option<CsEvent> {
         match event {
-            SpineEvent::DataNotified { data, .. } | SpineEvent::ReplyReceived { data, .. } => {
+            SpineEvent::DataNotified { resolved, .. }
+            | SpineEvent::ReplyReceived { resolved, .. } => {
                 // A heartbeat from the Energy Guard is what keeps the failsafe at bay.
-                if read_heartbeat(data).is_some() {
+                // `resolved`, not `data`: a notification may be partial, and a heartbeat
+                // that carries only its counter still has the timeout the peer announced.
+                if read_heartbeat(resolved).is_some() {
                     let before = self.system.state();
                     self.system.on_heartbeat(now);
                     if self.system.state() != before {
@@ -763,7 +889,9 @@ impl ControllableSystemActor {
 
         match diagnosis {
             Some(diagnosis) => {
-                let local = self.device_diagnosis.clone();
+                // From the *client* feature: SPINE §5.3.6 runs a subscription client →
+                // server, and `spine-go` refuses one whose near end is a server feature.
+                let local = self.device_diagnosis_client.clone();
                 engine.request_subscription(&local, &diagnosis, now);
                 self.guard_diagnosis = Some(diagnosis);
                 self.subscribed = true;

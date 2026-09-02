@@ -9,8 +9,27 @@ use alloc::string::String;
 
 use crate::model::{AbsoluteOrRelativeTime, Number, Scale, ScaledNumber};
 
-/// The largest power of ten a [`ScaledNumber`] can represent exactly in `f64`.
-const MAX_ABS_SCALE: i32 = 308;
+/// The powers of ten that are exactly representable in `f64`.
+///
+/// `10^n` is exact up to `n = 22`; beyond that the nearest `f64` is not a power of ten at
+/// all. Scaling by an entry of this table rather than by a magnitude built up from
+/// repeated multiplication is what keeps [`ScaledNumber::to_f64`] correctly rounded over
+/// the whole range a `scale` can name — see [`scaled_to_f64`] and [`pow10`].
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// The largest exponent [`POW10`] holds, and so the largest step that scales a value by
+/// an exact power of ten.
+const MAX_EXACT_POW10: i32 = POW10.len() as i32 - 1;
+
+/// The first exponent for which `10^exp` is not a finite `f64`.
+///
+/// `f64::MAX` is about `1.798 · 10^308`, so `10^308` is the last one that fits and
+/// everything from here up is infinity — the correctly rounded answer for a product that
+/// large, and zero for the reciprocal.
+const POW10_OVERFLOWS_AT: u32 = 309;
 
 impl ScaledNumber {
     /// A scaled number with both elements set.
@@ -56,13 +75,9 @@ impl ScaledNumber {
     /// assert_eq!(ScaledNumber::new(i64::MAX, 308).to_f64(), None, "overflows f64");
     /// ```
     pub fn to_f64(&self) -> Option<f64> {
-        let number = self.number?.get() as f64;
-        let scale = i32::from(self.scale.unwrap_or(Scale(0)).get());
-        if abs_i32(scale) > MAX_ABS_SCALE {
-            return None;
-        }
-        let value = number * pow10(scale);
-        value.is_finite().then_some(value)
+        let number = self.number?.get();
+        let scale = self.scale.unwrap_or(Scale(0)).get();
+        scaled_to_f64(number, scale)
     }
 
     /// Approximates `value` with at most `max_decimals` decimal places.
@@ -83,16 +98,28 @@ impl ScaledNumber {
         if !value.is_finite() {
             return Self::new(0, 0);
         }
+        // A value too large for `i64` at scale 0 is still perfectly representable — that
+        // is what the scale is for. Raising it until the mantissa fits is the honest
+        // answer; `value as i64` would saturate to `i64::MAX` and put a number nobody
+        // asked for on the wire.
+        let (value, base_scale) = fit_to_i64(value);
+        if base_scale > 0 {
+            return Self::new(round_half_away(value) as i64, base_scale);
+        }
+
         let max_decimals = i16::from(max_decimals.min(9));
         for decimals in 0..=max_decimals {
-            let scaled = value * pow10(i32::from(decimals));
+            let scaled = shift_decimal(value, decimals);
             let rounded = round_half_away(scaled);
-            if abs_f64(scaled - rounded) < 1e-9 {
+            // The tolerance is relative: an absolute 1e-9 is meaningless beside a
+            // megawatt and impossibly strict beside a microamp.
+            if abs_f64(scaled - rounded) <= abs_f64(scaled) * 1e-12 && fits_i64(rounded) {
                 return Self::new(rounded as i64, -decimals);
             }
         }
-        let scaled = value * pow10(i32::from(max_decimals));
-        Self::new(round_half_away(scaled) as i64, -max_decimals)
+        let scaled = shift_decimal(value, max_decimals);
+        let (scaled, extra) = fit_to_i64(scaled);
+        Self::new(round_half_away(scaled) as i64, extra - max_decimals)
     }
 
     /// True when both elements are present, as the implementation guide requires for a
@@ -310,31 +337,117 @@ pub fn format_iso8601_duration(duration: core::time::Duration) -> String {
     out
 }
 
-/// `10^exp`, computed by repeated multiplication.
+/// The largest magnitude that survives `as i64` without saturating: `2^63`, less one
+/// step, so every `f64` below it converts exactly.
+const I64_LIMIT: f64 = 9.223_372_036_854_775e18;
+
+/// `number × 10^scale`, correctly rounded, or [`None`] when that is not a finite `f64`.
 ///
-/// `f64::powi` lives in `std`; this crate's protocol core also builds for bare-metal
-/// targets, where only `core` is available. Scales in SPINE are small, so a bounded
-/// loop costs nothing and avoids a dependency on a maths library.
-fn pow10(exp: i32) -> f64 {
-    let mut out = 1.0f64;
-    if exp >= 0 {
-        for _ in 0..exp.min(MAX_ABS_SCALE) {
-            out *= 10.0;
-        }
-    } else {
-        for _ in 0..(-exp).min(MAX_ABS_SCALE) {
-            out /= 10.0;
-        }
+/// **Multiplying by a negative power of ten is not the same as dividing by a positive
+/// one, and only the second is correct.** No negative power of ten is representable in
+/// binary, so `10^-4` is already wrong before the multiplication, and the product rounds
+/// a second time: `12345 × 10⁻⁴` came out as `1.2345000000000002` rather than `1.2345`.
+/// Dividing by the exact `1e4` rounds once, which is the correctly rounded answer.
+///
+/// **A scale beyond the exact table is applied in steps, never through a built-up power
+/// of ten.** Only the first twenty-three powers of ten are `f64` values; `10^23` is not,
+/// so scaling by it in one multiplication rounds the magnitude *and* the product. Taking
+/// `10^22` and then `10^1` — each an exact factor — rounds once per step and gets `10^23`
+/// exactly right. `scale` is a signed 16-bit integer, so a peer reaches that seam in one
+/// schema-valid message.
+///
+/// The remaining inexactness is inherent to the return type rather than to this
+/// function: a `number` above 2⁵³ does not fit an `f64` mantissa. SPINE carries
+/// quantities, not counters, so that bound is far outside anything a device sends — but
+/// it is the reason this returns `f64` rather than claiming to be exact.
+fn scaled_to_f64(number: i64, scale: i16) -> Option<f64> {
+    if number == 0 {
+        return Some(0.0);
     }
-    out
+    let mut value = number as f64;
+    let mut remaining = i32::from(scale);
+    while remaining != 0 {
+        // Every step scales by an entry of the exact table, so it rounds once. `scale`
+        // has one sign, so the steps all pull the same way and no intermediate result
+        // overshoots a final answer that would have been representable.
+        let step = remaining.clamp(-MAX_EXACT_POW10, MAX_EXACT_POW10);
+        let magnitude = POW10[step.unsigned_abs() as usize];
+        value = if step > 0 {
+            value * magnitude
+        } else {
+            value / magnitude
+        };
+        if !value.is_finite() {
+            // Overflowed on the way up. An unrepresentable value is not a value, and
+            // saying so lets the caller refuse the message.
+            return None;
+        }
+        if value == 0.0 {
+            // Underflowed on the way down, which is the correctly rounded answer for a
+            // quantity that small rather than a failure.
+            return Some(0.0);
+        }
+        remaining -= step;
+    }
+    Some(value)
+}
+
+/// `10^exp` for a non-negative exponent, exact wherever `f64` allows it.
+///
+/// Up to `10^22` the value is read from [`POW10`], where each entry is the exact power.
+/// Above that no `f64` is a power of ten, so the rest is assembled *one exact factor of
+/// `10^22` at a time* rather than by multiplying by ten `exp - 22` times.
+///
+/// The difference is not cosmetic. Each multiplication rounds, so a chain of them
+/// accumulates: building `10^308` a decade at a time lands 3·10¹⁷ ulps from the true
+/// value, while multiplying by the largest exact power lands within 2 — the bound
+/// `every_power_of_ten_is_within_two_ulps_of_the_correctly_rounded_value` holds it to.
+/// `f64::powi` would do the same and lives in `std`, which the bare-metal build does not
+/// have.
+fn pow10(exp: u32) -> f64 {
+    if let Some(exact) = POW10.get(exp as usize) {
+        return *exact;
+    }
+    if exp >= POW10_OVERFLOWS_AT {
+        return f64::INFINITY;
+    }
+    POW10[MAX_EXACT_POW10 as usize] * pow10(exp - MAX_EXACT_POW10 as u32)
+}
+
+/// `value × 10^decimals`, using the exact table so the shift rounds once.
+fn shift_decimal(value: f64, decimals: i16) -> f64 {
+    value * pow10(decimals.unsigned_abs().into())
+}
+
+/// True when `value` converts to `i64` without saturating.
+fn fits_i64(value: f64) -> bool {
+    abs_f64(value) < I64_LIMIT
+}
+
+/// Divides `value` down by tens until it fits an `i64`, returning the scale that buys.
+///
+/// `1e30` becomes `(1.0, 30)` — `number = 1, scale = 30` — rather than a saturated
+/// `i64::MAX` at scale 0.
+fn fit_to_i64(value: f64) -> (f64, i16) {
+    if fits_i64(value) {
+        return (value, 0);
+    }
+    // Each attempt divides the *original* by one exact power of ten, so the result
+    // rounds once. Dividing by ten repeatedly would round once per step, and thirty
+    // steps turned `1e30` into `1.0000000000000004e30`.
+    let mut scale = 1i16;
+    while scale < 300 {
+        let shifted = value / pow10(u32::from(scale.unsigned_abs()));
+        if fits_i64(shifted) {
+            return (shifted, scale);
+        }
+        scale += 1;
+    }
+    (value / pow10(300), 300)
 }
 
 fn abs_f64(v: f64) -> f64 {
     if v < 0.0 { -v } else { v }
-}
-
-fn abs_i32(v: i32) -> i32 {
-    if v < 0 { -v } else { v }
 }
 
 /// Rounds halfway cases away from zero, as `f64::round` does.
@@ -453,5 +566,124 @@ mod tests {
         assert_eq!(partial.to_f64(), Some(7.0));
         assert!(!partial.is_complete());
         assert!(partial.normalized().is_complete());
+    }
+
+    /// A negative scale divides by an exact power of ten rather than multiplying by an
+    /// inexact one.
+    ///
+    /// `10⁻⁴` is not representable, so multiplying by it rounds twice. Both spellings of
+    /// the same quantity have to agree, or a limit changes when a peer chooses a different
+    /// scale for it.
+    #[test]
+    fn a_negative_scale_is_correctly_rounded() {
+        assert_eq!(ScaledNumber::new(12_345, -4).to_f64(), Some(1.2345));
+        assert_eq!(ScaledNumber::new(1, -7).to_f64(), Some(1e-7));
+        assert_eq!(ScaledNumber::new(235, -1).to_f64(), Some(23.5));
+        assert_eq!(ScaledNumber::new(4_200_000, -3).to_f64(), Some(4200.0));
+
+        // The same number written at four different scales is the same number.
+        for scale in 0..=6i16 {
+            let number = 42 * 10i64.pow(u32::from(scale as u16));
+            assert_eq!(
+                ScaledNumber::new(number, -scale).to_f64(),
+                Some(42.0),
+                "42 written at scale -{scale}"
+            );
+        }
+    }
+
+    /// A value too large for `i64` raises the scale instead of saturating.
+    ///
+    /// `1e30 as i64` is `i64::MAX`, which is a different number by a factor of nine —
+    /// and it would reach the wire as a limit nobody asked for.
+    #[test]
+    fn a_huge_value_raises_the_scale_rather_than_saturating() {
+        let big = ScaledNumber::from_f64(1e30, 2);
+        assert_eq!(big.to_f64(), Some(1e30));
+        assert!(
+            big.number.expect("a number").get() < i64::MAX,
+            "saturated instead of scaling: {big:?}"
+        );
+
+        let negative = ScaledNumber::from_f64(-1e25, 2);
+        assert_eq!(negative.to_f64(), Some(-1e25));
+    }
+
+    /// Every quantity a device sends survives `f64` and comes back unchanged.
+    ///
+    /// This is the round trip the use-case layer depends on: it works in watts and
+    /// amperes as `f64`, and the wire is exact, so the two only agree if the conversion
+    /// is a bijection over the domain that can occur.
+    #[test]
+    fn realistic_quantities_round_trip_exactly() {
+        let watts = [0.0, 1.0, 4200.0, 11_000.0, 23.5, 0.001, 16.0, 6.0, 3_333.33];
+        for value in watts {
+            let round_tripped = ScaledNumber::from_f64(value, 3)
+                .to_f64()
+                .expect("a finite quantity");
+            assert_eq!(round_tripped, value, "{value} did not survive the wire");
+        }
+    }
+
+    /// How far `a` is from `b`, counted in representable `f64` values between them.
+    fn ulps_apart(a: f64, b: f64) -> i64 {
+        (a.to_bits() as i64 - b.to_bits() as i64).abs()
+    }
+
+    /// Every power of ten `f64` can hold, against the correctly rounded answer.
+    ///
+    /// The oracle is the decimal-to-binary conversion in `str::parse`, which is correctly
+    /// rounded by definition. Building the powers past the exact table a decade at a time
+    /// put `10^308` 3·10¹⁷ ulps out, and — worse, because it is reachable — put `10^23`
+    /// out by a whole factor of ten.
+    #[test]
+    fn every_power_of_ten_is_within_two_ulps_of_the_correctly_rounded_value() {
+        for exp in 0..=308u32 {
+            let exact: f64 = format!("1e{exp}").parse().expect("a finite power of ten");
+            let ours = pow10(exp);
+            let ulps = ulps_apart(exact, ours);
+            assert!(
+                ulps <= 2,
+                "10^{exp}: {ours:e} is {ulps} ulps from {exact:e}"
+            );
+        }
+        assert_eq!(pow10(309), f64::INFINITY, "past what an f64 can hold");
+        assert_eq!(pow10(u32::MAX), f64::INFINITY);
+    }
+
+    /// The seam in the exact table is not a seam on the wire.
+    ///
+    /// `scale` is a signed 16-bit integer, so a peer crosses `10^22` in one schema-valid
+    /// message. Scaling in exact steps keeps every scale that multiplies exact, and holds
+    /// the ones that divide to a single rounding — where building `10^23` first and
+    /// dividing by that lost a decimal digit as well as an ulp.
+    #[test]
+    fn a_scale_past_the_exact_table_is_still_that_scale() {
+        for exp in 0..=30i16 {
+            let exact: f64 = format!("1e{exp}").parse().expect("finite");
+            assert_eq!(
+                ScaledNumber::new(1, exp).to_f64(),
+                Some(exact),
+                "scale {exp} multiplies exactly"
+            );
+        }
+        for exp in 0..=30i16 {
+            let exact: f64 = format!("1e-{exp}").parse().expect("finite");
+            let ours = ScaledNumber::new(1, -exp).to_f64().expect("finite");
+            assert!(
+                ulps_apart(exact, ours) <= 1,
+                "scale -{exp}: {ours:e} against {exact:e}"
+            );
+        }
+    }
+
+    /// An overflowing scale is not a value, and a vanishing one is zero.
+    #[test]
+    fn unrepresentable_scales_are_reported_rather_than_approximated() {
+        assert_eq!(ScaledNumber::new(i64::MAX, 308).to_f64(), None, "overflows");
+        assert_eq!(ScaledNumber::new(i64::MAX, i16::MAX).to_f64(), None);
+        // Below the smallest subnormal the answer really is zero, not "unreadable".
+        assert_eq!(ScaledNumber::new(1, i16::MIN).to_f64(), Some(0.0));
+        assert_eq!(ScaledNumber::new(0, i16::MAX).to_f64(), Some(0.0));
     }
 }

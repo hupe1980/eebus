@@ -51,7 +51,7 @@ pub fn reconnect_delay_for(peer: &Ski, attempt: u32) -> Duration {
     if spread == 0 {
         return Duration::from_millis(base);
     }
-    // Fold the SKI into one byte, so every part of the identity contributes.
+    // Fold the whole SKI into one number, so every part of the identity contributes.
     let mixed = peer.as_bytes().iter().fold(0u64, |acc, byte| {
         acc.wrapping_mul(31).wrapping_add(*byte as u64)
     });

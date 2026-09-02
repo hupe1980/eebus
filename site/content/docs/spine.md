@@ -10,13 +10,26 @@ SPINE defines what a device *says it is* and how peers read, write and subscribe
 
 ## The model
 
-```text
-Device        d:_i:46925_HeatPump-1
- └─ Entity    [0]  DeviceInformation   ← always present
-     └─ Feature 1  NodeManagement      ← the entry point for every peer
- └─ Entity    [1]  HeatPumpAppliance
-     ├─ Feature 1  LoadControl         ← the limit lives here
-     └─ Feature 2  DeviceDiagnosis     ← the heartbeat lives here
+```mermaid
+flowchart TB
+  dev["<b>Device</b><br><small>d:_i:46925_HeatPump-1</small>"]
+  e0["<b>Entity [0]</b> DeviceInformation<br><small>always present</small>"]
+  e1["<b>Entity [1]</b> HeatPumpAppliance"]
+  nm["<b>Feature 0</b> NodeManagement<br><small>the entry point for every peer</small>"]
+  lc["<b>Feature 1</b> LoadControl<br><small>the limit lives here</small>"]
+  dd["<b>Feature 2</b> DeviceDiagnosis<br><small>the heartbeat lives here</small>"]
+
+  dev --> e0 --> nm
+  dev --> e1
+  e1 --> lc
+  e1 --> dd
+
+  classDef d fill:#0b8f63,stroke:#0b8f63,color:#fff;
+  classDef e fill:#e6f5ef,stroke:#0b8f63,color:#101620;
+  classDef f fill:transparent,stroke:#7b8595,color:#101620;
+  class dev d
+  class e0,e1 e
+  class nm,lc,dd f
 ```
 
 An entity path is a list, so entities nest. A **feature address** is the triple
@@ -39,6 +52,20 @@ Every conversation begins at NodeManagement on entity 0.
 
 An application that skips the second and guesses from feature types will eventually meet a
 device that has a `LoadControl` feature for an unrelated reason.
+
+Two details worth knowing before writing a client:
+
+**A read names its function in either of two spellings** — the `function` element, or an
+empty instance of the data element. `spine-go` uses the second exclusively, so a reader that
+understands only the first cannot answer most of the deployed base, and a writer that sends
+only the first is answered `errorNumber` 6. The specification's own example reads carry
+both, and so does this crate.
+
+**A feature is identified by its type *and* its role.** An entity may hold a
+`DeviceDiagnosis` server and a `DeviceDiagnosis` client at once — `evcc` and the Porsche
+Mobile Charger Connect both ship exactly that — and a Controllable System needs to, because
+it serves its own heartbeat and subscribes to the Energy Guard's. A subscription runs
+client → server, so the near end of that one must be the client feature.
 
 ## Bindings and subscriptions
 
@@ -77,6 +104,17 @@ A write is refused with `errorNumber` 7 when an entry arrives without its primar
 identifiers, which use-case IG §3.1 requires in every message: such an entry names nothing
 stored, so it can neither update nor delete.
 
+**A partial write cannot grow a list without end.** Appending an entry whose identifier
+matches nothing stored is correct behaviour, and repeated with a fresh identifier it is a
+way to spend a controller's memory over a legitimate protocol flow. One function holds at
+most 128 entries, and a write that would exceed that is refused whole.
+
+**And the queue of undecided writes is bounded.** A deferred write is memory the *peer*
+allocates and the application frees, so at most sixteen may wait; beyond that a peer is
+answered `errorNumber` 3, overload. One that goes undecided past §5.2.5's maximum response
+delay is abandoned and reported as `SpineEvent::WriteAbandoned` — answering later would
+reach a peer that had already given up.
+
 ## Acknowledgements and errors
 
 A message may request an acknowledgement, and whether one is owed depends on the classifier,
@@ -98,20 +136,64 @@ this one is answered `DestinationUnreachable` rather than ignored.
 `TC_SPINE_COMP_006` calls that the recommended behaviour — while tolerating the one
 deviation it permits, a leading `v`.
 
+## What a peer's address has to be
+
+A device address is a routing key and a stored identity: the hub binds a connection to it,
+the engine allocates a peer record per distinct one, and every § 14a audit record names it.
+Two rules apply, and they are deliberately different.
+
+**What this node builds** goes through the full §7.1.1.2 pattern,
+`d:_(i:<IANA PEN>|n:<vendor>)_<unique>`.
+
+**What a peer sends** is checked only for what protects this node: bounded length, no
+control or whitespace characters, not empty. A datagram whose source fails that is discarded
+in silence, because there is nowhere to send an error to.
+
+Enforcing conformance on reception would mean refusing `evcc`, which announces
+`d:_i:EVCC_HEMS-…` — the `i:` marker without the IANA Private Enterprise Number it is
+reserved for. So the deviation is tolerated and *measured*: a test names which addresses in
+the device corpus are non-conformant, so a third one is a failure rather than a surprise.
+
+## How long a peer is given to answer
+
+Ten seconds (§5.2.5.3), unless the feature announced longer in its detailed discovery — in
+which case that. A client that ignores the announcement reports a conformant peer as
+*unresponsive*, and the implementation guide reserves the staggered retry for exactly that,
+so the guess retries against a peer answering as fast as it promised.
+
+`LocalFeature::with_max_response_delay` declares this node's own figure. Discovery publishes
+it, and it is also how long the engine holds a *deferred write* on that feature open — a
+Controllable System that must ask a compressor controller before it can answer a limit needs
+both halves.
+
 ## Restricted Function Exchange
 
 RFE is how SPINE reads and writes *part* of a function: a **selector** says which entries,
 an **elements** filter says which fields of them.
 
 ```rust
-data.restrict(selectors, elements)?;                  // what a partial read answers with
-rfe::apply_partial(&mut stored, update);              // merge by identifier, element by element
-rfe::delete_elements(&mut stored, |e| …, &elements);  // LPC §3.4.1.4's delete-and-write
+data.restrict(selectors, elements)?;                     // what a partial read answers with
+rfe::apply_partial(&mut stored, update);                 // merge by identifier, element by element
+data.delete_restricted(&update, selectors, elements)?;   // what a delete filter addresses
 ```
 
 **The merge rule is the part to get right.** An omitted element means *unchanged*, all the
 way down the tree. A `scaledNumber` arriving with a bare `number` must keep its stored
 `scale`, or a 4.2 kW limit becomes 42 MW.
+
+**It applies to what a peer sends you, not only to what it writes.** A server may notify a
+*partial* update — the implementation guide §3.2.2 asks clients to subscribe rather than
+poll, so that is the ordinary shape a measurement arrives in. The engine therefore keeps the
+merged state of every function a peer has sent, and `SpineEvent::DataNotified` and
+`ReplyReceived` carry `data` for what arrived and `resolved` for what it means, exactly as a
+deferred write does. Read `resolved`.
+
+**A delete is filtered too, and a command may carry more than one filter.** `selectors`
+choose the entries a delete addresses; `elements` choose the parts of them, and the entries
+survive. LPC UC TS §3.4.1.4's worked example is one command with two filters — the first
+withdraws a limit's `timePeriod.endTime`, the second writes its new value as a partial
+update — so a command's filters are applied **in order**. Answering only the delete removes
+the limit instead of making it open-ended.
 
 Nothing in the XML Schemas links a data type to its selectors and elements filters — the
 link is a naming convention — so the generator resolves it into a table covering 141
@@ -119,4 +201,6 @@ functions, and merge, delete and partial read are written once against that tabl
 
 A filtered request for a function the table does not cover is refused with `errorNumber` 8
 rather than answered approximately. Announcing what you cannot do is worse than announcing
-less.
+less. The table itself is published:
+[which functions can be exchanged in part](@/docs/functions.md), generated from the same
+source the compiler reads.

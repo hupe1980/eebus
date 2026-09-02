@@ -6,3 +6,7 @@ publish = false
 
 [dependencies]
 roxmltree = "0.21"
+# `preserve_order`, because the EEBUS JSON projection is an *ordered* sequence: a
+# converter that let a map reorder the keys would produce a valid-looking document that
+# says something different.
+serde_json = { version = "1", features = ["preserve_order"] }

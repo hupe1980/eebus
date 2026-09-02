@@ -24,6 +24,17 @@ use crate::model::{
 
 use super::address::{self, NODE_MANAGEMENT_ENTITY, NODE_MANAGEMENT_FEATURE};
 
+/// The most list entries one function will hold.
+///
+/// A partial write appends any entry whose identifier matches nothing stored, so a peer
+/// with a binding can grow a stored list one message at a time — a legitimate protocol
+/// flow with no natural end. Nothing in SPINE caps it.
+///
+/// The number is generous against real devices: the largest lists in practice are a big
+/// inverter's measurement descriptions, a few dozen entries. Reaching it means something
+/// on the wire is wrong, and the answer is `errorNumber` 3 — overload.
+pub const MAX_LIST_ENTRIES: usize = 128;
+
 /// What a peer may do with one function of a feature.
 ///
 /// Reported in `nodeManagementDetailedDiscoveryData` so that a peer knows, before it
@@ -149,6 +160,7 @@ pub struct LocalFeature {
     role: Role,
     approval: WriteApproval,
     functions: Vec<FunctionEntry>,
+    max_response_delay: Option<core::time::Duration>,
 }
 
 impl LocalFeature {
@@ -160,6 +172,7 @@ impl LocalFeature {
             role,
             approval: WriteApproval::Automatic,
             functions: Vec::new(),
+            max_response_delay: None,
         }
     }
 
@@ -168,6 +181,30 @@ impl LocalFeature {
     pub fn with_deferred_writes(mut self) -> Self {
         self.approval = WriteApproval::Deferred;
         self
+    }
+
+    /// Announces that this feature may take longer than the ten-second default to answer.
+    ///
+    /// §5.2.5.3 provides `maxResponseDelay` in detailed discovery for exactly this, and a
+    /// feature whose writes the application decides on is the case that needs it: a
+    /// Controllable System that must ask a compressor controller before it can say whether
+    /// it can follow a limit has no way to be slow *and* conformant otherwise. Announcing
+    /// it does two things — a peer waits that long before calling this node unresponsive,
+    /// and the engine holds a deferred write for the same period instead of abandoning it
+    /// after ten seconds.
+    ///
+    /// Leave it unset unless the feature genuinely needs it. The default is the
+    /// specification's, and a long delay announced by a feature that answers instantly
+    /// slows down every client's error handling.
+    #[must_use]
+    pub fn with_max_response_delay(mut self, delay: core::time::Duration) -> Self {
+        self.max_response_delay = Some(delay);
+        self
+    }
+
+    /// How long this feature says it may take to answer, if it says.
+    pub fn max_response_delay(&self) -> Option<core::time::Duration> {
+        self.max_response_delay
     }
 
     /// Who decides whether a peer's write is accepted.
@@ -225,7 +262,13 @@ impl LocalFeature {
     ///
     /// Used before deferring a decision to the application: a write that the feature
     /// would refuse anyway is refused at once rather than put to a use case.
-    pub fn check_write(&self, update: &CmdData, partial: bool) -> Result<(), FeatureError> {
+    ///
+    /// `restricted` covers both halves of §5.3.4 — a partial update *and* a delete — since
+    /// `possibleOperations` has one flag for the pair. A feature that announces `write`
+    /// without `write.partial` is saying it exchanges whole functions only, and serving a
+    /// delete on it would be doing something it never announced. That is D14's rule in the
+    /// other direction, and it costs nothing to keep.
+    pub fn check_write(&self, update: &CmdData, restricted: bool) -> Result<(), FeatureError> {
         let function = Function::from(update.key());
         let entry = self
             .function(&function)
@@ -233,7 +276,7 @@ impl LocalFeature {
         if !entry.operations.write {
             return Err(FeatureError::NotWriteable);
         }
-        if partial && !entry.operations.write_partial {
+        if restricted && !entry.operations.write_partial {
             return Err(FeatureError::PartialNotSupported);
         }
         // Use-case IG §3.1: every message carries an entry's primary and sub identifiers.
@@ -292,6 +335,19 @@ impl LocalFeature {
         if !update.entries_identified() {
             return Err(FeatureError::MissingIdentifier);
         }
+        // A partial write appends every entry whose identifier matches nothing stored,
+        // which is correct and also a way to grow a list one message at a time. The bound
+        // is deliberately the worst case — nothing in the update matches — because
+        // counting the matches means the merge, and a refusal has to happen before it.
+        let stored_entries = entry.data.as_ref().map_or(0, CmdData::entry_count);
+        let would_hold = if partial {
+            stored_entries + update.entry_count()
+        } else {
+            update.entry_count()
+        };
+        if would_hold > MAX_LIST_ENTRIES {
+            return Err(FeatureError::TooManyEntries);
+        }
         match &mut entry.data {
             Some(stored) => stored.apply(update, partial)?,
             None => entry.data = Some(update),
@@ -301,6 +357,49 @@ impl LocalFeature {
 
     /// Deletes what `update` identifies, for a command whose `cmdControl` says `delete`.
     pub fn delete(&mut self, update: &CmdData) -> Result<(), FeatureError> {
+        let entry = self.writeable_function(update)?;
+        if let Some(stored) = &mut entry.data {
+            stored.delete(update)?;
+        }
+        Ok(())
+    }
+
+    /// Applies one `cmdControl: delete` filter, honouring what it addresses.
+    ///
+    /// A delete carries the same two filters a read does (SPINE §5.3.4.3): the selectors
+    /// say which entries, the elements say which parts of them. Reading only the payload
+    /// and ignoring both — which is what [`delete`](Self::delete) does — turns LPC UC TS
+    /// §3.4.1.4's "withdraw this limit's `endTime`" into "remove this limit", and a
+    /// curtailment that should have become open-ended is lifted instead.
+    ///
+    /// A filter naming a selector this implementation cannot match by comparison is
+    /// refused with `errorNumber` 8 rather than served approximately, exactly as a
+    /// partial read is.
+    pub fn delete_filtered(
+        &mut self,
+        update: &CmdData,
+        filter: &crate::model::Filter,
+    ) -> Result<(), FeatureError> {
+        let entry = self.writeable_function(update)?;
+        let Some(stored) = &mut entry.data else {
+            return Ok(());
+        };
+        let elements = filter.elements.as_ref();
+        match filter.selectors.as_deref().unwrap_or_default() {
+            [] => stored.delete_restricted(update, None, elements)?,
+            // Two selectors address two sets of entries, and a delete of their union is
+            // a delete of each in turn.
+            many => {
+                for selector in many {
+                    stored.delete_restricted(update, Some(selector), elements)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The function `update` addresses, once it is known to be writeable and addressable.
+    fn writeable_function(&mut self, update: &CmdData) -> Result<&mut FunctionEntry, FeatureError> {
         let function = Function::from(update.key());
         let entry = self
             .function_mut(&function)
@@ -311,10 +410,7 @@ impl LocalFeature {
         if !update.entries_identified() {
             return Err(FeatureError::MissingIdentifier);
         }
-        if let Some(stored) = &mut entry.data {
-            stored.delete(update)?;
-        }
-        Ok(())
+        Ok(entry)
     }
 
     fn to_function_properties(&self) -> Vec<FunctionProperty> {
@@ -331,6 +427,9 @@ impl LocalFeature {
 /// Why an operation on a feature failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FeatureError {
+    /// The write would leave the function holding more entries than [`MAX_LIST_ENTRIES`].
+    #[error("the function would hold more than {MAX_LIST_ENTRIES} entries")]
+    TooManyEntries,
     /// The feature does not declare that function.
     #[error("the feature does not support this function")]
     UnknownFunction,
@@ -346,6 +445,9 @@ pub enum FeatureError {
     /// The payload belonged to a different function than the stored data.
     #[error(transparent)]
     Mismatch(#[from] FunctionMismatch),
+    /// A filter addressed the data in a way this implementation cannot serve.
+    #[error(transparent)]
+    Restricted(#[from] crate::model::rfe::RestrictError),
 }
 
 impl FeatureError {
@@ -357,6 +459,8 @@ impl FeatureError {
                 super::ErrorNumber::CommandRejected
             }
             Self::PartialNotSupported => super::ErrorNumber::RestrictedExchangeNotSupported,
+            Self::Restricted(error) => error.error_number(),
+            Self::TooManyEntries => super::ErrorNumber::Overload,
         }
     }
 }
@@ -382,13 +486,19 @@ impl LocalEntity {
     /// Adds a feature.
     ///
     /// Returns [`DeviceError::DuplicateFeatureType`] if the entity already has a feature
-    /// of that type: the implementation guide §3.4 forbids two, because discovery could
-    /// not tell them apart.
+    /// of that type **in that role**.
+    ///
+    /// The implementation guide §3.4 forbids two because discovery could not tell them
+    /// apart, and a server and a client of one type are told apart by exactly what
+    /// discovery reports. Real devices rely on this — `evcc` and the Porsche Mobile
+    /// Charger Connect each carry a `DeviceDiagnosis` server and client on one entity — and
+    /// so does LPC, whose Controllable System serves its own heartbeat and subscribes to
+    /// the guard's.
     pub fn add_feature(&mut self, feature: LocalFeature) -> Result<(), DeviceError> {
         if self
             .features
             .iter()
-            .any(|f| f.feature_type == feature.feature_type)
+            .any(|f| f.feature_type == feature.feature_type && f.role == feature.role)
         {
             return Err(DeviceError::DuplicateFeatureType);
         }
@@ -499,32 +609,64 @@ impl LocalDevice {
     /// `vendor` is `i:<IANA PEN>` or `n:<vendor name>`, and `unique` is whatever makes
     /// the address unique within that vendor.
     pub fn new(vendor: &str, unique: &str, device_type: DeviceType) -> Result<Self, DeviceError> {
-        let address = address::device_address(vendor, unique)?;
+        Ok(Self::from_address(
+            address::device_address(vendor, unique)?,
+            device_type,
+        ))
+    }
+
+    /// A device with an address it already has, rather than one built from its parts.
+    ///
+    /// A SPINE device address is the identity a peer's bindings, subscriptions and audit
+    /// records are filed under, so a device that restarts has to come back with the same
+    /// one — and [`address`](Self::address) is where it was kept. Deriving it again from
+    /// `vendor` and `unique` works only for a device that stored those two strings instead,
+    /// and re-parsing the address to get them back is the kind of round trip that goes
+    /// wrong quietly.
+    ///
+    /// The address is taken as given: it came from [`address`](Self::address), from a
+    /// peer's discovery data, or from a capture, and each of those has already been through
+    /// the parser.
+    ///
+    /// ```
+    /// use eebus::prelude::*;
+    ///
+    /// let device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)?;
+    /// let restored = LocalDevice::from_address(
+    ///     device.address().clone(),
+    ///     DeviceType::HeatGenerationSystem,
+    /// );
+    /// assert_eq!(restored.address(), device.address());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn from_address(address: AddressDevice, device_type: DeviceType) -> Self {
         let mut node_management =
             LocalEntity::new([NODE_MANAGEMENT_ENTITY], EntityType::DeviceInformation);
-        node_management.add_feature(
-            LocalFeature::new(
-                NODE_MANAGEMENT_FEATURE,
-                FeatureType::NodeManagement,
-                // "special": NodeManagement both serves its own data and consumes a
-                // peer's, so neither `server` nor `client` describes it.
-                Role::Special,
+        node_management
+            .add_feature(
+                LocalFeature::new(
+                    NODE_MANAGEMENT_FEATURE,
+                    FeatureType::NodeManagement,
+                    // "special": NodeManagement both serves its own data and consumes a
+                    // peer's, so neither `server` nor `client` describes it.
+                    Role::Special,
+                )
+                .with_function(
+                    Function::NodeManagementDetailedDiscoveryData,
+                    Operations::read(),
+                )
+                .with_function(Function::NodeManagementUseCaseData, Operations::read())
+                .with_function(Function::NodeManagementBindingData, Operations::read())
+                .with_function(Function::NodeManagementSubscriptionData, Operations::read()),
             )
-            .with_function(
-                Function::NodeManagementDetailedDiscoveryData,
-                Operations::read(),
-            )
-            .with_function(Function::NodeManagementUseCaseData, Operations::read())
-            .with_function(Function::NodeManagementBindingData, Operations::read())
-            .with_function(Function::NodeManagementSubscriptionData, Operations::read()),
-        )?;
+            .expect("entity 0 is fresh, so its NodeManagement feature is its first");
 
-        Ok(Self {
+        Self {
             address,
             device_type,
             feature_set: NetworkManagementFeatureSet::Smart,
             entities: vec![node_management],
-        })
+        }
     }
 
     /// The device's address.

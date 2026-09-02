@@ -35,6 +35,13 @@ encodes the format directly through `serde` in a single streaming pass — no in
 `Value`, no allocation for field names. Round trips are byte for byte, which matters
 because the fixtures are the specification's own example datagrams.
 
+**Byte for byte for a schema-valid message.** The model is generated from the XSDs, so a
+field a peer sends where the schema defines none has nowhere to go and is dropped. That is
+not hypothetical: SPINE's detailed discovery uses a *restricted* address type carrying only
+the entity path, and `eebus-go` puts a `device` in it anyway. Dropping it is the
+interoperable answer — the enclosing `deviceInformation` already names the device — and the
+device captures in the test suite hold the crate to exactly that one exception.
+
 ```rust
 use eebus::model::{from_json_str, to_json, CmdData, Function};
 
@@ -65,6 +72,19 @@ Three rules follow, and all three are easy to get wrong:
   near `i64::MAX` reaches infinity in one well-formed message. `to_f64` answers `None`, and
   a use case handed a present-but-unreadable value NACKs the write rather than substituting
   a number the peer never sent.
+* **A negative scale divides; it does not multiply.** No negative power of ten is
+  representable in binary, so `number × 10⁻⁴` rounds twice — once building the constant,
+  once in the product — and `12345 × 10⁻⁴` comes out as `1.2345000000000002`. Dividing by
+  the exact `1e4` rounds once. The two spellings of a quantity have to agree, or a limit
+  changes when a peer picks a different scale for it.
+* **And a scale past `10²²` is still that scale.** Only the first twenty-three powers of ten
+  are `f64` values, so a bigger scale is applied *in steps* of the largest exact one rather
+  than through a magnitude built up first — which rounds once per step instead of once per
+  decade, and gets `10²³` exactly right. `scale` is a signed 16-bit integer, so a peer
+  reaches that seam in one schema-valid message.
+* **A value too large for an `i64` raises the scale.** `1e30 as i64` is `i64::MAX`, a
+  different number by a factor of nine; `ScaledNumber::from_f64` answers `number = 1,
+  scale = 30` instead, which is what the scale is for.
 
 ## Durations
 

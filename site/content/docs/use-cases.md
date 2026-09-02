@@ -73,9 +73,19 @@ differing only in the prefix. So the state machine and both actors are written o
 pointed by a `Direction`:
 
 ```rust
-ControllableSystemActor::new(system, lpc::DIRECTION, load_control, config, diagnosis)
-ControllableSystemActor::new(system, lpp::DIRECTION, load_control, config, diagnosis)
+ControllableSystemActor::builder(system, lpc::DIRECTION, features).install(&mut engine, now)
+ControllableSystemActor::builder(system, lpp::DIRECTION, features).install(&mut engine, now)
 ```
+
+`features` is a [`CsFeatures`](https://docs.rs/eebus/latest/eebus/usecases/limitation/struct.CsFeatures.html)
+with named fields rather than a row of `FeatureAddress` arguments, because nothing but the
+order would say which is which — and a device that answers a grid operator's limit write on
+its heartbeat feature is a device that compiles.
+
+`install` publishes the limit description and locks the two features to one binding partner,
+and it is the *only* way to obtain an actor. Skipping it leaves a device that looks perfectly
+healthy — discovery answered, bindings and subscription granted, heartbeats flowing — whose
+empty limit list gives an Energy Guard no `limitId` to write to.
 
 Three more pairs work the same way:
 

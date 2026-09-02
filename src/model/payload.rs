@@ -30,7 +30,13 @@ use crate::model::{
 ///
 /// let cmd = Cmd::read(Function::LoadControlLimitListData);
 /// assert_eq!(cmd.function, Some(Function::LoadControlLimitListData));
-/// assert!(cmd.data.is_none());
+/// // A read names its function twice: in `function`, and as an empty instance of the
+/// // data element. The specification's own example reads carry both, and `spine-go`
+/// // dispatches on the second alone.
+/// assert_eq!(
+///     cmd.data,
+///     Some(CmdData::LoadControlLimitListData(LoadControlLimitListData::default()))
+/// );
 ///
 /// let notify = Cmd::with_data(CmdData::LoadControlLimitListData(
 ///     LoadControlLimitListData::default(),
@@ -60,8 +66,13 @@ pub struct Cmd {
 impl Cmd {
     /// A command that reads `function` in full.
     pub fn read(function: Function) -> Self {
+        // Both the `function` element and an empty instance of the data element, which is
+        // what the specification's own example reads carry — and `spine-go` dispatches on
+        // the data element alone, answering `errorNumber` 6 to a read without it.
+        let data = CmdData::empty(function.as_str());
         Self {
             function: Some(function),
+            data,
             ..Self::default()
         }
     }

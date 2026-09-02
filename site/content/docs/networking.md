@@ -24,7 +24,7 @@ loop {
         HubEvent::Spine(event) => { actor.handle_event(hub.engine_mut(), &event, hub.now()); }
         HubEvent::Tick => { actor.handle_timeout(hub.engine_mut(), hub.now()); }
         HubEvent::Disconnected { ski, .. } => { /* the session is gone, the use case is not */ }
-        HubEvent::Connected { .. } => {}
+        HubEvent::Connected { version, .. } => { /* 1.1, or 1.0 with an older peer */ }
     }
     hub.wake_at(actor.poll_timeout());
 }
@@ -78,14 +78,24 @@ does not have every device dialling in the same instant.
 ## `next` is not cancel-safe
 
 The one rule for the event loop: **do not put `hub.next()` in a `tokio::select!` or a
-`timeout`.** It reads from the sockets, and dropping it part-way through a WebSocket frame
-loses what had been read — silently. It comes back minutes later as a subscription that was
-never granted, a heartbeat that never arrived, and a limit refused for want of one.
+`timeout`.** `Hub::run(handler)` is the loop that cannot get this wrong.
+
+The hazard is the *sending* half. Reading is cancel-safe — `WebSocketStream` buffers a
+partial frame and resumes — but `next` flushes the engine's queue before it reads, and
+`Sink::send` carries no such guarantee. Dropped part-way through it leaves **half a frame on
+the wire**, and the peer's parser is then out of step with the stream.
+
+**The hub notices.** A write in flight is marked before the `await` and unmarked after, so a
+future dropped in between leaves the mark set; the next call finds it and closes that
+connection with `Disconnect::InterruptedWrite`. A reconnection costs a second. Carrying on
+costs the session, and costs it silently — minutes later, as a subscription that was never
+granted, a heartbeat that never arrived, and a limit refused for want of one.
 
 Everything a caller would reach for `select!` to do has somewhere else to go. Timers go to
-`wake_at`, which the hub folds into its own deadlines and answers with `HubEvent::Tick`.
-Work arriving from elsewhere — a listener accepting connections, an mDNS browse, a command
-channel — is drained *between* calls, on the tick:
+`wake_at`, which the hub folds into its own deadlines and answers with `HubEvent::Tick` —
+and **a deadlock guard is a timer**, which is the most natural reason to reach for `timeout`
+and the one to resist. Work arriving from elsewhere — a listener accepting connections, an
+mDNS browse, a command channel — is drained *between* calls, on the tick:
 
 ```rust
 loop {
@@ -93,6 +103,7 @@ loop {
     while let Ok(stream) = inbox.try_recv() {
         hub.accept(stream).await?;
     }
+    // The deadline, and the tick that carries it.
     hub.wake_at(hub.now() + Duration::from_secs(1));
 
     // And then the one await that owns the sockets, uninterrupted.
@@ -104,6 +115,18 @@ loop {
 past is not an error: the hub runs its timers and comes straight back rather than reading
 with a zero-length timeout, which would starve the connection it was supposed to be
 watching.
+
+## How many connections
+
+A hub holds at most `DEFAULT_MAX_CONNECTIONS` — sixteen — and two to the same peer, which is
+what §12.2.3 legitimately produces while a double connection is arbitrated.
+`Hub::set_max_connections` raises it for a gateway that serves more. SHIP caps neither, and
+a device that malfunctions and dials in a thousand times takes the memory of every node that
+answers.
+
+Beyond the cap, `accept` and `connect` close with a `connectionClose` and report
+`ConnectionError::TooManyConnections`; `adopt` hands the connection back. Nothing already
+held is dropped to make room: a cap decides what is *accepted*.
 
 ## Deciding is not answering
 

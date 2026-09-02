@@ -26,7 +26,9 @@ If you know the standard and want the code, go straight to
 
 If you are evaluating the crate, [Architecture](@/docs/architecture.md),
 [Conformance](@/docs/conformance.md) and [Certification](@/docs/certification.md) are the
-pages that answer "is this real".
+pages that answer "is this real", and
+[Which functions can be exchanged in part](@/docs/functions.md) answers the one SPINE
+question that has no short answer — it is the generated table itself, all 142 rows.
 
 ## Conventions
 

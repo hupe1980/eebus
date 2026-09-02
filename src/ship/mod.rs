@@ -37,3 +37,19 @@ pub use spine::*;
 
 #[cfg(feature = "pairing")]
 pub mod pairing;
+
+/// Compares two byte strings without an early exit.
+///
+/// Two secrets are compared here: a PIN, whose whole defence is the escalating penalty of
+/// SHIP §13.4.4.3.4, and a pairing secret. A comparison that stops at the first differing
+/// byte turns either into an oracle that gives up one byte at a time, and the penalty is
+/// counted per *attempt* rather than per byte, so it does not help.
+///
+/// Unequal lengths are reported at once. A length is not the secret: a PIN's is announced
+/// in the handshake and a pairing secret's is fixed by whoever printed the sticker.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}

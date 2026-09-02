@@ -750,7 +750,9 @@ impl EvCharging {
         }
         match self.last_heartbeat {
             None => CurrentSource::NotYetCurtailed,
-            Some(last) if self.now.saturating_sub(last) > self.timeout => {
+            // `>=`: the deadline `poll_timeout` publishes is `last + timeout`, and
+            // waiting until exactly that instant has to be enough.
+            Some(last) if self.now.saturating_sub(last) >= self.timeout => {
                 CurrentSource::GuardSilent
             }
             Some(_) if self.limit.is_some() => CurrentSource::Curtailed,
@@ -854,10 +856,16 @@ mod tests {
         assert_eq!(ev.source(), CurrentSource::Curtailed);
         assert_eq!(ev.effective(Phase::A), Some(16.0));
 
-        // Exactly four seconds after the last beat is still in time; a moment later is not.
-        ev.handle_timeout(secs(5));
+        // A moment before four seconds is still in time; four seconds exactly is not.
+        //
+        // The boundary belongs to silence, which is the convention everywhere in this
+        // crate that a deadline is published — and here it is load-bearing rather than
+        // tidy: `poll_timeout` answers `last + timeout`, so a caller that sleeps until
+        // that instant is the shape sans-IO invites, and under the other rule it saw no
+        // change, asked again, got the same instant back, and never fell back at all
+        ev.handle_timeout(secs(4) + Duration::from_millis(999));
         assert_eq!(ev.source(), CurrentSource::Curtailed);
-        ev.handle_timeout(secs(6));
+        ev.handle_timeout(ev.poll_timeout().expect("a published deadline"));
         assert_eq!(ev.source(), CurrentSource::GuardSilent);
         assert_eq!(ev.effective(Phase::A), Some(6.0));
 
@@ -1118,8 +1126,16 @@ impl EvActor {
         now: Duration,
     ) -> Option<EvEvent> {
         match event {
-            SpineEvent::DataNotified { feature, data }
-            | SpineEvent::ReplyReceived { feature, data } => {
+            SpineEvent::DataNotified {
+                feature,
+                resolved: data,
+                ..
+            }
+            | SpineEvent::ReplyReceived {
+                feature,
+                resolved: data,
+                ..
+            } => {
                 // Only the Energy Guard this car subscribed to counts. Taking a heartbeat
                 // from whoever sends one would let any device on the connection keep the
                 // car curtailed — which is the opposite of what scenarios 2 and 3 are for.
@@ -1438,8 +1454,16 @@ impl OverloadGuardActor {
         now: Duration,
     ) -> Option<GuardEvent> {
         match event {
-            SpineEvent::ReplyReceived { feature, data }
-            | SpineEvent::DataNotified { feature, data } => {
+            SpineEvent::ReplyReceived {
+                feature,
+                resolved: data,
+                ..
+            }
+            | SpineEvent::DataNotified {
+                feature,
+                resolved: data,
+                ..
+            } => {
                 let index = self
                     .peers
                     .iter()

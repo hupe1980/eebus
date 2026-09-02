@@ -11,7 +11,8 @@ whether or not the device passes. What the laboratory runs is not a secret: each
 has a High-Level Test Specification listing its *abstract test cases* — an identifier, the
 requirements it covers, which actor is under test, and whether it is mandatory.
 
-This crate carries all 203 of them as data, and measures itself against them.
+This crate carries all 203 of them as data, **drives every one of them**, and prints what
+that adds up to.
 
 ## The catalogue
 
@@ -41,21 +42,25 @@ the same list tells a manufacturer what it has committed to.
 test per identifier, and prints what it adds up to:
 
 ```text
-$ cargo test --test conformance -- --nocapture coverage
+$ cargo test --features full --test conformance -- --nocapture coverage
 
-LPC   ControllableSystem    39/43   90%
-LPC   EnergyGuard            5/8    62%
-LPP   ControllableSystem    39/43   90%
-LPP   EnergyGuard            5/8    62%
+LPC   ControllableSystem      39/43   90%
+LPC   EnergyGuard              5/8    62%
+LPP   ControllableSystem      39/43   90%
+LPP   EnergyGuard              5/8    62%
+MPC   MonitoredUnit           20/20  100%
+MPC   MonitoringAppliance     34/34  100%
+MGCP  GridConnectionPoint     18/18  100%
+MGCP  MonitoringAppliance     29/29  100%
 
-      total                 88/102  86%
+      total                  189/203  93%
 ```
 
-The number that is *not* covered is the interesting one, and it is not padding. Roughly a
-third of the abstract test cases are about the device rather than the protocol — that a
-factory reset restores the defaults, that a value survives a power cut, that a reboot
-completes inside the declared start-up time — and no library can answer those for the
-device it is linked into. Each is listed with the reason:
+**The fourteen that are missing are the whole point.** They are exactly the seven
+device-level test cases, counted once for LPC and once for LPP; a test holds the gap to that
+set, so the number moves neither by dropping a case nor by relabelling one. The Energy
+Guard's 62 % is the same arithmetic, not a shortfall: three of its eight cases are about a
+device rebooting. Each is listed with the reason:
 
 ```text
 Not covered here, and why (the same list for LPP):
@@ -67,7 +72,13 @@ Not covered here, and why (the same list for LPP):
   EGConnection_001     the test rebuilds the actor rather than rebooting a device
 ```
 
-A coverage number that quietly counted "we cannot test this" would be worth nothing.
+A coverage number that quietly counted "we cannot test this" would be worth nothing. Each of
+these is a real obligation that lands on the integrator, and the list doubles as that
+integrator's checklist.
+
+The report prints one softer case alongside them: the library notifies a change the moment
+the application publishes it (SPINE IG §2.4), but whether the *measured* value reaches it
+inside the 120 seconds MPC and MGCP allow is the application's own publish cadence.
 
 ## The tester hooks
 

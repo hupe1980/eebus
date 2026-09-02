@@ -128,13 +128,19 @@ pub enum TlsError {
 /// A node's TLS configuration: its identity, and what it will accept from a peer.
 ///
 /// Building one does not decide whom to trust. It produces a client and a server config
-/// that complete a handshake with any SHIP node and record who it turned out to be; the
-/// decision is made afterwards, from [`peer_ski`].
+/// that complete a handshake with any SHIP node; who it turned out to be is read off the
+/// finished connection with [`peer_ski`], and the decision is the SHIP handshake's.
+///
+/// Both configurations are built once and shared. A `rustls` config carries a parsed
+/// certificate and key and is designed to be reused across connections, which is why
+/// [`ClientConfig`] and [`ServerConfig`] come back behind an [`Arc`].
 #[derive(Debug)]
 pub struct ShipTls {
     identity: Arc<Identity>,
     provider: Arc<rustls::crypto::CryptoProvider>,
     record_size: usize,
+    client: Mutex<Option<Arc<ClientConfig>>>,
+    server: Mutex<Option<Arc<ServerConfig>>>,
 }
 
 impl ShipTls {
@@ -144,6 +150,8 @@ impl ShipTls {
             identity: Arc::new(identity),
             provider: Arc::new(ship_provider()),
             record_size: RECOMMENDED_RECORD_SIZE,
+            client: Mutex::new(None),
+            server: Mutex::new(None),
         }
     }
 
@@ -164,18 +172,18 @@ impl ShipTls {
         self.identity.ski
     }
 
-    /// The configuration for dialling a peer.
+    /// The configuration for dialling a peer, built on first use and shared thereafter.
     ///
-    /// `observed` records the SKI of whoever answers, which the SHIP handshake then
-    /// checks against the node's trust store.
-    pub fn client_config(&self, observed: &PeerObserver) -> Result<ClientConfig, TlsError> {
+    /// Who answered is read off the finished connection with [`peer_ski`], and the SHIP
+    /// handshake checks it against the node's trust store.
+    pub fn client_config(&self) -> Result<Arc<ClientConfig>, TlsError> {
+        if let Some(config) = self.client.lock().ok().and_then(|held| held.clone()) {
+            return Ok(config);
+        }
         let mut config = ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS12])?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AnySelfSigned::new(
-                observed.clone(),
-                self.provider.clone(),
-            )))
+            .with_custom_certificate_verifier(Arc::new(AnySelfSigned::new(self.provider.clone())))
             .with_client_auth_cert(self.chain(), self.key())?;
         config.max_fragment_size = Some(self.record_size);
         // A resumed session skips the certificate exchange, and this node identifies its
@@ -183,23 +191,31 @@ impl ShipTls {
         // the trust decision comes first.
         config.resumption = rustls::client::Resumption::disabled();
         config.enable_sni = true;
+        let config = Arc::new(config);
+        if let Ok(mut held) = self.client.lock() {
+            *held = Some(config.clone());
+        }
         Ok(config)
     }
 
-    /// The configuration for accepting a peer.
+    /// The configuration for accepting a peer, built on first use and shared thereafter.
     ///
     /// Client authentication is mandatory: a SHIP server that cannot see the dialling
     /// node's certificate has no way to identify it.
-    pub fn server_config(&self, observed: &PeerObserver) -> Result<ServerConfig, TlsError> {
+    pub fn server_config(&self) -> Result<Arc<ServerConfig>, TlsError> {
+        if let Some(config) = self.server.lock().ok().and_then(|held| held.clone()) {
+            return Ok(config);
+        }
         let mut config = ServerConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS12])?
-            .with_client_cert_verifier(Arc::new(AnySelfSigned::new(
-                observed.clone(),
-                self.provider.clone(),
-            )))
+            .with_client_cert_verifier(Arc::new(AnySelfSigned::new(self.provider.clone())))
             .with_single_cert(self.chain(), self.key())?;
         config.max_fragment_size = Some(self.record_size);
         config.session_storage = rustls::server::ServerSessionMemoryCache::new(0);
+        let config = Arc::new(config);
+        if let Ok(mut held) = self.server.lock() {
+            *held = Some(config.clone());
+        }
         Ok(config)
     }
 
@@ -231,80 +247,49 @@ impl ShipTls {
     }
 }
 
-/// Where the SKI of the peer on a connection is recorded.
+/// The SKI of the peer on an established `rustls` connection.
 ///
-/// One per connection: the verifier writes the SKI it saw, and the SHIP handshake reads
-/// it back to decide whether this is a device the user has approved.
-///
-/// ```
-/// # use eebus::tls::PeerObserver;
-/// let observer = PeerObserver::new();
-/// assert_eq!(observer.ski(), None); // nothing has connected yet
-/// ```
-#[derive(Clone, Debug, Default)]
-pub struct PeerObserver {
-    seen: Arc<Mutex<Option<Ski>>>,
-}
-
-impl PeerObserver {
-    /// A fresh observer, for one connection.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The SKI of the certificate the peer presented, once it has.
-    pub fn ski(&self) -> Option<Ski> {
-        self.seen.lock().ok().and_then(|seen| *seen)
-    }
-
-    fn record(&self, ski: Ski) {
-        if let Ok(mut seen) = self.seen.lock() {
-            *seen = Some(ski);
-        }
-    }
-}
-
-/// The SKI of the peer on an established rustls connection.
-///
-/// A shortcut for reading it straight off the connection rather than through a
-/// [`PeerObserver`], for code that has the connection to hand.
+/// This is *the* way a SHIP node learns who it is talking to: the certificate is
+/// self-signed and carries no name worth trusting, so the Subject Key Identifier
+/// computed from its public key is the identity, and it is what the trust store holds
+/// (SHIP §5.4). `rustls` keeps the peer's chain on the connection, so no configuration
+/// needs to be built per connection to capture it.
 pub fn peer_ski(state: &rustls::CommonState) -> Option<Ski> {
     let certificates = state.peer_certificates()?;
     cert::ski_from_der(certificates.first()?).ok()
 }
 
-/// Accepts any well-formed certificate and records who it belonged to.
+/// Accepts any well-formed certificate, having checked that SHIP could work with it.
 ///
 /// This is the piece that would be a security hole in an ordinary TLS client and is the
 /// specified behaviour here: there is no authority to chain to, so validity is not what
 /// decides whether to talk to a peer. What is checked is that the certificate parses and
 /// carries a key on the curve SHIP requires — a peer failing either cannot complete a
-/// SHIP handshake anyway, and saying so here gives a legible error.
+/// SHIP handshake anyway, and saying so here gives a legible error. Who the peer *is* is
+/// read off the finished connection with [`peer_ski`]; the trust decision is the SHIP
+/// handshake's, one layer up.
 #[derive(Debug)]
 struct AnySelfSigned {
-    observed: PeerObserver,
     provider: Arc<rustls::crypto::CryptoProvider>,
     no_hints: Vec<DistinguishedName>,
 }
 
 impl AnySelfSigned {
-    fn new(observed: PeerObserver, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
         Self {
-            observed,
             provider,
             no_hints: Vec::new(),
         }
     }
 
-    /// Records the peer's SKI, refusing a certificate SHIP could not work with.
+    /// Refuses a certificate SHIP could not work with.
     fn observe(&self, end_entity: &CertificateDer<'_>) -> Result<(), RustlsError> {
         use rustls::CertificateError;
 
         cert::uses_ship_curve(end_entity)
             .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
-        let ski = cert::ski_from_der(end_entity)
+        cert::ski_from_der(end_entity)
             .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
-        self.observed.record(ski);
         Ok(())
     }
 
@@ -442,22 +427,16 @@ mod tests {
         server: &ShipTls,
     ) -> (
         Result<(), RustlsError>,
-        PeerObserver,
-        PeerObserver,
         rustls::ClientConnection,
         rustls::ServerConnection,
     ) {
-        let seen_by_client = PeerObserver::new();
-        let seen_by_server = PeerObserver::new();
-
         let mut client_connection = rustls::ClientConnection::new(
-            Arc::new(client.client_config(&seen_by_client).unwrap()),
+            client.client_config().unwrap(),
             ServerName::try_from("heatpump.local").unwrap(),
         )
         .unwrap();
         let mut server_connection =
-            rustls::ServerConnection::new(Arc::new(server.server_config(&seen_by_server).unwrap()))
-                .unwrap();
+            rustls::ServerConnection::new(server.server_config().unwrap()).unwrap();
 
         let mut result = Ok(());
         for _ in 0..16 {
@@ -483,37 +462,27 @@ mod tests {
                 break;
             }
         }
-        (
-            result,
-            seen_by_client,
-            seen_by_server,
-            client_connection,
-            server_connection,
-        )
+        (result, client_connection, server_connection)
     }
 
     #[test]
     fn two_self_signed_nodes_complete_a_handshake_and_learn_each_others_ski() {
         let client = node("i:46925_u:ControlBox-1");
         let server = node("i:46925_u:HeatPump-1");
-        let (result, seen_by_client, seen_by_server, client_connection, server_connection) =
-            handshake(&client, &server);
+        let (result, client_connection, server_connection) = handshake(&client, &server);
 
         result.expect("the handshake completes");
         assert!(!client_connection.is_handshaking());
 
         // Each end learned who the other is — which is the whole point, since there is no
         // authority to ask.
-        assert_eq!(seen_by_client.ski(), Some(server.ski()));
-        assert_eq!(seen_by_server.ski(), Some(client.ski()));
         assert_eq!(peer_ski(&client_connection), Some(server.ski()));
         assert_eq!(peer_ski(&server_connection), Some(client.ski()));
     }
 
     #[test]
     fn ship_9_1_the_connection_is_tls_1_2() {
-        let (result, _, _, client_connection, _) =
-            handshake(&node("i:46925_u:A"), &node("i:46925_u:B"));
+        let (result, client_connection, _) = handshake(&node("i:46925_u:A"), &node("i:46925_u:B"));
         result.unwrap();
         assert_eq!(
             client_connection.protocol_version(),
@@ -544,7 +513,7 @@ mod tests {
     fn ship_9_2_records_stay_within_the_size_the_specification_allows() {
         assert_eq!(
             node("i:46925_u:A")
-                .client_config(&PeerObserver::new())
+                .client_config()
                 .unwrap()
                 .max_fragment_size,
             Some(RECOMMENDED_RECORD_SIZE)
@@ -561,17 +530,15 @@ mod tests {
         // A plain client config with no client certificate: the server has nothing to
         // identify the peer by, so it must abort rather than serve an anonymous node.
         let server = node("i:46925_u:HeatPump-1");
-        let seen = PeerObserver::new();
-        let config = server.server_config(&seen).unwrap();
+        let config = server.server_config().unwrap();
 
         let anonymous = ClientConfig::builder_with_provider(Arc::new(ship_provider()))
             .with_protocol_versions(&[&rustls::version::TLS12])
             .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AnySelfSigned::new(
-                PeerObserver::new(),
-                Arc::new(ship_provider()),
-            )))
+            .with_custom_certificate_verifier(Arc::new(AnySelfSigned::new(Arc::new(
+                ship_provider(),
+            ))))
             .with_no_client_auth();
 
         let mut client_connection = rustls::ClientConnection::new(
@@ -579,7 +546,7 @@ mod tests {
             ServerName::try_from("heatpump.local").unwrap(),
         )
         .unwrap();
-        let mut server_connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let mut server_connection = rustls::ServerConnection::new(config).unwrap();
 
         let mut refused = false;
         for _ in 0..16 {
@@ -606,15 +573,18 @@ mod tests {
             }
         }
         assert!(refused, "client authentication is mandatory");
-        assert_eq!(seen.ski(), None, "and nobody was identified");
+        assert_eq!(
+            peer_ski(&server_connection),
+            None,
+            "and nobody was identified"
+        );
     }
 
     #[test]
     fn application_data_crosses_the_connection() {
         let client = node("i:46925_u:A");
         let server = node("i:46925_u:B");
-        let (result, _, _, mut client_connection, mut server_connection) =
-            handshake(&client, &server);
+        let (result, mut client_connection, mut server_connection) = handshake(&client, &server);
         result.unwrap();
 
         client_connection

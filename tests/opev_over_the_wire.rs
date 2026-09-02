@@ -380,16 +380,18 @@ fn a_heartbeat_from_somebody_else_does_not_count() {
         1,
     );
     pair.now += Duration::from_secs(6);
+    let beat = eebus::model::CmdData::DeviceDiagnosisHeartbeatData(
+        eebus::model::DeviceDiagnosisHeartbeatData {
+            heartbeat_counter: Some(1),
+            ..Default::default()
+        },
+    );
     pair.ev.handle_event(
         &mut pair.car,
         &SpineEvent::DataNotified {
             feature: elsewhere,
-            data: eebus::model::CmdData::DeviceDiagnosisHeartbeatData(
-                eebus::model::DeviceDiagnosisHeartbeatData {
-                    heartbeat_counter: Some(1),
-                    ..Default::default()
-                },
-            ),
+            data: beat.clone(),
+            resolved: beat,
         },
         pair.now,
     );

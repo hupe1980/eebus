@@ -11,6 +11,42 @@ grid intact without disconnecting anyone: an Energy Guard tells a Controllable S
 much power it may draw, and the system honours it. **Limitation of Power Production** is
 the same thing for feed-in. Together they are the technical basis for §14a EnWG and §9 EEG.
 
+## The exchange, end to end
+
+Everything between a fresh connection and an acknowledged limit. The pre-scenario half is
+where most integrations go wrong: the binding grants the right to write, the subscription
+is what makes the heartbeat arrive, and §2.11 refuses to evaluate a limit that has no
+recent heartbeat behind it.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant EG as Energy Guard<br>(control box)
+  participant CS as Controllable System<br>(heat pump)
+
+  rect rgb(230, 245, 239)
+    Note over EG,CS: pre-scenario communication (§3.3)
+    EG->>CS: read nodeManagementDetailedDiscoveryData
+    CS-->>EG: entities, features, roles
+    EG->>CS: read nodeManagementUseCaseData
+    CS-->>EG: LPC · ControllableSystem · scenarios 1–4
+    EG->>CS: bindingRequest LoadControl
+    EG->>CS: bindingRequest DeviceConfiguration
+    CS-->>EG: granted
+    EG->>CS: subscriptionRequest DeviceDiagnosis
+    CS-->>EG: granted
+    CS->>EG: subscriptionRequest DeviceDiagnosis
+    EG-->>CS: granted
+  end
+
+  EG->>CS: notify deviceDiagnosisHeartbeatData
+  Note right of CS: §2.11 — a limit is evaluated only<br>with a heartbeat inside 60 s
+  EG->>CS: write loadControlLimitListData 4200 W
+  Note left of CS: the appliance decides:<br>can it follow this?
+  CS-->>EG: result errorNumber 0
+  Note over EG,CS: under §14a EnWG that acknowledgement<br>*is* the record the operator must produce
+```
+
 ## The four scenarios
 
 1. **Control the active power limit** — the limit itself, with an optional duration,
@@ -26,16 +62,42 @@ the same thing for feed-in. Together they are the technical basis for §14a EnWG
 A Controllable System is in exactly one of three states, and the transitions between them
 are the use case:
 
-```text
-        a limit arrives                 the limit expires
-   ┌──────────────────────▶ Limited ──────────────────────┐
-   │                          │                           ▼
-Normal ◀───────────────────────┘                       Normal
-   │                    guard heard from
-   │  guard silent for the heartbeat timeout
-   ▼
-FailsafeState  ── guard heard from again ──▶  Normal
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> init
+
+  init: init
+  note right of init
+    A restart begins limited by the
+    failsafe value, not unlimited.
+  end note
+
+  unlctrl: unlimited/controlled
+  limited: limited
+  failsafe: failsafe state
+  unlauto: unlimited/autonomous
+
+  init --> limited: limit written, heartbeat recent
+  init --> unlctrl: limit refused, or deactivated
+  init --> unlauto: nothing arrives within 120 s
+
+  unlctrl --> limited: an active limit
+  limited --> unlctrl: deactivated, or the duration runs out
+  limited --> failsafe: no heartbeat for 120 s
+  unlctrl --> failsafe: no heartbeat for 120 s
+  failsafe --> limited: heartbeat, then an active limit
+  failsafe --> unlctrl: heartbeat, then a refusal
+  failsafe --> unlauto: the failsafe duration elapses
+  unlauto --> limited: heartbeat, then an active limit
+  unlauto --> unlctrl: heartbeat, then a refusal
 ```
+
+The two `unlimited` states are not the same thing. **`unlimited/controlled`** means an
+Energy Guard is present and is currently asking for nothing — a refusal reaches it too,
+because a refusal proves a controller is there. **`unlimited/autonomous`** means nobody is
+in control and the device is running its own logic, which it may only do once the failsafe
+duration has elapsed.
 
 The failsafe is not optional and not a suggestion. §14a fixes 4.2 kW as the floor an
 installation must keep available, and the failsafe duration has a minimum so that a brief
@@ -79,6 +141,11 @@ rules are unforgiving. Here they live behind one call:
 ```rust
 guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 ```
+
+and nothing before it: the guard takes up a peer that announces the Controllable System by
+itself, because §2.11 requires the opening limit write as soon as the bindings settle,
+whether or not the grid is asking for anything. `require` does not depend on ordering
+either — a limit asked for before the peer is reachable is held, not discarded.
 
 Behind that line:
 

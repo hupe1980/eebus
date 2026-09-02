@@ -38,7 +38,8 @@ use eebus::ship::{ShipId, ShipTxtRecord};
 use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::tls::ShipTls;
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent,
+    self, ControllableSystem, ControllableSystemActor, ControllableSystemBuilder, CsConfig,
+    CsEvent, CsFeatures,
 };
 use eebus::usecases::lpc;
 use eebus::usecases::signals::Signals;
@@ -98,9 +99,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_device_type("HeatPump");
     let _mdns = simulator::announce(&record, ship_id.as_str(), bound.port())?;
 
-    let (engine, mut actor) = build(failsafe, nominal);
+    let (engine, actor) = build(failsafe, nominal);
     let mut hub = Hub::new(node, engine);
-    actor.install(hub.engine_mut(), Duration::ZERO);
+    let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
     report(&actor);
 
     // One task accepts; the hub drives everything that is already connected.
@@ -201,7 +202,7 @@ fn announce_decision(decision: &CsEvent) {
 }
 
 /// A heat pump with the four features LPC asks of a Controllable System.
-fn build(failsafe: f64, nominal: f64) -> (Engine, ControllableSystemActor) {
+fn build(failsafe: f64, nominal: f64) -> (Engine, ControllableSystemBuilder) {
     let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)
         .expect("a valid device address");
     device
@@ -210,6 +211,7 @@ fn build(failsafe: f64, nominal: f64) -> (Engine, ControllableSystemActor) {
                 .with_feature(limitation::load_control_feature(1))
                 .with_feature(limitation::device_configuration_feature(2))
                 .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::device_diagnosis_client_feature(5))
                 .with_feature(limitation::electrical_connection_feature(4)),
         )
         .expect("a fresh entity");
@@ -217,20 +219,24 @@ fn build(failsafe: f64, nominal: f64) -> (Engine, ControllableSystemActor) {
     let load_control = device.address_of(&[1], 1);
     let configuration = device.address_of(&[1], 2);
     let diagnosis = device.address_of(&[1], 3);
+    let diagnosis_client = device.address_of(&[1], 5);
     let electrical = device.address_of(&[1], 4);
 
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
 
-    let actor = ControllableSystemActor::new(
+    let actor = ControllableSystemActor::builder(
         ControllableSystem::new(
             CsConfig::new(failsafe, Duration::from_secs(2 * 3_600)).with_nominal_max(nominal),
             Duration::ZERO,
         ),
         lpc::DIRECTION,
-        load_control,
-        configuration,
-        diagnosis,
+        CsFeatures {
+            load_control,
+            device_configuration: configuration,
+            device_diagnosis: diagnosis,
+            device_diagnosis_client: diagnosis_client,
+        },
     )
     .with_electrical_connection(electrical);
     (engine, actor)

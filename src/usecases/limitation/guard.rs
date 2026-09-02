@@ -273,6 +273,13 @@ pub struct EnergyGuardActor {
     heartbeat: HeartbeatProducer,
 
     peers: Vec<Tracked>,
+    /// What the grid requires of a device this guard has not attached to yet.
+    ///
+    /// A requirement is a fact about the installation, not about how far the pre-scenario
+    /// exchange has got. Dropping one because the bindings had not settled would discard a
+    /// grid operator's instruction silently — which under §14a EnWG is the worst failure
+    /// this crate could have.
+    deferred: Vec<(AddressDevice, Option<LimitWrite>)>,
     audit: AuditLog,
 }
 
@@ -295,6 +302,7 @@ impl EnergyGuardActor {
             // the first one goes out immediately rather than a minute from now.
             heartbeat: HeartbeatProducer::new(now).due_at(now),
             peers: Vec::new(),
+            deferred: Vec::new(),
             audit: AuditLog::new(),
         }
     }
@@ -351,6 +359,11 @@ impl EnergyGuardActor {
         self.peers.retain(|t| t.peer.device != device);
 
         let mut tracked = Tracked::new(peer, now);
+        // Anything the grid asked for before this peer was reachable applies now.
+        if let Some(index) = self.deferred.iter().position(|(d, _)| d == &device) {
+            let (_, limit) = self.deferred.remove(index);
+            set_required(&mut tracked, limit, now);
+        }
         for feature in [
             tracked.peer.load_control.clone(),
             tracked.peer.device_configuration.clone(),
@@ -406,17 +419,37 @@ impl EnergyGuardActor {
     /// Passing [`None`] means "no limit is required", which is communicated as an
     /// explicit deactivation — and, per §2.13, only when the grid actually permits
     /// unlimited operation.
+    /// Order does not matter. A requirement set before the guard has attached to the
+    /// device — which is normal, since a grid operator does not wait for a binding to
+    /// settle — is held and applied the moment it does.
     pub fn require(&mut self, device: &AddressDevice, limit: Option<LimitWrite>, now: Duration) {
         if let Some(tracked) = self.peers.iter_mut().find(|t| &t.peer.device == device) {
             set_required(tracked, limit, now);
+            return;
         }
+        self.deferred.retain(|(d, _)| d != device);
+        self.deferred.push((device.clone(), limit));
     }
 
     /// Sets the same limit for every peer, which is what a grid-wide curtailment is.
+    ///
+    /// Unlike [`require`](Self::require) this names no device, so there is nothing to hold
+    /// for a peer that has not appeared: it applies to the peers attached now.
     pub fn require_all(&mut self, limit: Option<LimitWrite>, now: Duration) {
         for tracked in &mut self.peers {
             set_required(tracked, limit, now);
         }
+    }
+
+    /// What the grid requires of devices this guard has not attached to yet.
+    ///
+    /// Empty in a healthy installation. A device that stays here is one that was asked
+    /// for something and has never announced the Controllable System — worth surfacing,
+    /// because under §14a the operator is owed an answer either way.
+    pub fn deferred_requirements(
+        &self,
+    ) -> impl Iterator<Item = (&AddressDevice, Option<LimitWrite>)> {
+        self.deferred.iter().map(|(d, l)| (d, *l))
     }
 
     /// Writes the failsafe active power limit onto a peer ([LPC/LPP-021]).
@@ -539,8 +572,28 @@ impl EnergyGuardActor {
         now: Duration,
     ) -> Option<GuardEvent> {
         match event {
-            SpineEvent::DataNotified { feature, data }
-            | SpineEvent::ReplyReceived { feature, data } => {
+            // A peer that announces the Controllable System is taken up here rather than
+            // on request: §2.11 requires the opening limit write as soon as the bindings
+            // settle, whether or not the grid is asking for anything, so a guard that
+            // waited to be attached would leave a conformant appliance in `init`.
+            SpineEvent::DiscoveryUpdated { device } | SpineEvent::UseCasesUpdated { device } => {
+                if self.peers.iter().any(|t| &t.peer.device == device) {
+                    return None;
+                }
+                let peer = super::locate(engine.peer(device)?, self.direction)?;
+                self.attach(engine, peer, now);
+                None
+            }
+            SpineEvent::DataNotified {
+                feature,
+                resolved: data,
+                ..
+            }
+            | SpineEvent::ReplyReceived {
+                feature,
+                resolved: data,
+                ..
+            } => {
                 let index = self.peers.iter().position(|t| {
                     t.peer.device_diagnosis.as_ref() == Some(feature)
                         || &t.peer.load_control == feature

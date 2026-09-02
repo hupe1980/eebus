@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::ship::{DEFAULT_PATH, HandshakeConfig, Role, SUBPROTOCOL, Ski, Trust};
-use crate::tls::{PeerObserver, ShipTls};
+use crate::tls::{ShipTls, peer_ski};
 
 use super::connection::{ConnectionError, ShipConnection, check_subprotocol, run_handshake};
 
@@ -377,15 +377,16 @@ impl Node {
     /// serial bridge — and it is what [`connect`](Self::connect) does once it has a
     /// socket.
     pub async fn connect_over(&self, stream: TcpStream) -> Result<ShipConnection, ConnectionError> {
-        let observed = PeerObserver::new();
-        let connector = TlsConnector::from(Arc::new(self.tls.client_config(&observed)?));
+        let connector = TlsConnector::from(self.tls.client_config()?);
 
         // SHIP §9.5 requires SNI to be sent; a SHIP server is required to ignore it, so
         // any syntactically valid name serves.
         let server_name =
             rustls::pki_types::ServerName::try_from("ship.local").expect("a valid DNS name");
         let stream = connector.connect(server_name, stream).await?;
-        let peer = observed.ski().ok_or(ConnectionError::NoPeerIdentity)?;
+        // The certificate `rustls` kept is the peer's identity: SHIP trusts a Subject Key
+        // Identifier, not a name.
+        let peer = peer_ski(stream.get_ref().1).ok_or(ConnectionError::NoPeerIdentity)?;
 
         let mut request = alloc::format!("wss://ship.local{DEFAULT_PATH}")
             .into_client_request()
@@ -416,10 +417,9 @@ impl Node {
     /// Accepts one peer on an open socket.
     pub async fn accept(&self, stream: TcpStream) -> Result<ShipConnection, ConnectionError> {
         stream.set_nodelay(true)?;
-        let observed = PeerObserver::new();
-        let acceptor = TlsAcceptor::from(Arc::new(self.tls.server_config(&observed)?));
+        let acceptor = TlsAcceptor::from(self.tls.server_config()?);
         let stream = acceptor.accept(stream).await?;
-        let peer = observed.ski().ok_or(ConnectionError::NoPeerIdentity)?;
+        let peer = peer_ski(stream.get_ref().1).ok_or(ConnectionError::NoPeerIdentity)?;
 
         let socket = tokio_tungstenite::accept_hdr_async_with_config(
             tokio_rustls::TlsStream::Server(stream),

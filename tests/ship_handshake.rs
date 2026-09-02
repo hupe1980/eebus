@@ -13,7 +13,7 @@ use eebus::ship::{
     ConnectionHelloPhase, ControlMessage, EndMessage, Event, Handshake, HandshakeConfig,
     MessageProtocolFormat, MessageProtocolFormats, MessageProtocolHandshake,
     MessageProtocolHandshakeVersion, Phase, PinRequirement, PinState, ProtocolHandshakeType, Role,
-    ShipMessage, Trust,
+    ShipMessage, ShipVersion, Trust,
 };
 
 /// Two handshakes and a virtual clock.
@@ -101,9 +101,11 @@ fn tc_ship_role_001_002_handshake_completes_in_both_roles() {
     assert!(link.a.is_ready_for_data() && link.b.is_ready_for_data());
 
     // SHIP 1.1.0 §13.4.4.2.3 has the client announce major 1, minor 1.
-    let ((major, minor), format) = link.a.negotiated().cloned().expect("negotiated");
-    assert_eq!((major, minor), (1, 1));
+    let (version, format) = link.a.negotiated().cloned().expect("negotiated");
+    assert_eq!(version, ShipVersion::V1_1);
+    assert_eq!(version.to_string(), "1.1");
     assert_eq!(format, "JSON-UTF8");
+    assert_eq!(link.a.ship_version(), Some(ShipVersion::V1_1));
     assert_eq!(link.b.negotiated(), link.a.negotiated());
 
     assert!(
@@ -123,7 +125,7 @@ fn tc_ship_role_001_002_handshake_completes_in_both_roles() {
 #[test]
 fn version_negotiation_falls_back_to_the_older_peer() {
     let legacy = HandshakeConfig {
-        max_version: (1, 0),
+        max_version: ShipVersion::V1_0,
         ..HandshakeConfig::default()
     };
     let mut link = Link::with_configs(
@@ -134,8 +136,12 @@ fn version_negotiation_falls_back_to_the_older_peer() {
     );
     link.pump();
 
-    assert_eq!(link.a.negotiated().map(|(v, _)| *v), Some((1, 0)));
-    assert_eq!(link.b.negotiated().map(|(v, _)| *v), Some((1, 0)));
+    assert_eq!(link.a.ship_version(), Some(ShipVersion::V1_0));
+    assert_eq!(link.b.ship_version(), Some(ShipVersion::V1_0));
+    assert!(
+        ShipVersion::V1_0 < ShipVersion::V1_1,
+        "versions order the way versions order"
+    );
     assert_eq!(link.a.phase(), Phase::DataExchange);
 }
 
@@ -1041,4 +1047,59 @@ fn run(a: &mut Handshake, b: &mut Handshake, now: &mut Duration) {
         *now += Duration::from_millis(1);
     }
     panic!("the handshake did not settle");
+}
+
+/// No secret this crate holds reaches a log through `{:?}`.
+///
+/// Three types carry key material — a node's private key, a SHIP PIN and a pairing
+/// secret — and a derived `Debug` puts each of them in the clear the first time anybody
+/// prints the value that contains it. A PIN's whole defence is the escalating penalty of
+/// SHIP §13.4.4.3.4, which is worth nothing once the PIN is in a log; a pairing secret's is
+/// that it was printed on a sticker in one building.
+///
+/// This is a property rather than a convention, because a convention is exactly what
+/// failed: `ShipQr` documented its secrets as redacted for as long as they were not.
+#[test]
+fn no_secret_reaches_a_log_through_debug() {
+    use eebus::ship::{Handshake, HandshakeConfig, PinRequirement, Role, ShipQr, Trust};
+
+    const PIN: &str = "1A2B3C4D";
+    const PEER_PIN: &str = "9F8E7D6C";
+    const SECRET: &str = "0F1E2D3C4B5A69788796A5B4C3D2E1F0";
+
+    let config = HandshakeConfig {
+        pin: PinRequirement::Required(PIN.into()),
+        peer_pin: Some(PEER_PIN.into()),
+        ..HandshakeConfig::default()
+    };
+    let handshake = Handshake::new(Role::Client, config.clone(), Trust::Trusted, Duration::ZERO);
+    let qr: ShipQr = format!(
+        "SHIP;SKI:5555AAAAFFFF1111CCCC3333EEEEDDDD99992222;ID:i:1_u:x;\
+         PIN:{PIN};SPSEC:{SECRET};ENDSHIP;"
+    )
+    .parse()
+    .expect("a valid code");
+
+    for (what, printed) in [
+        ("the handshake config", format!("{config:?}")),
+        ("the handshake itself", format!("{handshake:?}")),
+        ("a scanned QR code", format!("{qr:?}")),
+        ("the pairing requirement", format!("{:?}", config.pin)),
+    ] {
+        for secret in [PIN, PEER_PIN, SECRET] {
+            assert!(
+                !printed.contains(secret),
+                "{what} printed `{secret}`: {printed}"
+            );
+        }
+        assert!(
+            printed.contains("<redacted>"),
+            "{what} says nothing about what it left out: {printed}"
+        );
+    }
+
+    // And the values are still readable through the API, which is the point of redacting
+    // the *printing* rather than the storage.
+    assert_eq!(config.peer_pin.as_deref(), Some(PEER_PIN));
+    assert_eq!(qr.pairing_secret.as_deref(), Some(SECRET));
 }

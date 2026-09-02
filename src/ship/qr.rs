@@ -41,7 +41,7 @@ use super::{DeviceCategory, DiscoveryError, ShipId, Ski};
 /// assert_eq!(qr.brand.as_deref(), Some("ExampleBrand"));
 /// assert_eq!(qr.nominal_power, Some((0, 11_000)));
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ShipQr {
     /// The `secp256r1` Subject Key Identifier. Mandatory (`SRIP-310/4`).
     pub ski: Ski,
@@ -78,8 +78,9 @@ pub struct ShipQr {
     pub certificate_fingerprint: Option<String>,
     /// The pairing secret (`SPSEC`) of the SHIP Pairing Service.
     ///
-    /// This is key material: it is redacted from [`Debug`] output by
-    /// [`ShipQr::redacted`] and should not be logged.
+    /// This is key material, and so is [`pin`](Self::pin). Both are redacted by this
+    /// type's [`Debug`], so `{:?}` on a scanned code is safe; [`ShipQr::redacted`] is for
+    /// handing a sanitised *value* onward.
     pub pairing_secret: Option<String>,
     /// Keys this version does not know, kept in the order they appeared.
     pub unknown: Vec<(String, String)>,
@@ -255,7 +256,12 @@ impl ShipQr {
         out
     }
 
-    /// A copy with the pairing secret and PIN removed, safe to log.
+    /// A copy with the pairing secret and PIN removed.
+    ///
+    /// [`Debug`] already redacts both, so this is for the other case: handing a scanned
+    /// code onward — to an event, a diagnostic payload, a support bundle — with the key
+    /// material taken out. The result is not a valid QR payload any more, and
+    /// [`to_payload`](Self::to_payload) on it would produce a code that pairs with nothing.
     #[must_use]
     pub fn redacted(&self) -> Self {
         Self {
@@ -266,6 +272,39 @@ impl ShipQr {
                 .map(|_| "<redacted>".to_owned()),
             ..self.clone()
         }
+    }
+}
+
+/// Prints everything except the two fields that are key material.
+///
+/// A QR code is mostly public — that is the point of printing it on a sticker — but the
+/// `PIN` and `SPSEC` fields are not, and a derived `Debug` would put both in the clear the
+/// first time anybody logs a scan. Redacting here rather than in a method somebody has to
+/// remember is what makes every value that carries a code safe to print.
+impl fmt::Debug for ShipQr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const REDACTED: &str = "<redacted>";
+        f.debug_struct("ShipQr")
+            .field("ski", &self.ski)
+            .field("pin", &self.pin.as_ref().map(|_| REDACTED))
+            .field("id", &self.id)
+            .field("brand", &self.brand)
+            .field("device_type", &self.device_type)
+            .field("model", &self.model)
+            .field("serial", &self.serial)
+            .field("categories", &self.categories)
+            .field("nominal_power", &self.nominal_power)
+            .field("brainpool_p256r1_ski", &self.brainpool_p256r1_ski)
+            .field("brainpool_p384r1_ski", &self.brainpool_p384r1_ski)
+            .field("public_key", &self.public_key)
+            .field("certificate_url", &self.certificate_url)
+            .field("certificate_fingerprint", &self.certificate_fingerprint)
+            .field(
+                "pairing_secret",
+                &self.pairing_secret.as_ref().map(|_| REDACTED),
+            )
+            .field("unknown", &self.unknown)
+            .finish()
     }
 }
 
@@ -602,5 +641,40 @@ mod tests {
         let safe = qr.redacted();
         assert_eq!(safe.pin.as_deref(), Some("<redacted>"));
         assert_eq!(safe.ski, qr.ski, "identity is not secret");
+    }
+
+    /// `{:?}` on a scanned code does not print the two fields that are key material.
+    ///
+    /// The sticker is public and so is nearly everything on it; the PIN and the pairing
+    /// secret are the exceptions, and a derived `Debug` puts both in a log the first time
+    /// anybody prints a scan. Redacting in a method somebody has to call is a rule, and
+    /// this is a property.
+    #[test]
+    fn debug_does_not_print_the_pin_or_the_pairing_secret() {
+        let text = "SHIP;SKI:5555AAAAFFFF1111CCCC3333EEEEDDDD99992222;ID:i:1_u:x;\
+                    PIN:5555AAAAFF;SPSEC:0F1E2D3C4B5A69788796A5B4C3D2E1F0;ENDSHIP;";
+        let qr: ShipQr = text.parse().expect("the example parses");
+        assert_eq!(qr.pin.as_deref(), Some("5555AAAAFF"), "still readable");
+        assert_eq!(
+            qr.pairing_secret.as_deref(),
+            Some("0F1E2D3C4B5A69788796A5B4C3D2E1F0")
+        );
+
+        let printed = alloc::format!("{qr:?}");
+        assert!(
+            !printed.contains("5555AAAAFF\""),
+            "the PIN reached the log: {printed}"
+        );
+        assert!(
+            !printed.contains("0F1E2D3C4B5A69788796A5B4C3D2E1F0"),
+            "the pairing secret reached the log: {printed}"
+        );
+        assert_eq!(printed.matches("<redacted>").count(), 2);
+        assert!(
+            printed
+                .to_ascii_uppercase()
+                .contains("5555AAAAFFFF1111CCCC3333EEEEDDDD99992222"),
+            "and the SKI, which is not secret, is still there: {printed}"
+        );
     }
 }

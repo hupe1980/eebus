@@ -8,8 +8,11 @@
 use std::path::{Path, PathBuf};
 
 mod codegen;
+mod devices;
 mod fixtures;
+mod floats;
 mod naming;
+mod rfe;
 mod xsd;
 
 fn main() {
@@ -35,8 +38,42 @@ fn main() {
                 }
             }
         }
+        Some("devices") => {
+            let root = repo_root();
+            let Some(corpus) = args.next() else {
+                eprintln!("usage: cargo xtask devices <path-to-enbility/devices checkout>");
+                std::process::exit(2);
+            };
+            match devices::run(&root, std::path::Path::new(&corpus)) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("rfe-table") => {
+            let root = repo_root();
+            match rfe::run(&root) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("check-floats") => {
+            let root = repo_root();
+            match floats::run(&root) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         other => {
-            eprintln!("usage: cargo xtask <codegen|fixtures>");
+            eprintln!("usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats>");
             if let Some(o) = other {
                 eprintln!("unknown task: {o}");
             }

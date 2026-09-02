@@ -148,6 +148,8 @@ compile_error!(
 #[cfg_attr(docsrs, doc(cfg(feature = "cert")))]
 pub mod cert;
 pub mod codec;
+#[cfg(feature = "conformance")]
+#[cfg_attr(docsrs, doc(cfg(feature = "conformance")))]
 pub mod conformance;
 #[cfg(feature = "mdns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]

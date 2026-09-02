@@ -74,6 +74,12 @@ pub fn detailed_discovery(device: &LocalDevice) -> NodeManagementDetailedDiscove
                     feature_type: Some(feature.feature_type().clone()),
                     role: Some(feature.role()),
                     supported_function: Some(device.function_properties(feature)),
+                    // §5.2.5.3: a feature that may take longer than the ten-second default
+                    // says so here, rather than leaving a client to call it unresponsive.
+                    max_response_delay: feature
+                        .max_response_delay()
+                        .map(crate::model::format_iso8601_duration)
+                        .map(crate::model::MaxResponseDelay::from),
                     ..Default::default()
                 }),
             });
@@ -254,6 +260,13 @@ pub struct RemoteFeature {
     pub role: Role,
     /// The functions it declares, and what may be done with each.
     pub functions: Vec<FunctionProperty>,
+    /// How long this feature says it may take to answer, if it said.
+    ///
+    /// §5.2.5.3 lets a server that needs longer than the ten-second default announce it
+    /// here. [`Engine`](super::Engine) waits this long for anything it sends to this
+    /// feature: a client that guesses instead reports a conformant peer as unresponsive,
+    /// which under the implementation guide §2.6.2 is what calls for a staggered retry.
+    pub max_response_delay: Option<core::time::Duration>,
 }
 
 impl RemoteFeature {
@@ -317,8 +330,13 @@ impl RemoteEntity {
 /// One use case a peer plays, on one of its entities.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteUseCase {
-    /// The feature the use case is anchored on.
-    pub address: FeatureAddress,
+    /// The feature the use case is anchored on, if the peer named one.
+    ///
+    /// **Absent is normal, not an error.** SPINE 1.1.1's `useCaseInformation` has no
+    /// address element at all, and `eebus-go` — and therefore evcc — leaves it out. It
+    /// means "somewhere on this device", and [`RemoteDevice::feature_for`] resolves it
+    /// from the features instead.
+    pub address: Option<FeatureAddress>,
     /// The actor the peer plays.
     pub actor: UseCaseActor,
     /// The use case's name.
@@ -430,6 +448,10 @@ impl RemoteDevice {
                 feature_type: feature_type.clone(),
                 role,
                 functions: description.supported_function.clone().unwrap_or_default(),
+                max_response_delay: description
+                    .max_response_delay
+                    .as_ref()
+                    .and_then(|d| crate::model::parse_iso8601_duration(d.as_str())),
             };
 
             match entities.iter_mut().find(|e| e.address == path) {
@@ -449,7 +471,10 @@ impl RemoteDevice {
     pub fn apply_use_case_data(&mut self, data: &NodeManagementUseCaseData) {
         let mut out = Vec::new();
         for information in data.use_case_information.iter().flatten() {
-            let (Some(address), Some(actor)) = (&information.address, &information.actor) else {
+            // The address is optional on the wire and absent from every SPINE 1.1.1 peer,
+            // so only the actor is required here: dropping the entry for want of an
+            // address discards every use case such a peer plays.
+            let Some(actor) = &information.actor else {
                 continue;
             };
             for support in information.use_case_support.iter().flatten() {
@@ -457,7 +482,7 @@ impl RemoteDevice {
                     continue;
                 };
                 out.push(RemoteUseCase {
-                    address: address.clone(),
+                    address: information.address.clone(),
                     actor: actor.clone(),
                     name: name.clone(),
                     version: support.use_case_version.clone(),
@@ -478,6 +503,18 @@ impl RemoteDevice {
         self.use_cases = out;
     }
 
+    /// Finds one of this peer's features by its full address.
+    ///
+    /// The address a use case holds is a `FeatureAddress`; this is how it gets back to
+    /// what discovery said about that feature, such as its `maxResponseDelay`.
+    pub fn feature_at(&self, address: &FeatureAddress) -> Option<&RemoteFeature> {
+        let path = super::address::entity_path(address);
+        self.entity(&path)?
+            .features
+            .iter()
+            .find(|f| f.address.feature == address.feature)
+    }
+
     /// Finds an entity by its address path.
     pub fn entity(&self, address: &[u32]) -> Option<&RemoteEntity> {
         self.entities.iter().find(|e| e.address == address)
@@ -494,14 +531,27 @@ impl RemoteDevice {
     ///
     /// The use-case implementation guide §3.3 requires an actor's client and server
     /// features to live on the same entity as the use case itself, which is what makes
-    /// this lookup well defined.
+    /// this lookup well defined — *when the peer says which entity that is*.
+    ///
+    /// When it does not — which every SPINE 1.1.1 peer and `eebus-go` do — the actor is
+    /// somewhere on the device and the feature is what says where. One entity carrying a
+    /// feature of that type and role resolves it; two is ambiguous, and a guess would bind
+    /// the wrong entity, so the answer is [`None`].
     pub fn feature_for(
         &self,
         use_case: &RemoteUseCase,
         feature_type: &FeatureType,
         role: Role,
     ) -> Option<&RemoteFeature> {
-        let path = super::address::entity_path(&use_case.address);
+        let Some(address) = &use_case.address else {
+            let mut candidates = self
+                .entities
+                .iter()
+                .filter_map(|entity| entity.feature(feature_type, role));
+            let only = candidates.next()?;
+            return candidates.next().is_none().then_some(only);
+        };
+        let path = super::address::entity_path(address);
         self.entity(&path)?.feature(feature_type, role)
     }
 

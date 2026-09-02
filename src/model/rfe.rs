@@ -303,34 +303,53 @@ where
     }
 }
 
-/// Deletes elements *within* entries: the entries stay, the addressed elements go.
-///
-/// This is the shape LPC §3.4.1.4 uses to withdraw a limit's `endTime` while writing a
-/// new value in the same command: deleting the whole entry would drop the limit.
-pub fn delete_elements<L, E>(stored: &mut L, selector: impl Fn(&L::Item) -> bool, elements: &E)
+/// Which entries a delete command addresses when it carries no selectors filter: the
+/// ones its payload identifies, or — when the payload names none — all of them.
+pub fn addresses_named<I: Identified>(named: &[I]) -> impl Fn(&I) -> bool + '_ {
+    move |item| named.is_empty() || named.iter().any(|target| target.same_entry(item))
+}
+
+/// Which entries a selectors filter addresses.
+pub fn addresses_selected<'a, I, S>(selectors: &'a S) -> impl Fn(&I) -> bool + 'a
+where
+    S: Selectors<Target = I>,
+{
+    move |item| selectors.matches(item)
+}
+
+/// Removes the entries `addressed` picks.
+pub fn delete_addressed<L>(stored: &mut L, addressed: impl Fn(&L::Item) -> bool)
 where
     L: ListData,
-    E: Elements<Target = L::Item>,
 {
     if let Some(entries) = stored.entries_mut() {
-        for entry in entries.iter_mut().filter(|e| selector(e)) {
-            elements.clear_from(entry);
-        }
+        entries.retain(|entry| !addressed(entry));
     }
 }
 
-/// Selects the entries a partial read should answer with.
-pub fn select<'a, L, S>(stored: &'a L, selectors: &S) -> Vec<&'a L::Item>
+/// Deletes elements *within* the entries `addressed` picks: the entries stay, the
+/// elements the filter names go.
+///
+/// This is the shape LPC UC TS §3.4.1.4 uses to withdraw a limit's `endTime` while
+/// writing a new value in the same command — deleting the whole entry would drop the
+/// limit, which is a curtailment lifted rather than one shortened.
+///
+/// Identifiers survive whether or not the filter names them, for the same reason they
+/// survive a partial read: an entry that can no longer be told from its siblings is not
+/// a smaller entry, it is a lost one (use-case implementation guide §3.1).
+pub fn clear_addressed<L, E>(stored: &mut L, addressed: impl Fn(&L::Item) -> bool, elements: &E)
 where
     L: ListData,
-    S: Selectors<Target = L::Item>,
+    L::Item: Identified + Clone,
+    E: Elements<Target = L::Item>,
 {
-    stored
-        .entries()
-        .unwrap_or_default()
-        .iter()
-        .filter(|item| selectors.matches(item))
-        .collect()
+    if let Some(entries) = stored.entries_mut() {
+        for entry in entries.iter_mut().filter(|e| addressed(e)) {
+            let identity = entry.clone();
+            elements.clear_from(entry);
+            entry.restore_identity(&identity);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -489,7 +508,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        delete_elements(
+        clear_addressed(
             &mut list,
             |e| e.limit_id == Some(LoadControlLimitId(1)),
             &elements,
@@ -519,7 +538,7 @@ mod tests {
             time_period: Some(TimePeriodElements::default()),
             ..Default::default()
         };
-        delete_elements(&mut list, |_| true, &elements);
+        clear_addressed(&mut list, |_| true, &elements);
         assert!(
             list.load_control_limit_data.as_ref().unwrap()[0]
                 .time_period
@@ -533,12 +552,70 @@ mod tests {
         let selector = LoadControlLimitListDataSelectors {
             limit_id: Some(LoadControlLimitId(2)),
         };
-        let picked = select(&list, &selector);
+        let picked = restrict_list_by_selectors(&list, &selector).expect("a matchable selector");
+        let picked = picked.load_control_limit_data.expect("entries");
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].limit_id, Some(LoadControlLimitId(2)));
 
-        let all = select(&list, &LoadControlLimitListDataSelectors::default());
-        assert_eq!(all.len(), 2, "an empty selector selects everything");
+        let all = restrict_list_by_selectors(&list, &LoadControlLimitListDataSelectors::default())
+            .expect("a matchable selector");
+        assert_eq!(
+            all.load_control_limit_data.expect("entries").len(),
+            2,
+            "an empty selector selects everything"
+        );
+    }
+
+    /// SPINE §5.3.4.3: a delete carries the same filters a read does.
+    ///
+    /// The selectors say which entries; the elements say which parts of them. LPC UC TS
+    /// §3.4.1.4 uses the second to withdraw a limit's `endTime` — removing the whole
+    /// entry instead lifts the curtailment rather than shortening it.
+    #[test]
+    fn a_delete_filter_addresses_entries_and_elements_separately() {
+        let elements = LoadControlLimitDataElements {
+            time_period: Some(TimePeriodElements {
+                end_time: Some(crate::codec::ElementTag),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let only_two = LoadControlLimitListDataSelectors {
+            limit_id: Some(LoadControlLimitId(2)),
+        };
+
+        let mut list = stored();
+        for entry in list.load_control_limit_data.as_mut().unwrap() {
+            entry.time_period = Some(TimePeriod {
+                start_time: Some("2026-08-30T10:00:00Z".into()),
+                end_time: Some("2026-08-30T11:00:00Z".into()),
+            });
+        }
+
+        // Selectors alone: the entry goes.
+        let mut entries_only = list.clone();
+        delete_addressed(&mut entries_only, addresses_selected(&only_two));
+        let kept = entries_only.load_control_limit_data.expect("entries");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].limit_id, Some(LoadControlLimitId(1)));
+
+        // Selectors and elements: the entry stays and the element goes, from that entry
+        // and no other.
+        clear_addressed(&mut list, addresses_selected(&only_two), &elements);
+        let kept = list.load_control_limit_data.expect("entries");
+        assert_eq!(kept.len(), 2, "no entry was removed");
+        let two = kept
+            .iter()
+            .find(|e| e.limit_id == Some(LoadControlLimitId(2)))
+            .expect("the addressed entry");
+        assert!(two.time_period.as_ref().unwrap().end_time.is_none());
+        assert!(two.time_period.as_ref().unwrap().start_time.is_some());
+        assert_eq!(two.limit_id, Some(LoadControlLimitId(2)), "identity kept");
+        let one = kept
+            .iter()
+            .find(|e| e.limit_id == Some(LoadControlLimitId(1)))
+            .expect("the untouched entry");
+        assert!(one.time_period.as_ref().unwrap().end_time.is_some());
     }
 
     #[test]

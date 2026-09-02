@@ -33,18 +33,27 @@
 //!
 //! prints the table.
 
+// The catalogue is optional — a firmware build leaves tens of kilobytes of test-case
+// descriptions out — so the suite that measures against it is optional too.
+#![cfg(feature = "conformance")]
+
 mod common;
 
 use core::time::Duration;
 
 use eebus::conformance::{self, Coverage};
+use eebus::model::{
+    ElectricalConnectionPhaseName as Phase, EntityType, Function, MeasurementValueState,
+};
+use eebus::usecases::descriptor::UseCaseDescriptor;
 use eebus::usecases::descriptor::{actors, names};
 use eebus::usecases::limitation::{
     self, ControllableSystem, CsConfig, EffectiveLimit, LimitWrite, LimitationState, LocalDecision,
     NackReason, NominalMax, RejectReason, WriteOutcome,
 };
+use eebus::usecases::monitoring::{Measurand, MonitoredUnit, Naming, Quantity, ReadingState};
 use eebus::usecases::signals::Signals;
-use eebus::usecases::{lpc, lpp};
+use eebus::usecases::{lpc, lpp, mgcp, mpc};
 
 use common::Pair;
 
@@ -273,9 +282,11 @@ fn atc_lpc_com_pt_egmessages_001() {
     let mut pair = Pair::new();
     pair.commission();
 
-    // CF_CS_UnlCntrl: the opening deactivation every Energy Guard sends.
+    // CF_CS_UnlCntrl: the opening deactivation every Energy Guard sends. Nothing here
+    // asks for it — implementation guide §2.11 requires the guard to send it as soon as
+    // the bindings settle, and it attaches itself to a peer that announces the
+    // Controllable System, so the pre-condition establishes itself.
     let device = pair.device();
-    pair.guard.require(&device, None, pair.now);
     pair.advance(secs(1));
     assert_eq!(
         pair.pump.system().state(),
@@ -296,7 +307,8 @@ fn atc_lpc_com_pt_egmessages_001() {
     assert_eq!(
         pair.accepted().len(),
         2,
-        "the opening deactivation, and the limit that answers the stimulus"
+        "the opening deactivation the guard sends itself, and the limit that answers the \
+         stimulus"
     );
 }
 
@@ -1315,6 +1327,573 @@ const INS_CLAIMS: &[(&str, &str, Claim)] = &[
     ("INS2", "CSTransition1_001", Claim::Tested),
 ];
 
+// ---- MPC and MGCP: the measurement catalogue ----------------------------------
+//
+// The 101 abstract test cases of these two specifications are far more regular than
+// LPC's: every one of them is "this measurand, published or resolved, normal or not".
+// Written out as 101 functions they would be 101 copies of four shapes, and the copy
+// that drifted would be the one nobody read. So they are a table — one row per `ATC_…`
+// identifier, which is the same granularity a laboratory reports at — driven through the
+// same in-memory pair the ordinary monitoring tests use.
+//
+// The `NT_` rows are the interesting half. [MPC-003] says a value whose `valueState` is
+// `error` is to be ignored *whatever number came with it*, so what the row asserts is not
+// that a number is wrong but that no number is offered at all.
+
+/// What one measurement abstract test case asks of the implementation.
+#[derive(Clone, Debug)]
+enum Check {
+    /// The unit publishes this measurand, and it reaches the peer.
+    Publishes(Measurand, f64),
+    /// The appliance resolves the measurand to this value, with state `normal`.
+    Reads(Measurand, f64),
+    /// The value arrives flagged `error`, and the appliance offers no number for it.
+    Refuses(Measurand),
+    /// A poll — a read of the measurement list — is answered.
+    Polling,
+    /// A change reaches a subscriber as a notification, without being asked for.
+    Notification,
+    /// MGCP scenario 1's PV curtailment factor, which is a configuration key rather than
+    /// a measurement and so is the one row that does not go through the measurand layer.
+    Curtailment(f64),
+}
+
+const V_PN: f64 = 230.0;
+const V_PP: f64 = 400.0;
+
+/// Every measurand the two specifications name, so one unit can serve every row.
+fn all_measurands() -> Vec<Measurand> {
+    let mut all = vec![
+        Measurand::total_power(),
+        Measurand::total(Quantity::EnergyConsumed),
+        Measurand::total(Quantity::EnergyProduced),
+        Measurand::total(Quantity::Frequency),
+    ];
+    for phase in [Phase::A, Phase::B, Phase::C] {
+        all.push(Measurand::on(Quantity::Power, phase.clone()));
+        all.push(Measurand::on(Quantity::Current, phase.clone()));
+        all.push(Measurand::on(Quantity::Voltage, phase));
+    }
+    for phase in [Phase::Ab, Phase::Bc, Phase::Ac] {
+        all.push(Measurand::on(Quantity::Voltage, phase));
+    }
+    all
+}
+
+/// A monitored unit measuring everything, and the appliance reading it.
+fn measurement_pair(
+    entity: EntityType,
+    server: &'static UseCaseDescriptor,
+    client: &'static UseCaseDescriptor,
+    scenarios: &[u32],
+    naming: Option<Naming>,
+    curtailment: bool,
+) -> common::MonitoringPair {
+    let mut unit = MonitoredUnit::new(1);
+    if let Some(naming) = naming {
+        unit = unit.naming(naming);
+    }
+    for measurand in all_measurands() {
+        unit = unit.with(measurand);
+    }
+    let mut pair =
+        common::MonitoringPair::build_with(unit, entity, server, client, scenarios, curtailment);
+    pair.commission();
+    pair
+}
+
+fn mpc_pair() -> common::MonitoringPair {
+    measurement_pair(
+        EntityType::HeatPumpAppliance,
+        &mpc::MONITORED_UNIT,
+        &mpc::MONITORING_APPLIANCE,
+        &[1, 2, 3, 4, 5],
+        None,
+        false,
+    )
+}
+
+fn mgcp_pair() -> common::MonitoringPair {
+    measurement_pair(
+        EntityType::GridConnectionPointOfPremises,
+        &mgcp::GRID_CONNECTION_POINT,
+        &mgcp::MONITORING_APPLIANCE,
+        &[1, 2, 3, 4, 5, 6, 7],
+        Some(mgcp::NAMING),
+        true,
+    )
+}
+
+/// Runs one row and returns the reason it failed, if it did.
+fn run_check(pair: &mut common::MonitoringPair, check: Check) -> Result<(), String> {
+    match check {
+        Check::Publishes(measurand, value) => {
+            pair.report(&measurand, value);
+            if pair.unit.value(&measurand) != Some(value) {
+                return Err(format!("the unit did not hold {measurand:?}"));
+            }
+            // It reaching the peer is what "sends" means; the unit holding it is not.
+            match pair.readings.get(&measurand).and_then(|r| r.usable()) {
+                Some(seen) if seen == value => Ok(()),
+                other => Err(format!("the peer saw {other:?}, not {value}")),
+            }
+        }
+        Check::Reads(measurand, value) => {
+            pair.report(&measurand, value);
+            let reading = pair
+                .readings
+                .get(&measurand)
+                .ok_or_else(|| format!("no reading for {measurand:?}"))?;
+            if reading.state != ReadingState::Normal {
+                return Err(format!("state was {:?}, not normal", reading.state));
+            }
+            match reading.usable() {
+                Some(seen) if seen == value => Ok(()),
+                other => Err(format!("resolved to {other:?}, not {value}")),
+            }
+        }
+        Check::Refuses(measurand) => {
+            pair.report(&measurand, 1_234.0);
+            pair.unit
+                .set_state(&measurand, MeasurementValueState::Error);
+            let feature = pair.unit_feature(2);
+            pair.unit.notify(&mut pair.unit_engine, &feature, pair.now);
+            pair.exchange();
+            let reading = pair
+                .readings
+                .get(&measurand)
+                .ok_or_else(|| format!("no reading for {measurand:?}"))?;
+            if reading.state != ReadingState::Error {
+                return Err(format!("state was {:?}, not error", reading.state));
+            }
+            match reading.usable() {
+                None => Ok(()),
+                Some(v) => Err(format!("offered {v} for a failed measurement — [MPC-003]")),
+            }
+        }
+        Check::Polling => {
+            // A read of the measurement list is answered with the values, without a
+            // subscription having been granted.
+            let client = pair.manager_client();
+            let measurement = pair.unit_feature(2);
+            pair.report(&Measurand::total_power(), 2_300.0);
+            pair.manager.read(
+                &measurement,
+                &client,
+                Function::MeasurementListData,
+                pair.now,
+            );
+            pair.exchange();
+            match pair.readings.total_power() {
+                Some(2_300.0) => Ok(()),
+                other => Err(format!("a poll answered {other:?}")),
+            }
+        }
+        Check::Notification => {
+            // Nothing is read. The value changes and the change arrives on its own,
+            // which is what the subscription granted at commissioning is for.
+            let before = pair.readings.total_power();
+            pair.report(&Measurand::total_power(), 4_242.0);
+            if before == Some(4_242.0) {
+                return Err("the value did not change, so nothing was proved".into());
+            }
+            match pair.readings.total_power() {
+                Some(4_242.0) => Ok(()),
+                other => Err(format!("the notification carried {other:?}")),
+            }
+        }
+        Check::Curtailment(percent) => {
+            pair.report_curtailment(percent);
+            match pair.curtailment() {
+                Some(seen) if (seen - percent).abs() < f64::EPSILON => Ok(()),
+                other => Err(format!("the factor read back as {other:?}, not {percent}")),
+            }
+        }
+    }
+}
+
+/// The 54 abstract test cases of MPC 1.0.2, one row each.
+fn mpc_catalogue() -> Vec<(&'static str, Check)> {
+    use Check::*;
+    let p = |q, ph| Measurand::on(q, ph);
+    let mut rows: Vec<(&'static str, Check)> = vec![
+        // --- Monitored Unit: it publishes ---
+        ("ATC_MPC_COM_PT_MUPolling_001", Polling),
+        ("ATC_MPC_COM_PT_MUNotification_001", Notification),
+        (
+            "ATC_MPC_SCE1_PT_MUTotalActivePower_001",
+            Publishes(Measurand::total_power(), 2_300.0),
+        ),
+        (
+            "ATC_MPC_SCE1_PT_MUPhaseActivePower_001",
+            Publishes(p(Quantity::Power, Phase::A), 800.0),
+        ),
+        (
+            "ATC_MPC_SCE1_PT_MUPhaseActivePower_002",
+            Publishes(p(Quantity::Power, Phase::B), 760.0),
+        ),
+        (
+            "ATC_MPC_SCE1_PT_MUPhaseActivePower_003",
+            Publishes(p(Quantity::Power, Phase::C), 740.0),
+        ),
+        // Two rows each: the specification drives the value up and then down, so the
+        // second is the same measurand at a different value rather than a second point.
+        (
+            "ATC_MPC_SCE2_PT_MUTotalConsumedEnergy_001",
+            Publishes(Measurand::total(Quantity::EnergyConsumed), 12_500.0),
+        ),
+        (
+            "ATC_MPC_SCE2_PT_MUTotalConsumedEnergy_002",
+            Publishes(Measurand::total(Quantity::EnergyConsumed), 13_000.0),
+        ),
+        (
+            "ATC_MPC_SCE2_PT_MUTotalProducedEnergy_001",
+            Publishes(Measurand::total(Quantity::EnergyProduced), 4_100.0),
+        ),
+        (
+            "ATC_MPC_SCE2_PT_MUTotalProducedEnergy_002",
+            Publishes(Measurand::total(Quantity::EnergyProduced), 4_600.0),
+        ),
+        (
+            "ATC_MPC_SCE3_PT_MUActiveACCurrent_001",
+            Publishes(p(Quantity::Current, Phase::A), 3.5),
+        ),
+        (
+            "ATC_MPC_SCE3_PT_MUActiveACCurrent_002",
+            Publishes(p(Quantity::Current, Phase::B), 3.3),
+        ),
+        (
+            "ATC_MPC_SCE3_PT_MUActiveACCurrent_003",
+            Publishes(p(Quantity::Current, Phase::C), 3.2),
+        ),
+        (
+            "ATC_MPC_SCE4_PT_MUACVoltage_001",
+            Publishes(p(Quantity::Voltage, Phase::A), V_PN),
+        ),
+        (
+            "ATC_MPC_SCE4_PT_MUACVoltage_002",
+            Publishes(p(Quantity::Voltage, Phase::B), V_PN),
+        ),
+        (
+            "ATC_MPC_SCE4_PT_MUACVoltage_003",
+            Publishes(p(Quantity::Voltage, Phase::C), V_PN),
+        ),
+        (
+            "ATC_MPC_SCE4_PT_MUACVoltage_004",
+            Publishes(p(Quantity::Voltage, Phase::Ab), V_PP),
+        ),
+        (
+            "ATC_MPC_SCE4_PT_MUACVoltage_005",
+            Publishes(p(Quantity::Voltage, Phase::Bc), V_PP),
+        ),
+        (
+            "ATC_MPC_SCE4_PT_MUACVoltage_006",
+            Publishes(p(Quantity::Voltage, Phase::Ac), V_PP),
+        ),
+        (
+            "ATC_MPC_SCE5_PT_MUFrequency_001",
+            Publishes(Measurand::total(Quantity::Frequency), 50.0),
+        ),
+        // --- Monitoring Appliance: it resolves, and refuses what it must ---
+        ("ATC_MPC_COM_PT_MAPolling_001", Polling),
+        ("ATC_MPC_COM_PT_MANotification_001", Notification),
+        (
+            "ATC_MPC_SCE1_PT_MATotalActivePower_001",
+            Reads(Measurand::total_power(), 2_300.0),
+        ),
+        (
+            "ATC_MPC_SCE1_NT_MATotalActivePower_002",
+            Refuses(Measurand::total_power()),
+        ),
+        (
+            "ATC_MPC_SCE2_PT_MATotalConsumedEnergy_001",
+            Reads(Measurand::total(Quantity::EnergyConsumed), 12_500.0),
+        ),
+        (
+            "ATC_MPC_SCE2_NT_MATotalConsumedEnergy_002",
+            Refuses(Measurand::total(Quantity::EnergyConsumed)),
+        ),
+        (
+            "ATC_MPC_SCE2_PT_MATotalProducedEnergy_001",
+            Reads(Measurand::total(Quantity::EnergyProduced), 4_100.0),
+        ),
+        (
+            "ATC_MPC_SCE2_NT_MATotalProducedEnergy_002",
+            Refuses(Measurand::total(Quantity::EnergyProduced)),
+        ),
+        (
+            "ATC_MPC_SCE5_PT_MAFrequency_001",
+            Reads(Measurand::total(Quantity::Frequency), 50.0),
+        ),
+        (
+            "ATC_MPC_SCE5_NT_MAFrequency_002",
+            Refuses(Measurand::total(Quantity::Frequency)),
+        ),
+    ];
+    // The phase-indexed families: odd numbers are the positive test, even the negative,
+    // one pair per phase, which is exactly how the specification numbers them.
+    let phases = [Phase::A, Phase::B, Phase::C];
+    for (i, phase) in phases.into_iter().enumerate() {
+        let pt = 2 * i + 1;
+        let nt = 2 * i + 2;
+        rows.push((
+            leak(format!("ATC_MPC_SCE1_PT_MAPhaseActivePower_{pt:03}")),
+            Reads(p(Quantity::Power, phase.clone()), 800.0),
+        ));
+        rows.push((
+            leak(format!("ATC_MPC_SCE1_NT_MAPhaseActivePower_{nt:03}")),
+            Refuses(p(Quantity::Power, phase.clone())),
+        ));
+        rows.push((
+            leak(format!("ATC_MPC_SCE3_PT_MAActiveACCurrent_{pt:03}")),
+            Reads(p(Quantity::Current, phase.clone()), 3.5),
+        ));
+        rows.push((
+            leak(format!("ATC_MPC_SCE3_NT_MAActiveACCurrent_{nt:03}")),
+            Refuses(p(Quantity::Current, phase.clone())),
+        ));
+    }
+    let voltages = [
+        Phase::A,
+        Phase::B,
+        Phase::C,
+        Phase::Ab,
+        Phase::Bc,
+        Phase::Ac,
+    ];
+    for (i, phase) in voltages.into_iter().enumerate() {
+        let pt = 2 * i + 1;
+        let nt = 2 * i + 2;
+        let value = if i < 3 { V_PN } else { V_PP };
+        rows.push((
+            leak(format!("ATC_MPC_SCE4_PT_MAACVoltage_{pt:03}")),
+            Reads(p(Quantity::Voltage, phase.clone()), value),
+        ));
+        rows.push((
+            leak(format!("ATC_MPC_SCE4_NT_MAACVoltage_{nt:03}")),
+            Refuses(p(Quantity::Voltage, phase.clone())),
+        ));
+    }
+    rows
+}
+
+/// The 47 abstract test cases of MGCP 1.0.2, one row each.
+fn mgcp_catalogue() -> Vec<(&'static str, Check)> {
+    use Check::*;
+    let p = |q, ph| Measurand::on(q, ph);
+    let mut rows: Vec<(&'static str, Check)> = vec![
+        // --- the Grid Connection Point publishes ---
+        ("ATC_MGCP_COM_PT_GCPPolling_001", Polling),
+        ("ATC_MGCP_COM_PT_GCPNotification_001", Notification),
+        (
+            "ATC_MGCP_SCE1_PT_GCPPowerLimitFactor_001",
+            Curtailment(70.0),
+        ),
+        (
+            "ATC_MGCP_SCE2_PT_GCPTotalActivePower_001",
+            Publishes(Measurand::total_power(), 2_300.0),
+        ),
+        // "a negative total feed-in energy while consuming" and its positive twin: the
+        // grid's own sign convention, which is why MGCP names these differently from MPC.
+        (
+            "ATC_MGCP_SCE3_PT_GCPTotalFeedInEnergy_001",
+            Publishes(Measurand::total(Quantity::EnergyProduced), 0.0),
+        ),
+        (
+            "ATC_MGCP_SCE3_PT_GCPTotalFeedInEnergy_002",
+            Publishes(Measurand::total(Quantity::EnergyProduced), 8_400.0),
+        ),
+        (
+            "ATC_MGCP_SCE4_PT_GCPTotalConsumedEnergy_001",
+            Publishes(Measurand::total(Quantity::EnergyConsumed), 0.0),
+        ),
+        (
+            "ATC_MGCP_SCE4_PT_GCPTotalConsumedEnergy_002",
+            Publishes(Measurand::total(Quantity::EnergyConsumed), 21_000.0),
+        ),
+        (
+            "ATC_MGCP_SCE5_PT_GCPActiveACCurrent_001",
+            Publishes(p(Quantity::Current, Phase::A), 3.5),
+        ),
+        (
+            "ATC_MGCP_SCE5_PT_GCPActiveACCurrent_002",
+            Publishes(p(Quantity::Current, Phase::B), 3.3),
+        ),
+        (
+            "ATC_MGCP_SCE5_PT_GCPActiveACCurrent_003",
+            Publishes(p(Quantity::Current, Phase::C), 3.2),
+        ),
+        (
+            "ATC_MGCP_SCE6_PT_GCPACVoltage_001",
+            Publishes(p(Quantity::Voltage, Phase::A), V_PN),
+        ),
+        (
+            "ATC_MGCP_SCE6_PT_GCPACVoltage_002",
+            Publishes(p(Quantity::Voltage, Phase::B), V_PN),
+        ),
+        (
+            "ATC_MGCP_SCE6_PT_GCPACVoltage_003",
+            Publishes(p(Quantity::Voltage, Phase::C), V_PN),
+        ),
+        (
+            "ATC_MGCP_SCE6_PT_GCPACVoltage_004",
+            Publishes(p(Quantity::Voltage, Phase::Ab), V_PP),
+        ),
+        (
+            "ATC_MGCP_SCE6_PT_GCPACVoltage_005",
+            Publishes(p(Quantity::Voltage, Phase::Bc), V_PP),
+        ),
+        (
+            "ATC_MGCP_SCE6_PT_GCPACVoltage_006",
+            Publishes(p(Quantity::Voltage, Phase::Ac), V_PP),
+        ),
+        (
+            "ATC_MGCP_SCE7_PT_GCPFrequency_001",
+            Publishes(Measurand::total(Quantity::Frequency), 50.0),
+        ),
+        // --- the Monitoring Appliance resolves ---
+        ("ATC_MGCP_COM_PT_MAPolling_001", Polling),
+        ("ATC_MGCP_COM_PT_MANotification_001", Notification),
+        ("ATC_MGCP_SCE1_PT_MAPowerLimitFactor_001", Curtailment(60.0)),
+        (
+            "ATC_MGCP_SCE2_PT_MATotalActivePower_001",
+            Reads(Measurand::total_power(), 2_300.0),
+        ),
+        (
+            "ATC_MGCP_SCE2_NT_MATotalActivePower_002",
+            Refuses(Measurand::total_power()),
+        ),
+        (
+            "ATC_MGCP_SCE3_PT_MATotalFeedInEnergy_001",
+            Reads(Measurand::total(Quantity::EnergyProduced), 8_400.0),
+        ),
+        (
+            "ATC_MGCP_SCE3_NT_MATotalFeedInEnergy_002",
+            Refuses(Measurand::total(Quantity::EnergyProduced)),
+        ),
+        (
+            "ATC_MGCP_SCE4_PT_MATotalConsumedEnergy_001",
+            Reads(Measurand::total(Quantity::EnergyConsumed), 21_000.0),
+        ),
+        (
+            "ATC_MGCP_SCE4_NT_MATotalConsumedEnergy_002",
+            Refuses(Measurand::total(Quantity::EnergyConsumed)),
+        ),
+        (
+            "ATC_MGCP_SCE7_PT_MAFrequency_001",
+            Reads(Measurand::total(Quantity::Frequency), 50.0),
+        ),
+        (
+            "ATC_MGCP_SCE7_NT_MAFrequency_002",
+            Refuses(Measurand::total(Quantity::Frequency)),
+        ),
+    ];
+    let phases = [Phase::A, Phase::B, Phase::C];
+    for (i, phase) in phases.into_iter().enumerate() {
+        let pt = 2 * i + 1;
+        let nt = 2 * i + 2;
+        rows.push((
+            leak(format!("ATC_MGCP_SCE5_PT_MAActiveACCurrent_{pt:03}")),
+            Reads(p(Quantity::Current, phase.clone()), 3.5),
+        ));
+        rows.push((
+            leak(format!("ATC_MGCP_SCE5_NT_MAActiveACCurrent_{nt:03}")),
+            Refuses(p(Quantity::Current, phase.clone())),
+        ));
+    }
+    let voltages = [
+        Phase::A,
+        Phase::B,
+        Phase::C,
+        Phase::Ab,
+        Phase::Bc,
+        Phase::Ac,
+    ];
+    for (i, phase) in voltages.into_iter().enumerate() {
+        let pt = 2 * i + 1;
+        let nt = 2 * i + 2;
+        let value = if i < 3 { V_PN } else { V_PP };
+        rows.push((
+            leak(format!("ATC_MGCP_SCE6_PT_MAACVoltage_{pt:03}")),
+            Reads(p(Quantity::Voltage, phase.clone()), value),
+        ));
+        rows.push((
+            leak(format!("ATC_MGCP_SCE6_NT_MAACVoltage_{nt:03}")),
+            Refuses(p(Quantity::Voltage, phase.clone())),
+        ));
+    }
+    rows
+}
+
+/// The generated identifiers outlive the table, and a test binary's lifetime is the run.
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Every row of the MPC catalogue, run against a real exchange.
+///
+/// One test rather than fifty-four, because every row is the same four shapes and the
+/// identifier is in the failure message — which is the granularity a laboratory reports
+/// at. A row that fails names itself.
+#[test]
+fn every_mpc_abstract_test_case() {
+    let failures = run_catalogue(&mpc_catalogue(), mpc_pair);
+    assert!(failures.is_empty(), "MPC:\n{}", failures.join("\n"));
+}
+
+/// The same for MGCP's forty-seven.
+#[test]
+fn every_mgcp_abstract_test_case() {
+    let failures = run_catalogue(&mgcp_catalogue(), mgcp_pair);
+    assert!(failures.is_empty(), "MGCP:\n{}", failures.join("\n"));
+}
+
+/// Runs each row on a pair of its own, so one row cannot leave state behind for the next.
+fn run_catalogue(
+    rows: &[(&'static str, Check)],
+    build: fn() -> common::MonitoringPair,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (id, check) in rows {
+        let mut pair = build();
+        if let Err(why) = run_check(&mut pair, check.clone()) {
+            failures.push(format!("  {id}: {why}"));
+        }
+    }
+    failures
+}
+
+/// Every row names a test case the catalogue carries, and every test case has a row.
+///
+/// The two halves matter equally: a typo inflates the coverage number it was written to
+/// justify, and a missing row lets a test case nobody has looked at hide in the gap.
+#[test]
+fn the_measurement_catalogues_and_the_specification_agree() {
+    for (label, use_case, rows) in [
+        ("MPC", names::MPC, mpc_catalogue()),
+        ("MGCP", names::MGCP, mgcp_catalogue()),
+    ] {
+        for (id, _) in &rows {
+            assert!(
+                conformance::find(id).is_some(),
+                "{label}: {id} is not in the catalogue"
+            );
+        }
+        for case in conformance::for_use_case(use_case) {
+            assert!(
+                rows.iter().any(|(id, _)| *id == case.id),
+                "{label}: {} has no row in this file",
+                case.id
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            conformance::for_use_case(use_case).count(),
+            "{label}: the table and the specification are different sizes"
+        );
+    }
+}
+
 /// Rebuilds a full `ATC_…` identifier from the short name a claim carries.
 fn identifier(use_case: &str, group: &str, name: &str) -> String {
     let kind = if name.starts_with("CSConnection_001")
@@ -1374,51 +1953,111 @@ fn every_test_case_of_lpc_and_lpp_has_a_claim() {
     }
 }
 
-/// The coverage number, printed and asserted.
+/// The coverage number, printed and asserted, over all four certifiable use cases.
 ///
 /// `cargo test --test conformance -- --nocapture coverage` prints the table.
 #[test]
-fn coverage_of_the_limitation_specifications() {
+fn coverage_of_the_certifiable_use_cases() {
     let mut report = String::new();
     report.push_str("\nEEBUS High-Level Test Specification coverage\n");
     report.push_str("=============================================\n\n");
 
     let mut totals = (0usize, 0usize);
+    fn row(
+        report: &mut String,
+        totals: &mut (usize, usize),
+        label: &str,
+        use_case: &'static str,
+        actor: &'static str,
+        actor_label: &str,
+        claims: &[(String, Claim)],
+    ) {
+        let scope: Vec<_> = conformance::for_actor(use_case, actor).collect();
+        if scope.is_empty() {
+            return;
+        }
+        // Only the claims that fall inside this scope: a Monitored Unit's coverage is not
+        // improved by a Monitoring Appliance test.
+        let tested: Vec<&str> = claims
+            .iter()
+            .filter(|(id, claim)| {
+                matches!(claim, Claim::Tested) && scope.iter().any(|case| case.id == id)
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let coverage = Coverage::of(scope.iter().copied(), &tested);
+        totals.0 += coverage.covered();
+        totals.1 += scope.len();
+        report.push_str(&format!(
+            "{label:<5} {actor_label:<22} {:>3}/{:<3} {:>3}%\n",
+            coverage.covered(),
+            scope.len(),
+            coverage.percent()
+        ));
+        assert!(
+            coverage.unknown().is_empty(),
+            "claims naming nothing: {:?}",
+            coverage.unknown()
+        );
+    }
+
     for (use_case, label) in [(names::LPC, "LPC"), (names::LPP, "LPP")] {
         let claims = claims_for(label);
         for (actor, actor_label) in [
             (actors::CONTROLLABLE_SYSTEM, "ControllableSystem"),
             (actors::ENERGY_GUARD, "EnergyGuard"),
         ] {
-            let scope: Vec<_> = conformance::for_actor(use_case, actor).collect();
-            // Only the claims that fall inside this scope: a Controllable System's
-            // coverage is not improved by an Energy Guard test.
-            let tested: Vec<&str> = claims
-                .iter()
-                .filter(|(id, claim)| {
-                    matches!(claim, Claim::Tested) && scope.iter().any(|case| case.id == id)
-                })
-                .map(|(id, _)| id.as_str())
-                .collect();
-            let coverage = Coverage::of(scope.iter().copied(), &tested);
-            totals.0 += coverage.covered();
-            totals.1 += scope.len();
-            report.push_str(&format!(
-                "{label:<5} {actor_label:<20} {:>3}/{:<3} {:>3}%\n",
-                coverage.covered(),
-                scope.len(),
-                coverage.percent()
-            ));
-            assert!(
-                coverage.unknown().is_empty(),
-                "claims naming nothing: {:?}",
-                coverage.unknown()
+            row(
+                &mut report,
+                &mut totals,
+                label,
+                use_case,
+                actor,
+                actor_label,
+                &claims,
+            );
+        }
+    }
+
+    // Every row of the two measurement catalogues is driven, so every one is a claim.
+    for (label, use_case, rows, dut, dut_label) in [
+        (
+            "MPC",
+            names::MPC,
+            mpc_catalogue(),
+            actors::MONITORED_UNIT,
+            "MonitoredUnit",
+        ),
+        (
+            "MGCP",
+            names::MGCP,
+            mgcp_catalogue(),
+            actors::GRID_CONNECTION_POINT,
+            "GridConnectionPoint",
+        ),
+    ] {
+        let claims: Vec<(String, Claim)> = rows
+            .iter()
+            .map(|(id, _)| ((*id).to_string(), Claim::Tested))
+            .collect();
+        for (actor, actor_label) in [
+            (dut, dut_label),
+            (actors::MONITORING_APPLIANCE, "MonitoringAppliance"),
+        ] {
+            row(
+                &mut report,
+                &mut totals,
+                label,
+                use_case,
+                actor,
+                actor_label,
+                &claims,
             );
         }
     }
 
     report.push_str(&format!(
-        "\n      {:<20} {:>3}/{:<3} {:>3}%\n",
+        "\n      {:<22} {:>3}/{:<3} {:>3}%\n",
         "total",
         totals.0,
         totals.1,
@@ -1431,12 +2070,31 @@ fn coverage_of_the_limitation_specifications() {
             report.push_str(&format!("  {name:<20} {reason}\n"));
         }
     }
+    report.push_str(
+        "\nCovered here, and still owed by the device:\n\
+         \x20 MPC/MGCP notification   the library notifies a change at once, as SPINE IG\n\
+         \x20                         \u{a7}2.4 asks. Whether the *measured* value reaches it\n\
+         \x20                         inside the 120 s the test allows is the application's\n\
+         \x20                         own publish cadence, not the library's.\n",
+    );
     println!("{report}");
 
-    // The four use cases have 203 abstract test cases between them; these two have 102.
-    assert_eq!(totals.1, 102);
-    assert!(
-        totals.0 * 100 / totals.1 >= 80,
-        "coverage fell below 80%:\n{report}"
+    // The four specifications have 203 abstract test cases between them, and every one is
+    // in scope here — the number this crate quotes has to be the number it measures.
+    assert_eq!(totals.1, 203, "the catalogue is not fully in scope");
+
+    // And the gap is exactly the cases no library can answer: seven device-level test
+    // cases, counted once for LPC and once for LPP. This is the assertion that keeps the
+    // claim honest in both directions — it fails if a test is quietly dropped, and it
+    // fails if something is marked `Device` to make the number go up.
+    let device_cases = CS_CLAIMS
+        .iter()
+        .chain(EG_CLAIMS)
+        .filter(|(_, claim)| matches!(claim, Claim::Device(_)))
+        .count();
+    assert_eq!(
+        totals.1 - totals.0,
+        device_cases * 2,
+        "the uncovered set is no longer exactly the device-level cases:\n{report}"
     );
 }

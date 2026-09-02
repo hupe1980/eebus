@@ -48,11 +48,6 @@ impl MsgCounterSource {
         self.next = self.next.checked_add(1).unwrap_or(1);
         MsgCounter(value)
     }
-
-    /// The counter that will be handed out next, without taking it.
-    pub fn peek(&self) -> MsgCounter {
-        MsgCounter(self.next)
-    }
 }
 
 /// What a receiver made of an incoming counter.

@@ -31,6 +31,17 @@ cargo run -p xtask -- codegen    # regenerate src/model/generated and src/ship/g
 cargo run -p xtask -- fixtures   # regenerate tests/fixtures from the specification's examples
 ```
 
+A third generator needs no specifications at all:
+
+```sh
+git clone --depth=1 https://github.com/enbility/devices /tmp/devices
+cargo run -p xtask -- devices /tmp/devices   # tests/fixtures/devices
+```
+
+That corpus is captures from real hardware, MIT-licensed and stored as ordinary JSON, so
+the converter projects it into the JSON-UTF8 of SHIP §11.4. Re-running it when the corpus
+has not changed produces no diff.
+
 `specs/` is git-ignored; only generated Rust is committed. The generator formats its output
 through rustfmt, so re-running it when nothing has changed produces no diff — which makes
 "is the checked-in model current?" a question CI can answer.

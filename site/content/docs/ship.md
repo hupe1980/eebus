@@ -66,11 +66,49 @@ Once the WebSocket is up, five phases run before any SPINE datagram may cross (�
    commissioning through: the `pending` node asks, and granting a request restarts the
    granter's own Wait-For-Ready-Timer (§13.4.4.1.3).
 3. **`protocolHandshake`** — agree the SHIP version and the message format. JSON-UTF8 in
-   practice; the specification allows others.
+   practice; the specification allows others. §13.4.4.2.2 requires support for every version
+   from 1.0 up to a node's own maximum, so two peers settle on the lower. `Node::handshake_config`
+   sets the ceiling — `ShipVersion::V1_0` pins a device to the certification minimum — and
+   `ShipConnection::ship_version`, `Hub::ship_version` and `HubEvent::Connected` report what
+   came of it. It matters: 1.0 has no `accessMethods.id`, so a 1.0 peer cannot be dialled back.
 4. **`pinVerification`** — optional, with penalties for wrong attempts.
 5. **`accessMethods`** — exchange identities. `accessMethods.id` is populated, which SHIP
    1.1.0 makes mandatory and which a peer needs in order to dial back in the other
    direction.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant S as Server
+  Note over C,S: TCP · TLS 1.2 mutual auth · WebSocket upgrade
+
+  C->>S: init (one byte)
+  S->>C: init (one byte)
+
+  rect rgb(230, 245, 239)
+    Note over C,S: hello — trust is settled here
+    C->>S: connectionHello: pending
+    S->>C: connectionHello: pending
+    loop while a person decides, capped at T_hello_init
+      C->>S: prolongationRequest
+      S->>C: granted — restarts the granter's own timer
+    end
+    C->>S: connectionHello: ready
+    S->>C: connectionHello: ready
+  end
+
+  C->>S: protocolHandshake: announceMax 1.1, JSON-UTF8
+  S->>C: protocolHandshake: select 1.1, JSON-UTF8
+  C->>S: protocolHandshake: select (echoed back)
+
+  C->>S: connectionPinState: none
+  S->>C: connectionPinState: none
+
+  C->>S: accessMethodsRequest
+  S->>C: accessMethods: id
+  Note over C,S: data exchange — SPINE datagrams may now cross
+```
 
 The close handshake (§13.4.8) is symmetric and equally required; dropping the socket is not
 a close.
@@ -100,8 +138,18 @@ where one should. SHIP §12.2.3 resolves it deterministically: the node with the
 SKI** keeps the **most recent** connection and drops the older; the node with the smaller
 SKI waits three seconds and then pings to confirm which survived.
 
-Both halves are implemented. This is a place where the crate deliberately differs from
-`ship-go`, which keeps the initiator's connection instead — see
+Both halves are implemented, and the rule has a flaw worth knowing about. **"The most
+recent connection" is a local judgement** — each node decides it from its own clock, about
+two events milliseconds apart on two machines, and nothing makes the two agree.
+`enbility`'s [2025 analysis of SHIP](https://enbility.net/blog/20250704-analysis-documents/)
+shows this can end with both connections closed and none left; `ship-go` deviates
+deliberately, keeping the *initiator's* connection, which both ends judge identically.
+
+This crate follows §12.2.3 — a laboratory tests the specification, not a reference
+implementation — and bounds the hazard instead: the smaller-SKI side runs exactly one ping
+round and then decides, and a lost connection is redialled. Interoperating with `ship-go`
+needs no compatibility switch: whichever rule the far end applies, one side closes something
+and the other's bounded fallback settles the rest. See
 [Conformance](@/docs/conformance.md).
 
 ## Framing
