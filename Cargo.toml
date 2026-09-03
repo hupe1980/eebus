@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -22,7 +22,8 @@ exclude = ["specs/", "site/", "xtask/"]
 [features]
 default = ["std", "pairing", "conformance"]
 std = ["serde/std", "serde_json/std", "thiserror/std"]
-# The SHIP Pairing Service: automated trust establishment from a QR-code secret.
+# The SHIP Pairing Service: automated trust establishment from a QR-code secret, in both
+# roles. With `runtime` and `mdns` it also turns on the hub's end of it.
 pairing = ["dep:hmac", "dep:sha2"]
 # The four High-Level Test Specifications as data: 203 abstract test cases with their
 # descriptions and requirements. A few tens of kilobytes of static strings that a device
@@ -42,7 +43,7 @@ aws-lc-rs = ["rustls?/aws_lc_rs", "tokio-rustls?/aws_lc_rs", "rcgen?/aws_lc_rs"]
 
 # Certificates: generating a node's own, and reading a peer's SKI out of one.
 # Needs a provider: `--features cert,ring` or `--features cert,aws-lc-rs`.
-cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:time"]
+cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:sha2", "dep:time"]
 # TLS 1.2 as SHIP §9 mandates, with the trust decision deferred to the SHIP handshake.
 tls = ["cert", "dep:rustls"]
 # Sockets: TCP, TLS and WebSocket on Tokio, driving the sans-IO cores.
@@ -66,7 +67,7 @@ x509-parser = { version = "0.18", optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 time = { version = "0.3", default-features = false, optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
-tokio = { version = "1", default-features = false, features = ["net", "rt", "time", "macros", "sync", "io-util"], optional = true }
+tokio = { version = "1.37", default-features = false, features = ["net", "rt", "time", "macros", "sync", "io-util"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
@@ -75,7 +76,7 @@ mdns-sd = { version = "0.21", default-features = false, optional = true }
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "net", "time"] }
 
 # The sans-IO example needs nothing; the networked one needs a socket.
 # The cross-implementation suite. `required-features` is what keeps it out of an

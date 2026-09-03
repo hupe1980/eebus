@@ -1238,27 +1238,14 @@ fn lpc_and_lpp_differ_only_in_what_they_publish() {
 // ---- the claims, and the coverage they add up to ------------------------------
 
 /// How this crate answers for one abstract test case.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Claim {
     /// The test of the same name in this file drives it.
     Tested,
-    /// The library cannot answer for it; the device it is linked into must. The string is
-    /// what the device has to show the laboratory.
-    Device(&'static str),
-}
-
-/// Reasons that recur, so that the same thing is always said the same way.
-mod because {
-    pub const FACTORY_RESET: &str =
-        "a factory reset and the defaults it restores are the device's, not the library's";
-    pub const PERSISTENCE: &str = "the library holds the values in memory and hands them to the application; where \
-         they are stored across a power cut is the device's decision";
-    pub const BLACK_START: &str = "powering the device off and on again; `runtime::reconnect` handles the dialling \
-         back, but the power supply is not something a test can cut";
-    pub const REBOOT: &str = "the test rebuilds the actor rather than rebooting a device, so the start-up \
-         duration it measures is not the device's";
-    pub const APPLIANCE: &str = "what the appliance actually draws, which the library reports a ceiling for and \
-         does not control";
+    /// The library cannot answer for it; the device it is linked into must. The reason is
+    /// the catalogue's — `conformance::DEVICE_LEVEL` — so that a consumer's harness and
+    /// this suite say the same thing about the same case.
+    Device,
 }
 
 /// Every abstract test case of LPC's Controllable System, and how this crate answers it.
@@ -1271,13 +1258,13 @@ const CS_CLAIMS: &[(&str, Claim)] = &[
     ("CSConnection_003", Claim::Tested),
     ("CSConnection_004", Claim::Tested),
     ("CSConnection_005", Claim::Tested),
-    ("CSConnection_006", Claim::Device(because::APPLIANCE)),
+    ("CSConnection_006", Claim::Device),
     ("CSConnection_007", Claim::Tested),
     ("CSConnection_008", Claim::Tested),
-    ("CSConnection_009", Claim::Device(because::BLACK_START)),
+    ("CSConnection_009", Claim::Device),
     ("CSInit_001", Claim::Tested),
-    ("CSInit_002", Claim::Device(because::FACTORY_RESET)),
-    ("CSInit_003", Claim::Device(because::PERSISTENCE)),
+    ("CSInit_002", Claim::Device),
+    ("CSInit_003", Claim::Device),
     ("CSLimited_001", Claim::Tested),
     ("CSLimited_002", Claim::Tested),
     ("CSUnlCntrl_001", Claim::Tested),
@@ -1311,11 +1298,11 @@ const CS_CLAIMS: &[(&str, Claim)] = &[
 /// LPC's Energy Guard.
 const EG_CLAIMS: &[(&str, Claim)] = &[
     ("EGHeartbeat_001", Claim::Tested),
-    ("EGConnection_001", Claim::Device(because::REBOOT)),
+    ("EGConnection_001", Claim::Device),
     ("EGConnection_002", Claim::Tested),
-    ("EGConnection_003", Claim::Device(because::BLACK_START)),
+    ("EGConnection_003", Claim::Device),
     ("EGMessages_001", Claim::Tested),
-    ("EGMessages_002", Claim::Device(because::REBOOT)),
+    ("EGMessages_002", Claim::Device),
     ("EGMessages_003", Claim::Tested),
     ("EGMessages_004", Claim::Tested),
 ];
@@ -1923,6 +1910,35 @@ fn claims_for(use_case: &str) -> Vec<(String, Claim)> {
     ids
 }
 
+/// What this suite marks as the device's and what the catalogue publishes as the device's
+/// are one list, in both directions.
+///
+/// `conformance::device_level` is the checklist a consumer's harness works from, and this
+/// suite is what keeps it honest: a case marked `Device` here and not there would be a
+/// case nobody answers for, and one there and not here would be one this suite drives
+/// while telling the consumer it cannot be driven.
+#[test]
+fn the_device_level_cases_are_the_catalogues_and_the_suites_alike() {
+    for use_case in ["LPC", "LPP"] {
+        let mut claimed: Vec<String> = claims_for(use_case)
+            .into_iter()
+            .filter(|(_, claim)| *claim == Claim::Device)
+            .map(|(id, _)| id)
+            .collect();
+        claimed.sort();
+        let mut published: Vec<String> = conformance::device_level()
+            .map(|(case, _)| case.id.to_string())
+            .filter(|id| id.starts_with(&format!("ATC_{use_case}_")))
+            .collect();
+        published.sort();
+        assert_eq!(claimed, published, "{use_case}");
+        for id in &claimed {
+            let case = conformance::find(id).expect("a real case");
+            assert!(case.owed_by_device().is_some(), "{id} carries its reason");
+        }
+    }
+}
+
 /// Every claim names a test case that exists — a typo would otherwise inflate the number
 /// it was made to justify.
 #[test]
@@ -2065,8 +2081,9 @@ fn coverage_of_the_certifiable_use_cases() {
     ));
 
     report.push_str("\nNot covered here, and why (the same list for LPP):\n");
-    for (name, claim) in CS_CLAIMS.iter().chain(EG_CLAIMS) {
-        if let Claim::Device(reason) = claim {
+    for (case, reason) in conformance::device_level() {
+        if case.use_case == names::LPC {
+            let name = case.id.trim_start_matches("ATC_LPC_COM_PT_");
             report.push_str(&format!("  {name:<20} {reason}\n"));
         }
     }
@@ -2090,7 +2107,7 @@ fn coverage_of_the_certifiable_use_cases() {
     let device_cases = CS_CLAIMS
         .iter()
         .chain(EG_CLAIMS)
-        .filter(|(_, claim)| matches!(claim, Claim::Device(_)))
+        .filter(|(_, claim)| matches!(claim, Claim::Device))
         .count();
     assert_eq!(
         totals.1 - totals.0,

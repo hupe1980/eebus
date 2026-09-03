@@ -2083,3 +2083,327 @@ fn a_slow_feature_keeps_its_undecided_writes_as_long_as_it_announced() {
         );
     }
 }
+
+/// A binding or subscription call names its client in the payload, and the client has to
+/// be the peer that sent it.
+///
+/// SHIP authenticated the sender; the payload is what the sender says. A paired peer that
+/// could name another device's client address would be able to release that device's
+/// binding — the one thing standing between an Energy Guard's limit and a second energy
+/// manager — or grant itself a relation in the other's name. Neither is a right §7.3 gives
+/// a binding's client over anybody else.
+#[test]
+fn a_peer_cannot_act_on_a_relation_in_another_peers_name() {
+    use eebus::model::{
+        NodeManagementBindingDeleteCall, NodeManagementBindingDeleteCallBindingDelete,
+        NodeManagementSubscriptionRequestCall,
+        NodeManagementSubscriptionRequestCallSubscriptionRequest,
+    };
+
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+    let mut meter = sub_meter();
+    let (target, guard_client) = bound_pair(&mut guard, &mut pump_device, now);
+    let meter_nm = node_management(meter.device().address());
+    let pump_nm = node_management(pump_device.device().address());
+
+    // The meter tries to release the guard's binding.
+    let release = Datagram {
+        header: Some(eebus::model::Header {
+            specification_version: Some("1.3.0".into()),
+            address_source: Some(meter_nm.clone()),
+            address_destination: Some(pump_nm.clone()),
+            msg_counter: Some(MsgCounter(50)),
+            cmd_classifier: Some(CmdClassifier::Call),
+            ack_request: Some(true),
+            ..Default::default()
+        }),
+        payload: Some(Payload {
+            cmd: Some(vec![eebus::model::Cmd::with_data(
+                CmdData::NodeManagementBindingDeleteCall(NodeManagementBindingDeleteCall {
+                    binding_delete: Some(NodeManagementBindingDeleteCallBindingDelete {
+                        client_address: Some(guard_client.clone()),
+                        server_address: Some(target.clone()),
+                        ..Default::default()
+                    }),
+                }),
+            )]),
+        }),
+    };
+    pump_device.handle_datagram(&round_trip(&release), now);
+    assert!(
+        pump_device.relations().is_bound(&guard_client, &target),
+        "the guard's binding is still held"
+    );
+    let answer = pump_device.poll_transmit().expect("a result");
+    let error = match answer
+        .payload
+        .and_then(|p| p.cmd)
+        .and_then(|c| c.into_iter().next())
+    {
+        Some(eebus::model::Cmd {
+            data: Some(CmdData::ResultData(result)),
+            ..
+        }) => result.error_number,
+        other => panic!("expected a result, saw {other:?}"),
+    };
+    assert_eq!(error, Some(ErrorNumber::CommandRejected));
+
+    // And it cannot subscribe in the guard's name either; from its own, it can.
+    let subscribe = |client: FeatureAddress, counter: u64| Datagram {
+        header: Some(eebus::model::Header {
+            specification_version: Some("1.3.0".into()),
+            address_source: Some(meter_nm.clone()),
+            address_destination: Some(pump_nm.clone()),
+            msg_counter: Some(MsgCounter(counter)),
+            cmd_classifier: Some(CmdClassifier::Call),
+            ack_request: Some(true),
+            ..Default::default()
+        }),
+        payload: Some(Payload {
+            cmd: Some(vec![eebus::model::Cmd::with_data(
+                CmdData::NodeManagementSubscriptionRequestCall(
+                    NodeManagementSubscriptionRequestCall {
+                        subscription_request: Some(
+                            NodeManagementSubscriptionRequestCallSubscriptionRequest {
+                                client_address: Some(client),
+                                server_address: Some(target.clone()),
+                                server_feature_type: None,
+                            },
+                        ),
+                    },
+                ),
+            )]),
+        }),
+    };
+    pump_device.handle_datagram(&round_trip(&subscribe(guard_client.clone(), 51)), now);
+    let _ = pump_device.poll_transmit();
+    assert_eq!(
+        pump_device.relations().subscriptions().len(),
+        0,
+        "nothing was granted in the guard's name"
+    );
+
+    // A client address without a device part is completed from the header, which is how
+    // `spine-go` phrases it.
+    let own = FeatureAddress {
+        device: None,
+        ..meter.device().address_of(&[1], 1)
+    };
+    pump_device.handle_datagram(&round_trip(&subscribe(own, 52)), now);
+    let _ = pump_device.poll_transmit();
+    let granted = pump_device.relations().subscriptions();
+    assert_eq!(granted.len(), 1);
+    assert_eq!(
+        granted[0].client.device.as_ref(),
+        Some(meter.device().address()),
+        "filed under the peer that asked"
+    );
+    let _ = events(&mut meter);
+}
+
+/// A write that asks for nothing is not acknowledged as though it had.
+///
+/// A `write` with `ackRequest` and no command used to be answered with `errorNumber` 0 —
+/// an acknowledgement, under §14a EnWG, of a limit that was never sent.
+#[test]
+fn an_empty_write_is_not_acknowledged_as_a_success() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+    let (target, source) = bound_pair(&mut guard, &mut pump_device, now);
+
+    let empty = Datagram {
+        header: Some(write_header(&source, &target, MsgCounter(60))),
+        payload: Some(Payload { cmd: Some(vec![]) }),
+    };
+    pump_device.handle_datagram(&round_trip(&empty), now);
+    let answer = pump_device.poll_transmit().expect("a result");
+    let error = match answer
+        .payload
+        .and_then(|p| p.cmd)
+        .and_then(|c| c.into_iter().next())
+    {
+        Some(eebus::model::Cmd {
+            data: Some(CmdData::ResultData(result)),
+            ..
+        }) => result.error_number,
+        other => panic!("expected a result, saw {other:?}"),
+    };
+    assert_eq!(error, Some(ErrorNumber::General));
+}
+
+/// A payload carrying two commands is refused whole, not executed in part.
+///
+/// SPINE §5.3.2: "each instance of a payload element SHALL contain exactly one cmd
+/// instance". The XML Schema permits more, so a peer can send them, and a single
+/// `result` cannot report two outcomes — a peer told "applied" about a pair of writes of
+/// which one failed has been told something untrue. Under §14a that is the difference
+/// between evidence and a guess, so the whole datagram is answered `errorNumber` 1 and
+/// neither command is applied.
+#[test]
+fn a_payload_with_two_commands_is_refused_rather_than_half_applied() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+    let (target, source) = bound_pair(&mut guard, &mut pump_device, now);
+
+    let limit = |watts: f64| eebus::model::Cmd {
+        data: Some(CmdData::LoadControlLimitListData(
+            LoadControlLimitListData {
+                load_control_limit_data: Some(vec![LoadControlLimitData {
+                    limit_id: Some(LoadControlLimitId(1)),
+                    is_limit_active: Some(true),
+                    value: Some(ScaledNumber::from_f64(watts, 0)),
+                    ..Default::default()
+                }]),
+            },
+        )),
+        ..Default::default()
+    };
+    let two = Datagram {
+        header: Some(write_header(&source, &target, MsgCounter(61))),
+        payload: Some(Payload {
+            cmd: Some(vec![limit(4200.0), limit(11000.0)]),
+        }),
+    };
+    pump_device.handle_datagram(&round_trip(&two), now);
+
+    let answer = pump_device.poll_transmit().expect("a result");
+    let error = match answer
+        .payload
+        .and_then(|p| p.cmd)
+        .and_then(|c| c.into_iter().next())
+    {
+        Some(eebus::model::Cmd {
+            data: Some(CmdData::ResultData(result)),
+            ..
+        }) => result.error_number,
+        other => panic!("expected a result, saw {other:?}"),
+    };
+    assert_eq!(error, Some(ErrorNumber::General));
+    assert!(
+        events(&mut pump_device)
+            .iter()
+            .all(|event| !matches!(event, SpineEvent::WriteRequested(_))),
+        "neither command reached the application"
+    );
+}
+
+/// Accepting a write is a decision; storing it is the engine's job, and the two can
+/// disagree. When they do, the peer was told the error, and so is the application.
+#[test]
+fn accepting_a_write_the_engine_cannot_store_is_reported() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = deciding_heat_pump();
+    let (target, source) = bound_pair(&mut guard, &mut pump_device, now);
+
+    // A single write with more entries than one function may hold.
+    let entries: Vec<LoadControlLimitData> = (1..=(eebus::spine::MAX_LIST_ENTRIES as u32 + 1))
+        .map(|id| LoadControlLimitData {
+            limit_id: Some(LoadControlLimitId(id)),
+            is_limit_active: Some(true),
+            value: Some(ScaledNumber::from_f64(1.0, 0)),
+            ..Default::default()
+        })
+        .collect();
+    let too_many = CmdData::LoadControlLimitListData(LoadControlLimitListData {
+        load_control_limit_data: Some(entries),
+    });
+    guard.write(&target, &source, too_many, true, now);
+    let datagram = guard.poll_transmit().expect("the write");
+    pump_device.handle_datagram(&round_trip(&datagram), now);
+
+    let token = events(&mut pump_device)
+        .into_iter()
+        .find_map(|e| match e {
+            SpineEvent::WriteRequested(write) => Some(write.token),
+            _ => None,
+        })
+        .expect("the write was put to the application");
+
+    let outcome = pump_device.accept_write(token, now);
+    assert!(
+        matches!(
+            outcome,
+            Err(eebus::spine::WriteError::NotStored(
+                eebus::spine::FeatureError::TooManyEntries
+            ))
+        ),
+        "the application is told the write was not stored: {outcome:?}"
+    );
+    assert_eq!(
+        pump_device.accept_write(token, now),
+        Err(eebus::spine::WriteError::UnknownToken),
+        "and the token resolves once"
+    );
+    assert!(!pump_device.reject_write(token, ErrorNumber::CommandRejected, now));
+
+    // What the peer heard is the error, not an acknowledgement.
+    let answer = pump_device.poll_transmit().expect("a result");
+    guard.handle_datagram(&round_trip(&answer), now);
+    assert!(
+        events(&mut guard).iter().any(|e| matches!(
+            e,
+            SpineEvent::ResultReceived {
+                error: ErrorNumber::Overload,
+                ..
+            }
+        )),
+        "the peer was answered with the error"
+    );
+}
+
+/// Discovery is filed under the address the header carries — the one SHIP authenticated
+/// and the one every reply goes back to — not under whatever the payload claims.
+#[test]
+fn discovery_is_filed_under_the_header_address_not_the_payloads() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+    let guard_nm = node_management(guard.device().address());
+    let pump_nm = node_management(pump_device.device().address());
+    guard.read(
+        &pump_nm,
+        &guard_nm,
+        Function::NodeManagementDetailedDiscoveryData,
+        now,
+    );
+    let read = guard.poll_transmit().expect("the read");
+    pump_device.handle_datagram(&round_trip(&read), now);
+    let mut reply = pump_device.poll_transmit().expect("the reply");
+
+    // The payload names somebody else.
+    let impostor = eebus::spine::device_address("i:99999", "Impostor").unwrap();
+    if let Some(eebus::model::Cmd {
+        data: Some(CmdData::NodeManagementDetailedDiscoveryData(discovery)),
+        ..
+    }) = reply
+        .payload
+        .as_mut()
+        .and_then(|p| p.cmd.as_mut())
+        .and_then(|c| c.first_mut())
+    {
+        discovery
+            .device_information
+            .as_mut()
+            .and_then(|d| d.description.as_mut())
+            .and_then(|d| d.device_address.as_mut())
+            .expect("the address is there")
+            .device = Some(impostor.clone());
+    }
+    guard.handle_datagram(&round_trip(&reply), now);
+
+    assert!(
+        guard
+            .peer(pump_device.device().address())
+            .is_some_and(|p| !p.entities.is_empty()),
+        "filed under the sender"
+    );
+    assert!(
+        guard.peer(&impostor).is_none(),
+        "and nothing was filed under the name in the payload"
+    );
+}

@@ -64,7 +64,12 @@ Once the WebSocket is up, five phases run before any SPINE datagram may cross (�
    asked, and the wait is prolonged for as long as the decision takes. `T_hello_init` is
    two minutes and a person takes longer, so the prolongation is what carries a
    commissioning through: the `pending` node asks, and granting a request restarts the
-   granter's own Wait-For-Ready-Timer (§13.4.4.1.3).
+   granter's own Wait-For-Ready-Timer (§13.4.4.1.3). It is not unbounded — a Wait-For-Ready
+   timer that expires aborts, whichever phase the node is in — but once the peer has
+   announced `ready` the pending node retires its own timer and keeps the connection up by
+   asking, which is what gives a person as long as the peer will allow. On a network the
+   `Hub` reports the waiting peer as `TrustRequested`, and `approve` or `refuse` answers it
+   in place — [Pairing](@/docs/networking.md#pairing).
 3. **`protocolHandshake`** — agree the SHIP version and the message format. JSON-UTF8 in
    practice; the specification allows others. §13.4.4.2.2 requires support for every version
    from 1.0 up to a node's own maximum, so two peers settle on the lower. `Node::handshake_config`
@@ -122,14 +127,28 @@ handshake.poll_event();                // "trust needed", "ready", "closed"
 
 ## The Pairing Service
 
-Beyond manual SKI approval, the Pairing Service 1.0.0 lets an installer scan a QR code
-carrying a shared secret and have trust established automatically. The crate implements the
-digest and the replay guard (§7, §11), and the QR payload format from the installation
-requirements. It is behind the `pairing` feature, on by default.
+Beyond manual SKI approval, the Pairing Service 1.0.0 lets an installer configure a
+control unit from a QR code and have trust established with nobody asked anything. It is
+behind the `pairing` feature, on by default, and both roles are implemented: `devA`, the
+household device that evaluates requests (§9), and `devZ`, the control unit that announces
+them (§8). The digest is an HMAC-SHA256 over the TXT record's fields in the order §7 fixes,
+keyed by the printed secret and a fresh nonce, and a replay guard (§11) refuses a captured
+announcement twice.
 
-Keys the payload grammar gains later are skipped on the way in (`SRIP-310/15`) and written
-back out unchanged, so a tool that re-renders a code — onto a screen after a certificate
-update, say — does not strip fields it happens not to understand.
+What is trusted is a **certificate fingerprint** rather than a SKI: §10.2 has it checked at
+the TLS handshake and treated as equivalent, and §10.3 allows one control unit at a time.
+Trust lives in the same store as SHIP's (§10.4). The timing rules are the subtle part —
+when a request is on the air (§4.2) and when a node will look at one at all (§4.3) — and
+both are worked through in [Pairing](@/docs/networking.md#or-nobody-is-asked-at-all); the
+two simulators do the whole exchange over a real network.
+
+`Fingerprint` is the SHA-256 of the DER certificate in the 64-uppercase-hex wire form, and
+it is strict about case: the digest covers the text as sent, so a lowercase value would
+mean verifying a message the sender never signed.
+
+Keys the QR payload grammar gains later are skipped on the way in (`SRIP-310/15`) and
+written back out unchanged, so a tool that re-renders a code — onto a screen after a
+certificate update, say — does not strip fields it happens not to understand.
 
 ## Two nodes that dial each other at once
 

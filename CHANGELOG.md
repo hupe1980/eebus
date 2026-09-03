@@ -4,7 +4,193 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.3.0] — unreleased
+## [0.4.0] — unreleased
+
+### Fixed
+
+- **An Energy Guard could not send an open-ended limit.** To write a limit with no
+  duration it omitted the `timePeriod`, and under the partial concept an omitted element
+  means *unchanged* — so the Controllable System kept the previous end time, and a limit
+  meant to be indefinite lapsed when the old one would have: the household returned to
+  full draw while the operator's record said otherwise. LPC UC TS §3.4.1.4 requires a
+  `delete` filter alongside the write and gives the combined command; the engine has
+  always served that shape, but nothing could send it. New `Engine::write_filtered`, and
+  the guard now sends the delete whenever the limit it writes carries no duration.
+- **A pending SHIP node re-announced instead of aborting when its Wait-For-Ready-Timer
+  expired.** SHIP §13.4.4.1.3, `SME_HELLO_STATE_PENDING_TIMEOUT` rule 1, has no exemption
+  for a node waiting on a user: the timer aborts. What was actually missing was the other
+  half of the rule — a peer's `ready` **retires** this node's own Wait-For-Ready-Timer
+  (`PENDING_LISTEN` rule 2), and from then on the connection is held up by prolongation
+  requests against the *peer's* timer, which is what gives a person as long as the peer
+  will allow. A `ready` carrying no `waiting` leaves nothing to prolong and now aborts
+  (rule 1). A ten-minute commissioning still completes.
+- **A payload with two commands was executed in part.** SPINE §5.3.2 permits exactly one
+  `cmd` per payload; the schema says `1..unbounded`, so a peer can send more, and the
+  engine ran each of them and answered with the worst outcome. One `result` cannot report
+  two outcomes, so a peer told "applied" about a pair of writes of which one failed had
+  been told something untrue — under §14a the difference between evidence and a guess.
+  Such a datagram is now refused whole with `errorNumber` 1 and neither command reaches
+  the application. Several *filters* in one command are unaffected.
+
+**A second full audit, of the runtime and the engine's authority checks.** Two of these are
+structural and the rest are defects nobody had reached; each is written up in
+`concepts/DECISIONS.md` (D75–D82).
+
+- **Pairing could not happen while a peer waited.** The SHIP handshake held an unapproved
+  peer `pending` and had `set_trust` for the answer since 0.1, and no runtime path ever
+  called it: `Node::accept` ran to completion or abort and exposed nothing in between, so
+  the only way to pair was to know the SKI before the connection. The handshake driver now
+  waits on the trust store beside the socket and the SHIP timer, so an approval completes
+  the handshake it is waiting in and a refusal ends it with `hello: aborted`. The hub reports
+  the waiting peer as `HubEvent::TrustRequested` and answers with `Hub::approve` and
+  `Hub::refuse`. (D75)
+- **The hub dialled and accepted inline, and a peer that was down starved every heartbeat.**
+  `redial` awaited a ten-second connect from inside `next`, one offline peer per turn;
+  a control box with ten unplugged devices stopped reading for the better part of a
+  backoff round, and every appliance that *was* connected fell into its failsafe state for
+  want of a heartbeat. Handshakes now run in tasks of their own and report back over a
+  channel the loop waits on alongside the sockets. (D76)
+- **A paired peer could release another peer's binding.** A binding or subscription call
+  names its client in the payload, and nothing checked that the address belonged to the
+  device SHIP authenticated as the sender. It has to now, or the call is refused with
+  `errorNumber` 7; a call that leaves the device part out is completed from the header,
+  which keeps `spine-go`'s spelling working. (D77)
+- **Bindings and subscriptions were unbounded**, which D46 had missed: a peer chooses its own
+  client addresses, so a paired peer could grow both tables one call at a time forever.
+  `spine::MAX_RELATIONS_PER_PEER` bounds each kind per device; a peer evicted under
+  `MAX_PEERS` now takes its relations, requests and undecided writes with it. (D78)
+- **`Engine::accept_write` could not say that it had failed.** A use case that accepted a
+  write the engine then could not store had already written "accepted" into the §14a
+  record while the peer was told `errorNumber` 3. It returns `Result<(), WriteError>` now,
+  `reject_write` returns whether the token was live, and the limitation and charging actors
+  record what the peer was told — `NackReason::NotStored` — and put the state machine
+  where a refused write leaves it. (D79)
+- **Any peer's heartbeat kept a Controllable System out of its failsafe state.** The actor
+  took every `deviceDiagnosisHeartbeatData` it was notified as the guard's; it now counts
+  only the diagnosis feature of the entity that holds both bindings (§3.8). (D80)
+- **Discovery was filed under the payload's device address, and a payload could rename a
+  record.** The header's source — what SHIP authenticated — is the key now; the payload
+  fills a record that has no address yet and nothing else. (D81)
+- **A `write` with no command was acknowledged as a success.** It is `errorNumber` 1. (D82)
+- The Controllable System's heartbeat now runs from the moment `install` puts it on the
+  wire rather than from the moment its builder was made.
+
+### Added
+
+- **The SHIP Pairing Service, end to end, in both roles.** Previously the crate had the
+  digest and the replay guard and nothing joined them to a network; now an installer's
+  configuration is the whole of commissioning. `devA` — the household energy manager —
+  turns it on with `Hub::accept_pairing_requests(Receiver)` plus `Hub::browse_pairing`,
+  and an authentic request arrives as `HubEvent::Paired { unit, displaced }`; one
+  addressed to this node that fails arrives as `HubEvent::PairingRefused`, which is the
+  mistyped-secret case §5.5 expects to be corrected, while a request for another node is
+  not reported at all. `devZ` — the control unit — builds it from the other device's QR
+  payload and `Requester` decides when it is on the air (§4.2): from the moment it is
+  configured — not from the first connection, since `devA` cannot trust `devZ` until it
+  has heard the request — across interruptions, until one uninterrupted connection has
+  held fifteen minutes. Both simulators
+  do it over a real network; `examples/heat_pump.rs --pairing` and
+  `examples/steuerbox.rs --pair-with '<QR payload>'`.
+
+  What it required, and what is new with it:
+
+  - **`ship::Fingerprint`** — the SHA-256 of a DER certificate, which is the identity the
+    Pairing Service trusts. Strict about the 64-uppercase-hex wire form on the way in,
+    because the digest covers the text as sent. `Identity::fingerprint`,
+    `ShipTls::fingerprint`, `Node::fingerprint`, `Hub::fingerprint`,
+    `tls::peer_fingerprint` and `ShipConnection::peer_fingerprint` expose it; `ShipQr`'s
+    `certificate_fingerprint` is now typed as one.
+  - **`runtime::PairedUnit`** — a control unit trusted by certificate, as a first-class
+    trust-store entry rather than a `TrustedPeer` with an invented SKI. The request names
+    no SKI and one cannot be derived from a fingerprint. `TrustStore::trust_unit`,
+    `unit`, `forget_unit`, `is_certificate_trusted`; `TrustedPeer` gains `fingerprint`.
+    A peer is admitted on **either** identity, which §10.2 makes equivalent, and the SKI
+    is recorded once a connection has proved one. One unit at a time (§10.3): pairing a
+    second untrusts the first, its SKI included, and closes its connection.
+  - **`pairing::Receiver`** (§9, the four steps), **`pairing::Requester`** (§4.2),
+    **`PairingAnnouncement`** with `to_pairs`/`from_pairs` (§5.4 — `txtvers` first,
+    unknown keys ignored, every mandatory value held to its pattern), **`pairing::Nonce`**,
+    `PairingRequest::sign`, `ReplayGuard::contains`, `SETTLED_AFTER`,
+    `REPLACEABLE_AFTER`.
+  - **`mdns::PairingEvent`, `PairingBrowse`, `Mdns::withdraw_pairing`** and an
+    `announce_pairing` that takes a signed announcement rather than a SHIP TXT record.
+  - **§4.3 lives in the hub**, because whether SHIP messages are flowing with the paired
+    unit is the one thing only the connection table knows: requests are not processed
+    while the pairing is working, and are taken up again after fifteen minutes of being
+    unable to reach it. That is what stops a captured announcement breaking a pairing that
+    is doing its job, and what lets a broken control unit be replaced without a factory
+    reset.
+  - The trust store's JSON is one object with `peers` and `unit` rather than a bare
+    array — §10.4 asks the Pairing Service's trust to live in the same store as SHIP's,
+    and a device writes one file. `TrustStore::to_json`/`from_json` handle both halves,
+    and `forget_all` counts the unit.
+  - **`tls::random`** — the backend's cryptographic generator, which §6.3 asks for behind
+    every nonce and secret.
+  - `PairedUnit::new`, for a store restored from disk. `PairedUnit::from_request` needs
+    `pairing`, and every pairing-only part of the hub is behind `mdns` **and** `pairing`,
+    so `runtime` on its own still builds.
+- **`HubEvent::HandshakeFailed` names the peer where one was proved.** An accepted
+  connection that failed after TLS reported `ski: None`, so a refusal could not be told
+  from a peer that never presented a certificate.
+- **`runtime::MAX_PENDING_TRUST`** — at most four peers may wait on an approval at once.
+  A peer held in `hello: pending` occupies a connection slot for minutes on nobody's
+  authority, and a handful of them held every slot; the one past the cap is now answered
+  `hello: aborted` immediately and reported as `ConnectionError::TooManyPendingPairings`,
+  so it retries rather than squatting. Closes R13.
+- **Interactive pairing, end to end.** `HubEvent::TrustRequested { ski, origin }` for a peer
+  waiting in the SHIP pending state, `Hub::approve` and `Hub::refuse` to answer it, and the
+  same through a `Node` driven by hand: `TrustStore` wakes a pending handshake on every
+  change (`TrustStore::watch`), and `Node::refuse_pairing` ends one. The two simulators ask
+  on the terminal — `y` to pair — which is what pressing the button on a real device
+  amounts to. `tests/runtime_over_a_socket.rs` drives both answers over loopback.
+- **`Hub::listen`, `Hub::dial` and `Hub::browse`**: the listener, every dial and the mDNS
+  browse are the hub's own now and run in the background; what they produce arrives as
+  `HubEvent::Connected`, `HandshakeFailed { origin, ski, error }`, `Found { peer, trusted }`
+  and `Lost { instance, ski }`. `runtime::Origin` says which end dialled and where the peer
+  is. A trusted peer mDNS finds is dialled and kept dialled; an untrusted one is kept aside
+  and dialled the moment `approve` names it. `runtime::CONNECT_TIMEOUT` bounds reaching a
+  peer and not the handshake, which has SHIP's own timers and may wait for a person.
+- **The device-level test cases as data.** `conformance::DEVICE_LEVEL`,
+  `conformance::device_level()` and `AbstractTestCase::owed_by_device` carry the fourteen
+  abstract test cases no library can answer — a factory reset, a power cut, a start-up
+  duration, what the appliance draws — with the reason each is the device's. A harness
+  driving a real device iterates them instead of transcribing them; this crate's own suite
+  derives its uncovered set from the same table and asserts the two agree.
+- `spine::MAX_RELATIONS_PER_PEER`, `spine::WriteError`, `NackReason::NotStored`,
+  `ControllableSystem::on_unstored_limit_write`.
+- Four engine tests for the authority rules: a relation cannot be released in another
+  peer's name, an empty write is not acknowledged, an unstorable acceptance is reported,
+  and discovery is filed under the header.
+
+### Changed
+
+**Breaking.** The crate is unpublished; each of these removes a way to get something wrong.
+
+- `Hub::connect` is gone: `Hub::dial(SocketAddr)` starts a dial and returns at once, and
+  `HubEvent::Connected` carries the SKI. `Hub::accept(TcpStream)` returns at once too, and
+  `Hub::listen` replaces a hand-written accept loop. `HubEvent` no longer derives
+  `PartialEq`, because `HandshakeFailed` carries the `ConnectionError`.
+- `Engine::accept_write` returns `Result<(), WriteError>`; `reject_write` returns `bool`.
+- `TrustStore` no longer derives `PartialEq`; compare `peers()` instead. Its JSON is now
+  an object with `peers` and `unit` rather than a bare array of peers, so a store written
+  by 0.3 does not load — re-approve, or wrap the old array as `{"peers": […]}`.
+- `ShipQr::certificate_fingerprint` is `Option<Fingerprint>` rather than
+  `Option<String>`, and a `FPH256` field that is not 64 uppercase hex digits now makes the
+  payload unreadable rather than being carried through.
+- `ship::pairing` is reshaped: `PairingRequest`'s `for_par`/`trust_par` are
+  `Fingerprint` and `trust_nonce` is a `Nonce`; `to_pairs` moved to
+  `PairingAnnouncement`, which `sign` produces; `verify` no longer records a digest that
+  did not verify, and the authenticity check alone is `verify_digest`.
+- `Mdns::announce_pairing` takes a `PairingAnnouncement`, not a `ShipTxtRecord`;
+  `Mdns::browse_pairing` returns a `PairingBrowse` of `PairingEvent`, not a `Browse` of
+  SHIP nodes.
+- A payload carrying more than one `cmd` is refused with `errorNumber` 1 (SPINE §5.3.2).
+- A pending SHIP node aborts when its Wait-For-Ready-Timer expires, and aborts on a
+  `ready` that carries no `waiting` (§13.4.4.1.3).
+- A binding or subscription call whose client address names a device other than the
+  sender is refused; a peer past `MAX_RELATIONS_PER_PEER` is answered `errorNumber` 3.
+
+## [0.3.0] — 2026-09-02
 
 ### Fixed
 
@@ -383,6 +569,7 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
-[0.3.0]: https://github.com/hupe1980/eebus/compare/v0.2.0...HEAD
+[0.4.0]: https://github.com/hupe1980/eebus/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hupe1980/eebus/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/eebus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/eebus/releases/tag/v0.1.0

@@ -739,13 +739,11 @@ impl Handshake {
             self.send_pin_state();
         }
         if expired(&mut self.timers.wait_for_ready, now) {
-            if self.trust == Trust::Pending {
-                // Still waiting for a person: renew our announcement rather than drop
-                // the connection, so the peer can keep prolonging.
-                self.announce_hello(now);
-            } else {
-                self.abort(AbortReason::Timeout(Phase::Hello));
-            }
+            // §13.4.4.1.3, READY_TIMEOUT and PENDING_TIMEOUT alike: the peer did not
+            // announce `ready` in time. Waiting for a user is not an exemption — this
+            // timer only runs while the *peer* is pending too, and a pending node whose
+            // peer is ready has already retired it (see `on_hello`).
+            self.abort(AbortReason::Timeout(Phase::Hello));
         }
         Ok(())
     }
@@ -851,6 +849,18 @@ impl Handshake {
 
         match hello.phase {
             Some(ConnectionHelloPhase::Ready) => {
+                if !self.hello_local_ready {
+                    // §13.4.4.1.3, PENDING_LISTEN rules 1 and 2. A `ready` without a
+                    // `waiting` leaves a pending node nothing to prolong, and is an
+                    // abort. One with a `waiting` ends this node's own Wait-For-Ready
+                    // timer: the peer is ready, and what is waited on from now is the
+                    // peer's patience, which the prolongation requests keep up.
+                    if peer_waiting.is_none() {
+                        self.abort(AbortReason::UnexpectedMessage(Phase::Hello));
+                        return;
+                    }
+                    self.timers.wait_for_ready = None;
+                }
                 self.hello_remote_ready = true;
                 self.timers.prolongation_reply = None;
                 self.try_finish_hello(now);

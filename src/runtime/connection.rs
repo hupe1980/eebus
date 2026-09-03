@@ -15,6 +15,8 @@ use crate::ship::{
     ShipMessage, Ski, Trust,
 };
 
+use super::node::Node;
+
 /// A stream that has been through TLS and the WebSocket upgrade.
 type Socket = WebSocketStream<tokio_rustls::TlsStream<TcpStream>>;
 
@@ -48,12 +50,24 @@ pub enum ConnectionError {
     /// The peer sent a text frame, which SHIP §10.3 forbids.
     #[error("SHIP carries binary frames only")]
     NotBinary,
+    /// As many peers are already waiting on a trust decision as the hub will hold.
+    ///
+    /// Not a protocol error, and not the peer's fault: it was told `hello: aborted` so
+    /// that it retries rather than occupying a connection slot for minutes while nobody
+    /// has approved it. See [`MAX_PENDING_TRUST`](crate::runtime::MAX_PENDING_TRUST).
+    #[error("as many peers are already waiting to be approved as the hub will hold")]
+    TooManyPendingPairings,
     /// The hub is already holding as many connections as it will.
     ///
-    /// Not a protocol error: the peer completed the handshake and was then turned away,
-    /// so that a device dialling in repeatedly cannot displace the peers already served.
+    /// Not a protocol error: the peer was turned away so that a device dialling in
+    /// repeatedly cannot displace the peers already served. A socket refused before its
+    /// handshake is simply dropped; one refused after it is closed with a
+    /// `connectionClose`.
     #[error("the hub is already holding as many connections as it will")]
     TooManyConnections,
+    /// A dial did not complete within the hub's connect timeout.
+    #[error("the peer did not complete the connection in time")]
+    Timeout,
     /// The TLS configuration was refused.
     #[error("{0}")]
     Tls(#[from] crate::tls::TlsError),
@@ -77,6 +91,7 @@ pub struct ShipConnection {
     handshake: Handshake,
     clock: Instant,
     peer: Ski,
+    peer_fingerprint: crate::ship::Fingerprint,
     peer_ship_id: Option<String>,
     started: Instant,
     awaiting_pong: bool,
@@ -93,6 +108,14 @@ impl ShipConnection {
     /// the peer proved it holds the key to.
     pub fn peer(&self) -> Ski {
         self.peer
+    }
+
+    /// The SHA-256 fingerprint of the certificate the peer presented.
+    ///
+    /// The identity the SHIP Pairing Service trusts (§10.2), and the one a node paired
+    /// that way was admitted on. Every peer proves one, whichever way it was trusted.
+    pub fn peer_fingerprint(&self) -> crate::ship::Fingerprint {
+        self.peer_fingerprint
     }
 
     /// The SHIP version this connection settled on, once the handshake reached it.
@@ -397,16 +420,31 @@ impl ShipConnection {
     }
 }
 
+/// Tells whoever is driving a node that a peer is waiting on a trust decision.
+///
+/// Called once per handshake, from the task running it, the moment the peer has been told
+/// `hello: pending`. What a [`Hub`](crate::runtime::Hub) hands in turns it into
+/// [`HubEvent::TrustRequested`](crate::runtime::HubEvent::TrustRequested).
+pub(crate) type TrustReporter = alloc::boxed::Box<dyn Fn(Ski) + Send + Sync>;
+
 /// Drives a [`Handshake`] over a socket until it reaches the data phase.
 ///
 /// This is the whole of the sans-IO bargain in one function: the state machine says what
 /// to send and when to wake it, and nothing here decides anything about the protocol.
+///
+/// Three things wake the loop: a frame, a SHIP timer, and a change to the node's trust
+/// store. The third is what makes pairing interactive — a peer held in the pending state
+/// is let through the moment a user approves its SKI, and turned away the moment a user
+/// refuses it — and it is the reason the loop takes the [`Node`] rather than a fixed
+/// [`Trust`].
 pub(crate) async fn run_handshake(
     mut socket: Socket,
     role: Role,
     config: HandshakeConfig,
     trust: Trust,
-    peer: Ski,
+    peer: super::node::PeerIdentity,
+    node: &Node,
+    report: Option<TrustReporter>,
 ) -> Result<ShipConnection, ConnectionError> {
     let started = Instant::now();
     let clock = Instant::now();
@@ -416,6 +454,9 @@ pub(crate) async fn run_handshake(
     // there is a `ShipConnection` to hold it. Kept here and handed over below, or the
     // one signal that says "your stored certificate is stale" is thrown away.
     let mut peer_key_counter = None;
+    // Subscribed before the first check, so a decision made between the two is not lost:
+    // `changed` reports every version this receiver has not yet seen.
+    let mut decisions = node.trust_store().watch();
 
     loop {
         // Everything the state machine wants to send.
@@ -433,6 +474,11 @@ pub(crate) async fn run_handshake(
                 Event::PeerKeyMaterialCounter { update_counter } => {
                     peer_key_counter = Some(update_counter);
                 }
+                Event::TrustRequired => {
+                    if let Some(report) = &report {
+                        report(peer.ski);
+                    }
+                }
                 _ => {}
             }
         }
@@ -445,7 +491,8 @@ pub(crate) async fn run_handshake(
                 socket,
                 handshake,
                 clock,
-                peer,
+                peer: peer.ski,
+                peer_fingerprint: peer.fingerprint,
                 peer_ship_id,
                 started,
                 awaiting_pong: false,
@@ -456,21 +503,32 @@ pub(crate) async fn run_handshake(
             return Ok(connection);
         }
 
-        // Wait for the peer, or for the next timer the state machine asked for.
+        // Wait for the peer, for the next timer the state machine asked for, or for a
+        // trust decision. Reading the socket is cancel-safe, so losing the race costs
+        // nothing; the timer and the watch are re-armed on the next turn.
         let deadline = handshake.poll_timeout();
-        let frame = match deadline {
-            Some(at) => {
-                let now = clock.elapsed();
-                let wait = at.saturating_sub(now);
-                match tokio::time::timeout(wait, socket.next()).await {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        handshake.handle_timeout(clock.elapsed())?;
-                        continue;
-                    }
-                }
+        let wait = deadline.map(|at| at.saturating_sub(clock.elapsed()));
+        let frame = tokio::select! {
+            frame = socket.next() => frame,
+            _ = tokio::time::sleep(wait.unwrap_or(Duration::ZERO)), if wait.is_some() => {
+                handshake.handle_timeout(clock.elapsed())?;
+                continue;
             }
-            None => socket.next().await,
+            changed = decisions.changed() => {
+                if changed.is_err() {
+                    // The store is gone, which cannot happen while the node exists;
+                    // nothing more will ever be decided, so wait on the wire alone.
+                    continue;
+                }
+                if node.take_refusal(&peer.ski) {
+                    handshake.set_trust(Trust::Rejected, clock.elapsed())?;
+                } else if node.trust_for(&peer) == Trust::Trusted {
+                    // Either way in: a user approved the SKI, or a pairing request named
+                    // the certificate. §10.2 makes the two equivalent at this point.
+                    handshake.set_trust(Trust::Trusted, clock.elapsed())?;
+                }
+                continue;
+            }
         };
 
         let Some(frame) = frame else {

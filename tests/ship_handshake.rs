@@ -287,6 +287,58 @@ fn the_prolongation_dance_survives_a_slow_user() {
     );
 }
 
+/// A `ready` with no `waiting` is an abort for a node that is still pending
+/// (§13.4.4.1.3, `SME_HELLO_STATE_PENDING_LISTEN` rule 1): it leaves this node nothing to
+/// prolong, so the connection cannot be held open while the user decides.
+#[test]
+fn a_ready_without_a_waiting_time_aborts_a_pending_node() {
+    let mut hs = Handshake::new(
+        Role::Client,
+        HandshakeConfig::default(),
+        Trust::Pending,
+        Duration::ZERO,
+    );
+    let _ = hs.poll_transmit();
+    hs.handle_message(ShipMessage::Cmi, Duration::ZERO).unwrap();
+    drain(&mut hs);
+
+    hs.handle_message(
+        ShipMessage::Control(ControlMessage::ConnectionHello(ConnectionHello {
+            phase: Some(ConnectionHelloPhase::Ready),
+            ..Default::default()
+        })),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(hs.phase(), Phase::Aborted);
+}
+
+/// `SME_HELLO_STATE_PENDING_TIMEOUT` rule 1 (§13.4.4.1.3): a pending node whose
+/// Wait-For-Ready-Timer expires executes the common abort procedure, exactly as a ready
+/// one does. Waiting for a user does not exempt it — the timer runs only while the *peer*
+/// has not announced `ready`, and two nodes each waiting for their own user are given
+/// `T_hello_init` between them and no more.
+#[test]
+fn a_pending_node_that_is_never_answered_aborts_like_any_other() {
+    let mut hs = Handshake::new(
+        Role::Client,
+        HandshakeConfig::default(),
+        Trust::Pending,
+        Duration::ZERO,
+    );
+    let _ = hs.poll_transmit();
+    hs.handle_message(ShipMessage::Cmi, Duration::ZERO).unwrap();
+    drain(&mut hs);
+    assert_eq!(hs.phase(), Phase::Hello);
+
+    hs.handle_timeout(Duration::from_secs(120)).unwrap();
+    assert_eq!(hs.phase(), Phase::Aborted);
+    assert!(
+        core::iter::from_fn(|| hs.poll_event())
+            .any(|e| e == Event::Aborted(AbortReason::Timeout(Phase::Hello)))
+    );
+}
+
 /// `TC_SHIP_HELLO_003`: when the Wait-For-Ready-Timer expires with nothing pending, the
 /// handshake is abandoned.
 #[test]
@@ -340,9 +392,11 @@ fn tc_ship_hello_004_pending_without_request_does_not_extend() {
     assert_eq!(hs.poll_timeout(), Some(deadline));
 }
 
-/// A peer that announces a very short waiting time gets no prolongation request:
-/// `T_hello_prolong_thr_inc` exists so that a peer cannot drive the exchange with
-/// near-zero waits.
+/// `SME_HELLO_STATE_PENDING_LISTEN`, rule 2 of SHIP §13.4.4.1.3: a `ready` from the peer
+/// ends the pending node's *own* Wait-For-Ready-Timer — the peer is ready, so there is
+/// nothing left to wait for — and what happens next depends on the announced `waiting`.
+/// Below `T_hello_prolong_thr_inc` no prolongation is armed, which is what stops a peer
+/// driving the exchange with near-zero waits.
 #[test]
 fn short_waiting_times_do_not_arm_a_prolongation_request() {
     // A *pending* node, because that is the side that asks at all.
@@ -356,14 +410,13 @@ fn short_waiting_times_do_not_arm_a_prolongation_request() {
     hs.handle_message(ShipMessage::Cmi, Duration::ZERO).unwrap();
     drain(&mut hs);
 
-    // Announcing five seconds is below `T_hello_prolong_thr_inc`; no request is armed.
+    // Announcing five seconds is below `T_hello_prolong_thr_inc`; no request is armed,
+    // and rule 2a has already retired this node's own Wait-For-Ready-Timer. Nothing is
+    // left to wake for: the peer's five seconds are its own to run down, and when they
+    // do it aborts and says so.
     hs.handle_message(ready_hello(5_000), Duration::ZERO)
         .unwrap();
-    assert_eq!(
-        hs.poll_timeout(),
-        Some(Duration::from_secs(120)),
-        "only the untouched Wait-For-Ready-Timer remains"
-    );
+    assert_eq!(hs.poll_timeout(), None, "every hello timer is deactivated");
 
     // A workable announcement does arm one, fifteen seconds before the peer's deadline.
     hs.handle_message(ready_hello(120_000), Duration::ZERO)

@@ -43,6 +43,17 @@ pub enum BindingPolicy {
     MultiplePerFeature,
 }
 
+/// How many bindings, and how many subscriptions, one peer device may hold on this node.
+///
+/// A relation is memory the *peer* allocates: it asks, and the entry lives until it or the
+/// connection goes away. SPINE caps neither, and a peer that has completed a SHIP handshake
+/// can ask from any client address it likes — a fresh entity path per request — so without
+/// a bound the two tables grow on the word of whoever is on the wire. Thirty-two of each
+/// is far beyond what a use case needs: the Energy Guard of LPC holds two bindings and
+/// three subscriptions, and an energy manager watching a large inverter a dozen. Beyond it
+/// the answer is `errorNumber` 3 — overload — which is what §5.2.5 defines it for.
+pub const MAX_RELATIONS_PER_PEER: usize = 32;
+
 /// One binding or subscription.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Relation {
@@ -169,6 +180,9 @@ impl Relations {
                 return Err(ErrorNumber::CommandRejected);
             }
         }
+        if held_by_peer(&self.bindings, client) >= MAX_RELATIONS_PER_PEER {
+            return Err(ErrorNumber::Overload);
+        }
 
         let id = self.next_binding;
         self.next_binding += 1;
@@ -208,6 +222,9 @@ impl Relations {
             .find(|s| same_feature(&s.client, client) && same_feature(&s.server, server))
         {
             return Ok(SubscriptionId(existing.id));
+        }
+        if held_by_peer(&self.subscriptions, client) >= MAX_RELATIONS_PER_PEER {
+            return Err(ErrorNumber::Overload);
         }
         let id = self.next_subscription;
         self.next_subscription += 1;
@@ -260,10 +277,56 @@ impl Relations {
     }
 }
 
+/// How many of `relations` a peer device holds — the same device as `client`, whichever
+/// of its features asked.
+fn held_by_peer(relations: &[Relation], client: &FeatureAddress) -> usize {
+    relations
+        .iter()
+        .filter(|relation| relation.client.device == client.device)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spine::{device_address, feature_address, node_management};
+
+    /// Nothing a peer can grow is unbounded: a peer that keeps asking from fresh client
+    /// addresses is told it has had enough, rather than served until the memory runs out.
+    #[test]
+    fn a_peer_cannot_hold_more_relations_than_the_cap() {
+        let heat_pump = device_address("i:67890", "HeatPump").unwrap();
+        let cem = device_address("i:12345", "Cem").unwrap();
+        let mut relations = Relations::new(BindingPolicy::MultiplePerFeature);
+
+        for entity in 1..=MAX_RELATIONS_PER_PEER as u32 {
+            let client = feature_address(&cem, &[entity], 1);
+            relations
+                .add_subscription(&client, &feature_address(&heat_pump, &[1], 1))
+                .expect("within the cap");
+            relations
+                .add_binding(&client, &feature_address(&heat_pump, &[1], 1))
+                .expect("within the cap");
+        }
+        let one_more = feature_address(&cem, &[99], 1);
+        let server = feature_address(&heat_pump, &[1], 1);
+        assert_eq!(
+            relations.add_subscription(&one_more, &server),
+            Err(ErrorNumber::Overload)
+        );
+        assert_eq!(
+            relations.add_binding(&one_more, &server),
+            Err(ErrorNumber::Overload)
+        );
+
+        // The cap is per peer: another device starts from nothing.
+        let other = feature_address(&device_address("i:99999", "Other").unwrap(), &[1], 1);
+        assert!(relations.add_subscription(&other, &server).is_ok());
+
+        // And a relation that already exists is answered with its identifier, not refused.
+        let first = feature_address(&cem, &[1], 1);
+        assert!(relations.add_subscription(&first, &server).is_ok());
+    }
 
     fn addresses() -> (FeatureAddress, FeatureAddress) {
         let control_box = device_address("i:12345", "ControlBox").unwrap();

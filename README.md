@@ -89,15 +89,14 @@ not a generic setter: under §14a EnWG the acknowledgement *is* the record that 
 applied, so it has to say what the appliance actually did.
 
 ```rust
-match engine.poll_event() {
-    Some(SpineEvent::WriteRequested(w)) => {
-        let write = limitation::read_limit_write(&w.resolved)?;   // merged, not the fragment
-        match system.on_limit_write(&write, decide(&write), now) {
-            WriteOutcome::Accepted => engine.accept_write(w.token, now),           // ACK
-            outcome => engine.reject_write(w.token, outcome.error_number(), now),  // NACK
-        }
+if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
+    let write = limitation::read_limit_write(&w.resolved)?;   // merged, not the fragment
+    let outcome = system.on_limit_write(&write, decide(&write), now);
+    if outcome.is_accepted() {
+        engine.accept_write(w.token, now)?;                         // ACK — or what the peer was told instead
+    } else {
+        engine.reject_write(w.token, outcome.error_number(), now);  // NACK
     }
-    _ => {}
 }
 ```
 
@@ -148,12 +147,19 @@ keeps hand-rolled powers of ten and float casts out of the two modules where the
 a number.
 
 **Nothing a peer sends can grow without bound.** SHIP and SPINE cap neither connections nor
-stored state. A hub holds sixteen connections and two per peer; the engine tracks
-thirty-two device addresses, thirty-two remembered functions per peer, sixteen undecided
-writes and 128 entries per function, and answers `errorNumber` 3 beyond any of them. A
-device address — a routing key, a stored identity, a line in the §14a record — is bounded
-and printable or the datagram is discarded. A write nobody decides is abandoned once the
-peer has stopped waiting.
+stored state. A hub holds sixteen connections and two per peer, handshakes in progress
+included; the engine tracks thirty-two device addresses, thirty-two remembered functions
+and thirty-two bindings and subscriptions per peer, sixteen undecided writes and 128
+entries per function, and answers `errorNumber` 3 beyond any of them. A device address — a
+routing key, a stored identity, a line in the §14a record — is bounded and printable or the
+datagram is discarded. A write nobody decides is abandoned once the peer has stopped
+waiting.
+
+**And nothing a peer sends speaks for another peer.** A binding or subscription call names
+its client in the payload; the engine honours it only from the device SHIP authenticated as
+the sender, so one paired peer cannot release another's binding. Discovery is filed under
+the header's source, not the payload's claim. A heartbeat keeps a Controllable System out of
+its failsafe state only when it comes from the Energy Guard that holds its bindings.
 
 **Fuzzed and property-tested.** Five `cargo fuzz` targets cover everything the network can
 reach — SHIP framing, the JSON codec, the QR payload, the TXT record, a whole datagram
@@ -211,9 +217,9 @@ in that position loses it, which is the interoperable answer.
 | | double-connection resolution, both halves | §12.2.3 |
 | | certificate updates, end to end | §12.1.3 |
 | | SKI, SHIP ID, `_ship._tcp` TXT record, installation QR code | §5.4, installation requirements 1.1.0 |
-| | Pairing Service digest and replay guard | Pairing Service 1.0.0 §7, §11 |
+| | the Pairing Service end to end: both roles, the TXT record, the fingerprint trust, the §4.3 policy | Pairing Service 1.0.0 |
 | **SPINE** | device model, NodeManagement, detailed and use-case discovery | §5.1, §7.1–7.3 |
-| | Restricted Function Exchange: partial read and write, filtered delete, several filters per command | §5.3.4, SPINE IG §3.3, LPC UC TS §3.4.1.4 |
+| | Restricted Function Exchange: partial read and write, filtered delete, several filters per command — sent as well as served | §5.3.4, SPINE IG §3.3, LPC UC TS §3.4.1.4 |
 | | a peer's partial notifications and replies merged into the state they update | §7.4, SPINE IG §3.2.2, §3.3 |
 | | acknowledgements, error numbers, counters, `specificationVersion` | §5.2.4–5.2.5, SPINE IG §2.5 |
 | | `maxResponseDelay`: honoured on what a peer announced, announced for what a feature needs | §5.2.5.3 |
@@ -233,6 +239,8 @@ in that position loses it, which is the interoperable answer.
 | | mDNS-SD announce and browse | SHIP §5 (`mdns`) |
 | | connection table, keep-alive, reconnection with spread backoff | SHIP §10 (`runtime`) |
 | | persistent trust store, and the "delete all foreign keys" reset | SHIP §12.2.2 (`runtime`) |
+| | interactive pairing: the pending peer reported, approved or refused in place, and bounded in number | SHIP §13.4.4.1 (`runtime`) |
+| | automatic pairing: `_shippairing._tcp` requests evaluated, and announced, from the hub | Pairing Service §4, §9 (`runtime`, `mdns`) |
 
 Where the crate deliberately departs from the reference implementations — the §12.2.3
 double-connection rule, no session resumption, refusing unsupported selectors rather than
@@ -263,24 +271,33 @@ A control box and a household appliance, on a real network — one on each side 
 exchange, so either can be tested without the other's hardware on the desk.
 
 ```sh
-# In one terminal. First run prints the SKI and the QR payload, and trusts nobody.
+# In one terminal: the household end. Prints its SKI and its QR payload.
 cargo run --example heat_pump --features full
 
-# In another. Trust each other, then hold the household to 4.2 kW.
-cargo run --example steuerbox --features full -- --trust <the pump's SKI> --limit 4200
-cargo run --example heat_pump --features full -- --trust <the box's SKI>
+# In another: the grid end. Finds the household over mDNS and offers to pair with it.
+cargo run --example steuerbox --features full -- --limit 4200
 ```
 
-They announce themselves over mDNS, find each other, persist their identity and their trust
-store between runs, and print the `lpc:` runtime signals a certification laboratory reads.
+Answer `y` on each side — the terminal stands in for the button on a real device — or pass
+`--trust <SKI>` to skip the question. They persist their identity and their trust store
+between runs, and print the `lpc:` runtime signals a certification laboratory reads.
 `--reset` is the EEBUS reset of SHIP §12.2.2: forget every peer, and the identity with it.
 
-On a network, [`Hub`](https://hupe1980.github.io/eebus/docs/networking/) owns the sockets and
-the clock — `hub.run(handler)` is the loop, because `hub.next()` is not cancel-safe and a
+On a network, [`Hub`](https://hupe1980.github.io/eebus/docs/networking/) owns the sockets
+and the clock. It listens, dials and browses **in the background** — a peer that is slow,
+unreachable or waiting for a user holds nothing else up — routes each datagram to the peer
+it names, keeps idle connections alive, resolves double connections, and redials with a
+backoff spread by the peer's SKI so a building coming back from a power cut does not dial
+all at once. `hub.run(handler)` is the loop, because `hub.next()` is not cancel-safe and a
 write cancelled anyway is closed with `Disconnect::InterruptedWrite` rather than left to
-corrupt the peer's stream. It dials and accepts, routes each datagram to the peer it names,
-keeps idle connections alive, resolves double connections, and redials with a backoff spread by the
-peer's SKI so a building coming back from a power cut does not dial all at once.
+corrupt the peer's stream.
+
+**Pairing happens while the peer waits.** An unapproved peer completes TLS, is held in the
+SHIP `hello: pending` state and reported as `TrustRequested`; `hub.approve(ski)` completes
+the handshake it is waiting in and `hub.refuse(ski)` answers `hello: aborted`. The
+[SHIP Pairing Service](https://hupe1980.github.io/eebus/docs/networking/#or-nobody-is-asked-at-all)
+is the other path, where a control unit proves it knows a printed secret and nobody is
+asked at all. There is no auto accept, and no third path.
 
 ## Building
 
@@ -344,12 +361,12 @@ so re-running it when nothing has changed produces no diff.
 | Feature | Default | Effect |
 |---|---|---|
 | `std` | ✅ | Standard library. Without it the crate builds `no_std + alloc`. |
-| `pairing` | ✅ | SHIP Pairing Service (pulls in `hmac` and `sha2`). |
+| `pairing` | ✅ | SHIP Pairing Service, both roles (`hmac`, `sha2`); with `runtime` and `mdns`, the hub's end of it too. |
 | `conformance` | ✅ | The 203 abstract test cases of the four HLTS as data. Tens of kilobytes of static strings a device in the field never reads; `--no-default-features` leaves it out. |
 | `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the SHIP handshake, the connection table. |
-| `mdns` | — | `_ship._tcp` announcement and discovery (`mdns-sd`). |
+| `mdns` | — | `_ship._tcp` announcement and discovery, and `_shippairing._tcp` with `pairing` (`mdns-sd`). |
 | `ring` | — | `rustls` and `rcgen` backed by `ring`. |
 | `aws-lc-rs` | — | The same, backed by `aws-lc-rs`. |
 | `interop` | — | The cross-implementation test suite. Needs Docker; nothing in the library depends on it, and `full` deliberately excludes it. |
@@ -362,9 +379,9 @@ by default: `rustls`' provider is process-global, so a library that pulled one i
 choose for every consumer downstream of it.
 
 ```toml
-eebus = { version = "0.3", features = ["runtime", "ring"] }
+eebus = { version = "0.4", features = ["runtime", "ring"] }
 # or, for a build that must not contain `ring`:
-eebus = { version = "0.3", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+eebus = { version = "0.4", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
 ```
 
 Naming both, or neither, is a `compile_error!` rather than a device that panics on its first

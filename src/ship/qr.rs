@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::str::FromStr;
 
-use super::{DeviceCategory, DiscoveryError, ShipId, Ski};
+use super::{DeviceCategory, DiscoveryError, Fingerprint, ShipId, Ski};
 
 /// The contents of a SHIP installation QR code.
 ///
@@ -74,8 +74,9 @@ pub struct ShipQr {
     pub public_key: Option<String>,
     /// A URL the device's certificate can be downloaded from, in PEM form.
     pub certificate_url: Option<String>,
-    /// The SHA-256 fingerprint of the DER certificate, used by the pairing service.
-    pub certificate_fingerprint: Option<String>,
+    /// The SHA-256 fingerprint of the DER certificate, which is what the Pairing
+    /// Service trusts (`FPH256`, SHIP 1.1.0).
+    pub certificate_fingerprint: Option<Fingerprint>,
     /// The pairing secret (`SPSEC`) of the SHIP Pairing Service.
     ///
     /// This is key material, and so is [`pin`](Self::pin). Both are redacted by this
@@ -104,6 +105,9 @@ pub enum QrError {
     /// The `SKI`, `BSKI` or `B2SKI` field did not hold a valid SKI.
     #[error("invalid SKI: {0}")]
     Ski(#[from] super::SkiParseError),
+    /// The `FPH256` field did not hold a valid fingerprint.
+    #[error("invalid fingerprint: {0}")]
+    Fingerprint(#[from] super::FingerprintParseError),
     /// `NOMINALPOWER` was not two comma-separated integers.
     #[error("invalid nominal power `{0}`: expected `<production>,<consumption>`")]
     NominalPower(String),
@@ -232,7 +236,7 @@ impl ShipQr {
         }
         if let Some(fingerprint) = &self.certificate_fingerprint {
             out.push_str("FPH256:");
-            out.push_str(fingerprint);
+            out.push_str(&fingerprint.to_hex());
             out.push(';');
         }
         if let Some(secret) = &self.pairing_secret {
@@ -353,7 +357,7 @@ impl FromStr for ShipQr {
                     let raw = field.split_once(':').map(|(_, v)| v).unwrap_or(value);
                     qr.certificate_url = Some(raw.trim().to_owned());
                 }
-                "FPH256" => qr.certificate_fingerprint = Some(strip_spaces(value)),
+                "FPH256" => qr.certificate_fingerprint = Some(strip_spaces(value).parse()?),
                 "SPSEC" => qr.pairing_secret = Some(strip_spaces(value)),
                 "CAT" => {
                     for part in value.split(',').filter(|p| !p.is_empty()) {
@@ -536,6 +540,7 @@ mod tests {
                 "NOMINALPOWER" => "0,11000",
                 "ID" => "i:12345_u:1",
                 "SKI" | "BSKI" | "B2SKI" => "5555AAAAFFFF1111CCCC3333EEEEDDDD99992222",
+                "FPH256" => "C74B7855D3479415F62CC01E5F6D9A93EBC676057D85417ADA16FD1384338943",
                 _ => "x",
             };
             let text = alloc::format!("SHIP;{SKI};{key}:{value};ENDSHIP;");
@@ -587,8 +592,8 @@ mod tests {
         );
         assert_eq!(qr.id.as_ref().unwrap().iana_pen(), Some("983327"));
         assert_eq!(
-            qr.certificate_fingerprint.as_deref(),
-            Some("C74B7855D3479415F62CC01E5F6D9A93EBC676057D85417ADA16FD1384338943")
+            qr.certificate_fingerprint.unwrap().to_string(),
+            "C74B7855D3479415F62CC01E5F6D9A93EBC676057D85417ADA16FD1384338943"
         );
         assert_eq!(
             qr.pairing_secret.as_deref(),

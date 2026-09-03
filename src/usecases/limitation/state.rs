@@ -280,6 +280,15 @@ pub enum NackReason {
     /// safe answer: any substitute would be a limit the Energy Guard never sent.
     #[error("the limit value could not be read")]
     Unreadable,
+    /// The system decided to accept and the engine could not store the result, so the peer
+    /// was answered with an error rather than an acknowledgement.
+    ///
+    /// The one refusal that is not the system's own: a merged list that would exceed the
+    /// engine's bound, or a payload that turned out not to belong to the function. It is
+    /// recorded as what the peer was *told*, because a §14a record that said "accepted"
+    /// while the wire said otherwise would be evidence of something that did not happen.
+    #[error("the accepted write could not be stored")]
+    NotStored,
     /// The peer refused and did not say why.
     ///
     /// This is what an Energy Guard sees, and it is not a gap in the protocol: [LPC-003]
@@ -574,6 +583,19 @@ impl ControllableSystem {
             return WriteOutcome::Rejected(NackReason::NoRecentHeartbeat);
         }
         self.refuse(NackReason::Unreadable, now)
+    }
+
+    /// Takes back an acceptance the engine could not store.
+    ///
+    /// [`on_limit_write`](Self::on_limit_write) moved the machine on the decision to
+    /// accept; the peer was then answered with an error, so what it holds is what a
+    /// *refused* write leaves — the previous limit, in the controlled state a refusal
+    /// lands in ([LPC/LPP-907]). This puts the machine there, so that what it reports
+    /// agrees with what went on the wire.
+    pub fn on_unstored_limit_write(&mut self, now: Duration) {
+        self.limit = None;
+        self.limit_expiry = None;
+        self.enter(LimitationState::UnlimitedControlled, now);
     }
 
     /// The state change every refused limit write makes, whatever the reason.

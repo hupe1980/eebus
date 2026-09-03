@@ -44,7 +44,7 @@ use rustls::{
 };
 
 use crate::cert::{self, Identity};
-use crate::ship::Ski;
+use crate::ship::{Fingerprint, Ski};
 
 /// The largest TLS record SHIP §9.2 allows a node to send.
 pub const MAX_RECORD_SIZE: usize = 1024;
@@ -123,6 +123,25 @@ pub enum TlsError {
     /// The record size was outside what SHIP §9.2 permits.
     #[error("a SHIP record is at most {MAX_RECORD_SIZE} bytes, asked for {0}")]
     RecordTooLarge(usize),
+    /// The backend's random number generator failed.
+    #[error("the random number generator failed")]
+    Random,
+}
+
+/// Fills `buffer` from the backend's cryptographic random number generator.
+///
+/// The Pairing Service §6.3 asks for a generator of this quality behind every nonce and
+/// every secret, and a node's own backend is the one it already trusts with its keys.
+///
+/// # Errors
+///
+/// [`TlsError::Random`] if the generator refused, which on the platforms the backends
+/// support does not happen.
+pub fn random(buffer: &mut [u8]) -> Result<(), TlsError> {
+    ship_provider()
+        .secure_random
+        .fill(buffer)
+        .map_err(|_| TlsError::Random)
 }
 
 /// A node's TLS configuration: its identity, and what it will accept from a peer.
@@ -165,6 +184,11 @@ impl ShipTls {
         }
         self.record_size = bytes;
         Ok(self)
+    }
+
+    /// This node's certificate fingerprint, which the Pairing Service identifies it by.
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.identity.fingerprint()
     }
 
     /// This node's SKI, which is what a peer will be asked to trust.
@@ -257,6 +281,16 @@ impl ShipTls {
 pub fn peer_ski(state: &rustls::CommonState) -> Option<Ski> {
     let certificates = state.peer_certificates()?;
     cert::ski_from_der(certificates.first()?).ok()
+}
+
+/// The certificate fingerprint of the peer on an established `rustls` connection.
+///
+/// The Pairing Service's identity (§10.2): the SHA-256 of the DER certificate the peer
+/// presented, to be compared with the `trustPar` it announced. A peer paired that way is
+/// admitted on this rather than on its SKI.
+pub fn peer_fingerprint(state: &rustls::CommonState) -> Option<Fingerprint> {
+    let certificates = state.peer_certificates()?;
+    Some(Fingerprint::of_der(certificates.first()?))
 }
 
 /// Accepts any well-formed certificate, having checked that SHIP could work with it.

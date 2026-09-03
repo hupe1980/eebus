@@ -42,10 +42,38 @@ judgement two nodes can disagree about, and disagreeing can leave both with noth
 rule is followed here and the hazard bounded instead: one ping round, then a decision, and a
 redial if it does go wrong. [More](@/docs/ship.md#two-nodes-that-dial-each-other-at-once).
 
-**Every table a peer can grow is capped.** Connections, tracked device addresses, and
-writes waiting on the application. SHIP and SPINE cap none of them; a peer that reaches a
-cap is told so — `errorNumber` 3 for a write, a `connectionClose` for a connection — rather
-than served until the memory runs out.
+**Every table a peer can grow is capped.** Connections — handshakes in progress included —
+peers waiting on an approval, tracked device addresses, bindings and subscriptions per
+peer, remembered functions per peer, entries per function, and writes waiting on the
+application. SHIP and SPINE cap none
+of them; a peer that reaches a cap is told so — `errorNumber` 3 for a write or a relation,
+a dropped socket or a `connectionClose` for a connection — rather than served until the
+memory runs out.
+
+**A binding or subscription call acts only in the sender's name.** The client address in
+the payload has to belong to the device SHIP authenticated, or the call is refused with
+`errorNumber` 7; a call that leaves the device part out is completed from the header. The
+reference implementation fills the address in and checks nothing, which lets one paired
+peer release another's binding.
+
+**Discovery is filed under the header's source, not the payload's device.** A peer's
+detailed discovery describes the device the *header* says sent it; a payload naming another
+device cannot file itself under that device, nor rename a record already held.
+
+**A heartbeat counts only from the Energy Guard that holds the bindings.** A Controllable
+System subscribes to the diagnosis feature of the entity that bound both its features
+(LPC IG §3.8), and a heartbeat from any other peer on the network does not keep its
+failsafe at bay.
+
+**A pairing is decided while the peer waits.** An unapproved peer is held in the SHIP
+`hello: pending` state and reported; approving its SKI completes the handshake it is
+waiting in, refusing it answers `hello: aborted`. There is no auto accept and no third
+path.
+
+**The SHIP Pairing Service is implemented, and trusts a certificate.** No reference
+implementation has it. Its request names no SKI, so the trust store holds a `PairedUnit`
+beside its SKI records and admits a peer whose fingerprint matches — which §10.2 says
+"SHALL be seen like a successful trust in an SKI".
 
 **A write the application never decides is abandoned** once §5.2.5's maximum response delay
 has passed, and reported as `SpineEvent::WriteAbandoned`. An answer after that would reach a
@@ -141,7 +169,7 @@ failure legible: it means *this crate* changed, not that the other one did.
 |---|---|
 | Unit and integration tests | `cargo test --workspace --features eebus/full` |
 | Examples, end to end | `cargo run --example grid_limit`, `--example networked` |
-| Both cryptography providers | `ring` builds and tests; `aws-lc-rs` is type-checked |
+| Both cryptography providers | the whole suite runs on `ring` and on `aws-lc-rs` |
 | Property tests | round trips, the RFE merge laws and the wire arithmetic, via `proptest` |
 | Real devices | fifteen datagrams from eight devices by seven manufacturers, parsed and resolved |
 | A live peer, both ways | `eebus-go`'s own control box and EVSE in a container, at a pinned revision, doing the §14a exchange in each direction — opt-in, `--features interop` |

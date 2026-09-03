@@ -35,7 +35,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::ship::Ski;
+use crate::ship::{Fingerprint, Ski};
 
 /// The signature algorithm SHIP requires: ECDSA on secp256r1 with SHA-256.
 const ALGORITHM: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ECDSA_P256_SHA256;
@@ -134,6 +134,12 @@ impl Identity {
     /// The certificate in DER form, which is what TLS sends.
     pub fn certificate_der(&self) -> &[u8] {
         self.certificate.der()
+    }
+
+    /// The SHA-256 fingerprint of the certificate: what the Pairing Service trusts, and
+    /// what goes into the QR code as `FPH256`.
+    pub fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::of_der(self.certificate.der())
     }
 
     /// The certificate in PEM form, for storing on disk.

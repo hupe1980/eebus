@@ -3,9 +3,11 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use std::sync::Mutex;
 
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::watch;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -14,10 +16,12 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-use crate::ship::{DEFAULT_PATH, HandshakeConfig, Role, SUBPROTOCOL, Ski, Trust};
-use crate::tls::{ShipTls, peer_ski};
+use crate::ship::{DEFAULT_PATH, Fingerprint, HandshakeConfig, Role, SUBPROTOCOL, Ski, Trust};
+use crate::tls::{ShipTls, peer_fingerprint, peer_ski};
 
-use super::connection::{ConnectionError, ShipConnection, check_subprotocol, run_handshake};
+use super::connection::{
+    ConnectionError, ShipConnection, TrustReporter, check_subprotocol, run_handshake,
+};
 
 /// One remembered peer.
 ///
@@ -38,6 +42,15 @@ pub struct TrustedPeer {
     /// When trust was established, ISO 8601, where the device had a clock to read.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trusted_at: Option<String>,
+    /// The SHA-256 fingerprint of the certificate it presented.
+    ///
+    /// Recorded when it is known — a peer paired through the Pairing Service announces
+    /// it, and every peer that completes TLS proves it — and used for nothing on its
+    /// own: the trust decision for this record is the SKI. It is here because §10.4 asks
+    /// a store to carry what it has learned about a peer, and because a person auditing
+    /// a pairing is owed the value that was on the sticker.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fingerprint: Option<Fingerprint>,
 }
 
 impl TrustedPeer {
@@ -51,6 +64,7 @@ impl TrustedPeer {
             name: None,
             ship_id: None,
             trusted_at: None,
+            fingerprint: None,
         }
     }
 
@@ -74,13 +88,98 @@ impl TrustedPeer {
         self.trusted_at = Some(timestamp.into());
         self
     }
+
+    /// Records the fingerprint of the certificate it presented.
+    #[must_use]
+    pub fn with_fingerprint(mut self, fingerprint: Fingerprint) -> Self {
+        self.fingerprint = Some(fingerprint);
+        self
+    }
+}
+
+/// A control unit trusted through the SHIP Pairing Service.
+///
+/// The Pairing Service trusts a **certificate**, not a key identifier: what `devZ`
+/// announces is the SHA-256 fingerprint of the certificate it will present, and §10.2
+/// says that matching it at the TLS handshake "SHALL be seen like a successful trust in
+/// an SKI". So it is stored as what it is, rather than as a `TrustedPeer` with an
+/// invented SKI — the SKI is not known until the unit connects, and §10.4 makes the SHIP
+/// ID the primary identifier instead.
+///
+/// A node holds at most one of these: §10.3 is explicit that "devA will never consider
+/// more than one SHIP node as devZ", and accepting a new request untrusts the previous
+/// unit.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PairedUnit {
+    /// The unit's SHIP ID, from the request's `trustId`. §10.4 calls this the primary
+    /// identifier throughout a node's lifetime.
+    pub ship_id: String,
+    /// The fingerprint of the certificate it will present, from `trustPar`.
+    pub fingerprint: Fingerprint,
+    /// The curve of its key, from `trustCurve`.
+    pub curve: String,
+    /// Its SKI, once a connection has proved one. §10.2 makes recording it optional and
+    /// explicitly not part of the authentication; it is kept so that everything else in
+    /// this crate — routing, the redial schedule, a user interface — can name the unit
+    /// the way it names every other peer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ski: Option<Ski>,
+    /// When the request was accepted, ISO 8601, where the device had a clock to read.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub paired_at: Option<String>,
+}
+
+impl PairedUnit {
+    /// The unit an accepted request describes.
+    #[cfg(feature = "pairing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "pairing")))]
+    pub fn from_request(request: &crate::ship::pairing::PairingRequest) -> Self {
+        Self {
+            ship_id: request.trust_id.clone(),
+            fingerprint: request.trust_par,
+            curve: request.trust_curve.clone(),
+            ski: None,
+            paired_at: None,
+        }
+    }
+
+    /// A unit trusted by SHIP ID and certificate fingerprint.
+    ///
+    /// [`from_request`](Self::from_request) is the ordinary source; this is for a store
+    /// restored from disk, and for a device whose pairing was configured some other way.
+    pub fn new(
+        ship_id: impl Into<String>,
+        fingerprint: Fingerprint,
+        curve: impl Into<String>,
+    ) -> Self {
+        Self {
+            ship_id: ship_id.into(),
+            fingerprint,
+            curve: curve.into(),
+            ski: None,
+            paired_at: None,
+        }
+    }
+
+    /// Records when the pairing was accepted.
+    #[must_use]
+    pub fn at_time(mut self, timestamp: impl Into<String>) -> Self {
+        self.paired_at = Some(timestamp.into());
+        self
+    }
 }
 
 /// The peers a node is willing to exchange data with.
 ///
 /// SHIP's whole trust model is this list. A peer whose SKI is not in it may still connect
 /// and complete TLS — it has to, so that its SKI can be shown to a user — but the SHIP
-/// handshake will hold it in the pending state rather than open the data phase.
+/// handshake will hold it in the pending state rather than open the data phase. **Adding
+/// the SKI while that handshake is waiting is what lets it through**: every change to the
+/// store wakes the handshakes that are pending on it, so a user approving a SKI off a
+/// screen is a pairing completed, not a reconnection owed.
+///
+/// The store is shared: clones refer to the same list, so the one a [`Node`] was built
+/// with and the one an application keeps a handle on are one store.
 ///
 /// # Persistence
 ///
@@ -105,9 +204,36 @@ impl TrustedPeer {
 /// delete all stored foreign public keys (e.g. via factory reset)". That is
 /// [`forget_all`](Self::forget_all), and it is what an "EEBUS reset" on a device's user
 /// interface has to reach.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TrustStore {
-    trusted: Arc<Mutex<BTreeMap<Ski, TrustedPeer>>>,
+    inner: Arc<Mutex<Trusted>>,
+    /// Bumped on every change, so a handshake waiting for a decision is woken by it.
+    changed: watch::Sender<u64>,
+}
+
+/// What a store holds: peers trusted by SKI, and the one unit trusted by certificate.
+#[derive(Debug, Default)]
+struct Trusted {
+    peers: BTreeMap<Ski, TrustedPeer>,
+    /// §10.3: at most one, ever.
+    unit: Option<PairedUnit>,
+}
+
+/// The persisted form of a [`TrustStore`].
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct StoredTrust {
+    peers: Vec<TrustedPeer>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    unit: Option<PairedUnit>,
+}
+
+impl Default for TrustStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            changed: watch::Sender::new(0),
+        }
+    }
 }
 
 impl TrustStore {
@@ -135,6 +261,8 @@ impl TrustStore {
     }
 
     /// Adds a peer, which is what a user approving a SKI amounts to.
+    ///
+    /// A handshake held in the pending state for this SKI proceeds at once.
     pub fn trust(&self, ski: Ski) {
         self.remember(TrustedPeer::new(ski));
     }
@@ -144,16 +272,134 @@ impl TrustStore {
     /// Replaces an existing record for the same SKI: re-approving a peer is a fresh
     /// decision, and the details that come with it are the current ones.
     pub fn remember(&self, peer: TrustedPeer) {
-        if let Ok(mut trusted) = self.trusted.lock() {
-            trusted.insert(peer.ski, peer);
+        if let Ok(mut trusted) = self.inner.lock() {
+            trusted.peers.insert(peer.ski, peer);
+        }
+        self.touch();
+    }
+
+    /// Trusts a control unit's certificate: the outcome of an accepted pairing request.
+    ///
+    /// §10.3: a node considers at most one unit at a time, so this replaces any previous
+    /// one — and untrusts the SKI that unit was reached under, which is what "remove SHIP
+    /// trust of past devZ" means in a store keyed by SKI. Returns the unit it displaced.
+    pub fn trust_unit(&self, unit: PairedUnit) -> Option<PairedUnit> {
+        let displaced = match self.inner.lock() {
+            Ok(mut trusted) => {
+                // A unit restored from disk already knows the SKI it presents, so the
+                // SKI-keyed half of the store is filled in here rather than waiting for
+                // the connection that proves it again.
+                let known = unit.ski.map(|ski| {
+                    TrustedPeer::new(ski)
+                        .with_ship_id(unit.ship_id.clone())
+                        .with_fingerprint(unit.fingerprint)
+                });
+                let previous = trusted.unit.replace(unit);
+                if let Some(ski) = previous.as_ref().and_then(|p| p.ski) {
+                    trusted.peers.remove(&ski);
+                }
+                if let Some(known) = known {
+                    trusted.peers.insert(known.ski, known);
+                }
+                previous
+            }
+            Err(_) => None,
+        };
+        self.touch();
+        displaced
+    }
+
+    /// The control unit trusted through the Pairing Service, if there is one.
+    pub fn unit(&self) -> Option<PairedUnit> {
+        self.inner.lock().ok().and_then(|t| t.unit.clone())
+    }
+
+    /// Forgets the paired control unit, and the SKI it was reached under.
+    ///
+    /// §10.4: removing this trust is what reactivates the processing of pairing
+    /// requests, which is why it is a call of its own rather than a `forget` of a SKI.
+    pub fn forget_unit(&self) -> Option<PairedUnit> {
+        let unit = match self.inner.lock() {
+            Ok(mut trusted) => {
+                let unit = trusted.unit.take();
+                if let Some(ski) = unit.as_ref().and_then(|p| p.ski) {
+                    trusted.peers.remove(&ski);
+                }
+                unit
+            }
+            Err(_) => None,
+        };
+        self.touch();
+        unit
+    }
+
+    /// Whether a certificate is the paired unit's (§10.2).
+    ///
+    /// This is the whole of the Pairing Service's authentication: the fingerprint of the
+    /// certificate presented at TLS against the one the request announced.
+    pub fn is_certificate_trusted(&self, fingerprint: &Fingerprint) -> bool {
+        self.inner
+            .lock()
+            .map(|trusted| {
+                trusted
+                    .unit
+                    .as_ref()
+                    .is_some_and(|u| &u.fingerprint == fingerprint)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Records the SKI a paired unit turned out to present (§10.2, note).
+    ///
+    /// Called once its first connection has proved one, so that everything keyed by SKI —
+    /// routing, the redial schedule, what a user is shown — can name it. Nothing about
+    /// the trust decision changes: the fingerprint is what admitted it.
+    pub(crate) fn observe_unit_ski(&self, fingerprint: &Fingerprint, ski: Ski) {
+        let changed = match self.inner.lock() {
+            Ok(mut trusted) => {
+                let Some(unit) = trusted
+                    .unit
+                    .as_mut()
+                    .filter(|u| &u.fingerprint == fingerprint)
+                else {
+                    return;
+                };
+                if unit.ski == Some(ski) {
+                    return;
+                }
+                let previous = unit.ski.replace(ski);
+                let ship_id = unit.ship_id.clone();
+                if let Some(previous) = previous {
+                    trusted.peers.remove(&previous);
+                }
+                trusted.peers.insert(
+                    ski,
+                    TrustedPeer::new(ski)
+                        .with_ship_id(ship_id)
+                        .with_fingerprint(*fingerprint),
+                );
+                true
+            }
+            Err(_) => false,
+        };
+        if changed {
+            self.touch();
         }
     }
 
     /// Removes a peer. Existing connections are not torn down by this.
+    ///
+    /// A peer that was trusted through the Pairing Service is untrusted *there* as well:
+    /// §10.4 makes removing the trust the thing that reactivates the pairing process, and
+    /// leaving the certificate trusted would let the unit straight back in.
     pub fn forget(&self, ski: &Ski) {
-        if let Ok(mut trusted) = self.trusted.lock() {
-            trusted.remove(ski);
+        if let Ok(mut trusted) = self.inner.lock() {
+            trusted.peers.remove(ski);
+            if trusted.unit.as_ref().and_then(|u| u.ski) == Some(*ski) {
+                trusted.unit = None;
+            }
         }
+        self.touch();
     }
 
     /// Forgets every peer: the "delete all stored foreign public keys" of SHIP §12.2.2.
@@ -168,71 +414,104 @@ impl TrustStore {
     /// and dropping a live limitation exchange mid-reset would be its own hazard. A device
     /// that means to disconnect as well should say so through its [`Hub`](super::Hub).
     pub fn forget_all(&self) -> usize {
-        match self.trusted.lock() {
+        let count = match self.inner.lock() {
             Ok(mut trusted) => {
-                let count = trusted.len();
-                trusted.clear();
+                let count = trusted.peers.len() + usize::from(trusted.unit.is_some());
+                trusted.peers.clear();
+                trusted.unit = None;
                 count
             }
             Err(_) => 0,
-        }
+        };
+        self.touch();
+        count
     }
 
     /// Whether a peer is trusted.
     pub fn is_trusted(&self, ski: &Ski) -> bool {
-        self.trusted
+        self.inner
             .lock()
-            .map(|trusted| trusted.contains_key(ski))
+            .map(|trusted| trusted.peers.contains_key(ski))
             .unwrap_or(false)
     }
 
     /// What is known about one trusted peer.
     pub fn get(&self, ski: &Ski) -> Option<TrustedPeer> {
-        self.trusted
+        self.inner
             .lock()
             .ok()
-            .and_then(|trusted| trusted.get(ski).cloned())
+            .and_then(|trusted| trusted.peers.get(ski).cloned())
     }
 
     /// How many peers are trusted.
     pub fn len(&self) -> usize {
-        self.trusted
+        self.inner
             .lock()
-            .map(|trusted| trusted.len())
+            .map(|trusted| trusted.peers.len())
             .unwrap_or(0)
     }
 
     /// Whether nothing is trusted — a node fresh out of the box, or freshly reset.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len() == 0 && self.unit().is_none()
     }
 
     /// Every trusted SKI.
-    pub fn all(&self) -> alloc::vec::Vec<Ski> {
-        self.trusted
+    pub fn all(&self) -> Vec<Ski> {
+        self.inner
             .lock()
-            .map(|trusted| trusted.keys().copied().collect())
+            .map(|trusted| trusted.peers.keys().copied().collect())
             .unwrap_or_default()
     }
 
     /// Every record, in SKI order, for persisting or for showing a user.
-    pub fn peers(&self) -> alloc::vec::Vec<TrustedPeer> {
-        self.trusted
+    pub fn peers(&self) -> Vec<TrustedPeer> {
+        self.inner
             .lock()
-            .map(|trusted| trusted.values().cloned().collect())
+            .map(|trusted| trusted.peers.values().cloned().collect())
             .unwrap_or_default()
     }
 
     /// The store as JSON, for writing to disk.
+    ///
+    /// Both halves: the peers trusted by SKI, and the control unit trusted by
+    /// certificate. The Pairing Service §10.4 is explicit that it needs no store of its
+    /// own — "a SHIP implementation is responsible to store trust from a shippairing
+    /// request like it stores trust from classic SHIP trust mechanisms" — so this is the
+    /// one file a device writes.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(&self.peers())
+        serde_json::to_string_pretty(&StoredTrust {
+            peers: self.peers(),
+            unit: self.unit(),
+        })
     }
 
     /// A store read back from [`to_json`](Self::to_json).
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        Ok(Self::restored(serde_json::from_str::<
-            alloc::vec::Vec<TrustedPeer>,
-        >(json)?))
+        let stored: StoredTrust = serde_json::from_str(json)?;
+        let store = Self::restored(stored.peers);
+        if let Some(unit) = stored.unit {
+            store.trust_unit(unit);
+        }
+        Ok(store)
+    }
+
+    /// A receiver that is woken by every change to the store.
+    ///
+    /// This is how a SHIP handshake held in the pending state learns that the user has
+    /// decided: it waits on this rather than polling, and re-reads the store when it
+    /// wakes. The value is a change counter and carries no meaning of its own.
+    pub fn watch(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Wakes everything waiting on [`watch`](Self::watch).
+    ///
+    /// Every mutating method calls it; a [`Node`] calls it too when a pairing is refused,
+    /// which is a decision about a peer that leaves the store itself unchanged.
+    pub(crate) fn touch(&self) {
+        self.changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
@@ -279,6 +558,10 @@ pub struct Node {
     tls: ShipTls,
     trust: TrustStore,
     handshake: HandshakeConfig,
+    /// Peers whose pending pairing a user has said no to, consumed by the handshake that
+    /// was waiting. A refusal is about *this* attempt: the peer may ask again, and the
+    /// user may answer differently.
+    refusals: Mutex<Vec<Ski>>,
 }
 
 impl Node {
@@ -293,6 +576,7 @@ impl Node {
             ship_id,
             tls,
             trust,
+            refusals: Mutex::new(Vec::new()),
         }
     }
 
@@ -322,6 +606,15 @@ impl Node {
         self.tls.ski()
     }
 
+    /// This node's certificate fingerprint.
+    ///
+    /// The identity the SHIP Pairing Service uses (§6.2): what goes on this device's QR
+    /// code as `FPH256`, and what a control unit puts in the `forPar` of a request
+    /// addressed to it.
+    pub fn fingerprint(&self) -> crate::ship::Fingerprint {
+        self.tls.fingerprint()
+    }
+
     /// This node's SHIP ID.
     pub fn ship_id(&self) -> &str {
         &self.ship_id
@@ -330,6 +623,34 @@ impl Node {
     /// The trust store, for approving a peer a user has just confirmed.
     pub fn trust_store(&self) -> &TrustStore {
         &self.trust
+    }
+
+    /// Refuses a peer whose handshake is waiting for a decision.
+    ///
+    /// The other answer to a pending pairing. Approving is
+    /// [`trust_store().trust(ski)`](TrustStore::trust); this tells the waiting handshake to
+    /// abort with `hello: aborted` instead, so the peer learns it was turned down rather
+    /// than timing out. It says nothing about the future — the peer may ask again — and
+    /// nothing at all about a peer that is not currently waiting.
+    pub fn refuse_pairing(&self, ski: Ski) {
+        if let Ok(mut refusals) = self.refusals.lock()
+            && !refusals.contains(&ski)
+        {
+            refusals.push(ski);
+        }
+        self.trust.touch();
+    }
+
+    /// Takes a refusal for `ski`, if one was recorded.
+    pub(crate) fn take_refusal(&self, ski: &Ski) -> bool {
+        let Ok(mut refusals) = self.refusals.lock() else {
+            return false;
+        };
+        let Some(index) = refusals.iter().position(|s| s == ski) else {
+            return false;
+        };
+        refusals.remove(index);
+        true
     }
 
     /// The part of an "EEBUS reset" this crate can perform: forgetting every peer.
@@ -358,17 +679,29 @@ impl Node {
     /// Dials a peer and runs the whole stack: TCP, TLS, WebSocket, SHIP handshake.
     ///
     /// Returns once the connection is ready for SPINE data. A peer whose SKI is not
-    /// trusted is held in the pending state until its timer runs out, which is the
-    /// specified behaviour — the peer's user may be approving this node at the same time.
+    /// trusted is held in the pending state, which is the specified behaviour — the peer's
+    /// user may be approving this node at the same time — and an approval added to this
+    /// node's [`TrustStore`] meanwhile lets it through; otherwise it ends when the SHIP
+    /// timers run out.
     pub async fn connect(
         &self,
         address: impl ToSocketAddrs,
+    ) -> Result<ShipConnection, ConnectionError> {
+        self.connect_reporting(address, None).await
+    }
+
+    /// [`connect`](Self::connect), telling `report` when the peer turns out to be one
+    /// this node has not approved.
+    pub(crate) async fn connect_reporting(
+        &self,
+        address: impl ToSocketAddrs,
+        report: Option<TrustReporter>,
     ) -> Result<ShipConnection, ConnectionError> {
         let stream = TcpStream::connect(address).await?;
         // SHIP §10.2: Nagle would delay the small control messages the handshake is made
         // of behind an acknowledgement that has nothing to do with them.
         stream.set_nodelay(true)?;
-        self.connect_over(stream).await
+        self.connect_over_reporting(stream, report).await
     }
 
     /// Runs the stack over a socket that is already open.
@@ -377,6 +710,14 @@ impl Node {
     /// serial bridge — and it is what [`connect`](Self::connect) does once it has a
     /// socket.
     pub async fn connect_over(&self, stream: TcpStream) -> Result<ShipConnection, ConnectionError> {
+        self.connect_over_reporting(stream, None).await
+    }
+
+    pub(crate) async fn connect_over_reporting(
+        &self,
+        stream: TcpStream,
+        report: Option<TrustReporter>,
+    ) -> Result<ShipConnection, ConnectionError> {
         let connector = TlsConnector::from(self.tls.client_config()?);
 
         // SHIP §9.5 requires SNI to be sent; a SHIP server is required to ignore it, so
@@ -386,7 +727,7 @@ impl Node {
         let stream = connector.connect(server_name, stream).await?;
         // The certificate `rustls` kept is the peer's identity: SHIP trusts a Subject Key
         // Identifier, not a name.
-        let peer = peer_ski(stream.get_ref().1).ok_or(ConnectionError::NoPeerIdentity)?;
+        let peer = PeerIdentity::of(stream.get_ref().1)?;
 
         let mut request = alloc::format!("wss://ship.local{DEFAULT_PATH}")
             .into_client_request()
@@ -410,16 +751,33 @@ impl Node {
             self.handshake.clone(),
             self.trust_for(&peer),
             peer,
+            self,
+            report,
         )
         .await
     }
 
     /// Accepts one peer on an open socket.
+    ///
+    /// A peer this node has not approved is held in the SHIP pending state — which is what
+    /// lets a user read its SKI off a screen — and an approval added to the
+    /// [`TrustStore`] meanwhile completes the handshake; a
+    /// [`refuse_pairing`](Self::refuse_pairing) ends it with `hello: aborted`.
     pub async fn accept(&self, stream: TcpStream) -> Result<ShipConnection, ConnectionError> {
+        self.accept_reporting(stream, None).await
+    }
+
+    /// [`accept`](Self::accept), telling `report` when the peer is one this node has not
+    /// approved and is now waiting on a decision.
+    pub(crate) async fn accept_reporting(
+        &self,
+        stream: TcpStream,
+        report: Option<TrustReporter>,
+    ) -> Result<ShipConnection, ConnectionError> {
         stream.set_nodelay(true)?;
         let acceptor = TlsAcceptor::from(self.tls.server_config()?);
         let stream = acceptor.accept(stream).await?;
-        let peer = peer_ski(stream.get_ref().1).ok_or(ConnectionError::NoPeerIdentity)?;
+        let peer = PeerIdentity::of(stream.get_ref().1)?;
 
         let socket = tokio_tungstenite::accept_hdr_async_with_config(
             tokio_rustls::TlsStream::Server(stream),
@@ -434,15 +792,19 @@ impl Node {
             self.handshake.clone(),
             self.trust_for(&peer),
             peer,
+            self,
+            report,
         )
         .await
     }
 
     /// Binds a listener, for a node that accepts connections.
     ///
-    /// Hand each accepted socket to [`accept`](Self::accept). Whether to accept a second
-    /// connection from a peer already connected is a decision SHIP §12.2.3 settles by
-    /// SKI comparison, and belongs to the code owning the connection table.
+    /// Hand each accepted socket to [`accept`](Self::accept), or let a
+    /// [`Hub`](super::Hub) do both with [`Hub::listen`](super::Hub::listen). Whether to
+    /// accept a second connection from a peer already connected is a decision SHIP
+    /// §12.2.3 settles by SKI comparison, and belongs to the code owning the connection
+    /// table.
     pub async fn listen(
         &self,
         address: impl ToSocketAddrs,
@@ -450,12 +812,46 @@ impl Node {
         Ok(TcpListener::bind(address).await?)
     }
 
-    fn trust_for(&self, peer: &Ski) -> Trust {
-        if self.trust.is_trusted(peer) {
-            Trust::Trusted
-        } else {
-            Trust::Pending
+    /// Whether a peer that has just completed TLS is one this node will talk to.
+    ///
+    /// Two ways in, and they are equal in standing. The SKI is classic SHIP §12.2. The
+    /// certificate fingerprint is the Pairing Service §10.2, which says that matching it
+    /// "SHALL be seen like a successful trust in an SKI from the perspective of the SHIP
+    /// specification" — so a control unit paired that way reaches the data phase without
+    /// anybody having compared forty hex digits. Matching it also records the SKI, which
+    /// is what every table in this crate is keyed by.
+    pub(crate) fn trust_for(&self, peer: &PeerIdentity) -> Trust {
+        if self.trust.is_trusted(&peer.ski) {
+            return Trust::Trusted;
         }
+        if self.trust.is_certificate_trusted(&peer.fingerprint) {
+            self.trust.observe_unit_ski(&peer.fingerprint, peer.ski);
+            return Trust::Trusted;
+        }
+        Trust::Pending
+    }
+}
+
+/// Who the peer on a finished TLS connection turned out to be.
+///
+/// Both identities SHIP knows a node by: the Subject Key Identifier of its public key,
+/// and the SHA-256 fingerprint of the whole certificate. They are carried together
+/// because a node may have been trusted by either — a user approving a SKI, or a Pairing
+/// Service request naming a fingerprint — and the handshake has to be able to ask about
+/// both without going back to `rustls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerIdentity {
+    pub(crate) ski: Ski,
+    pub(crate) fingerprint: Fingerprint,
+}
+
+impl PeerIdentity {
+    /// Reads both identities off a completed TLS connection.
+    fn of(state: &rustls::CommonState) -> Result<Self, ConnectionError> {
+        Ok(Self {
+            ski: peer_ski(state).ok_or(ConnectionError::NoPeerIdentity)?,
+            fingerprint: peer_fingerprint(state).ok_or(ConnectionError::NoPeerIdentity)?,
+        })
     }
 }
 

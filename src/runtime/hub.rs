@@ -2,12 +2,14 @@
 //!
 //! There is *one* [`Engine`], because there is one device with one set of features, one
 //! subscription list and one set of bindings; and there are several connections, one per
-//! peer. The [`Hub`] joins the two. It routes each datagram the engine produces to the
-//! peer it addresses, runs the opening discovery so an application hears about a peer only
-//! once it knows what that peer is, resolves double connections (SHIP §12.2.3), keeps idle
-//! connections alive with the pings §10.4 asks for, dials remembered peers back, and drives
-//! the clock — the engine's deadlines, the SHIP timers, and whatever the application asked
-//! to be woken for.
+//! peer. The [`Hub`] joins the two. It listens and dials, runs every TLS and SHIP handshake
+//! off the loop so that a slow or unapproved peer holds nothing else up, asks the
+//! application when a peer needs a trust decision, routes each datagram the engine produces
+//! to the peer it addresses, runs the opening discovery so an application hears about a
+//! peer only once it knows what that peer is, resolves double connections (SHIP §12.2.3),
+//! keeps idle connections alive with the pings §10.4 asks for, dials remembered peers back,
+//! and drives the clock — the engine's deadlines, the SHIP timers, and whatever the
+//! application asked to be woken for.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,21 +19,27 @@
 //! # let node: Node = unimplemented!();
 //! # let engine: eebus::spine::Engine = unimplemented!();
 //! let mut hub = Hub::new(node, engine);
-//! hub.connect("192.0.2.10:4712").await?;
+//! hub.listen("0.0.0.0:4712").await?;                 // the household end listens…
+//! hub.dial("192.0.2.10:4712".parse()?);              // …and a control box is dialled
 //!
 //! loop {
 //!     match hub.next().await? {
+//!         HubEvent::TrustRequested { ski, .. } => hub.approve(ski), // or show it to a user
 //!         HubEvent::PeerDiscovered { device, .. } => println!("found {}", device.as_str()),
 //!         HubEvent::Spine(event) => { /* hand it to a use case */ }
 //!         HubEvent::Disconnected { ski, .. } => println!("lost {ski}"),
 //!         HubEvent::Tick => { /* a timer the application asked for */ }
 //!         HubEvent::PeerKeysUpdated { .. } => { /* persist the trust store */ }
-//!         HubEvent::Connected { .. } => {}
+//!         _ => {}
 //!     }
 //! }
 //! # }
 //! ```
 
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 use std::time::Instant;
@@ -39,13 +47,16 @@ use std::time::Instant;
 use std::net::SocketAddr;
 
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::sync::mpsc;
 
 use crate::model::{AddressDevice, Datagram, MsgCounter};
 use crate::ship::{CURVE_SECP256R1, ConnectionCloseReason, PeerKeys, Resolution, Ski};
 use crate::spine::{Engine, SpineEvent};
 
-use super::connection::{ConnectionError, ShipConnection};
+use super::connection::{ConnectionError, ShipConnection, TrustReporter};
 use super::node::Node;
+#[cfg(all(feature = "mdns", feature = "pairing"))]
+use super::node::PairedUnit;
 use super::reconnect::reconnect_delay_for;
 
 /// How long a connection may be idle before a keep-alive ping goes out.
@@ -68,6 +79,10 @@ pub const CLOSE_MAX_TIME: Duration = Duration::from_secs(2);
 /// EEBUS devices, and a node that has run out of room is a node that keeps serving the
 /// peers it already had.
 ///
+/// The cap counts handshakes still in progress as well as connections held: a peer that
+/// dials in and then sits in the SHIP pending state has taken a slot, and a hundred of
+/// them would otherwise be a hundred TLS sessions waiting for a user who is not there.
+///
 /// Raise it with [`Hub::set_max_connections`] on a gateway that really does serve more.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
 
@@ -78,20 +93,30 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
 /// until arbitration settles it. A third is not something the protocol produces.
 pub const MAX_CONNECTIONS_PER_PEER: usize = 2;
 
-/// How long a hub with nothing to wait for sleeps before reporting a tick.
+/// How long a dial may take to reach a TCP connection before it is given up on.
 ///
-/// A hub with no connections and no timers has nothing that can happen to it. Returning
-/// immediately would spin a caller's loop; blocking forever would leave a caller that
-/// wants to dial or reconnect with no chance to. A second is short enough to react and
-/// long enough to cost nothing.
-const IDLE_TICK: Duration = Duration::from_secs(1);
+/// A peer that is switched off, or behind a firewall that drops rather than refuses,
+/// would otherwise hold the attempt for as long as the operating system's own timeout —
+/// minutes, on some systems — and the redial schedule with it. The SHIP handshake that
+/// follows has timers of its own and is not covered by this.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a dial may take before it is given up on.
+/// How many peers may be waiting on a trust decision at once.
 ///
-/// The hub dials from inside its own event loop, so a peer that accepts the TCP
-/// connection and then says nothing would otherwise stall every other connection for as
-/// long as the operating system's own timeout — minutes, on some systems.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A peer held in the SHIP `hello: pending` state occupies a connection slot for as long
+/// as its own timers allow — up to four minutes, and longer if it keeps asking for
+/// prolongation — while nothing about it has been approved by anybody. Four is more than
+/// a commissioning visit needs and few enough that unapproved peers cannot fill the
+/// table: past it a peer is answered `hello: aborted` at once, which tells it to try
+/// again later rather than leaving it to time out.
+pub const MAX_PENDING_TRUST: usize = 4;
+
+/// How many untrusted peers seen on the network a hub remembers the address of.
+///
+/// Enough to hold every device on a large installation between "found" and "approved";
+/// bounded because mDNS is unauthenticated and the list is filled by whoever announces.
+#[cfg(feature = "mdns")]
+const MAX_SIGHTINGS: usize = 64;
 
 /// Why a connection ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,12 +144,65 @@ pub enum Disconnect {
     InterruptedWrite,
 }
 
+/// Which end opened a connection, and where the other end is.
+///
+/// Carried by the events about a connection that has not yet reached the peer's SPINE
+/// address — a trust request, a failed handshake — because until then the socket address
+/// is all there is to name it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The peer dialled this node.
+    Accepted {
+        /// The address it dialled from.
+        from: SocketAddr,
+    },
+    /// This node dialled the peer.
+    Dialed {
+        /// The address it was dialled at.
+        address: SocketAddr,
+    },
+}
+
+impl Origin {
+    /// The peer's socket address, whichever end dialled.
+    pub fn address(&self) -> SocketAddr {
+        match self {
+            Origin::Accepted { from } => *from,
+            Origin::Dialed { address } => *address,
+        }
+    }
+}
+
+impl core::fmt::Display for Origin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Origin::Accepted { from } => write!(f, "accepted from {from}"),
+            Origin::Dialed { address } => write!(f, "dialled at {address}"),
+        }
+    }
+}
+
 /// Something that happened on one of the hub's connections.
 // `SpineEvent` carries a payload; boxing it would make every match arm indirect for the
 // sake of a stack frame nobody is short of.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum HubEvent {
+    /// A peer this node has not approved has connected and is waiting for a decision.
+    ///
+    /// The peer has completed TLS — so the SKI is proven, not claimed — and has been told
+    /// `hello: pending` (SHIP §13.4.4.1). Show the SKI to a user and answer with
+    /// [`Hub::approve`] or [`Hub::refuse`]; until then the peer keeps the connection up
+    /// for as long as its own SHIP timers allow, prolonging where it can, and nothing
+    /// else on the hub waits for it. A peer approved some other way — the SKI added to
+    /// the [`TrustStore`](super::TrustStore) directly, or scanned from a QR code — gets
+    /// through just the same.
+    TrustRequested {
+        /// The peer, as its certificate proved it.
+        ski: Ski,
+        /// Which end dialled, and where the peer is.
+        origin: Origin,
+    },
     /// A peer completed the SHIP handshake and is now connected.
     Connected {
         /// Its SKI.
@@ -134,6 +212,20 @@ pub enum HubEvent {
         /// Worth a line in a start-up log: the difference between 1.0 and 1.1 decides
         /// whether `accessMethods.id` is there to dial back with.
         version: Option<crate::ship::ShipVersion>,
+    },
+    /// A connection did not reach the data phase.
+    ///
+    /// A dial that found nobody, a TLS handshake that failed, a SHIP handshake the peer
+    /// aborted or a trust decision that never came — and a hub with no room, which is
+    /// [`ConnectionError::TooManyConnections`]. A remembered peer is dialled again on its
+    /// backoff; anything else is the application's to retry.
+    HandshakeFailed {
+        /// Which end dialled, and where the peer is.
+        origin: Origin,
+        /// The peer, where the connection got far enough to prove one.
+        ski: Option<Ski>,
+        /// What went wrong.
+        error: Arc<ConnectionError>,
     },
     /// A peer answered the opening discovery, so its device address and its use cases
     /// are now known.
@@ -169,11 +261,107 @@ pub enum HubEvent {
         /// Why.
         reason: Disconnect,
     },
+    /// A SHIP node announced itself on the network, or changed what it announces.
+    ///
+    /// Reported by a [`browse`](Hub::browse). A trusted peer has already been remembered
+    /// and is being dialled; an untrusted one is reported so a user can be shown it, and
+    /// is dialled the moment [`Hub::approve`] names its SKI. Everything in the record is
+    /// a claim until TLS proves the SKI.
+    #[cfg(feature = "mdns")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
+    Found {
+        /// What was announced.
+        peer: crate::mdns::Discovered,
+        /// Whether this node already trusts it, and so has taken it up.
+        trusted: bool,
+    },
+    /// A SHIP node withdrew its announcement, and has been dropped from the redial
+    /// schedule.
+    #[cfg(feature = "mdns")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
+    Lost {
+        /// The mDNS instance that has gone.
+        instance: String,
+        /// The SKI it was discovered under, where it was a remembered peer.
+        ski: Option<Ski>,
+    },
+    /// A control unit paired itself through the SHIP Pairing Service.
+    ///
+    /// Its certificate is trusted from this moment, and a connection it makes reaches the
+    /// data phase with nobody having compared a SKI (Pairing Service §10.2). Persist the
+    /// trust store: this is a pairing, and losing it means an installer's visit.
+    ///
+    /// `displaced` is the unit this one replaced, if any. §10.3 permits exactly one at a
+    /// time, so a replacement is also a revocation, and worth telling a user about.
+    ///
+    /// The unit's `ski` is [`None`] here and filled in when it connects — the request
+    /// does not carry one (§10.2). A device that persists on this event alone therefore
+    /// stores the pairing without it, which still admits the unit, because the
+    /// fingerprint is what the trust rests on; persisting on [`Connected`](Self::Connected)
+    /// as well is what records the whole of it.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "mdns", feature = "pairing"))))]
+    Paired {
+        /// The unit now trusted.
+        unit: PairedUnit,
+        /// The unit it replaced.
+        displaced: Option<PairedUnit>,
+    },
+    /// A pairing request addressed to this node was not honoured.
+    ///
+    /// Almost always an installer who mistyped the secret or scanned the wrong QR code,
+    /// which is exactly the case the Pairing Service §5.5 expects to be corrected and
+    /// re-announced — so this is worth showing, where a request for some *other* node is
+    /// not reported at all.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "mdns", feature = "pairing"))))]
+    PairingRefused {
+        /// The mDNS instance the request was announced under.
+        instance: String,
+        /// Why it was refused.
+        error: crate::ship::pairing::PairingError,
+    },
     /// The SPINE engine reported something.
     Spine(SpineEvent),
     /// A timer expired: either the engine's, or one the application asked for with
     /// [`Hub::wake_at`].
     Tick,
+}
+
+/// What a background task delivers to the loop.
+enum Inbound {
+    /// The listener accepted a socket; the hub decides whether to run it.
+    Accepted(TcpStream),
+    /// A handshake in progress found the peer unapproved and told it to wait.
+    TrustRequested { ski: Ski, origin: Origin },
+    /// A handshake reached the data phase.
+    Established {
+        connection: Box<ShipConnection>,
+        origin: Origin,
+        /// The SKI a redial was looking for.
+        expected: Option<Ski>,
+    },
+    /// A handshake did not.
+    Failed {
+        origin: Origin,
+        expected: Option<Ski>,
+        ski: Option<Ski>,
+        error: ConnectionError,
+    },
+    #[cfg(feature = "mdns")]
+    Found(Box<crate::mdns::Discovered>),
+    #[cfg(feature = "mdns")]
+    Lost(String),
+    /// A `_shippairing._tcp` request was announced or withdrawn.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    Pairing(crate::mdns::PairingEvent),
+}
+
+/// What woke the loop.
+enum Wake {
+    Inbound(Inbound),
+    Frame((usize, Result<crate::ship::ShipMessage, ConnectionError>)),
+    Deadline,
 }
 
 /// One connection, and what the hub has learned over it.
@@ -222,17 +410,56 @@ struct Known {
     ///
     /// A withdrawal names the instance and nothing else, so this is what ties one back to
     /// the SKI it belongs to.
-    instance: Option<alloc::string::String>,
+    instance: Option<String>,
     /// How many attempts have failed since the last success.
     attempts: u32,
     /// When to dial next, if it is not connected.
     next_attempt: Duration,
+    /// Whether a dial is running in the background right now.
+    dialing: bool,
+}
+
+/// An untrusted peer seen on the network, kept so an approval can dial it.
+#[derive(Clone, Debug)]
+struct Sighting {
+    ski: Ski,
+    address: SocketAddr,
+    instance: String,
+}
+
+/// `devA`'s end of the SHIP Pairing Service, and the §4.3 policy over it.
+#[cfg(all(feature = "mdns", feature = "pairing"))]
+#[derive(Debug)]
+struct Pairing {
+    receiver: crate::ship::pairing::Receiver,
+    /// When the paired unit was last in SHIP message exchange.
+    ///
+    /// [`None`] means "not since this hub started", which is the same thing for §4.3's
+    /// purposes: the rule is about a *continuously running* node that has been unable to
+    /// reach its unit for fifteen minutes, and a hub that has just started has been
+    /// unable to reach it for exactly as long as it has been running.
+    last_exchange: Option<Duration>,
+}
+
+#[cfg(all(feature = "mdns", feature = "pairing"))]
+impl Pairing {
+    /// Whether `addCu` requests are being processed at all (Pairing Service §4.3).
+    ///
+    /// Off while the pairing is working, which is what stops a captured or malicious
+    /// announcement breaking a pairing that is doing its job — the specification is
+    /// explicit that this matters most when the secret is static. On again only once the
+    /// paired unit has been unreachable for [`REPLACEABLE_AFTER`](crate::ship::pairing::REPLACEABLE_AFTER),
+    /// which is how a broken control unit gets replaced without a factory reset.
+    fn accepting(&self, paired: bool, now: Duration) -> bool {
+        use crate::ship::pairing::REPLACEABLE_AFTER;
+        !paired || now >= self.last_exchange.unwrap_or(Duration::ZERO) + REPLACEABLE_AFTER
+    }
 }
 
 /// A node's connections and the SPINE engine behind them.
 #[derive(Debug)]
 pub struct Hub {
-    node: Node,
+    node: Arc<Node>,
     engine: Engine,
     links: Vec<Link>,
     clock: Instant,
@@ -244,9 +471,11 @@ pub struct Hub {
     max_connections: usize,
     /// Peers to dial back when the connection to them drops.
     known: Vec<Known>,
+    /// Untrusted peers the network has announced, waiting on an approval.
+    sightings: Vec<Sighting>,
     /// What is known about each peer's key material (SHIP §12.1.3).
     peer_keys: Vec<(Ski, PeerKeys)>,
-    pending: Vec<HubEvent>,
+    pending: VecDeque<HubEvent>,
     /// The connection a write is in flight on, if one is.
     ///
     /// Set immediately before an `await` that puts bytes on a socket and cleared after it,
@@ -254,13 +483,33 @@ pub struct Hub {
     /// of the next call is proof the previous one was cancelled mid-write — the one hazard
     /// `Hub::next` cannot defend against, made detectable instead of silent.
     writing: Option<usize>,
+    /// What the background tasks deliver: accepted sockets, finished handshakes, trust
+    /// requests, and what mDNS found.
+    inbox: mpsc::UnboundedReceiver<Inbound>,
+    inbox_tx: mpsc::UnboundedSender<Inbound>,
+    /// Handshakes running in the background, counted against the cap.
+    in_flight: usize,
+    /// Handshakes held in the SHIP pending state, waiting on a decision.
+    ///
+    /// Keyed by [`Origin`] rather than by SKI, because that is what the outcome comes
+    /// back with: a handshake that fails before reaching the data phase reports where it
+    /// was, and the SKI is remembered here so the failure can still name the peer.
+    /// Bounded by [`MAX_PENDING_TRUST`] — an unapproved peer holds a connection slot on
+    /// nobody's authority, so the number of them is not left to whoever is on the wire.
+    awaiting_trust: Vec<(Origin, Ski)>,
+    /// `devA`'s end of the SHIP Pairing Service, once an application has turned it on.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    pairing: Option<Pairing>,
+    /// The listener and browse tasks this hub owns, ended with it.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Hub {
     /// A hub serving `engine` over `node`'s connections.
     pub fn new(node: Node, engine: Engine) -> Self {
+        let (inbox_tx, inbox) = mpsc::unbounded_channel();
         Self {
-            node,
+            node: Arc::new(node),
             engine,
             links: Vec::new(),
             clock: Instant::now(),
@@ -268,9 +517,17 @@ impl Hub {
             duplicates: Vec::new(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             known: Vec::new(),
+            sightings: Vec::new(),
             peer_keys: Vec::new(),
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             writing: None,
+            inbox,
+            inbox_tx,
+            in_flight: 0,
+            awaiting_trust: Vec::new(),
+            #[cfg(all(feature = "mdns", feature = "pairing"))]
+            pairing: None,
+            tasks: Vec::new(),
         }
     }
 
@@ -282,6 +539,11 @@ impl Hub {
     /// This node's SHIP ID.
     pub fn ship_id(&self) -> &str {
         self.node.ship_id()
+    }
+
+    /// This node's certificate fingerprint, which the Pairing Service identifies it by.
+    pub fn fingerprint(&self) -> crate::ship::Fingerprint {
+        self.node.fingerprint()
     }
 
     /// This node's SKI, which is what a peer is asked to trust.
@@ -354,166 +616,124 @@ impl Hub {
             .map(|l| l.ski)
     }
 
-    /// Dials a peer and adds the connection.
+    // ---- pairing ---------------------------------------------------------------
+
+    /// Approves a peer: adds its SKI to the trust store, lets a handshake waiting on it
+    /// through, and dials it if the network has announced it.
     ///
-    /// Subject to the same cap as [`accept`](Self::accept): a hub with no room closes the
-    /// connection it just opened and reports
-    /// [`ConnectionError::TooManyConnections`].
-    pub async fn connect(&mut self, address: impl ToSocketAddrs) -> Result<Ski, ConnectionError> {
-        let connection = self.node.connect(address).await?;
-        match self.adopt(connection) {
-            Ok(ski) => Ok(ski),
-            Err(refused) => {
-                let _ = refused
-                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
-                    .await;
-                Err(ConnectionError::TooManyConnections)
+    /// The answer to [`HubEvent::TrustRequested`], and to a [`HubEvent::Found`] that was
+    /// not trusted. Adding the SKI to the [`TrustStore`](super::TrustStore) directly does
+    /// the first two of those as well — the store is what the handshake watches — so an
+    /// application that approves from a user interface thread needs only that; this is
+    /// the same, plus the dial. Persist the store afterwards, or the approval is gone at
+    /// the next restart.
+    pub fn approve(&mut self, ski: Ski) {
+        self.node.trust_store().trust(ski);
+        if let Some(index) = self.sightings.iter().position(|s| s.ski == ski) {
+            let sighting = self.sightings.remove(index);
+            self.remember(ski, sighting.address);
+            if let Some(known) = self.known.iter_mut().find(|k| k.ski == ski) {
+                known.instance = Some(sighting.instance);
             }
         }
     }
 
-    /// What this node has stored about a peer's key material.
+    /// Refuses a peer whose handshake is waiting on a decision.
     ///
-    /// Persist it alongside the trust store: the counter is what tells a returning node
-    /// whether it has missed a certificate update, and a node that forgets it will ask
-    /// for the whole state again on every connection.
-    pub fn peer_keys(&self, ski: &Ski) -> Option<&PeerKeys> {
-        self.peer_keys
-            .iter()
-            .find(|(s, _)| s == ski)
-            .map(|(_, k)| k)
+    /// The other answer to [`HubEvent::TrustRequested`]: the peer is told `hello: aborted`
+    /// and the connection ends, reported as [`HubEvent::HandshakeFailed`]. It says nothing
+    /// about the future — the peer may dial again and be asked about again — and it does
+    /// not forget a SKI already in the trust store; that is
+    /// [`TrustStore::forget`](super::TrustStore::forget).
+    pub fn refuse(&self, ski: Ski) {
+        self.node.refuse_pairing(ski);
     }
 
-    /// Restores what was stored about a peer's key material.
-    pub fn restore_peer_keys(&mut self, ski: Ski, keys: PeerKeys) {
-        match self.peer_keys.iter_mut().find(|(s, _)| *s == ski) {
-            Some((_, existing)) => *existing = keys,
-            None => self.peer_keys.push((ski, keys)),
-        }
-    }
+    // ---- opening connections ---------------------------------------------------
 
-    /// Announces this node's key material to every connected peer (SHIP §12.1.3.2).
+    /// Binds a listener and accepts on it for as long as the hub lives.
     ///
-    /// Call it when a certificate renewal begins. Peers not currently connected are
-    /// reached the next time they are, because the `updateCounter` in the `hello` tells
-    /// them to ask.
-    pub async fn announce_key_material(&mut self) -> Result<(), ConnectionError> {
-        for index in 0..self.links.len() {
-            let _ = self.links[index].connection.send_key_material().await;
-        }
-        Ok(())
-    }
-
-    /// Remembers a peer, so the hub dials it and dials it again when the link drops.
-    ///
-    /// This is what turns a discovered address into a connection that stays up: mDNS
-    /// finds a `_ship._tcp` service and hands its SKI and address here, or an installer's
-    /// configuration does. The hub dials it, and on a failure backs off from a second to
-    /// two minutes, spread out by the peer's SKI so a building coming back from a power
-    /// cut does not have every device dialling in the same instant.
-    ///
-    /// Only a trusted peer is worth remembering — an untrusted one will be held in the
-    /// SHIP hello phase and time out — but the hub does not enforce that, because a user
-    /// may be approving it while the connection is being made.
-    pub fn remember(&mut self, ski: Ski, address: SocketAddr) {
-        let now = self.now();
-        match self.known.iter_mut().find(|k| k.ski == ski) {
-            Some(known) => {
-                known.address = address;
-                known.attempts = 0;
-                known.next_attempt = now;
+    /// Every socket accepted goes through [`accept`](Self::accept): TLS, the WebSocket
+    /// upgrade and the SHIP handshake run in the background, and the outcome arrives as
+    /// [`HubEvent::Connected`], [`HubEvent::TrustRequested`] or
+    /// [`HubEvent::HandshakeFailed`]. Returns the address bound, which is what an mDNS
+    /// announcement needs.
+    pub async fn listen(
+        &mut self,
+        address: impl ToSocketAddrs,
+    ) -> Result<SocketAddr, ConnectionError> {
+        let listener = self.node.listen(address).await?;
+        let bound = listener.local_addr()?;
+        let inbox = self.inbox_tx.clone();
+        self.tasks.push(tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        if inbox.send(Inbound::Accepted(stream)).is_err() {
+                            return;
+                        }
+                    }
+                    // Out of descriptors, most likely. Spinning on the error would make
+                    // it worse; a pause lets the load pass.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
             }
-            None => self.known.push(Known {
-                ski,
-                address,
-                instance: None,
-                attempts: 0,
-                next_attempt: now,
-            }),
+        }));
+        Ok(bound)
+    }
+
+    /// Dials a peer once, in the background.
+    ///
+    /// For an address that came from configuration rather than from discovery — a peer to
+    /// dial once and see. The outcome arrives as [`HubEvent::Connected`],
+    /// [`HubEvent::TrustRequested`] or [`HubEvent::HandshakeFailed`], and nothing on the
+    /// hub waits for it. A peer that should be dialled *again* whenever the connection
+    /// drops is [`remember`](Self::remember).
+    pub fn dial(&mut self, address: SocketAddr) {
+        self.spawn_dial(address, None);
+    }
+
+    /// Runs the server side of the stack on an accepted socket, in the background.
+    ///
+    /// [`listen`](Self::listen) calls this for every socket it accepts; it is public for
+    /// a listener the application owns. The outcome arrives as an event. A hub with no
+    /// room — connections held plus handshakes running — drops the socket at once and
+    /// reports [`ConnectionError::TooManyConnections`], so that a device dialling in
+    /// repeatedly cannot displace the peers already served.
+    pub fn accept(&mut self, stream: TcpStream) {
+        let from = stream
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let origin = Origin::Accepted { from };
+        if !self.has_room() {
+            drop(stream);
+            self.pending.push_back(HubEvent::HandshakeFailed {
+                origin,
+                ski: None,
+                error: Arc::new(ConnectionError::TooManyConnections),
+            });
+            return;
         }
-    }
-
-    /// Remembers a peer mDNS found, if it is one this node trusts.
-    ///
-    /// The whole of the discovery-to-connection path in one line: the browse loop hands
-    /// each `_ship._tcp` service here, the ones already approved are dialled and kept
-    /// dialled, and the rest are ignored until a person approves them. Returns whether
-    /// the peer was taken up.
-    ///
-    /// Everything in a TXT record is a claim rather than a fact — the SKI included. It
-    /// becomes a fact when TLS proves the peer holds the matching key, which is why the
-    /// hub checks what it connected to rather than what it was told.
-    #[cfg(feature = "mdns")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
-    pub fn remember_discovered(&mut self, found: &crate::mdns::Discovered) -> bool {
-        if !self.node.trust_store().is_trusted(&found.ski) {
-            return false;
-        }
-        let Some(address) = found.socket_address() else {
-            return false;
-        };
-        self.remember(found.ski, address);
-        if let Some(known) = self.known.iter_mut().find(|k| k.ski == found.ski) {
-            known.instance = Some(found.instance.clone());
-        }
-        true
-    }
-
-    /// Forgets the peer discovered under an mDNS instance name.
-    ///
-    /// What [`crate::mdns::BrowseEvent::Lost`] carries is the instance, so this is how a
-    /// withdrawal reaches the redial schedule. Returns the SKI that was forgotten, or
-    /// [`None`] if no remembered peer was discovered under that name.
-    pub fn forget_discovered(&mut self, instance: &str) -> Option<Ski> {
-        let index = self
-            .known
-            .iter()
-            .position(|k| k.instance.as_deref() == Some(instance))?;
-        Some(self.known.remove(index).ski)
-    }
-
-    /// Stops dialling a peer. Any connection to it stays up.
-    pub fn forget_peer(&mut self, ski: &Ski) {
-        self.known.retain(|k| &k.ski != ski);
-    }
-
-    /// The peers the hub will dial, connected or not.
-    pub fn remembered(&self) -> impl Iterator<Item = (Ski, SocketAddr)> + '_ {
-        self.known.iter().map(|k| (k.ski, k.address))
-    }
-
-    /// The most connections this hub will hold at once.
-    pub fn max_connections(&self) -> usize {
-        self.max_connections
-    }
-
-    /// Changes how many connections this hub will hold at once.
-    ///
-    /// [`DEFAULT_MAX_CONNECTIONS`] suits a household. A gateway serving a whole building
-    /// raises it; a controller with a few kilobytes to spare lowers it. Connections
-    /// already held are never dropped to meet a lowered limit — the cap decides what is
-    /// *accepted*, and closing a working session to satisfy a setting would be worse
-    /// than being over it.
-    pub fn set_max_connections(&mut self, limit: usize) {
-        self.max_connections = limit;
-    }
-
-    /// Runs the server side of the stack on an accepted socket and adds the connection.
-    ///
-    /// A connection the hub has no room for is closed with a `connectionClose` rather
-    /// than dropped on the floor, and reported as
-    /// [`ConnectionError::TooManyConnections`].
-    pub async fn accept(&mut self, stream: TcpStream) -> Result<Ski, ConnectionError> {
-        let connection = self.node.accept(stream).await?;
-        match self.adopt(connection) {
-            Ok(ski) => Ok(ski),
-            Err(refused) => {
-                let _ = refused
-                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
-                    .await;
-                Err(ConnectionError::TooManyConnections)
-            }
-        }
+        self.in_flight += 1;
+        let node = self.node.clone();
+        let inbox = self.inbox_tx.clone();
+        let report = self.reporter(origin);
+        tokio::spawn(async move {
+            let outcome = node.accept_reporting(stream, Some(report)).await;
+            let _ = inbox.send(match outcome {
+                Ok(connection) => Inbound::Established {
+                    connection: Box::new(connection),
+                    origin,
+                    expected: None,
+                },
+                Err(error) => Inbound::Failed {
+                    origin,
+                    expected: None,
+                    ski: None,
+                    error,
+                },
+            });
+        });
     }
 
     /// Adds a connection the caller established itself.
@@ -523,9 +743,8 @@ impl Hub {
     /// Hands the connection back when the hub is already holding
     /// [`max_connections`](Self::max_connections), or a second connection to this peer
     /// already exists and is being arbitrated. The caller owns the refused connection and
-    /// decides how to end it; [`accept`](Self::accept) closes it politely. It comes back
-    /// boxed because a `ShipConnection` is two kilobytes and every ordinary call would
-    /// otherwise carry that on the stack.
+    /// decides how to end it. It comes back boxed because a `ShipConnection` is two
+    /// kilobytes and every ordinary call would otherwise carry that on the stack.
     pub fn adopt(&mut self, connection: ShipConnection) -> Result<Ski, Box<ShipConnection>> {
         let ski = connection.peer();
         let now = self.now();
@@ -558,10 +777,443 @@ impl Hub {
             .links
             .last()
             .and_then(|link| link.connection.ship_version());
-        self.pending.push(HubEvent::Connected { ski, version });
+        self.pending.push_back(HubEvent::Connected { ski, version });
         self.start_discovery(self.links.len() - 1, now);
         Ok(ski)
     }
+
+    /// Whether another handshake fits under the cap.
+    fn has_room(&self) -> bool {
+        self.links.len() + self.in_flight < self.max_connections
+    }
+
+    /// A callback that turns a handshake's trust request into an event on this hub.
+    fn reporter(&self, origin: Origin) -> TrustReporter {
+        let inbox = self.inbox_tx.clone();
+        Box::new(move |ski| {
+            let _ = inbox.send(Inbound::TrustRequested { ski, origin });
+        })
+    }
+
+    /// Starts a dial in the background, looking for `expected` if it is a redial.
+    fn spawn_dial(&mut self, address: SocketAddr, expected: Option<Ski>) {
+        let origin = Origin::Dialed { address };
+        if !self.has_room() {
+            self.pending.push_back(HubEvent::HandshakeFailed {
+                origin,
+                ski: expected,
+                error: Arc::new(ConnectionError::TooManyConnections),
+            });
+            if let Some(ski) = expected {
+                let now = self.now();
+                self.defer_redial(&ski, now);
+            }
+            return;
+        }
+        self.in_flight += 1;
+        if let Some(known) = expected.and_then(|ski| self.known.iter_mut().find(|k| k.ski == ski)) {
+            known.dialing = true;
+        }
+        let node = self.node.clone();
+        let inbox = self.inbox_tx.clone();
+        let report = self.reporter(origin);
+        tokio::spawn(async move {
+            // The timeout covers reaching the peer, not the handshake: a peer that answers
+            // and then holds this node in the pending state for a user to approve is
+            // doing what SHIP asks, and has timers of its own.
+            let stream =
+                match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+                    Ok(Ok(stream)) => Ok(stream),
+                    Ok(Err(error)) => Err(ConnectionError::Io(error)),
+                    Err(_) => Err(ConnectionError::Timeout),
+                };
+            let outcome = match stream {
+                Ok(stream) => match stream.set_nodelay(true) {
+                    Ok(()) => node.connect_over_reporting(stream, Some(report)).await,
+                    Err(error) => Err(ConnectionError::Io(error)),
+                },
+                Err(error) => Err(error),
+            };
+            let _ = inbox.send(match outcome {
+                Ok(connection) => Inbound::Established {
+                    connection: Box::new(connection),
+                    origin,
+                    expected,
+                },
+                Err(error) => Inbound::Failed {
+                    origin,
+                    expected,
+                    ski: None,
+                    error,
+                },
+            });
+        });
+    }
+
+    // ---- peers to keep ---------------------------------------------------------
+
+    /// Remembers a peer, so the hub dials it and dials it again when the link drops.
+    ///
+    /// This is what turns a discovered address into a connection that stays up: mDNS
+    /// finds a `_ship._tcp` service and hands its SKI and address here, or an installer's
+    /// configuration does. The hub dials it, and on a failure backs off from a second to
+    /// two minutes, spread out by the peer's SKI so a building coming back from a power
+    /// cut does not have every device dialling in the same instant.
+    ///
+    /// Only a trusted peer is worth remembering — an untrusted one will be held in the
+    /// SHIP hello phase and time out — but the hub does not enforce that, because a user
+    /// may be approving it while the connection is being made.
+    pub fn remember(&mut self, ski: Ski, address: SocketAddr) {
+        let now = self.now();
+        match self.known.iter_mut().find(|k| k.ski == ski) {
+            Some(known) => {
+                known.address = address;
+                known.attempts = 0;
+                known.next_attempt = now;
+            }
+            None => self.known.push(Known {
+                ski,
+                address,
+                instance: None,
+                attempts: 0,
+                next_attempt: now,
+                dialing: false,
+            }),
+        }
+    }
+
+    /// Remembers a peer mDNS found, if it is one this node trusts.
+    ///
+    /// [`browse`](Self::browse) does this for every announcement it sees; it is public
+    /// for an application that runs its own browse. A trusted peer is dialled and kept
+    /// dialled; an untrusted one is kept aside, and dialled the moment
+    /// [`approve`](Self::approve) names it. Returns whether the peer was taken up.
+    ///
+    /// Everything in a TXT record is a claim rather than a fact — the SKI included. It
+    /// becomes a fact when TLS proves the peer holds the matching key, which is why the
+    /// hub checks what it connected to rather than what it was told.
+    #[cfg(feature = "mdns")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
+    pub fn remember_discovered(&mut self, found: &crate::mdns::Discovered) -> bool {
+        let Some(address) = found.socket_address() else {
+            return false;
+        };
+        if !self.node.trust_store().is_trusted(&found.ski) {
+            self.sightings.retain(|s| s.ski != found.ski);
+            if self.sightings.len() >= MAX_SIGHTINGS {
+                self.sightings.remove(0);
+            }
+            self.sightings.push(Sighting {
+                ski: found.ski,
+                address,
+                instance: found.instance.clone(),
+            });
+            return false;
+        }
+        self.remember(found.ski, address);
+        if let Some(known) = self.known.iter_mut().find(|k| k.ski == found.ski) {
+            known.instance = Some(found.instance.clone());
+        }
+        true
+    }
+
+    /// Forgets the peer discovered under an mDNS instance name.
+    ///
+    /// What [`crate::mdns::BrowseEvent::Lost`] carries is the instance, so this is how a
+    /// withdrawal reaches the redial schedule. Returns the SKI that was forgotten, or
+    /// [`None`] if no remembered peer was discovered under that name.
+    pub fn forget_discovered(&mut self, instance: &str) -> Option<Ski> {
+        self.sightings.retain(|s| s.instance != instance);
+        let index = self
+            .known
+            .iter()
+            .position(|k| k.instance.as_deref() == Some(instance))?;
+        Some(self.known.remove(index).ski)
+    }
+
+    /// Stops dialling a peer. Any connection to it stays up.
+    pub fn forget_peer(&mut self, ski: &Ski) {
+        self.known.retain(|k| &k.ski != ski);
+    }
+
+    /// The peers the hub will dial, connected or not.
+    pub fn remembered(&self) -> impl Iterator<Item = (Ski, SocketAddr)> + '_ {
+        self.known.iter().map(|k| (k.ski, k.address))
+    }
+
+    /// Turns on `devA`'s end of the SHIP Pairing Service.
+    ///
+    /// From here on, [`browse_pairing`](Self::browse_pairing) evaluates every
+    /// `_shippairing._tcp` request the network announces against the secret printed on
+    /// this node's label, and an authentic one is trusted without asking anybody:
+    /// [`HubEvent::Paired`]. This is what makes a metering control unit installable by an
+    /// electrician who never sees either device's screen.
+    ///
+    /// The [`Receiver`](crate::ship::pairing::Receiver) carries the replay guard of §11,
+    /// whose entries a device persists and restores — without that, a captured
+    /// announcement replayed after a reboot is honoured again.
+    ///
+    /// ```no_run
+    /// # fn example(hub: &mut eebus::runtime::Hub, mdns: &eebus::mdns::Mdns)
+    /// #     -> Result<(), Box<dyn std::error::Error>> {
+    /// use eebus::ship::pairing::{PairingSecret, Receiver};
+    ///
+    /// let secret = PairingSecret::from_hex("7A37DCF81BDB50F8E92CFA4160CCB3DE")?;
+    /// let fingerprint = hub.node().fingerprint();
+    /// hub.accept_pairing_requests(Receiver::new(hub.ship_id().to_string(), fingerprint, secret));
+    /// hub.browse_pairing(mdns)?;
+    /// # Ok(()) }
+    /// ```
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "mdns", feature = "pairing"))))]
+    pub fn accept_pairing_requests(&mut self, receiver: crate::ship::pairing::Receiver) {
+        self.pairing = Some(Pairing {
+            receiver,
+            last_exchange: None,
+        });
+    }
+
+    /// Stops evaluating pairing requests. The unit already paired stays trusted.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "mdns", feature = "pairing"))))]
+    pub fn refuse_pairing_requests(&mut self) {
+        self.pairing = None;
+    }
+
+    /// The replay guard, whose entries are what to persist after a [`HubEvent::Paired`].
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "mdns", feature = "pairing"))))]
+    pub fn pairing_guard(&self) -> Option<&crate::ship::pairing::ReplayGuard> {
+        self.pairing.as_ref().map(|p| p.receiver.guard())
+    }
+
+    /// Browses for `_shippairing._tcp` requests for as long as the hub lives.
+    ///
+    /// Requests are evaluated by [`accept_pairing_requests`](Self::accept_pairing_requests)'s
+    /// receiver; without one, nothing is looked at. A request for another node is not
+    /// reported — on a network with two energy managers each sees the other's — and one
+    /// for this node that fails becomes [`HubEvent::PairingRefused`].
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "mdns", feature = "pairing"))))]
+    pub fn browse_pairing(
+        &mut self,
+        mdns: &crate::mdns::Mdns,
+    ) -> Result<(), crate::mdns::MdnsError> {
+        let browse = mdns.browse_pairing()?;
+        let inbox = self.inbox_tx.clone();
+        std::thread::Builder::new()
+            .name("eebus-mdns-pairing".into())
+            .spawn(move || {
+                loop {
+                    if inbox.is_closed() {
+                        return;
+                    }
+                    let Some(event) = browse.recv_timeout(Duration::from_millis(500)) else {
+                        continue;
+                    };
+                    if inbox.send(Inbound::Pairing(event)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| {
+                crate::mdns::MdnsError::Daemon(mdns_sd::Error::Msg(error.to_string()))
+            })?;
+        Ok(())
+    }
+
+    /// Evaluates one announced pairing request (Pairing Service §9), and acts on it.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    fn evaluate_pairing(&mut self, event: crate::mdns::PairingEvent) {
+        use crate::mdns::PairingEvent;
+        use crate::ship::pairing::PairingError;
+
+        // A withdrawal is `devZ` saying the request is finished with. Nothing to undo:
+        // the trust it established is trust, and §4.2 has the request disappear as soon
+        // as the connection it asked for is working.
+        let PairingEvent::Announced { instance, pairs } = event else {
+            return;
+        };
+        let now = self.now();
+        let paired = self.node.trust_store().unit().is_some();
+        let Some(pairing) = self.pairing.as_mut() else {
+            return;
+        };
+        if !pairing.accepting(paired, now) {
+            return;
+        }
+        let request = match pairing.receiver.evaluate(&pairs) {
+            Ok(request) => request,
+            // Not addressed here. Silent by design: this is the ordinary case on any
+            // network with more than one energy manager on it.
+            Err(PairingError::NotForThisNode) => return,
+            Err(error) => {
+                self.pending
+                    .push_back(HubEvent::PairingRefused { instance, error });
+                return;
+            }
+        };
+        let unit = PairedUnit::from_request(&request);
+        // A unit that re-pairs — a reboot, a fresh nonce — displaces "itself", which is
+        // not a revocation and must not close its connection or be reported as one.
+        let displaced = self
+            .node
+            .trust_store()
+            .trust_unit(unit.clone())
+            .filter(|previous| previous.fingerprint != unit.fingerprint);
+        // §4.3: the pairing is now the one being protected, so it is what the fifteen
+        // minutes are measured against — not the unit that was just replaced.
+        if let Some(pairing) = self.pairing.as_mut() {
+            pairing.last_exchange = Some(now);
+        }
+        // A unit that has been displaced is gone: its connection is not authorised any
+        // more, and leaving it up would let the old control unit keep writing limits.
+        if let Some(ski) = displaced.as_ref().and_then(|unit| unit.ski) {
+            self.close_links_to(&ski);
+        }
+        self.pending.push_back(HubEvent::Paired { unit, displaced });
+    }
+
+    /// Notes that the paired control unit is reachable (Pairing Service §4.3, rule 1.b.ii).
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    fn note_unit_exchange(&mut self, fingerprint: crate::ship::Fingerprint, now: Duration) {
+        if self.pairing.is_none() {
+            return;
+        }
+        if self
+            .node
+            .trust_store()
+            .unit()
+            .is_some_and(|unit| unit.fingerprint == fingerprint)
+            && let Some(pairing) = self.pairing.as_mut()
+        {
+            pairing.last_exchange = Some(now);
+        }
+    }
+
+    /// Closes every connection to a peer, off the loop.
+    ///
+    /// The same shape as the double-connection close: `connectionClose{announce}` goes
+    /// out and the peer is given `maxTime` to confirm, but nothing here waits for it —
+    /// this is called from the event path, where an await would hold up every other
+    /// connection. Only the Pairing Service needs it today, for §10.3's displaced
+    /// control unit; [`disconnect`](Self::disconnect) is the public equivalent for a
+    /// caller that can wait.
+    #[cfg(all(feature = "mdns", feature = "pairing"))]
+    fn close_links_to(&mut self, ski: &Ski) {
+        let doomed: Vec<usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| &link.ski == ski)
+            .map(|(index, _)| index)
+            .collect();
+        for index in doomed.into_iter().rev() {
+            let link = self.links.remove(index);
+            let device = link.device.clone();
+            tokio::spawn(async move {
+                let _ = link
+                    .connection
+                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                    .await;
+            });
+            self.forget_peer_state(*ski, device, Disconnect::Local);
+        }
+    }
+
+    /// Browses for `_ship._tcp` on `mdns` for as long as the hub lives.
+    ///
+    /// Every announcement arrives as [`HubEvent::Found`], having already been taken up
+    /// through [`remember_discovered`](Self::remember_discovered); every withdrawal as
+    /// [`HubEvent::Lost`], having already been dropped from the redial schedule. With a
+    /// listener and an announcement beside it, this is the whole of a device's networking:
+    /// it finds its peers, is found by them, and asks the application only when a trust
+    /// decision is needed.
+    #[cfg(feature = "mdns")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
+    pub fn browse(&mut self, mdns: &crate::mdns::Mdns) -> Result<(), crate::mdns::MdnsError> {
+        let browse = mdns.browse()?;
+        let inbox = self.inbox_tx.clone();
+        // The mDNS receiver blocks a thread rather than a task, so it gets a thread of
+        // its own, and checks between events whether the hub is still there to tell.
+        std::thread::Builder::new()
+            .name("eebus-mdns-browse".into())
+            .spawn(move || {
+                loop {
+                    if inbox.is_closed() {
+                        return;
+                    }
+                    let Some(event) = browse.recv_timeout(Duration::from_millis(500)) else {
+                        continue;
+                    };
+                    let inbound = match event {
+                        crate::mdns::BrowseEvent::Found(found) => Inbound::Found(Box::new(found)),
+                        crate::mdns::BrowseEvent::Lost { instance } => Inbound::Lost(instance),
+                    };
+                    if inbox.send(inbound).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| {
+                crate::mdns::MdnsError::Daemon(mdns_sd::Error::Msg(error.to_string()))
+            })?;
+        Ok(())
+    }
+
+    /// The most connections this hub will hold at once.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Changes how many connections this hub will hold at once.
+    ///
+    /// [`DEFAULT_MAX_CONNECTIONS`] suits a household. A gateway serving a whole building
+    /// raises it; a controller with a few kilobytes to spare lowers it. Connections
+    /// already held are never dropped to meet a lowered limit — the cap decides what is
+    /// *accepted*, and closing a working session to satisfy a setting would be worse
+    /// than being over it.
+    pub fn set_max_connections(&mut self, limit: usize) {
+        self.max_connections = limit;
+    }
+
+    // ---- key material -----------------------------------------------------------
+
+    /// What this node has stored about a peer's key material.
+    ///
+    /// Persist it alongside the trust store: the counter is what tells a returning node
+    /// whether it has missed a certificate update, and a node that forgets it will ask
+    /// for the whole state again on every connection.
+    pub fn peer_keys(&self, ski: &Ski) -> Option<&PeerKeys> {
+        self.peer_keys
+            .iter()
+            .find(|(s, _)| s == ski)
+            .map(|(_, k)| k)
+    }
+
+    /// Restores what was stored about a peer's key material.
+    pub fn restore_peer_keys(&mut self, ski: Ski, keys: PeerKeys) {
+        match self.peer_keys.iter_mut().find(|(s, _)| *s == ski) {
+            Some((_, existing)) => *existing = keys,
+            None => self.peer_keys.push((ski, keys)),
+        }
+    }
+
+    /// Announces this node's key material to every connected peer (SHIP §12.1.3.2).
+    ///
+    /// Call it when a certificate renewal begins. Peers not currently connected are
+    /// reached the next time they are, because the `updateCounter` in the `hello` tells
+    /// them to ask.
+    pub async fn announce_key_material(&mut self) -> Result<(), ConnectionError> {
+        for index in 0..self.links.len() {
+            self.writing = Some(index);
+            let _ = self.links[index].connection.send_key_material().await;
+            self.writing = None;
+        }
+        Ok(())
+    }
+
+    // ---- closing -----------------------------------------------------------------
 
     /// Closes one peer's connections, telling it why.
     pub async fn disconnect(&mut self, ski: &Ski, reason: ConnectionCloseReason) {
@@ -570,7 +1222,7 @@ impl Hub {
             let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
         }
         self.forget(ski);
-        self.pending.push(HubEvent::Disconnected {
+        self.pending.push_back(HubEvent::Disconnected {
             ski: *ski,
             reason: Disconnect::Local,
         });
@@ -596,8 +1248,11 @@ impl Hub {
     ///
     /// Anything the engine still has queued is sent first: closing on top of an
     /// unacknowledged write would leave the peer waiting for an answer that was already
-    /// decided.
+    /// decided. The listener and browse tasks end with it.
     pub async fn shutdown(&mut self, reason: ConnectionCloseReason) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
         let _ = self.dispatch().await;
         for link in core::mem::take(&mut self.links) {
             let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
@@ -605,32 +1260,25 @@ impl Hub {
         self.duplicates.clear();
     }
 
+    // ---- the loop ----------------------------------------------------------------
+
     /// Runs the hub's loop, handing every event to `handler`, until `handler` says stop.
     ///
     /// **This is the shape to reach for**, because [`next`](Self::next) is not cancel-safe
     /// and this loop cannot cancel it. `handler` returns [`ControlFlow::Break`](core::ops::ControlFlow::Break) to end the
-    /// loop, and gets `&mut Hub` so that it can do anything the loop could — accept a
-    /// socket, write a limit, ask for a tick.
-    ///
-    /// Work arriving from elsewhere goes where it goes in a hand-written loop: ask for a
-    /// tick with [`wake_at`](Self::wake_at) and drain it when [`HubEvent::Tick`] arrives.
+    /// loop, and gets `&mut Hub` so that it can do anything the loop could — approve a
+    /// peer, write a limit, ask for a tick.
     ///
     /// ```no_run
-    /// # async fn example(
-    /// #     mut hub: eebus::runtime::Hub,
-    /// #     mut inbox: tokio::sync::mpsc::Receiver<tokio::net::TcpStream>,
-    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// # async fn example(mut hub: eebus::runtime::Hub) -> Result<(), Box<dyn std::error::Error>> {
     /// use core::ops::ControlFlow;
-    /// use core::time::Duration;
     /// use eebus::runtime::HubEvent;
     ///
-    /// hub.wake_at(hub.now() + Duration::from_secs(1));
+    /// hub.listen("0.0.0.0:4712").await?;
     /// hub.run(|hub, event| {
-    ///     if let HubEvent::Tick = event {
-    ///         while let Ok(stream) = inbox.try_recv() {
-    ///             let _ = stream; // `hub.accept(stream)` — `run`'s handler is synchronous
-    ///         }
-    ///         hub.wake_at(hub.now() + Duration::from_secs(1));
+    ///     if let HubEvent::TrustRequested { ski, .. } = event {
+    ///         println!("approve {ski}?"); // a real device asks its user
+    ///         hub.approve(ski);
     ///     }
     ///     ControlFlow::Continue(())
     /// })
@@ -658,7 +1306,10 @@ impl Hub {
     /// Waits for the next thing to happen.
     ///
     /// Everything the engine has queued goes out first, so an application that has just
-    /// written a limit does not have to remember to flush.
+    /// written a limit does not have to remember to flush. Then it waits — on every
+    /// connection, on the handshakes and dials running in the background, on the
+    /// listener and the browse, and on the earliest deadline — and returns the first
+    /// thing that arrives.
     ///
     /// # This future is not cancel-safe
     ///
@@ -685,30 +1336,10 @@ impl Hub {
     ///
     /// * **Timers** — [`wake_at`](Self::wake_at). The hub folds the instant into its own
     ///   deadlines and answers with [`HubEvent::Tick`]; the read is never interrupted.
-    /// * **Work arriving from elsewhere** — a listener accepting connections, an mDNS
-    ///   browse, a command channel — is drained *between* calls, on the tick. Ask for a
-    ///   tick a second from now, and each one is a chance to look:
-    ///
-    /// ```no_run
-    /// # async fn example(
-    /// #     mut hub: eebus::runtime::Hub,
-    /// #     mut inbox: tokio::sync::mpsc::Receiver<tokio::net::TcpStream>,
-    /// # ) -> Result<(), Box<dyn std::error::Error>> {
-    /// use core::time::Duration;
-    ///
-    /// loop {
-    ///     // Between calls: whatever else has turned up.
-    ///     while let Ok(stream) = inbox.try_recv() {
-    ///         hub.accept(stream).await?;
-    ///     }
-    ///     hub.wake_at(hub.now() + Duration::from_secs(1));
-    ///
-    ///     // And then the one await that owns the sockets, uninterrupted.
-    ///     let event = hub.next().await?;
-    ///     # let _ = event;
-    /// }
-    /// # }
-    /// ```
+    /// * **Sockets** — [`listen`](Self::listen), [`dial`](Self::dial) and
+    ///   [`browse`](Self::browse) run in the background and arrive as events.
+    /// * **Anything else arriving from elsewhere** — a command channel, say — is drained
+    ///   *between* calls, on a tick asked for with `wake_at`.
     pub async fn next(&mut self) -> Result<HubEvent, ConnectionError> {
         // A write was in flight when the last `next` future was dropped, so a partial
         // frame is on that socket and the peer's parser is out of step with it. Nothing
@@ -720,8 +1351,8 @@ impl Hub {
         }
 
         loop {
-            if !self.pending.is_empty() {
-                return Ok(self.pending.remove(0));
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(event);
             }
 
             self.dispatch().await?;
@@ -731,25 +1362,13 @@ impl Hub {
             if self.follow_key_material().await {
                 continue;
             }
-
             if self.arbitrate().await? {
                 continue;
             }
 
             let now = self.now();
+            self.redial(now);
             let deadline = self.next_deadline(now);
-            if self.links.is_empty() {
-                // Nothing to read from: only a timer can produce an event, and if there
-                // is no timer either, the caller is told so at a pace it can act on.
-                let wait = deadline.map_or(IDLE_TICK, |at| at.saturating_sub(now));
-                tokio::time::sleep(wait).await;
-                self.fire_timers(self.now());
-                self.redial().await;
-                if deadline.is_none() && self.links.is_empty() {
-                    return Ok(HubEvent::Tick);
-                }
-                continue;
-            }
 
             // A deadline that has already passed is dealt with *before* the sockets are
             // touched, and not by reading with a zero-length timeout. A zero timeout
@@ -760,24 +1379,44 @@ impl Hub {
             if deadline.is_some_and(|at| at <= now) {
                 self.fire_timers(now);
                 self.keepalive().await?;
-                self.redial().await;
                 continue;
             }
 
-            let read = read_any(&mut self.links);
-            let outcome = match deadline {
-                Some(at) => {
-                    let wait = at.saturating_sub(now);
-                    tokio::time::timeout(wait, read).await.ok()
+            let wake = {
+                let Hub { inbox, links, .. } = &mut *self;
+                let wait = deadline.map(|at| at.saturating_sub(now));
+                // Every branch is cancel-safe: the channel hands a message over whole
+                // or not at all, and the reads are what `ShipConnection::next_message`
+                // exists to make droppable. Losing the race costs nothing.
+                tokio::select! {
+                    biased;
+                    inbound = inbox.recv() => match inbound {
+                        Some(inbound) => Wake::Inbound(inbound),
+                        // The hub holds a sender, so this cannot happen; treated as a
+                        // wake-up rather than an error.
+                        None => Wake::Deadline,
+                    },
+                    outcome = read_any(links) => Wake::Frame(outcome),
+                    _ = tokio::time::sleep(wait.unwrap_or(Duration::ZERO)), if wait.is_some() => {
+                        Wake::Deadline
+                    }
                 }
-                None => Some(read.await),
             };
 
-            match outcome {
-                Some((index, Ok(message))) => {
+            match wake {
+                Wake::Inbound(inbound) => self.handle_inbound(inbound),
+                Wake::Frame((index, Ok(message))) => {
                     let now = self.now();
                     self.links[index].last_seen = now;
                     self.links[index].pinged_at = None;
+                    // Pairing Service §4.3 rule 1.a counts *SHIP Message Exchange*, not
+                    // connections: this is where a working pairing keeps proving it works,
+                    // and so keeps the node from entertaining a request to replace it.
+                    #[cfg(all(feature = "mdns", feature = "pairing"))]
+                    {
+                        let fingerprint = self.links[index].connection.peer_fingerprint();
+                        self.note_unit_exchange(fingerprint, now);
+                    }
                     let link = &mut self.links[index];
                     if link.connection.handle_message(&message).is_err() {
                         self.drop_link(index, Disconnect::Remote);
@@ -805,7 +1444,7 @@ impl Hub {
                         _ => {}
                     }
                 }
-                Some((index, Err(error))) => {
+                Wake::Frame((index, Err(error))) => {
                     let link = self.links.remove(index);
                     let Link {
                         ski,
@@ -821,16 +1460,152 @@ impl Hub {
                     }
                     self.forget_peer_state(ski, device, Disconnect::Remote);
                 }
-                None => {
-                    self.fire_timers(self.now());
+                Wake::Deadline => {
+                    let now = self.now();
+                    self.fire_timers(now);
                     self.keepalive().await?;
-                    self.redial().await;
                 }
             }
         }
     }
 
     // ---- internals -------------------------------------------------------------
+
+    /// Takes what a background task delivered.
+    fn handle_inbound(&mut self, inbound: Inbound) {
+        match inbound {
+            Inbound::Accepted(stream) => self.accept(stream),
+            Inbound::TrustRequested { ski, origin } => {
+                if self.awaiting_trust.iter().any(|(held, _)| held == &origin) {
+                    // The same handshake reporting twice, which it does not, but a
+                    // duplicate must not consume a second slot.
+                    return;
+                }
+                if self.awaiting_trust.len() >= MAX_PENDING_TRUST {
+                    // Refused rather than queued: the peer is told `hello: aborted` and
+                    // its slot comes back at once, where leaving it pending would hold a
+                    // connection for minutes on nobody's authority. It may ask again.
+                    self.node.refuse_pairing(ski);
+                    self.pending.push_back(HubEvent::HandshakeFailed {
+                        origin,
+                        ski: Some(ski),
+                        error: Arc::new(ConnectionError::TooManyPendingPairings),
+                    });
+                    return;
+                }
+                self.awaiting_trust.push((origin, ski));
+                // The peer whose SKI is *already* waiting on a decision is not asked
+                // about twice: one peer is one decision, and answering it releases every
+                // handshake it is holding, because the trust store is what they watch.
+                if self
+                    .awaiting_trust
+                    .iter()
+                    .filter(|(_, waiting)| waiting == &ski)
+                    .count()
+                    == 1
+                {
+                    self.pending
+                        .push_back(HubEvent::TrustRequested { ski, origin });
+                }
+            }
+            #[cfg(all(feature = "mdns", feature = "pairing"))]
+            Inbound::Pairing(event) => self.evaluate_pairing(event),
+            Inbound::Established {
+                connection,
+                origin,
+                expected,
+            } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                let now = self.now();
+                let ski = connection.peer();
+                self.awaiting_trust.retain(|(held, _)| held != &origin);
+                #[cfg(all(feature = "mdns", feature = "pairing"))]
+                self.note_unit_exchange(connection.peer_fingerprint(), now);
+                if let Some(expected) = expected
+                    && let Some(known) = self.known.iter_mut().find(|k| k.ski == expected)
+                {
+                    known.dialing = false;
+                }
+                match self.adopt(*connection) {
+                    Ok(_) => match expected {
+                        Some(expected) if expected == ski => {
+                            if let Some(known) = self.known.iter_mut().find(|k| k.ski == ski) {
+                                known.attempts = 0;
+                                known.next_attempt = now;
+                            }
+                        }
+                        // Somebody else answered at that address. Adopting it is still
+                        // right — the peer proved an identity and the trust store decided
+                        // about it — but the peer we were looking for is not there.
+                        Some(expected) => self.defer_redial(&expected, now),
+                        None => {}
+                    },
+                    Err(refused) => {
+                        // No room, or a third connection to one peer. Closed politely,
+                        // off the loop: the peer is given `maxTime` to confirm and nothing
+                        // here waits for it.
+                        tokio::spawn(async move {
+                            let _ = refused
+                                .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                                .await;
+                        });
+                        self.pending.push_back(HubEvent::HandshakeFailed {
+                            origin,
+                            ski: Some(ski),
+                            error: Arc::new(ConnectionError::TooManyConnections),
+                        });
+                        if let Some(expected) = expected {
+                            self.defer_redial(&expected, now);
+                        }
+                    }
+                }
+            }
+            Inbound::Failed {
+                origin,
+                expected,
+                ski,
+                error,
+            } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                // One lookup, two jobs: name the peer, which a handshake that reached
+                // the pending state proved, and give its slot back — whatever the
+                // failure, or a refused peer's slot never returns to the pool.
+                let index = self
+                    .awaiting_trust
+                    .iter()
+                    .position(|(held, _)| held == &origin);
+                let ski = match index.map(|index| self.awaiting_trust.remove(index)) {
+                    Some((_, waiting)) => Some(waiting),
+                    None => ski,
+                };
+                if let Some(expected) = expected {
+                    let now = self.now();
+                    if let Some(known) = self.known.iter_mut().find(|k| k.ski == expected) {
+                        known.dialing = false;
+                    }
+                    self.defer_redial(&expected, now);
+                }
+                self.pending.push_back(HubEvent::HandshakeFailed {
+                    origin,
+                    ski,
+                    error: Arc::new(error),
+                });
+            }
+            #[cfg(feature = "mdns")]
+            Inbound::Found(found) => {
+                let trusted = self.remember_discovered(&found);
+                self.pending.push_back(HubEvent::Found {
+                    peer: *found,
+                    trusted,
+                });
+            }
+            #[cfg(feature = "mdns")]
+            Inbound::Lost(instance) => {
+                let ski = self.forget_discovered(&instance);
+                self.pending.push_back(HubEvent::Lost { instance, ski });
+            }
+        }
+    }
 
     /// Sends everything the engine has queued, to whichever peer each datagram names.
     async fn dispatch(&mut self) -> Result<(), ConnectionError> {
@@ -938,7 +1713,8 @@ impl Hub {
         {
             link.announced = true;
             let ski = link.ski;
-            self.pending.push(HubEvent::PeerDiscovered { ski, device });
+            self.pending
+                .push_back(HubEvent::PeerDiscovered { ski, device });
         }
         None
     }
@@ -976,7 +1752,7 @@ impl Hub {
                         store.forget(gone);
                     }
                 }
-                self.pending.push(HubEvent::PeerKeysUpdated {
+                self.pending.push_back(HubEvent::PeerKeysUpdated {
                     ski,
                     trusted: update.trust,
                     untrusted: update.untrust,
@@ -992,10 +1768,12 @@ impl Hub {
                 let known = self.keys_for(ski).update_counter();
                 if announced > known {
                     self.links[index].asked_for_keys = true;
+                    self.writing = Some(index);
                     let _ = self.links[index]
                         .connection
                         .request_key_material(known)
                         .await;
+                    self.writing = None;
                     moved = true;
                 }
             }
@@ -1037,7 +1815,7 @@ impl Hub {
                 Ok(false)
             }
             Resolution::KeepNewest => {
-                self.close_duplicates(&ski, now).await;
+                self.close_duplicates(&ski);
                 Ok(true)
             }
             Resolution::Wait { until } => {
@@ -1050,7 +1828,9 @@ impl Hub {
                 // be reached from a unit test with no socket in it.
                 for index in 0..self.links.len() {
                     if self.links[index].ski == ski {
+                        self.writing = Some(index);
                         let _ = self.links[index].connection.ping().await;
+                        self.writing = None;
                     }
                 }
                 if let Some(entry) = self.duplicates.iter_mut().find(|d| d.ski == ski) {
@@ -1072,14 +1852,14 @@ impl Hub {
                 }
                 // Whatever answered, keep the most recent of it — the same choice
                 // §12.2.3 gives the other side, so the two agree on the survivor.
-                self.close_duplicates(&ski, now).await;
+                self.close_duplicates(&ski);
                 Ok(true)
             }
         }
     }
 
     /// Keeps the most recent connection to `ski` and closes the rest.
-    async fn close_duplicates(&mut self, ski: &Ski, _now: Duration) {
+    fn close_duplicates(&mut self, ski: &Ski) {
         let keep = self
             .links
             .iter()
@@ -1102,11 +1882,15 @@ impl Hub {
         for index in doomed.into_iter().rev() {
             let link = self.links.remove(index);
             // §12.2.3: a connection already exchanging data is closed by the handshake
-            // of §13.4.8, not by pulling the socket out from under the peer.
-            let _ = link
-                .connection
-                .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
-                .await;
+            // of §13.4.8, not by pulling the socket out from under the peer — and off
+            // the loop, because the peer is given two seconds to confirm and nothing
+            // else should wait for it.
+            tokio::spawn(async move {
+                let _ = link
+                    .connection
+                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
+                    .await;
+            });
         }
         self.duplicates.retain(|d| &d.ski != ski);
         self.pending
@@ -1114,7 +1898,7 @@ impl Hub {
     }
 
     /// The earliest instant anything wants attention.
-    fn next_deadline(&self, now: Duration) -> Option<Duration> {
+    fn next_deadline(&self, _now: Duration) -> Option<Duration> {
         let mut next = self.wake_at;
         let mut consider = |at: Duration| {
             next = Some(next.map_or(at, |current: Duration| current.min(at)));
@@ -1124,7 +1908,7 @@ impl Hub {
             consider(at);
         }
         for known in &self.known {
-            if !self.links.iter().any(|l| l.ski == known.ski) {
+            if !known.dialing && !self.links.iter().any(|l| l.ski == known.ski) {
                 consider(known.next_attempt);
             }
         }
@@ -1137,7 +1921,6 @@ impl Hub {
                 None => consider(link.last_seen + KEEPALIVE_INTERVAL),
             }
         }
-        let _ = now;
         next
     }
 
@@ -1163,7 +1946,7 @@ impl Hub {
         let woken = self.wake_at.is_some_and(|at| now >= at);
         if woken {
             self.wake_at = None;
-            self.pending.push(HubEvent::Tick);
+            self.pending.push_back(HubEvent::Tick);
         }
     }
 
@@ -1188,69 +1971,37 @@ impl Hub {
         if !self.links.iter().any(|l| l.ski == ski) {
             self.forget(&ski);
         }
-        self.pending.push(HubEvent::Disconnected { ski, reason });
+        self.pending
+            .push_back(HubEvent::Disconnected { ski, reason });
     }
 
     fn forget(&mut self, ski: &Ski) {
         self.duplicates.retain(|d| &d.ski != ski);
     }
 
-    /// Dials a remembered peer that is not connected and whose backoff has expired.
-    ///
     /// Counts a failed attempt against a remembered peer and schedules the next one.
-    fn defer_redial(&mut self, index: usize, now: Duration) {
-        let known = &mut self.known[index];
-        known.attempts = known.attempts.saturating_add(1);
-        known.next_attempt = now + reconnect_delay_for(&known.ski, known.attempts);
+    fn defer_redial(&mut self, ski: &Ski, now: Duration) {
+        if let Some(known) = self.known.iter_mut().find(|k| &k.ski == ski) {
+            known.attempts = known.attempts.saturating_add(1);
+            known.next_attempt = now + reconnect_delay_for(&known.ski, known.attempts);
+        }
     }
 
-    /// Returns `true` when something changed, so the caller re-runs the loop rather than
-    /// going to sleep on a connection it has just made.
-    async fn redial(&mut self) -> bool {
-        let now = self.now();
-        let due = self.known.iter().position(|known| {
-            now >= known.next_attempt && !self.links.iter().any(|l| l.ski == known.ski)
-        });
-        let Some(index) = due else {
-            return false;
-        };
-
-        let (ski, address) = (self.known[index].ski, self.known[index].address);
-        let attempt = tokio::time::timeout(CONNECT_TIMEOUT, self.node.connect(address)).await;
-        match attempt.unwrap_or(Err(ConnectionError::Closed)) {
-            Ok(connection) if connection.peer() == ski => {
-                match self.adopt(connection) {
-                    Ok(_) => {
-                        self.known[index].attempts = 0;
-                        self.known[index].next_attempt = now;
-                    }
-                    // No room. Backing off is what stops a full hub redialling in a
-                    // tight loop, and the peer keeps its place in the schedule.
-                    Err(refused) => {
-                        let _ = refused
-                            .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
-                            .await;
-                        self.defer_redial(index, now);
-                    }
-                }
-                true
-            }
-            Ok(connection) => {
-                // Somebody else answered at that address. Adopting it is still right —
-                // the peer proved an identity and the trust store decided about it — but
-                // the peer we were looking for is not there.
-                self.defer_redial(index, now);
-                if let Err(refused) = self.adopt(connection) {
-                    let _ = refused
-                        .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
-                        .await;
-                }
-                true
-            }
-            Err(_) => {
-                self.defer_redial(index, now);
-                true
-            }
+    /// Starts a dial for every remembered peer that is not connected, not already being
+    /// dialled, and whose backoff has expired.
+    fn redial(&mut self, now: Duration) {
+        let due: Vec<(Ski, SocketAddr)> = self
+            .known
+            .iter()
+            .filter(|known| {
+                !known.dialing
+                    && now >= known.next_attempt
+                    && !self.links.iter().any(|l| l.ski == known.ski)
+            })
+            .map(|known| (known.ski, known.address))
+            .collect();
+        for (ski, address) in due {
+            self.spawn_dial(address, Some(ski));
         }
     }
 
@@ -1274,17 +2025,30 @@ impl Hub {
     }
 }
 
+impl Drop for Hub {
+    /// The listener and browse tasks are the hub's, and end with it.
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 /// Reads whichever connection speaks first.
 ///
 /// Every future here is a single cancel-safe socket read, so dropping the losers costs
 /// nothing — which is the property [`ShipConnection::next_message`] exists to provide, and
 /// which holds for a more specific reason than "it does not write": the WebSocket layer
-/// does answer a ping while reading, and never blocks doing it.
+/// does answer a ping while reading, and never blocks doing it. With nothing to read from
+/// it never resolves, and the loop waits on its other sources alone.
 async fn read_any(
     links: &mut [Link],
 ) -> (usize, Result<crate::ship::ShipMessage, ConnectionError>) {
     use futures_util::future::{FutureExt, select_all};
 
+    if links.is_empty() {
+        return core::future::pending().await;
+    }
     let futures: Vec<_> = links
         .iter_mut()
         .enumerate()

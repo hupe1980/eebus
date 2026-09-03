@@ -20,6 +20,9 @@ pub use handshake::*;
 mod ski;
 pub use ski::*;
 
+mod fingerprint;
+pub use fingerprint::*;
+
 mod discovery;
 pub use discovery::*;
 

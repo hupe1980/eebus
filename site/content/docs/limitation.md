@@ -16,7 +16,9 @@ the same thing for feed-in. Together they are the technical basis for §14a EnWG
 Everything between a fresh connection and an acknowledged limit. The pre-scenario half is
 where most integrations go wrong: the binding grants the right to write, the subscription
 is what makes the heartbeat arrive, and §2.11 refuses to evaluate a limit that has no
-recent heartbeat behind it.
+recent heartbeat behind it. The heartbeat that counts is the one from the Energy Guard
+entity that holds both bindings — the feature the Controllable System subscribed to under
+§3.8 — not one any peer on the network happens to notify.
 
 ```mermaid
 sequenceDiagram

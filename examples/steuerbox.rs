@@ -6,11 +6,12 @@
 //! writes the limit it is given.
 //!
 //! ```sh
-//! # First run: prints its own SKI, finds nothing, trusts nobody.
+//! # First run: prints its own SKI and what it finds on the network. A device it finds
+//! # but does not trust is offered for pairing; answer `y` to dial it.
 //! cargo run --example steuerbox --features runtime,mdns,ring
 //!
-//! # Trust the heat pump, whose SKI it printed on its own first run, and hold the
-//! # household to 4.2 kW — the §14a EnWG figure.
+//! # Or trust the heat pump in advance, from the SKI it printed on its own first run,
+//! # and hold the household to 4.2 kW — the §14a EnWG figure.
 //! cargo run --example steuerbox --features runtime,mdns,ring -- \
 //!     --trust 5555AAAAFFFF1111CCCC3333EEEEDDDD99992222 --limit 4200
 //!
@@ -19,6 +20,12 @@
 //!
 //! # Release it again, which is a deactivation and not the absence of a message.
 //! cargo run --example steuerbox --features runtime,mdns,ring -- --release
+//!
+//! # Pair with a household device without anybody comparing a SKI: paste the QR payload
+//! # the other device printed. This is the SHIP Pairing Service, and this box is `devZ` —
+//! # the control unit an installer configures on behalf of the metering point operator.
+//! cargo run --example steuerbox --features runtime,mdns,ring,pairing -- \
+//!     --pair-with 'SHIP;SKI:…;ID:i:46925_u:HeatPump-1;FPH256:…;SPSEC:…;ENDSHIP;'
 //! ```
 //!
 //! Everything the ordering rules require — the heartbeat before the limit, the two
@@ -30,10 +37,10 @@ mod simulator;
 
 use core::time::Duration;
 
-use eebus::mdns::BrowseEvent;
 use eebus::model::{DeviceType, EntityType};
 use eebus::runtime::{Hub, HubEvent, Node, TrustStore, TrustedPeer};
-use eebus::ship::{ShipId, ShipTxtRecord};
+use eebus::ship::pairing::{Nonce, PairingRequest, PairingSecret, Requester, RequesterAction};
+use eebus::ship::{ShipId, ShipQr, ShipTxtRecord};
 use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::tls::ShipTls;
 use eebus::usecases::limitation::{self, EnergyGuardActor, GuardEvent, LimitWrite};
@@ -66,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let port: u16 = args.value_or("--port", "4713").parse()?;
-    simulator::show_identity(&ship_id, ski, port);
+    simulator::show_identity(&ship_id, &identity, port, None);
 
     // What the grid is asking for. `--release` is not the absence of a limit: LPC
     // implementation guide §2.13 wants a deactivation sent, and sent only when the grid
@@ -99,56 +106,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let node = Node::new(ship_id.as_str(), ShipTls::new(identity), trust.clone());
+
+    // `devZ`'s end of the Pairing Service: everything needed to ask a household device to
+    // trust this one comes off that device's QR code, and the request is signed with the
+    // secret printed beside it.
+    let mut requester = match args.value("--pair-with") {
+        Some(payload) => Some(pairing_request(payload, &node, &trust)?),
+        None => None,
+    };
+    // §4.2: the request goes up before any connection exists — `devA` cannot trust this
+    // box until it has heard it, so waiting for a connection would be waiting for
+    // something this box's own silence prevents.
     let record = ShipTxtRecord::new(ship_id.clone(), ski)
         .with_brand("eebus-rs")
         .with_model("control-box-simulator")
         .with_device_type("GridConnectionHub");
-    let mdns = simulator::announce(&record, ship_id.as_str(), port)?;
-    let browse = mdns.browse()?;
+    let mut mdns = simulator::announce(&record, ship_id.as_str(), port)?;
+    if let Some(requester) = requester.as_mut() {
+        drive_pairing(&mut mdns, requester, ship_id.as_str(), port)?;
+    }
 
     let (engine, client, diagnosis) = build();
     let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
     let mut hub = Hub::new(node, engine);
+    // The hub browses: a trusted peer it finds is dialled and kept dialled; an untrusted
+    // one is reported, and dialled the moment it is approved.
+    hub.browse(&mdns)?;
+    let answers = simulator::Console::start();
 
     println!("browsing for _ship._tcp …\n");
     loop {
-        // Anything mDNS has found since the last pass, without blocking the event loop.
-        while let Some(event) = browse.try_recv() {
-            match event {
-                BrowseEvent::Found(found) => {
-                    let known = trust.is_trusted(&found.ski);
-                    println!(
-                        "found {} at {:?}:{}  {}",
-                        found.ski.to_display_string(),
-                        found.addresses,
-                        found.port,
-                        if known {
-                            "— trusted"
-                        } else {
-                            "— not trusted"
-                        }
-                    );
-                    if !known {
-                        println!("      start again with `--trust {}`", found.ski);
-                        continue;
-                    }
-                    if let Some(address) = found.socket_address()
-                        && hub.peers().all(|peer| peer != found.ski)
-                    {
-                        match hub.connect(address).await {
-                            Ok(ski) => println!("      connected to {ski}"),
-                            Err(error) => println!("      could not connect: {error}"),
-                        }
-                    }
-                }
-                BrowseEvent::Lost { instance } => println!("lost {instance}"),
-            }
-        }
-
-        // A tick a second from now, so the loop comes back to look at mDNS. `hub.next()`
-        // is not cancel-safe, so it is never wrapped in a `timeout` or a `select!`: a
-        // dropped read loses a frame, and a lost frame here is a subscription that is
-        // never granted and a limit refused for want of the heartbeat behind it.
         hub.wake_at(guard.poll_timeout());
         hub.wake_at(hub.now() + Duration::from_secs(1));
 
@@ -163,6 +150,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut reports = Vec::new();
         match event {
+            HubEvent::Found { peer, trusted } => {
+                println!(
+                    "found {} at {:?}:{}  {}",
+                    peer.ski.to_display_string(),
+                    peer.addresses,
+                    peer.port,
+                    if trusted {
+                        "— trusted, dialling"
+                    } else {
+                        "— not trusted"
+                    }
+                );
+                if !trusted {
+                    println!("      pair with it? [y/N] ");
+                    answers.ask(peer.ski);
+                }
+            }
+            HubEvent::Lost { instance, .. } => println!("lost {instance}"),
+            HubEvent::TrustRequested { ski, origin } => {
+                println!(
+                    "[box]  {} wants to pair, {origin}\n       trust it? [y/N] ",
+                    ski.to_display_string()
+                );
+                answers.ask(ski);
+            }
+            HubEvent::Connected { ski, .. } => {
+                println!("[box]  connected to {ski}");
+                // The clock towards withdrawing the request starts here, and restarts
+                // from zero on every reconnection (§4.2 note 1).
+                if let Some(requester) = requester.as_mut() {
+                    requester.on_connected(now);
+                }
+            }
+            HubEvent::HandshakeFailed { origin, error, .. } => {
+                println!("[box]  a connection {origin} failed: {error}");
+            }
             HubEvent::PeerDiscovered { device, .. } => {
                 let remote = hub.engine().peer(&device).expect("just discovered");
                 match limitation::locate(remote, lpc::DIRECTION) {
@@ -179,14 +202,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HubEvent::Spine(event) => {
                 reports.extend(guard.handle_event(hub.engine_mut(), &event, now))
             }
-            HubEvent::Tick => reports = guard.handle_timeout(hub.engine_mut(), now),
+            HubEvent::Tick => {
+                reports = guard.handle_timeout(hub.engine_mut(), now);
+                // §4.2: fifteen uninterrupted minutes, and the request is withdrawn for
+                // good — reboots included, which is why a real device would persist this.
+                if let Some(requester) = requester.as_mut() {
+                    requester.handle_timeout(now);
+                    drive_pairing(&mut mdns, requester, ship_id.as_str(), port)?;
+                }
+                for (ski, yes) in answers.decided() {
+                    if yes {
+                        hub.approve(ski);
+                        simulator::approve(&trust, &store, TrustedPeer::new(ski));
+                    } else {
+                        hub.refuse(ski);
+                        println!("[box]  refused {}", ski.to_display_string());
+                    }
+                }
+            }
             HubEvent::Disconnected { ski, reason } => {
-                println!("[box]  {ski} went away: {reason:?}");
+                println!("[box]  {ski} went away: {reason}");
+                if let Some(requester) = requester.as_mut() {
+                    requester.on_disconnected();
+                }
             }
             HubEvent::PeerKeysUpdated { .. } => {
                 let _ = store.save_trust(&trust);
             }
-            HubEvent::Connected { .. } => {}
+            // This box is `devZ`: it sends pairing requests, it does not receive them.
+            HubEvent::Paired { .. } | HubEvent::PairingRefused { .. } => {}
         }
 
         for report in reports {
@@ -223,6 +267,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn alloc_for(span: Duration) -> String {
     format!(" for {} s", span.as_secs())
+}
+
+/// Builds the shippairing request this box will announce, from `devA`'s QR payload.
+///
+/// The payload carries everything §8 needs about the other device: its SHIP ID, the
+/// fingerprint of the certificate it will present, and the secret that authenticates the
+/// request. Trusting `devA` first is not optional — §4.2 step 1 makes it this box's job
+/// to establish the SHIP connection, and a box that announced a request it could not then
+/// connect over would be asking for a pairing it cannot use.
+fn pairing_request(
+    payload: &str,
+    node: &Node,
+    trust: &TrustStore,
+) -> Result<Requester, Box<dyn std::error::Error>> {
+    let qr: ShipQr = payload.parse()?;
+    let for_id = qr.id.as_ref().ok_or("the QR code carries no SHIP ID")?;
+    let for_par = qr
+        .certificate_fingerprint
+        .ok_or("the QR code carries no FPH256 fingerprint")?;
+    let secret = qr
+        .pairing_secret
+        .as_deref()
+        .ok_or("the QR code carries no SPSEC pairing secret")?;
+    let secret = PairingSecret::from_hex(secret)?;
+
+    trust.remember(TrustedPeer::new(qr.ski).with_ship_id(for_id.as_str().to_string()));
+
+    // §5.4 and §6.3: a fresh nonce per request, from a cryptographic generator.
+    let mut bytes = [0u8; Nonce::LEN];
+    eebus::tls::random(&mut bytes)?;
+
+    let request = PairingRequest::new(
+        for_id.as_str(),
+        for_par,
+        node.ship_id(),
+        node.fingerprint(),
+        Nonce::from_bytes(bytes),
+    );
+    println!(
+        "will ask {} to trust this box by shippairing request\n",
+        for_id.as_str()
+    );
+    Ok(Requester::new(request.sign(&secret)?))
+}
+
+/// Carries out whatever the requester has decided: put the request on the air, or take it
+/// off for good.
+///
+/// §5.3: the port in the SRV record is required by DNS-SD and must be one nothing listens
+/// on, because this version of the specification defines no protocol over it — so the
+/// SHIP port is deliberately not reused here. The instance name follows §5.2's
+/// recommendation, the SHIP instance with a counter appended.
+fn drive_pairing(
+    mdns: &mut eebus::mdns::Mdns,
+    requester: &mut Requester,
+    instance: &str,
+    ship_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match requester.poll_action() {
+        Some(RequesterAction::Announce) => {
+            mdns.announce_pairing(
+                &format!("{instance}#1"),
+                requester.announcement(),
+                ship_port.wrapping_add(1),
+                &[std::net::IpAddr::from([127, 0, 0, 1])],
+            )?;
+            println!("[box]  announcing a shippairing request on _shippairing._tcp");
+        }
+        Some(RequesterAction::Withdraw) => {
+            mdns.withdraw_pairing()?;
+            println!("[box]  the pairing has held for 15 minutes; request withdrawn");
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// The control box: an Energy Guard on a `GridGuard` entity.

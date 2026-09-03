@@ -212,9 +212,7 @@ async fn eebus_go_writes_a_limit_and_this_crate_applies_it() {
     let (engine, actor) = heat_pump();
     let mut hub = Hub::new(node, engine);
     let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
-    hub.connect(("127.0.0.1", peer.port))
-        .await
-        .expect("a connection to the control box");
+    hub.dial(std::net::SocketAddr::from(([127, 0, 0, 1], peer.port)));
 
     // The loop obeys this crate's own rule: `hub.next()` is never wrapped in a `timeout`
     // or a `select!`, because the flush inside it is not cancel-safe. The deadline is
@@ -244,6 +242,10 @@ async fn eebus_go_writes_a_limit_and_this_crate_applies_it() {
             HubEvent::Disconnected { reason, .. } => {
                 let logs = docker(&["logs", &peer.id]).unwrap_or_default();
                 panic!("the control box hung up: {reason:?}\n--- peer log ---\n{logs}");
+            }
+            HubEvent::HandshakeFailed { error, .. } => {
+                let logs = docker(&["logs", &peer.id]).unwrap_or_default();
+                panic!("the control box refused the connection: {error}\n--- peer log ---\n{logs}");
             }
             _ => {}
         }
@@ -335,9 +337,7 @@ async fn this_crate_writes_a_limit_and_eebus_go_applies_it() {
 
     let (engine, mut guard) = control_box();
     let mut hub = Hub::new(node, engine);
-    hub.connect(("127.0.0.1", peer.port))
-        .await
-        .expect("a connection to the EVSE");
+    hub.dial(std::net::SocketAddr::from(([127, 0, 0, 1], peer.port)));
 
     let mut accepted = None;
     let started = std::time::Instant::now();
@@ -369,6 +369,10 @@ async fn this_crate_writes_a_limit_and_eebus_go_applies_it() {
             HubEvent::Disconnected { reason, .. } => {
                 let logs = docker(&["logs", &peer.id]).unwrap_or_default();
                 panic!("the EVSE hung up: {reason:?}\n--- peer log ---\n{logs}");
+            }
+            HubEvent::HandshakeFailed { error, .. } => {
+                let logs = docker(&["logs", &peer.id]).unwrap_or_default();
+                panic!("the EVSE refused the connection: {error}\n--- peer log ---\n{logs}");
             }
             _ => {}
         }

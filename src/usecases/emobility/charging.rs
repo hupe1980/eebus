@@ -1210,7 +1210,13 @@ impl EvActor {
             engine.reject_write(token, ErrorNumber::CommandRejected, now);
             return EvEvent::Refused { request };
         }
-        engine.accept_write(token, now);
+        if engine.accept_write(token, now).is_err() {
+            // The car decided to follow the limit and the engine could not store it, so
+            // the manager was answered with an error. What the manager was told is what
+            // this reports.
+            self.publish(engine, now);
+            return EvEvent::Refused { request };
+        }
         // What the Energy Guard reads back is what the car will charge at, which after a
         // clamp is not always what it asked for.
         self.publish(engine, now);

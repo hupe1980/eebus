@@ -97,8 +97,8 @@ uses. See [Embedded targets](@/docs/embedded.md).
 | `conformance` | ✅ | The 203 abstract test cases as data. Tens of kilobytes of static strings a device in the field never reads, so a firmware build leaves it out. |
 | `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
-| `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the handshake, the connection table. |
-| `mdns` | — | `_ship._tcp` announcement and discovery (`mdns-sd`). |
+| `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the handshake, the connection table, pairing. |
+| `mdns` | — | `_ship._tcp` announcement and discovery, and `_shippairing._tcp` with `pairing` (`mdns-sd`). |
 | `ring` | — | `rustls` and `rcgen` backed by `ring`. |
 | `aws-lc-rs` | — | The same, backed by `aws-lc-rs`. |
 | `interop` | — | The cross-implementation test suite. Needs Docker; nothing in the library depends on it, and `full` deliberately excludes it. |

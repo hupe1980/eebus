@@ -20,6 +20,29 @@ use core::net::IpAddr;
 
 use crate::ship::{DiscoveryError, PAIRING_SERVICE_TYPE, SERVICE_TYPE, ShipTxtRecord, Ski};
 
+/// What a [`PairingBrowse`] reported.
+///
+/// The TXT record comes back as it was announced, unread: the rules for reading it are
+/// the Pairing Service's (§5.4), an invalid record is a *refusal* that an installer may
+/// need to hear about rather than a service to skip in silence, and the evaluation needs
+/// the secret — all of which is [`Receiver`](crate::ship::pairing::Receiver)'s. The host
+/// name and port of the service are deliberately not carried: §5.3 forbids using either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingEvent {
+    /// A `_shippairing._tcp` request appeared, or was re-announced.
+    Announced {
+        /// The instance name, which is what identifies the request to mDNS.
+        instance: String,
+        /// The TXT record, key by key, in the order it was announced.
+        pairs: Vec<(String, String)>,
+    },
+    /// A request was withdrawn.
+    Withdrawn {
+        /// The instance name that has gone.
+        instance: String,
+    },
+}
+
 /// The domain mDNS-SD service types live in.
 const LOCAL: &str = ".local.";
 
@@ -92,7 +115,8 @@ impl Discovered {
 /// One daemon serves both directions; drop it and the announcement is withdrawn.
 pub struct Mdns {
     daemon: mdns_sd::ServiceDaemon,
-    announced: Vec<String>,
+    /// Every registration: the service type it was made under, and its full name.
+    announced: Vec<(&'static str, String)>,
 }
 
 impl core::fmt::Debug for Mdns {
@@ -124,29 +148,43 @@ impl Mdns {
         port: u16,
         addresses: &[IpAddr],
     ) -> Result<(), MdnsError> {
-        self.register(SERVICE_TYPE, instance, record, port, addresses)
+        self.register(SERVICE_TYPE, instance, record.to_pairs()?, port, addresses)
     }
 
-    /// Announces this node as `_shippairing._tcp`, for the Pairing Service.
+    /// Announces a signed pairing request as `_shippairing._tcp` (Pairing Service §5).
+    ///
+    /// This is `devZ`'s side — a control unit asking to be trusted — and
+    /// [`Requester`](crate::ship::pairing::Requester) says when to call it. `port` is
+    /// required by DNS-SD and meaningless here: §5.3 says it SHALL be one nothing listens
+    /// on, so pass one that is not the SHIP port. The instance name SHOULD be the SHIP
+    /// service's, with a counter appended where more than one request is announced
+    /// (§5.2).
+    #[cfg(feature = "pairing")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "pairing")))]
     pub fn announce_pairing(
         &mut self,
         instance: &str,
-        record: &ShipTxtRecord,
+        announcement: &crate::ship::pairing::PairingAnnouncement,
         port: u16,
         addresses: &[IpAddr],
     ) -> Result<(), MdnsError> {
-        self.register(PAIRING_SERVICE_TYPE, instance, record, port, addresses)
+        self.register(
+            PAIRING_SERVICE_TYPE,
+            instance,
+            announcement.to_pairs(),
+            port,
+            addresses,
+        )
     }
 
     fn register(
         &mut self,
-        service_type: &str,
+        service_type: &'static str,
         instance: &str,
-        record: &ShipTxtRecord,
+        properties: Vec<(String, String)>,
         port: u16,
         addresses: &[IpAddr],
     ) -> Result<(), MdnsError> {
-        let properties: Vec<(String, String)> = record.to_pairs()?;
         let host = alloc::format!("{}.local.", sanitise(instance));
         let service = mdns_sd::ServiceInfo::new(
             &alloc::format!("{service_type}{LOCAL}"),
@@ -158,7 +196,7 @@ impl Mdns {
         )?;
         let full = service.get_fullname().to_string();
         self.daemon.register(service)?;
-        self.announced.push(full);
+        self.announced.push((service_type, full));
         Ok(())
     }
 
@@ -167,9 +205,26 @@ impl Mdns {
     /// SHIP asks a node to stop announcing while it cannot accept another connection, so
     /// this is called when the connection table fills as well as at shutdown.
     pub fn withdraw(&mut self) -> Result<(), MdnsError> {
-        for fullname in self.announced.drain(..) {
+        for (_, fullname) in self.announced.drain(..) {
             self.daemon.unregister(&fullname)?;
         }
+        Ok(())
+    }
+
+    /// Withdraws the pairing requests, leaving the `_ship._tcp` announcement up.
+    ///
+    /// The Pairing Service §4.2 wants the request gone once a connection has held for
+    /// fifteen minutes, and the node itself still findable.
+    pub fn withdraw_pairing(&mut self) -> Result<(), MdnsError> {
+        let mut kept = Vec::with_capacity(self.announced.len());
+        for (service_type, fullname) in self.announced.drain(..) {
+            if service_type == PAIRING_SERVICE_TYPE {
+                self.daemon.unregister(&fullname)?;
+            } else {
+                kept.push((service_type, fullname));
+            }
+        }
+        self.announced = kept;
         Ok(())
     }
 
@@ -185,9 +240,12 @@ impl Mdns {
         })
     }
 
-    /// Browses for nodes offering the Pairing Service.
-    pub fn browse_pairing(&self) -> Result<Browse, MdnsError> {
-        Ok(Browse {
+    /// Browses for `_shippairing._tcp` requests: `devA`'s side of the Pairing Service.
+    ///
+    /// [`Hub::browse_pairing`](crate::runtime::Hub::browse_pairing) runs one of these and
+    /// evaluates what it finds; this is for an application that drives its own.
+    pub fn browse_pairing(&self) -> Result<PairingBrowse, MdnsError> {
+        Ok(PairingBrowse {
             events: self
                 .daemon
                 .browse(&alloc::format!("{PAIRING_SERVICE_TYPE}{LOCAL}"))?,
@@ -249,6 +307,71 @@ impl Browse {
                 return event;
             }
         }
+    }
+}
+
+/// An open browse for pairing requests.
+pub struct PairingBrowse {
+    events: mdns_sd::Receiver<mdns_sd::ServiceEvent>,
+}
+
+impl core::fmt::Debug for PairingBrowse {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PairingBrowse")
+    }
+}
+
+impl PairingBrowse {
+    /// Waits for the next request or withdrawal.
+    pub fn recv(&self) -> Option<PairingEvent> {
+        loop {
+            if let Some(event) = interpret_pairing(self.events.recv().ok()?) {
+                return event;
+            }
+        }
+    }
+
+    /// The next request or withdrawal, or [`None`] if nothing has happened yet.
+    pub fn try_recv(&self) -> Option<PairingEvent> {
+        loop {
+            if let Some(event) = interpret_pairing(self.events.try_recv().ok()?) {
+                return event;
+            }
+        }
+    }
+
+    /// The next request or withdrawal, giving up after `timeout`.
+    pub fn recv_timeout(&self, timeout: core::time::Duration) -> Option<PairingEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            if let Some(event) = interpret_pairing(self.events.recv_timeout(left).ok()?) {
+                return event;
+            }
+        }
+    }
+}
+
+/// Turns one mDNS event into a [`PairingEvent`], with the same conventions as
+/// [`interpret`].
+fn interpret_pairing(event: mdns_sd::ServiceEvent) -> Option<Option<PairingEvent>> {
+    match event {
+        mdns_sd::ServiceEvent::ServiceResolved(service) => Some(Some(PairingEvent::Announced {
+            instance: instance_of(&service.fullname),
+            pairs: service
+                .txt_properties
+                .iter()
+                .map(|property| (property.key().to_string(), property.val_str().to_string()))
+                .collect(),
+        })),
+        mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => Some(Some(PairingEvent::Withdrawn {
+            instance: instance_of(&fullname),
+        })),
+        mdns_sd::ServiceEvent::SearchStopped(_) => Some(None),
+        _ => None,
     }
 }
 

@@ -551,7 +551,10 @@ impl ControllableSystemBuilder {
     /// coming up together can otherwise win one each.
     #[must_use]
     pub fn install(self, engine: &mut Engine, now: Duration) -> ControllableSystemActor {
-        let actor = self.actor;
+        let mut actor = self.actor;
+        // The heartbeat runs from the moment the system is on the wire, not from the
+        // moment the builder was made.
+        actor.heartbeat = HeartbeatProducer::new(now);
         engine.bind_features_together([
             actor.load_control.clone(),
             actor.device_configuration.clone(),
@@ -775,12 +778,25 @@ impl ControllableSystemActor {
         now: Duration,
     ) -> Option<CsEvent> {
         match event {
-            SpineEvent::DataNotified { resolved, .. }
-            | SpineEvent::ReplyReceived { resolved, .. } => {
-                // A heartbeat from the Energy Guard is what keeps the failsafe at bay.
+            SpineEvent::DataNotified {
+                feature, resolved, ..
+            }
+            | SpineEvent::ReplyReceived {
+                feature, resolved, ..
+            } => {
+                // A heartbeat from the Energy Guard is what keeps the failsafe at bay —
+                // from *the* Energy Guard, the one whose `DeviceDiagnosis` this system
+                // subscribed to once its bindings settled (§3.8). Any other peer on the
+                // network can notify a heartbeat too, and one that counted would keep the
+                // failsafe at bay on the word of a device that is not in control.
+                //
                 // `resolved`, not `data`: a notification may be partial, and a heartbeat
                 // that carries only its counter still has the timeout the peer announced.
-                if read_heartbeat(resolved).is_some() {
+                let from_the_guard = self
+                    .guard_diagnosis
+                    .as_ref()
+                    .is_some_and(|guard| crate::spine::same_feature(guard, feature));
+                if from_the_guard && read_heartbeat(resolved).is_some() {
                     let before = self.system.state();
                     self.system.on_heartbeat(now);
                     if self.system.state() != before {
@@ -957,12 +973,19 @@ impl ControllableSystemActor {
         // A real device asks its controller here whether it can follow the limit; the
         // state machine handles everything else — the ordering gate, the value range and
         // the transition.
-        let outcome = self
+        let mut outcome = self
             .system
             .on_limit_write(&write, LocalDecision::Apply, now);
 
         if outcome.is_accepted() {
-            engine.accept_write(token, now);
+            if engine.accept_write(token, now).is_err() {
+                // The decision was to accept and the engine could not store it, so what
+                // went to the peer was an error. The record has to say what the peer was
+                // told, not what this system meant — and the state machine, which moved
+                // on the decision, is put back where a refusal leaves it.
+                outcome = WriteOutcome::Rejected(super::state::NackReason::NotStored);
+                self.system.on_unstored_limit_write(now);
+            }
             // The peer reads back what was applied, not what it asked for.
             self.publish(engine, now);
         } else {
@@ -1053,7 +1076,9 @@ impl ControllableSystemActor {
         }
 
         if outcome.is_accepted() {
-            engine.accept_write(token, now);
+            if engine.accept_write(token, now).is_err() {
+                outcome = WriteOutcome::Rejected(super::state::NackReason::NotStored);
+            }
             // The peer reads back what was applied, not what it asked for.
             self.publish(engine, now);
         } else {

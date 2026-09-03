@@ -73,8 +73,26 @@ Not covered here, and why (the same list for LPP):
 ```
 
 A coverage number that quietly counted "we cannot test this" would be worth nothing. Each of
-these is a real obligation that lands on the integrator, and the list doubles as that
-integrator's checklist.
+these is a real obligation that lands on the integrator, and the list is that integrator's
+checklist **as data**: `conformance::device_level()` yields each case with its reason, so a
+harness that drives a real device — one that can cut its power and press its reset — can
+iterate exactly the cases the library left it, filtered by actor and by what the parameter
+sheet commits to. This crate's own suite derives its list from the same table and asserts
+the two agree, so the checklist cannot drift from the number.
+
+```rust
+use eebus::conformance;
+use eebus::usecases::descriptor::actors;
+
+for (case, reason) in conformance::device_level()
+    .filter(|(case, _)| case.dut == actors::CONTROLLABLE_SYSTEM)
+{
+    println!("{}: {}\n  because {reason}", case.id, case.description);
+}
+```
+
+The catalogue is behind the default-on `conformance` feature, which a build with
+`default-features = false` has to name.
 
 The report prints one softer case alongside them: the library notifies a change the moment
 the application publishes it (SPINE IG §2.4), but whether the *measured* value reaches it

@@ -236,58 +236,35 @@ fn reconnecting_backs_off_and_stops_growing() {
     );
 }
 
-/// The hub does the pre-scenario work an application would otherwise write by hand:
-/// dial, discover, learn the peer's device address, and route by it.
-#[tokio::test]
-async fn the_hub_discovers_a_peer_and_routes_to_it() {
-    use eebus::runtime::{Hub, HubEvent};
+// ---- the Hub ---------------------------------------------------------------------
 
-    let (control_box, heat_pump) = pair();
-    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+use eebus::runtime::{ConnectionError, Disconnect, Hub, HubEvent, Origin};
+use eebus::ship::ConnectionCloseReason;
 
-    let server = tokio::spawn(async move {
-        let mut hub = Hub::new(heat_pump, pump_engine());
-        let (stream, _) = listener.accept().await.expect("a caller");
-        hub.accept(stream).await.expect("the handshake");
-        // Answer whatever arrives until the client is done with us.
-        for _ in 0..32 {
-            if hub.next().await.is_err() {
-                break;
-            }
+/// Drives `hub` until `pick` accepts an event, or `budget` runs out.
+///
+/// The deadline goes to `wake_at`, not around `hub.next()`: `next` is not cancel-safe, and
+/// a test that models the misuse is a test people copy. A tick that arrives early — the
+/// hub uses `wake_at` for its own arbitration too — is re-armed rather than mistaken for
+/// the deadline.
+async fn wait_for<T>(
+    hub: &mut Hub,
+    budget: Duration,
+    mut pick: impl FnMut(&mut Hub, HubEvent) -> Option<T>,
+) -> T {
+    let deadline = hub.now() + budget;
+    loop {
+        hub.wake_at(deadline);
+        let event = hub.next().await.expect("no transport error");
+        if let HubEvent::Tick = event
+            && hub.now() >= deadline
+        {
+            panic!("nothing acceptable happened within {budget:?}");
         }
-    });
-
-    let mut hub = Hub::new(control_box, box_engine());
-    let ski = hub.connect(address).await.expect("a connection");
-
-    let device = loop {
-        // A deadline goes to `wake_at`, not around `hub.next()`: `next` is not
-        // cancel-safe, and a test that models the misuse is a test people copy.
-        hub.wake_at(hub.now() + Duration::from_secs(5));
-        match hub.next().await.expect("no error") {
-            HubEvent::PeerDiscovered { device, .. } => break device,
-            HubEvent::Disconnected { .. } => panic!("the connection ended early"),
-            HubEvent::Tick => panic!("no peer was discovered within five seconds"),
-            _ => {}
+        if let Some(found) = pick(hub, event) {
+            return found;
         }
-    };
-
-    assert_eq!(device.as_str(), "d:_i:46925_HeatPump-1");
-    assert_eq!(hub.ski_of(&device), Some(ski));
-    assert_eq!(hub.device_of(&ski), Some(&device));
-
-    let remote = hub.engine().peer(&device).expect("the peer");
-    assert!(
-        remote
-            .use_case("limitationOfPowerConsumption", "ControllableSystem")
-            .is_some(),
-        "use-case discovery ran too, not just detailed discovery"
-    );
-
-    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
-        .await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
 }
 
 /// The heat pump, with the features LPC asks of a Controllable System.
@@ -332,15 +309,207 @@ fn box_engine() -> Engine {
     engine
 }
 
+/// Runs a hub's loop in the background for as long as the test needs it.
+fn serve(mut hub: Hub) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if hub.next().await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// The hub does the pre-scenario work an application would otherwise write by hand:
+/// listen, dial, run the handshakes off the loop, discover, learn the peer's device
+/// address, and route by it.
+#[tokio::test]
+async fn the_hub_discovers_a_peer_and_routes_to_it() {
+    let (control_box, heat_pump) = pair();
+    let pump_ski = heat_pump.ski();
+
+    let mut server = Hub::new(heat_pump, pump_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
+    let server = serve(server);
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.dial(address);
+
+    let ski = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::Connected { ski, .. } => Some(ski),
+        HubEvent::HandshakeFailed { error, .. } => panic!("the handshake failed: {error}"),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ski, pump_ski, "the answering node identified itself");
+
+    let device = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::PeerDiscovered { device, .. } => Some(device),
+        HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(device.as_str(), "d:_i:46925_HeatPump-1");
+    assert_eq!(hub.ski_of(&device), Some(ski));
+    assert_eq!(hub.device_of(&ski), Some(&device));
+
+    let remote = hub.engine().peer(&device).expect("the peer");
+    assert!(
+        remote
+            .use_case("limitationOfPowerConsumption", "ControllableSystem")
+            .is_some(),
+        "use-case discovery ran too, not just detailed discovery"
+    );
+
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
+    server.abort();
+}
+
+/// A peer nobody has approved is reported, and approving it completes the handshake it
+/// is waiting in — no reconnection, no timeout, no forty hex digits typed in advance.
+///
+/// This is the commissioning flow SHIP §13.4.4.1 describes: the peer completes TLS so its
+/// SKI is proven, is told `hello: pending`, and a person decides. The heat pump here is
+/// fresh out of the box and trusts nobody; the control box already trusts it.
+#[tokio::test]
+async fn an_unapproved_peer_is_reported_and_approved_interactively() {
+    let pump_trust = TrustStore::new();
+    let heat_pump = node("i:46925_u:HeatPump-1", pump_trust.clone());
+    let control_box = node(
+        "i:46925_u:ControlBox-1",
+        TrustStore::with([heat_pump.ski()]),
+    );
+    let box_ski = control_box.ski();
+
+    let mut pump = Hub::new(heat_pump, pump_engine());
+    let address = pump.listen("127.0.0.1:0").await.unwrap();
+
+    let mut control = Hub::new(control_box, box_engine());
+    control.dial(address);
+    let control = serve(control);
+
+    let (asked, origin) = wait_for(&mut pump, Duration::from_secs(5), |_, event| match event {
+        HubEvent::TrustRequested { ski, origin } => Some((ski, origin)),
+        HubEvent::Connected { .. } => panic!("an unapproved peer reached the data phase"),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        asked, box_ski,
+        "the SKI the certificate proved, not a claim"
+    );
+    assert!(matches!(origin, Origin::Accepted { .. }), "it dialled us");
+    assert!(
+        !pump_trust.is_trusted(&box_ski),
+        "nothing was decided by the hub"
+    );
+
+    // The user says yes. The handshake that was waiting continues on the same socket.
+    pump.approve(box_ski);
+    assert!(
+        pump_trust.is_trusted(&box_ski),
+        "and the store records it, for persisting"
+    );
+
+    let connected = wait_for(&mut pump, Duration::from_secs(5), |_, event| match event {
+        HubEvent::Connected { ski, .. } => Some(ski),
+        HubEvent::HandshakeFailed { error, .. } => panic!("the handshake failed: {error}"),
+        _ => None,
+    })
+    .await;
+    assert_eq!(connected, box_ski);
+    let _ = wait_for(&mut pump, Duration::from_secs(5), |_, event| match event {
+        HubEvent::PeerDiscovered { device, .. } => Some(device),
+        _ => None,
+    })
+    .await;
+
+    pump.shutdown(ConnectionCloseReason::Unspecific).await;
+    control.abort();
+}
+
+/// The other answer: a refused peer is told `hello: aborted`, and both sides report the
+/// handshake as failed rather than letting it time out.
+#[tokio::test]
+async fn a_refused_peer_is_told_so_and_the_handshake_ends() {
+    let heat_pump = node("i:46925_u:HeatPump-1", TrustStore::new());
+    let control_box = node(
+        "i:46925_u:ControlBox-1",
+        TrustStore::with([heat_pump.ski()]),
+    );
+    let box_ski = control_box.ski();
+
+    let mut pump = Hub::new(heat_pump, pump_engine());
+    let address = pump.listen("127.0.0.1:0").await.unwrap();
+    let mut control = Hub::new(control_box, box_engine());
+    control.dial(address);
+
+    // Drive both hubs from one task, so the refusal can be observed on each side.
+    let mut asked = false;
+    let mut pump_failed = None;
+    let mut box_failed = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while (pump_failed.is_none() || box_failed.is_none()) && std::time::Instant::now() < deadline {
+        pump.wake_at(pump.now() + Duration::from_millis(50));
+        match pump.next().await.expect("no error") {
+            HubEvent::TrustRequested { ski, .. } => {
+                assert_eq!(ski, box_ski);
+                asked = true;
+                pump.refuse(ski);
+            }
+            HubEvent::HandshakeFailed { error, ski, .. } => {
+                assert_eq!(
+                    ski,
+                    Some(box_ski),
+                    "the failure names the peer that was refused: it proved an identity \
+                     in TLS, and without it the event cannot be told from a peer that \
+                     never presented a certificate"
+                );
+                pump_failed = Some(error);
+            }
+            HubEvent::Connected { .. } => panic!("a refused peer reached the data phase"),
+            _ => {}
+        }
+        control.wake_at(control.now() + Duration::from_millis(50));
+        match control.next().await.expect("no error") {
+            HubEvent::HandshakeFailed { error, .. } => box_failed = Some(error),
+            HubEvent::Connected { .. } => panic!("the refusing peer opened data exchange"),
+            _ => {}
+        }
+    }
+
+    assert!(asked, "the pump was asked");
+    let pump_failed = pump_failed.expect("the pump reported the refusal");
+    assert!(
+        matches!(
+            *pump_failed,
+            ConnectionError::Aborted(eebus::ship::AbortReason::TrustRejected)
+        ),
+        "the pump's own refusal: {pump_failed}"
+    );
+    let box_failed = box_failed.expect("the control box heard about it");
+    assert!(
+        matches!(
+            *box_failed,
+            ConnectionError::Aborted(eebus::ship::AbortReason::PeerAborted)
+        ),
+        "the control box was told, not left to time out: {box_failed}"
+    );
+    assert!(
+        !pump.node().trust_store().is_trusted(&box_ski),
+        "and nothing was recorded"
+    );
+}
+
 /// A remembered peer is dialled, and dialled again when the connection drops.
 ///
 /// This is what keeps a §14a installation working across a router reboot: nothing tells
 /// the hub the peer is back, so it has to keep asking — with a backoff, so it does not
-/// hammer a device that is genuinely gone.
+/// hammer a device that is genuinely gone. And it dials in the background: a peer that is
+/// down never holds up the connections that are up.
 #[tokio::test]
 async fn a_remembered_peer_is_dialled_and_redialled() {
-    use eebus::runtime::{Hub, HubEvent};
-
     let (control_box, heat_pump) = pair();
     let pump_ski = heat_pump.ski();
     let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
@@ -364,10 +533,11 @@ async fn a_remembered_peer_is_dialled_and_redialled() {
 
     let mut connections = 0;
     let mut disconnections = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while connections < 2 && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout_at(deadline, hub.next()).await {
-            Ok(Ok(HubEvent::Connected { ski, version })) => {
+    let deadline = hub.now() + Duration::from_secs(20);
+    while connections < 2 && hub.now() < deadline {
+        hub.wake_at(deadline);
+        match hub.next().await {
+            Ok(HubEvent::Connected { ski, version }) => {
                 assert_eq!(ski, pump_ski);
                 assert_eq!(
                     version,
@@ -376,9 +546,9 @@ async fn a_remembered_peer_is_dialled_and_redialled() {
                 );
                 connections += 1;
             }
-            Ok(Ok(HubEvent::Disconnected { .. })) => disconnections += 1,
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) | Err(_) => break,
+            Ok(HubEvent::Disconnected { .. }) => disconnections += 1,
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
 
@@ -390,9 +560,28 @@ async fn a_remembered_peer_is_dialled_and_redialled() {
 
     hub.forget_peer(&pump_ski);
     assert_eq!(hub.remembered().count(), 0);
-    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
-        .await;
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+/// A dial that finds nobody is reported, not waited for.
+#[tokio::test]
+async fn a_dial_that_finds_nobody_is_reported() {
+    let (control_box, _) = pair();
+    let mut hub = Hub::new(control_box, box_engine());
+    // A port nothing listens on: bind one, learn it, and let it go.
+    let unused = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    hub.dial(unused);
+    let (origin, error) = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::HandshakeFailed { origin, error, .. } => Some((origin, error)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(origin, Origin::Dialed { address: unused });
+    assert!(matches!(*error, ConnectionError::Io(_)), "{error}");
 }
 
 /// SHIP §12.1.3 over a real connection: a peer renews its certificate, and the trust
@@ -402,7 +591,6 @@ async fn a_remembered_peer_is_dialled_and_redialled() {
 /// stack that cannot carry a renewal turns every renewal into a site visit.
 #[tokio::test]
 async fn a_certificate_renewal_updates_the_trust_store() {
-    use eebus::runtime::{Hub, HubEvent};
     use eebus::ship::OwnKeys;
 
     let (control_box, heat_pump) = pair();
@@ -415,35 +603,20 @@ async fn a_certificate_renewal_updates_the_trust_store() {
     keys.begin_update(successor).unwrap();
     let heat_pump = heat_pump.key_material(keys.clone());
 
-    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-
-    let server = tokio::spawn(async move {
-        let mut hub = Hub::new(heat_pump, pump_engine());
-        let (stream, _) = listener.accept().await.expect("a caller");
-        hub.accept(stream).await.expect("the handshake");
-        for _ in 0..64 {
-            if hub.next().await.is_err() {
-                break;
-            }
-        }
-    });
+    let mut server = Hub::new(heat_pump, pump_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
+    let server = serve(server);
 
     let trust = control_box.trust_store().clone();
     let mut hub = Hub::new(control_box, box_engine());
-    hub.connect(address).await.expect("a connection");
+    hub.dial(address);
 
-    let updated = loop {
-        // A deadline goes to `wake_at`, not around `hub.next()`: `next` is not
-        // cancel-safe, and a test that models the misuse is a test people copy.
-        hub.wake_at(hub.now() + Duration::from_secs(5));
-        match hub.next().await.expect("no error") {
-            HubEvent::PeerKeysUpdated { ski, trusted, .. } => break (ski, trusted),
-            HubEvent::Disconnected { .. } => panic!("the connection ended early"),
-            HubEvent::Tick => panic!("no key material arrived within five seconds"),
-            _ => {}
-        }
-    };
+    let updated = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::PeerKeysUpdated { ski, trusted, .. } => Some((ski, trusted)),
+        HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+        _ => None,
+    })
+    .await;
 
     assert_eq!(updated.0, pump_ski);
     assert!(
@@ -466,9 +639,8 @@ async fn a_certificate_renewal_updates_the_trust_store() {
         "and the counter is stored, so a restart does not ask again"
     );
 
-    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
-        .await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
+    server.abort();
 }
 
 /// Two peers cannot hold the same SPINE device address on one hub.
@@ -478,63 +650,49 @@ async fn a_certificate_renewal_updates_the_trust_store() {
 /// sharing a vendor and serial produce it without any malice, so it is reported.
 #[tokio::test]
 async fn a_second_peer_cannot_claim_the_first_peer_s_device_address() {
-    use eebus::runtime::{Disconnect, Hub, HubEvent};
-
     let box_trust = TrustStore::new();
     let control_box = node("i:46925_u:ControlBox-1", box_trust.clone());
 
     // Two heat pumps with distinct identities but — the misconfiguration — the same SPINE
     // device address, which is what `pump_engine` builds.
-    let mut listeners = Vec::new();
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
     for name in ["i:46925_u:HeatPump-A", "i:46925_u:HeatPump-B"] {
         let trust = TrustStore::new();
         let pump = node(name, trust.clone());
         trust.trust(control_box.ski());
         box_trust.trust(pump.ski());
-        let listener = pump.listen("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        listeners.push(address);
-        tokio::spawn(async move {
-            let mut hub = Hub::new(pump, pump_engine());
-            if let Ok((stream, _)) = listener.accept().await {
-                let _ = hub.accept(stream).await;
-                for _ in 0..32 {
-                    if hub.next().await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
+        let mut server = Hub::new(pump, pump_engine());
+        addresses.push(server.listen("127.0.0.1:0").await.unwrap());
+        servers.push(serve(server));
     }
 
     let mut hub = Hub::new(control_box, box_engine());
-    let first = hub.connect(listeners[0]).await.expect("the first peer");
-    let second = hub.connect(listeners[1]).await.expect("the second peer");
-    assert_ne!(first, second, "two distinct identities");
+    hub.dial(addresses[0]);
+    hub.dial(addresses[1]);
 
     // Which of the two answers discovery first is a race, and immaterial: whichever
     // binds the address keeps it, and the other is closed.
+    let mut connected = Vec::new();
     let mut discovered = Vec::new();
     let mut conflicted = Vec::new();
-    for _ in 0..64 {
-        if !discovered.is_empty() && !conflicted.is_empty() {
-            break;
-        }
-        hub.wake_at(hub.now() + Duration::from_secs(2));
+    let deadline = hub.now() + Duration::from_secs(5);
+    while (discovered.is_empty() || conflicted.is_empty()) && hub.now() < deadline {
+        hub.wake_at(deadline);
         match hub.next().await {
+            Ok(HubEvent::Connected { ski, .. }) => connected.push(ski),
             Ok(HubEvent::PeerDiscovered { ski, device }) => discovered.push((ski, device)),
             Ok(HubEvent::Disconnected { ski, reason }) => {
                 if reason == Disconnect::AddressConflict {
                     conflicted.push(ski);
                 }
             }
-            // The deadline, arriving as a tick rather than as a cancelled read.
-            Ok(HubEvent::Tick) => break,
             Ok(_) => {}
             Err(_) => break,
         }
     }
 
+    assert_eq!(connected.len(), 2, "both handshakes completed");
     assert_eq!(
         discovered.len(),
         1,
@@ -547,16 +705,18 @@ async fn a_second_peer_cannot_claim_the_first_peer_s_device_address() {
     );
     let (holder, device) = &discovered[0];
     assert_ne!(conflicted[0], *holder, "the holder was not the one closed");
-    assert!([first, second].contains(holder));
-    assert!([first, second].contains(&conflicted[0]));
+    assert!(connected.contains(holder));
+    assert!(connected.contains(&conflicted[0]));
     assert_eq!(
         hub.ski_of(device),
         Some(*holder),
         "the address still routes to the peer that bound it"
     );
 
-    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
-        .await;
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
+    for server in servers {
+        server.abort();
+    }
 }
 
 // ---- the §14a exchange, over a socket -----------------------------------------
@@ -576,7 +736,6 @@ async fn a_second_peer_cannot_claim_the_first_peer_s_device_address() {
 /// arriving would hide.
 #[tokio::test]
 async fn a_limit_arrives_over_a_socket_and_is_accepted() {
-    use eebus::runtime::{Hub, HubEvent};
     use eebus::usecases::limitation::{
         self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures,
         EnergyGuardActor, GuardEvent, LimitWrite, LimitationState,
@@ -584,51 +743,49 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
     use eebus::usecases::lpc;
 
     let (control_box, heat_pump) = pair();
-    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
 
     // ---- the appliance: listens, and applies what it is sent ------------------
-    let appliance = tokio::spawn(async move {
-        let mut device =
-            LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem).unwrap();
-        device
-            .add_entity(
-                LocalEntity::new([1], EntityType::HeatPumpAppliance)
-                    .with_feature(limitation::load_control_feature(1))
-                    .with_feature(limitation::device_configuration_feature(2))
-                    .with_feature(limitation::device_diagnosis_feature(3))
-                    .with_feature(limitation::device_diagnosis_client_feature(5))
-                    .with_feature(limitation::electrical_connection_feature(4)),
-            )
-            .unwrap();
-        let load_control = device.address_of(&[1], 1);
-        let configuration = device.address_of(&[1], 2);
-        let diagnosis = device.address_of(&[1], 3);
-        let diagnosis_client = device.address_of(&[1], 5);
-        let electrical = device.address_of(&[1], 4);
-
-        let mut engine = Engine::new(device);
-        engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
-        let actor = ControllableSystemActor::builder(
-            ControllableSystem::new(
-                CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)).with_nominal_max(11_000.0),
-                Duration::ZERO,
-            ),
-            lpc::DIRECTION,
-            CsFeatures {
-                load_control,
-                device_configuration: configuration,
-                device_diagnosis: diagnosis,
-                device_diagnosis_client: diagnosis_client,
-            },
+    let mut device =
+        LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem).unwrap();
+    device
+        .add_entity(
+            LocalEntity::new([1], EntityType::HeatPumpAppliance)
+                .with_feature(limitation::load_control_feature(1))
+                .with_feature(limitation::device_configuration_feature(2))
+                .with_feature(limitation::device_diagnosis_feature(3))
+                .with_feature(limitation::device_diagnosis_client_feature(5))
+                .with_feature(limitation::electrical_connection_feature(4)),
         )
-        .with_electrical_connection(electrical);
+        .unwrap();
+    let load_control = device.address_of(&[1], 1);
+    let configuration = device.address_of(&[1], 2);
+    let diagnosis = device.address_of(&[1], 3);
+    let diagnosis_client = device.address_of(&[1], 5);
+    let electrical = device.address_of(&[1], 4);
 
-        let mut hub = Hub::new(heat_pump, engine);
-        let (stream, _) = listener.accept().await.unwrap();
-        hub.accept(stream).await.expect("the handshake");
-        let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
+    let mut engine = Engine::new(device);
+    engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
+    let actor = ControllableSystemActor::builder(
+        ControllableSystem::new(
+            CsConfig::new(4_200.0, Duration::from_secs(2 * 3_600)).with_nominal_max(11_000.0),
+            Duration::ZERO,
+        ),
+        lpc::DIRECTION,
+        CsFeatures {
+            load_control,
+            device_configuration: configuration,
+            device_diagnosis: diagnosis,
+            device_diagnosis_client: diagnosis_client,
+        },
+    )
+    .with_electrical_connection(electrical);
 
+    let mut hub = Hub::new(heat_pump, engine);
+    let address = hub.listen("127.0.0.1:0").await.unwrap();
+    let now = hub.now();
+    let mut actor = actor.install(hub.engine_mut(), now);
+
+    let appliance = tokio::spawn(async move {
         let mut decided = None;
         for _ in 0..256 {
             hub.wake_at(actor.poll_timeout());
@@ -680,7 +837,7 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
 
     let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
     let mut hub = Hub::new(control_box, engine);
-    hub.connect(address).await.expect("the handshake");
+    hub.dial(address);
 
     let mut accepted = None;
     let mut refusals = 0;
@@ -702,6 +859,7 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
                 reports.extend(guard.handle_event(hub.engine_mut(), &event, now))
             }
             HubEvent::Tick => reports = guard.handle_timeout(hub.engine_mut(), now),
+            HubEvent::HandshakeFailed { error, .. } => panic!("the dial failed: {error}"),
             HubEvent::Disconnected { .. } => break,
             _ => {}
         }
@@ -727,8 +885,7 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
          means one of them wrote before the other could hear it"
     );
 
-    hub.shutdown(eebus::ship::ConnectionCloseReason::Unspecific)
-        .await;
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
     let (decided, state, effective) = tokio::time::timeout(Duration::from_secs(5), appliance)
         .await
         .expect("the appliance finished")
@@ -748,49 +905,57 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
 ///
 /// SHIP puts no cap on connections, and the omission is exploitable: a device on the LAN
 /// that dials in repeatedly takes the memory of every node that answers, and the node
-/// that runs out is the one that stops serving the peers it already had. The refusal is a
-/// `connectionClose` rather than a dropped socket, so the peer is told rather than left
-/// guessing.
+/// that runs out is the one that stops serving the peers it already had. The cap counts
+/// handshakes in progress as well as connections held, because a peer sitting in the
+/// pending state has taken a slot too.
 #[tokio::test]
 async fn a_full_hub_refuses_a_connection_rather_than_growing() {
-    use eebus::runtime::{ConnectionError, Hub};
-    use eebus::ship::ConnectionCloseReason;
-
     let (control_box, heat_pump) = pair();
-    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-
-    let server = tokio::spawn(async move {
-        let mut hub = Hub::new(heat_pump, pump_engine());
-        for _ in 0..2 {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let _ = hub.accept(stream).await;
-        }
-        hub
-    });
+    let mut server = Hub::new(heat_pump, pump_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
+    let server = serve(server);
 
     let mut hub = Hub::new(control_box, box_engine());
     hub.set_max_connections(1);
     assert_eq!(hub.max_connections(), 1);
 
-    hub.connect(address).await.expect("the first connection");
+    hub.dial(address);
+    wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::Connected { .. } => Some(()),
+        HubEvent::HandshakeFailed { error, .. } => panic!("the first dial failed: {error}"),
+        _ => None,
+    })
+    .await;
 
-    // The second is refused by this side, and the peer is closed politely.
-    let refused = hub.connect(address).await;
+    // The second is refused by this side.
+    hub.dial(address);
+    let error = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::HandshakeFailed { error, .. } => Some(error),
+        HubEvent::Connected { .. } => panic!("a full hub took a second connection"),
+        _ => None,
+    })
+    .await;
     assert!(
-        matches!(refused, Err(ConnectionError::TooManyConnections)),
-        "a full hub took a second connection: {refused:?}"
+        matches!(*error, ConnectionError::TooManyConnections),
+        "{error}"
     );
-    assert_eq!(
-        hub.peers().count(),
-        1,
-        "the refused connection was still adopted"
-    );
+    assert_eq!(hub.peers().count(), 1, "the refused dial was not adopted");
+
+    // And so is a socket accepted with no room for it: dropped before TLS, so it costs
+    // the hub nothing.
+    let (stream, _) = tokio::io::duplex(1);
+    drop(stream);
+    let extra = tokio::net::TcpStream::connect(address).await.unwrap();
+    hub.accept(extra);
+    let error = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::HandshakeFailed { error, .. } => Some(error),
+        _ => None,
+    })
+    .await;
+    assert!(matches!(*error, ConnectionError::TooManyConnections));
 
     hub.shutdown(ConnectionCloseReason::Unspecific).await;
-    let _ = server.await;
+    server.abort();
 }
 
 /// A `next` future cancelled mid-write is noticed, and the connection goes.
@@ -805,23 +970,18 @@ async fn a_full_hub_refuses_a_connection_rather_than_growing() {
 /// the write is genuinely parked at an `await` rather than racing to completion.
 #[tokio::test]
 async fn a_write_interrupted_by_a_cancelled_next_closes_the_connection() {
-    use eebus::runtime::{Disconnect, Hub, HubEvent};
-
     let (control_box, heat_pump) = pair();
-    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
 
     // A peer that answers discovery and then stops reading entirely. The connection stays
     // open — it is the *reading* that stops, which is what fills the buffers.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopped = stop.clone();
+    let mut server = Hub::new(heat_pump, pump_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
     let server = tokio::spawn(async move {
-        let mut hub = Hub::new(heat_pump, pump_engine());
-        let (stream, _) = listener.accept().await.expect("a caller");
-        hub.accept(stream).await.expect("the handshake");
         while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            hub.wake_at(hub.now() + Duration::from_millis(20));
-            if hub.next().await.is_err() {
+            server.wake_at(server.now() + Duration::from_millis(20));
+            if server.next().await.is_err() {
                 break;
             }
         }
@@ -829,19 +989,13 @@ async fn a_write_interrupted_by_a_cancelled_next_closes_the_connection() {
     });
 
     let mut hub = Hub::new(control_box, box_engine());
-    hub.connect(address).await.expect("a connection");
-
-    let device = loop {
-        // A deadline goes to `wake_at`, not around `hub.next()`: `next` is not
-        // cancel-safe, and a test that models the misuse is a test people copy.
-        hub.wake_at(hub.now() + Duration::from_secs(5));
-        match hub.next().await.expect("no error") {
-            HubEvent::PeerDiscovered { device, .. } => break device,
-            HubEvent::Disconnected { .. } => panic!("the connection ended early"),
-            HubEvent::Tick => panic!("no peer was discovered within five seconds"),
-            _ => {}
-        }
-    };
+    hub.dial(address);
+    let device = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::PeerDiscovered { device, .. } => Some(device),
+        HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+        _ => None,
+    })
+    .await;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -885,4 +1039,276 @@ async fn a_write_interrupted_by_a_cancelled_next_closes_the_connection() {
     assert_eq!(hub.peers().count(), 0, "and the connection is gone");
 
     server.abort();
+}
+
+// ---- the SHIP Pairing Service ------------------------------------------------------
+
+/// A control unit paired by certificate reaches the data phase without anybody having
+/// approved a SKI.
+///
+/// Pairing Service §10.2 in one assertion: "the fingerprint of the certificate received
+/// during the TLS handshake will be calculated instead and verified with the expected
+/// fingerprint of the shippairing request. If the fingerprints match, this SHALL be seen
+/// like a successful trust in an SKI". Nothing about `devZ`'s SKI is known to `devA`
+/// beforehand — it cannot be, since it is not in the request — so a store that admitted
+/// only SKIs would leave this connection in the pending state until it timed out.
+#[tokio::test]
+async fn a_unit_paired_by_certificate_is_let_through_without_its_ski() {
+    use eebus::ship::pairing::{PairingRequest, PairingSecret, Receiver};
+
+    // `devA`: the household energy manager, with a secret printed on its label.
+    let secret = PairingSecret::from_hex("7A37DCF81BDB50F8E92CFA4160CCB3DE").unwrap();
+    let manager_trust = TrustStore::new();
+    let manager = node("i:46925_u:HeatPump-1", manager_trust.clone());
+
+    // `devZ`: the control unit an installer has configured from `devA`'s QR code.
+    let unit_trust = TrustStore::new();
+    let unit = node("i:983327_u:ControlUnit-1", unit_trust.clone());
+    unit_trust.trust(manager.ski());
+    let (manager_fingerprint, unit_fingerprint) = (manager.fingerprint(), unit.fingerprint());
+
+    let request = PairingRequest::new(
+        manager.ship_id(),
+        manager.fingerprint(),
+        unit.ship_id(),
+        unit.fingerprint(),
+        "BDCEE427FA7208DF3C1F2A749BA6F4D4".parse().unwrap(),
+    );
+    let pairs = request.sign(&secret).unwrap().to_pairs();
+
+    // `devA` evaluates the announcement it would have heard over mDNS…
+    let mut receiver = Receiver::new(manager.ship_id(), manager.fingerprint(), secret);
+    let accepted = receiver.evaluate(&pairs).expect("an authentic request");
+    assert_eq!(accepted.trust_id, unit.ship_id());
+    assert!(
+        !manager_trust.is_trusted(&unit.ski()),
+        "the request never named a SKI, and none was invented"
+    );
+    manager_trust.trust_unit(eebus::runtime::PairedUnit::from_request(&accepted));
+
+    // …and the unit is admitted on the strength of the certificate alone.
+    let listener = manager.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let unit_ski = unit.ski();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        manager.accept(stream).await.expect("the handshake")
+    });
+    let client = unit.connect(address).await.expect("the handshake");
+    let served = server.await.unwrap();
+    assert_eq!(served.peer(), unit_ski);
+    assert_eq!(
+        served.peer_fingerprint(),
+        unit_fingerprint,
+        "the certificate the request named is the one that turned up"
+    );
+    assert_eq!(client.peer_fingerprint(), manager_fingerprint);
+
+    // §10.2's note: the SKI is recorded once it has been proved, so that everything else
+    // — routing, the redial schedule, what a user is shown — can name the unit.
+    assert_eq!(manager_trust.unit().unwrap().ski, Some(unit_ski));
+    assert!(manager_trust.is_trusted(&unit_ski));
+}
+
+/// §10.3: a node considers at most one control unit, and pairing a second revokes the
+/// first — including the SKI it had been reached under, or the old unit would still be
+/// able to connect.
+#[test]
+fn pairing_a_second_control_unit_untrusts_the_first() {
+    use eebus::runtime::PairedUnit;
+    use eebus::ship::Fingerprint;
+
+    let first_ski: Ski = "1111111111111111111111111111111111111111".parse().unwrap();
+    let store = TrustStore::new();
+    let first = PairedUnit {
+        ship_id: "i:983327_u:Old".into(),
+        fingerprint: Fingerprint::from_bytes([1; 32]),
+        curve: "secp256r1".into(),
+        ski: Some(first_ski),
+        paired_at: None,
+    };
+    store.trust_unit(first.clone());
+    assert!(store.is_trusted(&first_ski));
+
+    let second = PairedUnit {
+        ship_id: "i:983327_u:New".into(),
+        fingerprint: Fingerprint::from_bytes([2; 32]),
+        curve: "secp256r1".into(),
+        ski: None,
+        paired_at: None,
+    };
+    let displaced = store.trust_unit(second.clone());
+
+    assert_eq!(displaced, Some(first));
+    assert_eq!(store.unit(), Some(second));
+    assert!(
+        !store.is_trusted(&first_ski),
+        "the replaced unit is untrusted, SKI included"
+    );
+}
+
+/// §10.4: removing the trust is what reactivates the pairing process, so forgetting the
+/// SKI a unit was reached under must not leave its certificate trusted.
+#[test]
+fn forgetting_a_paired_unit_by_ski_removes_the_certificate_trust() {
+    use eebus::runtime::PairedUnit;
+    use eebus::ship::Fingerprint;
+
+    let ski: Ski = "2222222222222222222222222222222222222222".parse().unwrap();
+    let fingerprint = Fingerprint::from_bytes([3; 32]);
+    let store = TrustStore::new();
+    store.trust_unit(PairedUnit {
+        ship_id: "i:983327_u:Unit".into(),
+        fingerprint,
+        curve: "secp256r1".into(),
+        ski: Some(ski),
+        paired_at: None,
+    });
+    assert!(store.is_certificate_trusted(&fingerprint));
+
+    store.forget(&ski);
+    assert!(
+        !store.is_certificate_trusted(&fingerprint),
+        "the pairing is gone, not just the SKI it was reached under"
+    );
+    assert!(store.unit().is_none());
+}
+
+/// The whole store round-trips, both halves of it: §10.4 asks the Pairing Service's trust
+/// to live in the same store as SHIP's, and a device writes one file.
+#[test]
+fn a_paired_unit_survives_a_round_trip_through_json() {
+    use eebus::runtime::PairedUnit;
+    use eebus::ship::Fingerprint;
+
+    let ski: Ski = "3333333333333333333333333333333333333333".parse().unwrap();
+    let store = TrustStore::new();
+    store.trust(ski);
+    let unit = PairedUnit {
+        ship_id: "i:983327_u:Unit".into(),
+        fingerprint: Fingerprint::from_bytes([4; 32]),
+        curve: "secp256r1".into(),
+        ski: None,
+        paired_at: Some("2026-09-03T10:00:00Z".into()),
+    };
+    store.trust_unit(unit.clone());
+
+    let restored = TrustStore::from_json(&store.to_json().unwrap()).unwrap();
+    assert!(restored.is_trusted(&ski));
+    assert_eq!(restored.unit(), Some(unit));
+}
+
+/// An EEBUS reset forgets the pairing too: SHIP §12.2.2 says *all* stored foreign key
+/// material, and a certificate a control unit is admitted on is exactly that.
+#[test]
+fn an_eebus_reset_forgets_the_paired_unit() {
+    use eebus::runtime::PairedUnit;
+    use eebus::ship::Fingerprint;
+
+    let store = TrustStore::new();
+    store.trust("4444444444444444444444444444444444444444".parse().unwrap());
+    store.trust_unit(PairedUnit {
+        ship_id: "i:983327_u:Unit".into(),
+        fingerprint: Fingerprint::from_bytes([5; 32]),
+        curve: "secp256r1".into(),
+        ski: None,
+        paired_at: None,
+    });
+
+    assert_eq!(store.forget_all(), 2, "the peer and the unit");
+    assert!(store.is_empty());
+    assert!(store.unit().is_none());
+}
+
+/// A refused peer gives its slot back.
+///
+/// The cap only bounds anything if the slots are returned. They are released when a
+/// handshake *ends* — and an accepted handshake that fails reports no SKI, so a cap keyed
+/// on the SKI would never release one: after four refusals a node would refuse every
+/// pairing for the rest of its life, which is a denial of service the node does to
+/// itself. Refusing more peers in a row than the cap holds is the check.
+#[tokio::test]
+async fn refusing_a_peer_returns_the_slot_it_was_holding() {
+    use eebus::runtime::MAX_PENDING_TRUST;
+
+    let pump_trust = TrustStore::new();
+    let heat_pump = node("i:46925_u:HeatPump-1", pump_trust.clone());
+    let mut hub = Hub::new(heat_pump, pump_engine());
+    let address = hub.listen("127.0.0.1:0").await.unwrap();
+
+    // Twice the cap, one at a time, each refused before the next arrives.
+    for index in 0..(MAX_PENDING_TRUST * 2) {
+        let caller = node(&format!("i:46925_u:Caller-{index}"), TrustStore::new());
+        let dial = tokio::spawn(async move { caller.connect(address).await });
+
+        let refused = wait_for(
+            &mut hub,
+            Duration::from_secs(10),
+            |hub, event| match event {
+                HubEvent::TrustRequested { ski, .. } => {
+                    hub.refuse(ski);
+                    None
+                }
+                HubEvent::HandshakeFailed { error, .. } => Some(error),
+                _ => None,
+            },
+        )
+        .await;
+        assert!(
+            !matches!(*refused, ConnectionError::TooManyPendingPairings),
+            "caller {index} was turned away although every earlier one had been \
+             refused and its slot released: {refused}"
+        );
+        dial.abort();
+    }
+}
+
+/// Unapproved peers cannot fill the connection table between them.
+///
+/// A peer held in `hello: pending` occupies a slot for minutes on nobody's authority, so
+/// past [`MAX_PENDING_TRUST`] a peer is answered `hello: aborted` at once rather than
+/// queued behind the four already waiting.
+#[tokio::test]
+async fn only_so_many_peers_may_wait_for_approval_at_once() {
+    use eebus::runtime::MAX_PENDING_TRUST;
+
+    // A hub that trusts nobody, so every dial arrives as a trust request.
+    let pump_trust = TrustStore::new();
+    let heat_pump = node("i:46925_u:HeatPump-1", pump_trust.clone());
+    let mut hub = Hub::new(heat_pump, pump_engine());
+    hub.set_max_connections(64);
+    let address = hub.listen("127.0.0.1:0").await.unwrap();
+
+    // Each caller is a node of its own, because the cap counts distinct peers: one peer
+    // asking twice is one decision.
+    let mut callers = Vec::new();
+    for index in 0..=MAX_PENDING_TRUST {
+        let caller = node(&format!("i:46925_u:Caller-{index}"), TrustStore::with([]));
+        callers.push(tokio::spawn(async move { caller.connect(address).await }));
+    }
+
+    let mut waiting = Vec::new();
+    let error = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::TrustRequested { ski, .. } => {
+            waiting.push(ski);
+            None
+        }
+        HubEvent::HandshakeFailed { error, .. } => Some(error),
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        matches!(*error, ConnectionError::TooManyPendingPairings),
+        "the peer past the cap is turned away, not left pending: {error}"
+    );
+    assert_eq!(
+        waiting.len(),
+        MAX_PENDING_TRUST,
+        "and exactly the cap were asked about"
+    );
+
+    for caller in callers {
+        caller.abort();
+    }
 }

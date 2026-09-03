@@ -60,20 +60,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     control_box_trust.trust(heat_pump.ski());
     heat_pump_trust.trust(control_box.ski());
 
-    let listener = heat_pump.listen("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
+    // ---- The heat pump: listens, applies limits, and answers for them --------
+    let (engine, actor) = build_heat_pump();
+    let mut pump_hub = Hub::new(heat_pump, engine);
+    let address = pump_hub.listen("127.0.0.1:0").await?;
     println!("heat pump listening on {address}\n");
+    let now = pump_hub.now();
+    let mut actor = actor.install(pump_hub.engine_mut(), now);
 
-    // ---- The heat pump: applies limits, and answers for them ----------------
     let appliance = tokio::spawn(async move {
-        let (engine, actor) = build_heat_pump();
-        let mut hub = Hub::new(heat_pump, engine);
-
-        let (stream, from) = listener.accept().await.expect("a caller");
-        let ski = hub.accept(stream).await.expect("the SHIP handshake");
-        println!("[pump] {from} completed the handshake as {ski}");
-        let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
-
+        let mut hub = pump_hub;
         loop {
             let now = hub.now();
             let event = match hub.next().await {
@@ -81,6 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(_) => break,
             };
             match event {
+                HubEvent::Connected { ski, .. } => {
+                    println!("[pump] {ski} completed the handshake");
+                }
                 HubEvent::Spine(event) => {
                     if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
                         actor.handle_event(hub.engine_mut(), &event, now)
@@ -110,13 +109,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[pump] the connection ended");
     });
 
-    // ---- The control box: discovers, binds, and sends a limit ---------------
+    // ---- The control box: dials, discovers, binds, and sends a limit -----------
     let (engine, client, diagnosis) = build_control_box();
     let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
     let mut hub = Hub::new(control_box, engine);
 
-    let ski = hub.connect(address).await?;
-    println!("[box]  connected to {ski}\n");
+    // The dial runs in the background; `Connected` arrives as an event.
+    hub.dial(address);
 
     // The grid needs 3 kW. Everything from here — the heartbeat that has to precede the
     // limit, the binding it needs first — belongs to the actor.
@@ -133,6 +132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut reports = Vec::new();
 
         match event {
+            HubEvent::Connected { ski, .. } => println!("[box]  connected to {ski}\n"),
+            HubEvent::HandshakeFailed { error, .. } => {
+                return Err(format!("the dial failed: {error}").into());
+            }
             HubEvent::PeerDiscovered { device, .. } => {
                 let remote = hub.engine().peer(&device).expect("the peer we just heard");
                 assert!(
@@ -155,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             HubEvent::Tick => reports = guard.handle_timeout(hub.engine_mut(), now),
             HubEvent::Disconnected { .. } => break,
-            HubEvent::Connected { .. } | HubEvent::PeerKeysUpdated { .. } => {}
+            _ => {}
         }
 
         let mut done = false;

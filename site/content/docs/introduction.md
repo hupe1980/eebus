@@ -109,6 +109,7 @@ them.
 | [`enbility/ship-go`, `spine-go`, `eebus-go`](https://github.com/enbility/eebus-go) | Go | The de-facto reference, used by [evcc](https://docs.evcc.io/en/features/external-control/) and by several vendors. |
 | [`openmuc/jEEBus`](https://www.openmuc.org/eebus/ship/) | Java | An XSD-generated model with fluent builders — the generated-model idea is the one worth copying. |
 | [`NIBEGroup/openeebus`](https://github.com/NIBEGroup/openeebus) | C | The grid four, one remote connection at a time: the constrained-device niche. |
+| [`ULudo/eebus-sdk`](https://github.com/ULudo/eebus-sdk) | Python | An async SDK and CLI for LPC/LPP and smart-meter-gateway interoperability testing, with JSONL trace fixtures. |
 | [`DerAndereAndi/eebus-rust`](https://github.com/DerAndereAndi/eebus-rust) | Rust | An early experiment — the client handshake only. |
 | [`enbility/devices`](https://github.com/enbility/devices) | data | Captured discovery responses from real devices. |
 

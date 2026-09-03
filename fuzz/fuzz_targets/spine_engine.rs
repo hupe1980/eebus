@@ -69,7 +69,7 @@ fuzz_target!(|data: &[u8]| {
         while let Some(event) = engine.poll_event() {
             // A deferred write has to be resolved or the engine leaks it.
             if let eebus::spine::SpineEvent::WriteRequested(write) = event {
-                engine.accept_write(write.token, now);
+                let _ = engine.accept_write(write.token, now);
             }
         }
         // Everything queued must be encodable: a datagram the engine produces and cannot

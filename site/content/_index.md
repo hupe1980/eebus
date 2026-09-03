@@ -10,15 +10,14 @@ hero_code = """
 ```rust
 // A heat pump answers the grid operator's limit itself —
 // under §14a EnWG the acknowledgement *is* the record.
-match engine.poll_event() {
-    Some(SpineEvent::WriteRequested(w)) => {
-        let write = limitation::read_limit_write(&w.resolved)?;
-        match system.on_limit_write(&write, decide(&write), now) {
-            WriteOutcome::Accepted => engine.accept_write(w.token, now),
-            outcome => engine.reject_write(w.token, outcome.error_number(), now),
-        }
+if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
+    let write = limitation::read_limit_write(&w.resolved)?;
+    let outcome = system.on_limit_write(&write, decide(&write), now);
+    if outcome.is_accepted() {
+        engine.accept_write(w.token, now)?;                         // ACK
+    } else {
+        engine.reject_write(w.token, outcome.error_number(), now);  // NACK
     }
-    _ => {}
 }
 ```
 """
@@ -94,7 +93,7 @@ flowchart LR
 | You are building | You need | Start at |
 |---|---|---|
 | A heat pump, wallbox, battery or inverter that must accept a §14a limit | the Controllable System actors, the tester hooks, `no_std` | [Getting started](@/docs/getting-started.md), then [LPC and LPP](@/docs/limitation.md) |
-| An energy manager or grid control box that issues limits | the Energy Guard and Monitoring Appliance actors, `Hub` | [On a network](@/docs/networking.md) |
+| An energy manager or grid control box that issues limits | the Energy Guard and Monitoring Appliance actors, `Hub` with its listener, browse and pairing | [On a network](@/docs/networking.md) |
 | A gateway, simulator or test harness | the sans-IO core, without sockets | [Architecture](@/docs/architecture.md) |
 
 ## Both sides, not just the appliance

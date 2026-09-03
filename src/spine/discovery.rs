@@ -383,10 +383,16 @@ impl RemoteDevice {
             .as_ref()
             .and_then(|d| d.description.as_ref())
         {
-            if let Some(device) = description
-                .device_address
-                .as_ref()
-                .and_then(|a| a.device.clone())
+            // The address is the record's key, and the engine files the record under the
+            // header's source — the address SHIP authenticated. A payload is taken at its
+            // word only for a record that has no address yet, which is the opening read's
+            // reply and nothing else; letting it rename a record would let a peer file its
+            // discovery under a device that never sent it.
+            if self.address.is_none()
+                && let Some(device) = description
+                    .device_address
+                    .as_ref()
+                    .and_then(|a| a.device.clone())
             {
                 self.address = Some(device);
             }

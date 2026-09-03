@@ -85,6 +85,19 @@ affordable on a small controller.
 Both tables are readable — `nodeManagementBindingData` and `nodeManagementSubscriptionData`
 (§7.3.2, §7.4.2) — and both are answered from the relations actually held.
 
+**A request or a release is honoured only in the sender's own name.** The call names its
+client address in the payload, and the engine accepts it only when that address belongs to
+the device SHIP authenticated as the sender — a peer that leaves the device part out has it
+filled in from the header, which is how `spine-go` phrases it; a peer that names another
+device is answered `errorNumber` 7. Nothing in §7.3 gives a binding's client authority over
+anybody else's, and without the check one paired peer could release another's binding.
+
+**And a peer cannot hold relations without end.** Each device may hold at most
+`MAX_RELATIONS_PER_PEER` bindings and as many subscriptions; a request past that is answered
+`errorNumber` 3. A peer chooses its client addresses freely — a fresh entity path per
+request — so without a bound the two tables would grow on the word of whoever is on the
+wire.
+
 ## Deciding a write
 
 A feature may hand its writes to the application instead of storing them, which is what LPC
@@ -99,6 +112,13 @@ payloads:
 
 Decide on `resolved`. A partial write carries only what changed, so an absent
 `isLimitActive` means "unchanged", not "deactivate".
+
+`accept_write` answers with whether the engine could *store* what was accepted: a merged
+list that would exceed the bound, say, reaches the peer as `errorNumber` 3 rather than as an
+acknowledgement, and the use case has to know that, because a §14a record that said
+"accepted" while the wire said otherwise would be evidence of something that did not
+happen. The limitation actors handle it: the record says what the peer was told, and the
+state machine is put where a refused write leaves it.
 
 A write is refused with `errorNumber` 7 when an entry arrives without its primary and sub
 identifiers, which use-case IG §3.1 requires in every message: such an entry names nothing
@@ -131,6 +151,11 @@ owes_ack(CmdClassifier::Write, false, ErrorNumber::None);                 // fal
 
 Message counters are per-source and monotonic; a datagram addressed to a device that is not
 this one is answered `DestinationUnreachable` rather than ignored.
+
+**A payload carries exactly one command** (§5.3.2), and one that carries none or two is
+answered `errorNumber` 1. The schema permits several, so a peer can send them, but a
+single `result` cannot report two outcomes — so the datagram is refused whole rather than
+half-applied. Several *filters* in one command are a different thing, and supported.
 
 `specificationVersion` is checked, and a malformed one is refused —
 `TC_SPINE_COMP_006` calls that the recommended behaviour — while tolerating the one
@@ -194,6 +219,11 @@ survive. LPC UC TS §3.4.1.4's worked example is one command with two filters �
 withdraws a limit's `timePeriod.endTime`, the second writes its new value as a partial
 update — so a command's filters are applied **in order**. Answering only the delete removes
 the limit instead of making it open-ended.
+
+`Engine::write_filtered` sends that shape, and the Energy Guard uses it unasked: a limit
+with no duration always carries the delete that withdraws the old `endTime`. It has to —
+an absent element means unchanged, so omitting the `timePeriod` leaves the previous end
+time in force and a limit meant to be open-ended lapses when the old one would have.
 
 Nothing in the XML Schemas links a data type to its selectors and elements filters — the
 link is a naming convention — so the generator resolves it into a table covering 141

@@ -49,4 +49,12 @@ RUN go build -o /out/controlbox ./examples/controlbox \
 FROM alpine:3.20
 COPY --from=build /out/controlbox /out/evse /usr/local/bin/
 # No ENTRYPOINT: the test names which side it wants.
+#
+# Pointing the peer the other way — their `controlbox` dialling a Controllable System that
+# listens *outside* the container, a running `hemsd` say — needs the host reachable from
+# inside it. On Docker Desktop that is the name `host.docker.internal`; on Linux add
+# `--add-host=host.docker.internal:host-gateway` to `docker run`. `eebus-go`'s examples
+# find peers over mDNS, which does not cross the container boundary, so start the peer
+# with `-remoteski <the listener's SKI>` and run the container with `--network host`
+# where the listener has to be discovered rather than dialled.
 EXPOSE 4712

@@ -43,9 +43,9 @@ would be making that choice for every consumer downstream of it, including one w
 the first time a control box connects.
 
 ```toml
-eebus = { version = "0.3", features = ["runtime", "ring"] }
+eebus = { version = "0.4", features = ["runtime", "ring"] }
 # or, for a build that must not contain `ring`:
-eebus = { version = "0.3", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+eebus = { version = "0.4", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
 ```
 
 Nothing here ever reads the process default. The provider is built explicitly, with exactly
@@ -81,10 +81,17 @@ records it, and the relationship survives. The crate implements it end to end, a
 Two paths, both deliberate acts:
 
 * **Manual** — the user is shown the peer's SKI and approves it. The handshake stays
-  `pending` meanwhile, prolonging its wait up to the two-minute cap.
-* **Pairing Service** — an installer scans a QR code carrying a shared secret, and the
-  digest exchange (Pairing Service 1.0.0 §7) establishes trust automatically. A replay
-  guard (§11) prevents a captured exchange being reused.
+  `pending` meanwhile, prolonging its wait for as long as the peer allows, and the
+  approval completes it in place: `Hub::approve`, or adding the SKI to the `TrustStore`
+  the handshake is watching. `Hub::refuse` ends it with `hello: aborted` instead. See
+  [Pairing](@/docs/networking.md#pairing).
+* **Pairing Service** — an installer configures a control unit from a QR code carrying a
+  shared secret, and the digest exchange (Pairing Service 1.0.0 §7) establishes trust
+  with nobody asked anything. What is trusted is a **certificate fingerprint**, which
+  §10.2 makes equivalent to a trusted SKI. A replay guard (§11) refuses a captured
+  exchange, one unit is trusted at a time (§10.3), and a working pairing is not
+  replaceable until it has been unreachable for fifteen minutes (§4.3). See
+  [Pairing](@/docs/networking.md#or-nobody-is-asked-at-all).
 
 There is no third path. `register` is never advertised as `true` and there is no
 "auto accept" mode, both of which SHIP IG §2.3 forbids.
@@ -100,20 +107,38 @@ datagrams and bad certificates at any node.
   presenting the SKI without the key fails the handshake.
 * **Replay** — SPINE message counters are monotonic per source; the Pairing Service has its
   own guard.
+* **A stolen pairing secret** — printed, so photographable. The digest covers *both*
+  certificate fingerprints, so a captured announcement cannot be re-signed for another
+  certificate; the replay guard refuses it verbatim; and §4.3 means a working pairing is
+  not replaceable at all. An attacker with the secret and fifteen minutes of the real unit
+  being offline can pair, which is the model the specification chose.
 * **A timing oracle on a short secret** — the two comparisons that matter, a SHIP PIN and a
   pairing secret, go through one constant-time equality rather than stopping at the first
   differing byte. A PIN's whole defence is the escalating penalty of SHIP §13.4.4.3.4, and
   that penalty counts *attempts*: an equality that leaks a byte at a time turns eight hex
   digits into thirty-two guesses, and the penalty never notices.
 * **Resource exhaustion** — every table a peer can grow is bounded. The hub holds at most
-  `DEFAULT_MAX_CONNECTIONS` connections and two per peer, refusing the rest with a
-  `connectionClose`; the engine tracks at most `MAX_PEERS` device addresses, evicting the one
-  that has told it least, and at most `MAX_REMOTE_FUNCTIONS` of each peer's functions; at
-  most `MAX_DEFERRED_WRITES` writes may be waiting on the application, and one function holds
-  at most `MAX_LIST_ENTRIES` — after any of which a peer is answered `errorNumber` 3,
-  overload, rather than served. A device address is bounded and printable or the datagram is
-  discarded. SHIP itself caps none of this, and the omission is exploitable: a device that
-  dials in a thousand times takes the memory of every node that answers.
+  `DEFAULT_MAX_CONNECTIONS` connections and two per peer, handshakes still running
+  included, and drops the rest; at most `MAX_PENDING_TRUST` peers may be *waiting on an
+  approval* at once, because an unapproved peer occupies a slot for minutes on nobody's
+  authority, and the one past the cap is answered `hello: aborted` at once so that it
+  retries rather than squatting; the engine tracks at most `MAX_PEERS` device addresses,
+  evicting the one that has told it least together with everything filed under it, at most
+  `MAX_REMOTE_FUNCTIONS` of each peer's functions, and at most `MAX_RELATIONS_PER_PEER`
+  bindings and as many subscriptions from each peer; at most `MAX_DEFERRED_WRITES` writes
+  may be waiting on the application, and one function holds at most `MAX_LIST_ENTRIES` —
+  after any of which a peer is answered `errorNumber` 3, overload, rather than served. A
+  device address is bounded and printable or the datagram is discarded. SHIP itself caps
+  none of this, and the omission is exploitable: a device that dials in a thousand times
+  takes the memory of every node that answers.
+* **A paired peer acting in another's name** — a binding or subscription call names its
+  client in the payload, and the engine accepts it only from the device SHIP authenticated
+  as the sender. Without that, one paired peer could release another's binding — the one
+  thing standing between an Energy Guard's limit and a second energy manager — or grant
+  itself a relation under the other's address. Discovery is filed under the header's
+  source for the same reason, not under whatever device the payload claims to describe.
+  And a heartbeat keeps a Controllable System out of its failsafe state only when it comes
+  from the Energy Guard it subscribed to, not from whichever peer notifies one.
 
 What is *not* defended: an attacker with the private key is the node, and an attacker who
 can make the user approve their SKI is paired. Both are the intended semantics of the

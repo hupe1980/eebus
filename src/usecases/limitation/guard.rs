@@ -32,8 +32,10 @@ use core::time::Duration;
 
 use crate::model::{
     AddressDevice, CmdData, DeviceConfigurationKeyValueData, DeviceConfigurationKeyValueListData,
-    DeviceConfigurationKeyValueValue, FeatureAddress, FeatureType, Function, LoadControlLimitData,
-    LoadControlLimitListData, MsgCounter, Role, ScaledNumber, TimePeriod,
+    DeviceConfigurationKeyValueValue, FeatureAddress, FeatureType, Filter, FilterElements,
+    FilterSelectors, Function, LoadControlLimitData, LoadControlLimitDataElements,
+    LoadControlLimitListData, LoadControlLimitListDataSelectors, MsgCounter, Role, ScaledNumber,
+    TimePeriod, TimePeriodElements,
 };
 use crate::spine::{
     Engine, ErrorNumber, HeartbeatMonitor, HeartbeatProducer, LocalFeature, RemoteDevice,
@@ -856,7 +858,13 @@ impl EnergyGuardActor {
             .required
             .unwrap_or_else(LimitWrite::deactivated);
         let target = self.peers[index].peer.load_control.clone();
-        let counter = engine.write(&target, &self.client, limit_payload(&limit), true, now);
+        let counter = engine.write_filtered(
+            &target,
+            &self.client,
+            limit_payload(&limit),
+            limit_filters(&limit),
+            now,
+        );
 
         let tracked = &mut self.peers[index];
         let opening = !tracked.opening_write_sent;
@@ -922,6 +930,48 @@ fn normalise(mut limit: LimitWrite) -> LimitWrite {
     limit
 }
 
+/// The filters a limit write carries (LPC/LPP §3.4.1.4).
+///
+/// Always a `partial` update — a write that replaced the whole function would erase
+/// `isLimitChangeable` and whatever else the Controllable System keeps there. And, when
+/// the limit has **no** duration, a `delete` filter ahead of it that withdraws the
+/// `endTime`.
+///
+/// That delete is not optional and not cosmetic. Under the partial concept an absent
+/// element means *unchanged*, so a guard that follows "4.2 kW for fifteen minutes" with
+/// "4.2 kW, open-ended" and simply omits the `timePeriod` leaves the old end time in
+/// force: the limit lapses a quarter of an hour later, the household goes back to full
+/// draw, and the operator's record says it asked for something indefinite. The
+/// specification spells the remedy out and puts both filters in one command, which is
+/// also what keeps it atomic — there is no instant in which the peer holds neither the
+/// old duration nor the new value.
+///
+/// It is sent unconditionally rather than only when the peer is known to hold a duration:
+/// deleting an element that is not there is a no-op, and the alternative is tracking the
+/// peer's stored state well enough to be sure — which, after a reconnection, this side
+/// cannot be.
+fn limit_filters(limit: &LimitWrite) -> Vec<Filter> {
+    if limit.duration.is_some() {
+        return alloc::vec![Filter::partial()];
+    }
+    let withdraw_end_time = Filter::delete()
+        .select(FilterSelectors::LoadControlLimitListDataSelectors(
+            LoadControlLimitListDataSelectors {
+                limit_id: Some(LIMIT_ID),
+            },
+        ))
+        .covering(FilterElements::LoadControlLimitDataElements(
+            LoadControlLimitDataElements {
+                time_period: Some(TimePeriodElements {
+                    end_time: Some(crate::codec::ElementTag),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ));
+    alloc::vec![withdraw_end_time, Filter::partial()]
+}
+
 /// The `loadControlLimitListData` payload of a limit write (LPC/LPP Table 23).
 fn limit_payload(limit: &LimitWrite) -> CmdData {
     CmdData::LoadControlLimitListData(LoadControlLimitListData {
@@ -941,6 +991,56 @@ fn limit_payload(limit: &LimitWrite) -> CmdData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §3.4.1.4: a limit without a duration carries the delete that withdraws the old
+    /// `endTime`, because an omitted element means "unchanged" and would leave the
+    /// previous duration in force.
+    #[test]
+    fn a_limit_without_a_duration_withdraws_the_old_end_time() {
+        let filters = limit_filters(&LimitWrite::active(4_200.0));
+        assert_eq!(filters.len(), 2, "one delete, then the partial update");
+
+        let delete = &filters[0];
+        assert!(delete.is_delete());
+        assert!(
+            !delete.is_partial(),
+            "the delete and the update are separate filters"
+        );
+        assert_eq!(
+            delete.selectors.as_deref(),
+            Some(
+                &[FilterSelectors::LoadControlLimitListDataSelectors(
+                    LoadControlLimitListDataSelectors {
+                        limit_id: Some(LIMIT_ID),
+                    }
+                )][..]
+            ),
+            "the delete names the limit it addresses"
+        );
+        match &delete.elements {
+            Some(FilterElements::LoadControlLimitDataElements(elements)) => {
+                assert!(
+                    elements
+                        .time_period
+                        .as_ref()
+                        .is_some_and(|period| period.end_time.is_some()),
+                    "and the element it withdraws"
+                );
+                assert!(
+                    elements.value.is_none() && elements.is_limit_active.is_none(),
+                    "and nothing else: the value and the activation are being written"
+                );
+            }
+            other => panic!("expected load-control elements, saw {other:?}"),
+        }
+        assert!(filters[1].is_partial());
+
+        // A limit that *has* a duration writes it, so there is nothing to withdraw.
+        let with_duration =
+            limit_filters(&LimitWrite::active_for(4_200.0, Duration::from_secs(900)));
+        assert_eq!(with_duration.len(), 1);
+        assert!(with_duration[0].is_partial());
+    }
 
     /// §2.2: an activated limit never goes out with a duration of zero.
     #[test]

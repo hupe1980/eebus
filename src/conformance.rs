@@ -2733,6 +2733,102 @@ static MGCP: &[AbstractTestCase] = &[
 /// tables list them.
 pub static CATALOGUE: &[&[AbstractTestCase]] = &[LPC, LPP, MPC, MGCP];
 
+/// Why a test case is the device's to answer rather than the library's.
+///
+/// Five reasons cover the fourteen cases; they are constants so that the same thing is
+/// always said the same way, in a report and in a parameter sheet.
+pub mod device {
+    /// A factory reset and the defaults it restores are the device's, not the library's.
+    pub const FACTORY_RESET: &str =
+        "a factory reset and the defaults it restores are the device's, not the library's";
+    /// The library holds the values in memory; where they survive a power cut is the
+    /// device's decision.
+    pub const PERSISTENCE: &str = "the library holds the values in memory and hands them to the application; where \
+         they are stored across a power cut is the device's decision";
+    /// Powering the device off and on again.
+    pub const BLACK_START: &str = "powering the device off and on again; the runtime handles the dialling back, \
+         but the power supply is not something a library can cut";
+    /// A start-up duration is the device's, not a rebuilt actor's.
+    pub const REBOOT: &str = "the start-up duration measured is the device's, not that of an actor a test \
+         rebuilds in memory";
+    /// What the appliance actually draws.
+    pub const APPLIANCE: &str = "what the appliance actually draws, which the library reports a ceiling for and \
+         does not control";
+}
+
+/// The test cases no library can answer, with the reason each is the device's.
+///
+/// Roughly a third of the LPC and LPP catalogues are about the device rather than the
+/// protocol — a factory reset, a power cut, a start-up duration, what the appliance
+/// actually draws. `cargo test` here does not count them as covered, and a consumer's
+/// harness driving a real device is where they are answered: this table is that
+/// harness's checklist, one row per `ATC_…` identifier.
+///
+/// The seven are the same for LPC and LPP, so there are fourteen rows.
+pub static DEVICE_LEVEL: &[(&str, &str)] = &[
+    ("ATC_LPC_COM_PT_CSConnection_006", device::APPLIANCE),
+    ("ATC_LPC_COM_PT_CSConnection_009", device::BLACK_START),
+    ("ATC_LPC_COM_PT_CSInit_002", device::FACTORY_RESET),
+    ("ATC_LPC_COM_PT_CSInit_003", device::PERSISTENCE),
+    ("ATC_LPC_COM_PT_EGConnection_001", device::REBOOT),
+    ("ATC_LPC_COM_PT_EGConnection_003", device::BLACK_START),
+    ("ATC_LPC_COM_PT_EGMessages_002", device::REBOOT),
+    ("ATC_LPP_COM_PT_CSConnection_006", device::APPLIANCE),
+    ("ATC_LPP_COM_PT_CSConnection_009", device::BLACK_START),
+    ("ATC_LPP_COM_PT_CSInit_002", device::FACTORY_RESET),
+    ("ATC_LPP_COM_PT_CSInit_003", device::PERSISTENCE),
+    ("ATC_LPP_COM_PT_EGConnection_001", device::REBOOT),
+    ("ATC_LPP_COM_PT_EGConnection_003", device::BLACK_START),
+    ("ATC_LPP_COM_PT_EGMessages_002", device::REBOOT),
+];
+
+impl AbstractTestCase {
+    /// Why this test case is the device's to answer, if it is.
+    ///
+    /// [`None`] for a test case a library can drive — which is every one this crate's
+    /// own suite drives. [`Some`] carries the reason, which is what the device's harness
+    /// has to show the laboratory.
+    ///
+    /// ```
+    /// use eebus::conformance;
+    ///
+    /// let reset = conformance::find("ATC_LPC_COM_PT_CSInit_002").unwrap();
+    /// assert!(reset.owed_by_device().is_some(), "a factory reset is the device's");
+    ///
+    /// let timer = conformance::find("ATC_LPC_COM_PT_CSTransition5_001").unwrap();
+    /// assert!(timer.owed_by_device().is_none(), "a heartbeat timeout is the library's");
+    /// ```
+    pub fn owed_by_device(&self) -> Option<&'static str> {
+        DEVICE_LEVEL
+            .iter()
+            .find(|(id, _)| *id == self.id)
+            .map(|(_, reason)| *reason)
+    }
+}
+
+/// Every test case the device has to answer for itself, with the reason.
+///
+/// The checklist for a harness that drives a real device: iterate it, and for each row
+/// arrange the condition the description names — cut the power, trigger the reset — and
+/// check the result the description asks for. Filter by [`AbstractTestCase::dut`] for
+/// one actor, or by [`AbstractTestCase::is_mandatory_for`] for what the parameter sheet
+/// commits to.
+///
+/// ```
+/// use eebus::conformance;
+/// use eebus::usecases::descriptor::actors;
+///
+/// let mine: Vec<_> = conformance::device_level()
+///     .filter(|(case, _)| case.dut == actors::CONTROLLABLE_SYSTEM)
+///     .collect();
+/// assert_eq!(mine.len(), 8, "four for LPC and four for LPP");
+/// ```
+pub fn device_level() -> impl Iterator<Item = (&'static AbstractTestCase, &'static str)> {
+    DEVICE_LEVEL
+        .iter()
+        .filter_map(|(id, reason)| find(id).map(|case| (case, *reason)))
+}
+
 /// Looks a test case up by its `ATC_…` identifier.
 pub fn find(id: &str) -> Option<&'static AbstractTestCase> {
     CATALOGUE
@@ -2773,6 +2869,33 @@ mod tests {
         let counts: Vec<usize> = CATALOGUE.iter().map(|cases| cases.len()).collect();
         assert_eq!(counts, [51, 51, 54, 47], "LPC, LPP, MPC, MGCP");
         assert_eq!(counts.iter().sum::<usize>(), 203);
+    }
+
+    /// Every device-level row names a real test case, and the table is the same seven
+    /// for LPC and LPP: a row that exists for one and not the other is a transcription
+    /// error, since the two specifications are structurally identical.
+    #[test]
+    fn the_device_level_table_names_real_cases_the_same_way_for_both_use_cases() {
+        assert_eq!(DEVICE_LEVEL.len(), 14);
+        assert_eq!(device_level().count(), 14, "every row resolves");
+        let lpc: Vec<&str> = DEVICE_LEVEL
+            .iter()
+            .filter_map(|(id, _)| id.strip_prefix("ATC_LPC_"))
+            .collect();
+        let lpp: Vec<&str> = DEVICE_LEVEL
+            .iter()
+            .filter_map(|(id, _)| id.strip_prefix("ATC_LPP_"))
+            .collect();
+        assert_eq!(lpc, lpp, "the same seven under each prefix");
+        assert_eq!(lpc.len(), 7);
+        for (case, reason) in device_level() {
+            assert_eq!(case.owed_by_device(), Some(reason));
+            assert!(
+                case.use_case == names::LPC || case.use_case == names::LPP,
+                "{}: the measurement use cases have no device-level cases",
+                case.id
+            );
+        }
     }
 
     #[test]

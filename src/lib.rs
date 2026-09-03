@@ -86,10 +86,27 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! On a network, [`runtime::Hub`] owns the sockets and the clock: it dials and accepts,
+//! On a network, [`runtime::Hub`] owns the sockets and the clock: it listens, dials and
+//! browses in the background, asks the application when a peer needs a trust decision,
 //! runs the opening discovery, routes each datagram to the peer it names, keeps idle
 //! connections alive, and resolves the double connections two nodes that dial each other
 //! at the same moment would otherwise both hold.
+//!
+//! # Pairing
+//!
+//! Two ways in, and no third: SHIP IG §2.3 forbids an "auto accept" mode.
+//!
+//! **A person approves a SKI.** An unapproved peer completes TLS, which proves its SKI,
+//! and is held in the SHIP `hello: pending` state and reported as
+//! [`runtime::HubEvent::TrustRequested`]; [`runtime::Hub::approve`] completes the
+//! handshake it is waiting in, [`runtime::Hub::refuse`] ends it.
+//!
+//! **Or nobody is asked.** The **SHIP Pairing Service** ([`ship::pairing`]) is for a
+//! control unit installed by somebody who never sees the household's screen: it is
+//! configured from that device's QR code and announces a `_shippairing._tcp` request whose
+//! digest proves it knows the printed secret. [`runtime::Hub::accept_pairing_requests`]
+//! and [`runtime::Hub::browse_pairing`] receive; [`ship::pairing::Requester`] sends. What
+//! is trusted is a [`ship::Fingerprint`], which §10.2 makes equivalent to a SKI.
 //!
 //! See `examples/grid_limit.rs` for the whole §14a exchange against a virtual clock, and
 //! `examples/networked.rs` for the same thing over a socket. `examples/steuerbox.rs` and

@@ -222,6 +222,19 @@ enum CmdOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WriteToken(u64);
 
+/// Why [`Engine::accept_write`] could not do what the application decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WriteError {
+    /// The token names no write that is still waiting: it was resolved already, abandoned
+    /// after the peer stopped waiting ([`SpineEvent::WriteAbandoned`]), or never issued.
+    #[error("the token names no write that is still waiting for a decision")]
+    UnknownToken,
+    /// The application accepted, and the feature could not store the result. The peer has
+    /// been answered with this error rather than with an acknowledgement.
+    #[error("the accepted write could not be stored: {0}")]
+    NotStored(#[from] super::device::FeatureError),
+}
+
 /// A write that has been reported and not yet resolved.
 #[derive(Clone, Debug)]
 struct DeferredWrite {
@@ -654,10 +667,42 @@ impl Engine {
         partial: bool,
         now: Duration,
     ) -> MsgCounter {
+        let filters = if partial {
+            alloc::vec![Filter::partial()]
+        } else {
+            Vec::new()
+        };
+        self.write_filtered(destination, source, data, filters, now)
+    }
+
+    /// Writes to a peer's feature with filters of the caller's choosing.
+    ///
+    /// What [`write`](Self::write) cannot express: a command that **withdraws** an
+    /// element and writes new data in the same breath. A partial write can only ever set
+    /// elements, because an absent element means "unchanged" — so removing one takes a
+    /// `delete` filter, and LPC §3.4.1.4 gives the worked example of doing both at once:
+    ///
+    /// > Special care must be taken by the Actor Energy Guard in case a previous limit
+    /// > WITH the Element endTime set is overwritten with a new limit WITHOUT the Element
+    /// > endTime. […] the Energy Guard has to delete the old endTime Element with a
+    /// > partial delete command (that can be part of the write command that includes the
+    /// > new limit).
+    ///
+    /// Filters are applied in the order given, so the delete comes first and the partial
+    /// update after it. One command, one acknowledgement, and no window in which the peer
+    /// holds a limit with neither the old duration nor the new value.
+    pub fn write_filtered(
+        &mut self,
+        destination: &FeatureAddress,
+        source: &FeatureAddress,
+        data: CmdData,
+        filters: Vec<Filter>,
+        now: Duration,
+    ) -> MsgCounter {
         let counter = self.counters.next();
         let mut cmd = Cmd::with_data(data);
-        if partial {
-            cmd = cmd.with_filter(Filter::partial());
+        for filter in filters {
+            cmd = cmd.with_filter(filter);
         }
         self.send(
             Datagram {
@@ -973,20 +1018,36 @@ impl Engine {
         let mut error = ErrorNumber::None;
         let mut deferred = false;
 
-        for cmd in datagram.payload.iter().flat_map(|p| p.cmd.iter().flatten()) {
-            match self.handle_cmd(
-                cmd,
-                source,
-                destination,
-                classifier,
-                counter,
-                reference,
-                ack_request,
-                now,
-            ) {
-                CmdOutcome::Deferred => deferred = true,
-                CmdOutcome::Answer(outcome) if !outcome.is_success() => error = outcome,
-                CmdOutcome::Answer(_) => {}
+        // SPINE §5.3.2: "each instance of a payload element SHALL contain exactly one
+        // cmd instance". Several are refused whole rather than executed in part, because
+        // one acknowledgement cannot report two outcomes; none asked for nothing, and
+        // acknowledging that would report a write the peer never made.
+        let mut commands = datagram.payload.iter().flat_map(|p| p.cmd.iter().flatten());
+        match (commands.next(), commands.next()) {
+            (Some(cmd), None) => {
+                match self.handle_cmd(
+                    cmd,
+                    source,
+                    destination,
+                    classifier,
+                    counter,
+                    reference,
+                    ack_request,
+                    now,
+                ) {
+                    CmdOutcome::Deferred => deferred = true,
+                    CmdOutcome::Answer(outcome) if !outcome.is_success() => error = outcome,
+                    CmdOutcome::Answer(_) => {}
+                }
+            }
+            (Some(_), Some(_)) => error = ErrorNumber::General,
+            (None, _) => {
+                if matches!(
+                    classifier,
+                    CmdClassifier::Read | CmdClassifier::Write | CmdClassifier::Call
+                ) {
+                    error = ErrorNumber::General;
+                }
             }
         }
 
@@ -1261,9 +1322,20 @@ impl Engine {
     ///     }
     /// }
     /// ```
-    pub fn accept_write(&mut self, token: WriteToken, now: Duration) {
+    ///
+    /// # Errors
+    ///
+    /// The application's *decision* is to accept; whether the engine can then *store* the
+    /// write is a second question, and the two can disagree — the merged list would exceed
+    /// [`MAX_LIST_ENTRIES`](super::MAX_LIST_ENTRIES), say. When they do, the peer has been
+    /// answered with the error, **not** with an acknowledgement, and this says so: a use
+    /// case that had already moved its state machine and written "accepted" into a §14a
+    /// record would otherwise be holding evidence of an acknowledgement that never went
+    /// out. An unknown token — already resolved, abandoned, or never issued — is
+    /// [`WriteError::UnknownToken`].
+    pub fn accept_write(&mut self, token: WriteToken, now: Duration) -> Result<(), WriteError> {
         let Some(write) = self.take_deferred(token) else {
-            return;
+            return Err(WriteError::UnknownToken);
         };
         let function = Function::from(write.data.key());
         let outcome = match self.device.resolve_mut(&write.feature) {
@@ -1271,7 +1343,7 @@ impl Engine {
             Some(feature) => write.ops.apply_to(feature, write.data),
         };
 
-        let error = match outcome {
+        let error = match &outcome {
             Ok(()) => {
                 self.events.push_back(SpineEvent::DataWritten {
                     feature: write.feature.clone(),
@@ -1291,15 +1363,19 @@ impl Engine {
             error,
             now,
         );
+        outcome.map_err(WriteError::NotStored)
     }
 
     /// Refuses a deferred write, storing nothing and reporting `error`.
     ///
     /// `ErrorNumber::CommandRejected` is the one a use case means when it declines a
     /// value it cannot follow — LPC's NACK.
-    pub fn reject_write(&mut self, token: WriteToken, error: ErrorNumber, now: Duration) {
+    ///
+    /// Returns whether the token named a write still waiting; a refusal of a write that was
+    /// already resolved or abandoned changes nothing.
+    pub fn reject_write(&mut self, token: WriteToken, error: ErrorNumber, now: Duration) -> bool {
         let Some(write) = self.take_deferred(token) else {
-            return;
+            return false;
         };
         let error = if error.is_success() {
             // A refusal that reports success would tell the peer its limit was applied.
@@ -1315,6 +1391,7 @@ impl Engine {
             error,
             now,
         );
+        true
     }
 
     fn take_deferred(&mut self, token: WriteToken) -> Option<DeferredWrite> {
@@ -1336,6 +1413,28 @@ impl Engine {
         }
     }
 
+    /// The client address a binding or subscription call names, as this node will file it.
+    ///
+    /// The address is the *peer's* to name and the payload is where it names it — but the
+    /// peer that sent the datagram is the one SHIP authenticated, and the two have to
+    /// agree. A call naming a client on another device would let one paired peer grant
+    /// itself a relation in another's name, or release another's binding, and §7.3 gives a
+    /// binding's client no authority over anybody else's. A call that leaves the device
+    /// part out is completed from the header, which is what `spine-go` does too.
+    fn client_of_caller(
+        named: &FeatureAddress,
+        source: &FeatureAddress,
+    ) -> Result<FeatureAddress, ErrorNumber> {
+        match (&named.device, &source.device) {
+            (Some(named), Some(sender)) if named != sender => Err(ErrorNumber::CommandRejected),
+            (None, Some(sender)) => Ok(FeatureAddress {
+                device: Some(sender.clone()),
+                ..named.clone()
+            }),
+            _ => Ok(named.clone()),
+        }
+    }
+
     fn handle_call(&mut self, cmd: &Cmd, source: &FeatureAddress) -> ErrorNumber {
         match &cmd.data {
             Some(CmdData::NodeManagementBindingRequestCall(call)) => {
@@ -1347,6 +1446,11 @@ impl Engine {
                 else {
                     return ErrorNumber::General;
                 };
+                let client = match Self::client_of_caller(client, source) {
+                    Ok(client) => client,
+                    Err(error) => return error,
+                };
+                let client = &client;
                 if self.device.resolve(server).is_none() {
                     return ErrorNumber::DestinationUnknown;
                 }
@@ -1370,6 +1474,11 @@ impl Engine {
                 else {
                     return ErrorNumber::General;
                 };
+                let client = match Self::client_of_caller(client, source) {
+                    Ok(client) => client,
+                    Err(error) => return error,
+                };
+                let client = &client;
                 // NodeManagement itself is subscribable, so it is resolved separately
                 // from the ordinary features.
                 if !is_node_management(server) && self.device.resolve(server).is_none() {
@@ -1391,9 +1500,13 @@ impl Engine {
                     && let (Some(client), Some(server)) =
                         (&delete.client_address, &delete.server_address)
                 {
-                    self.relations.remove_binding(client, server);
+                    let client = match Self::client_of_caller(client, source) {
+                        Ok(client) => client,
+                        Err(error) => return error,
+                    };
+                    self.relations.remove_binding(&client, server);
                     self.events.push_back(SpineEvent::BindingReleased {
-                        client: client.clone(),
+                        client,
                         server: server.clone(),
                     });
                 }
@@ -1404,18 +1517,19 @@ impl Engine {
                     && let (Some(client), Some(server)) =
                         (&delete.client_address, &delete.server_address)
                 {
-                    self.relations.remove_subscription(client, server);
+                    let client = match Self::client_of_caller(client, source) {
+                        Ok(client) => client,
+                        Err(error) => return error,
+                    };
+                    self.relations.remove_subscription(&client, server);
                     self.events.push_back(SpineEvent::SubscriptionReleased {
-                        client: client.clone(),
+                        client,
                         server: server.clone(),
                     });
                 }
                 ErrorNumber::None
             }
-            _ => {
-                let _ = source;
-                ErrorNumber::CommandNotSupported
-            }
+            _ => ErrorNumber::CommandNotSupported,
         }
     }
 
@@ -1440,13 +1554,20 @@ impl Engine {
         // since §7.1.5's re-send may itself be partial.
         match &resolved {
             CmdData::NodeManagementDetailedDiscoveryData(discovery) => {
-                let device = discovery
-                    .device_information
-                    .as_ref()
-                    .and_then(|d| d.description.as_ref())
-                    .and_then(|d| d.device_address.as_ref())
-                    .and_then(|a| a.device.clone())
-                    .or_else(|| source.device.clone());
+                // Filed under the address the *header* carries, which is the one SHIP
+                // authenticated and the one every reply goes back to. The payload names
+                // one too, and a peer whose payload disagreed with its header would
+                // otherwise have its discovery filed under a device that never sent it.
+                // The payload is the fallback for the one message §2.7 lets through
+                // without a device part.
+                let device = source.device.clone().or_else(|| {
+                    discovery
+                        .device_information
+                        .as_ref()
+                        .and_then(|d| d.description.as_ref())
+                        .and_then(|d| d.device_address.as_ref())
+                        .and_then(|a| a.device.clone())
+                });
                 if let Some(device) = device {
                     let peer = self.peer_entry(&device);
                     peer.remote.apply_detailed_discovery(discovery);
@@ -1666,15 +1787,19 @@ impl Engine {
         if self.peers.len() >= MAX_PEERS {
             // Drop the one that has told us least: a peer that never completed discovery
             // is either gone or was never real, and keeping it would let whoever is
-            // sending addresses evict the peers that matter.
-            if let Some(index) = self
+            // sending addresses evict the peers that matter. Everything else filed under
+            // it goes too — its relations, the requests outstanding against it and the
+            // writes it has waiting — because an entry that outlives its peer record is
+            // an entry nothing can ever clean up.
+            let index = self
                 .peers
                 .iter()
                 .position(|p| p.remote.entities.is_empty() && p.remote.use_cases.is_empty())
-            {
-                self.peers.remove(index);
+                .unwrap_or(0);
+            if let Some(evicted) = self.peers[index].remote.address.clone() {
+                self.remove_peer(&evicted);
             } else {
-                self.peers.remove(0);
+                self.peers.remove(index);
             }
         }
         self.peers.push(Peer {

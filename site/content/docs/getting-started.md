@@ -15,7 +15,8 @@ The crate is not on crates.io yet. Take it from git:
 eebus = { git = "https://github.com/hupe1980/eebus" }
 ```
 
-Default features are `std` and `pairing`. Sockets, TLS and certificates are opt-in — see
+Default features are `std`, `pairing` and `conformance`. Sockets, TLS and certificates are
+opt-in — see
 [Feature flags](@/docs/architecture.md#feature-flags). Minimum supported Rust version is
 **1.88**.
 
@@ -117,9 +118,11 @@ use eebus::usecases::limitation::{self, WriteOutcome};
 if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
     // `resolved` is the update merged into what is stored; `data` is what arrived.
     let write = limitation::read_limit_write(&w.resolved)?;
-    match system.on_limit_write(&write, decide(&write), now) {
-        WriteOutcome::Accepted => engine.accept_write(w.token, now),
-        outcome => engine.reject_write(w.token, outcome.error_number(), now),
+    let outcome = system.on_limit_write(&write, decide(&write), now);
+    if outcome.is_accepted() {
+        engine.accept_write(w.token, now)?;                          // ACK — or what the peer was told instead
+    } else {
+        engine.reject_write(w.token, outcome.error_number(), now);   // NACK
     }
 }
 ```
