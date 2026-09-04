@@ -65,7 +65,19 @@ pub enum Quantity {
     /// Energy produced since the device was installed.
     YieldTotal,
     /// A component's temperature, in degrees Celsius.
+    ///
+    /// `componentTemperature` — an inverter's heatsink, say. Not the hot water: see
+    /// [`DhwTemperature`](Self::DhwTemperature), which is a different scope on a different
+    /// commodity and mixing the two would have a manager reading a heatsink as a tank.
     Temperature,
+    /// The temperature of the domestic hot water, in degrees Celsius ([MDT-001]).
+    ///
+    /// `dhwTemperature` on `commodityType: domesticHotWater`, which is the one measurement
+    /// in this crate that is not electricity. Comparing it against the setpoint
+    /// [`cdt`](crate::usecases::hvac::cdt) wrote is how the energy demand for hot water is
+    /// estimated, and how a manager finds out whether a temperature it asked for was
+    /// actually reached.
+    DhwTemperature,
 
     // ---- the direct-current side (MOB, MPS, MOI) --------------------------------
     /// Direct-current power, in watts.
@@ -116,7 +128,7 @@ impl Quantity {
             | Self::DcChargeEnergy
             | Self::DcDischargeEnergy
             | Self::StateOfEnergy => MeasurementType::Energy,
-            Self::Temperature => MeasurementType::Temperature,
+            Self::Temperature | Self::DhwTemperature => MeasurementType::Temperature,
             Self::DcCurrent => MeasurementType::Current,
             Self::DcVoltage => MeasurementType::Voltage,
             Self::UsableCapacity => MeasurementType::Capacity,
@@ -150,7 +162,7 @@ impl Quantity {
             | Self::DcDischargeEnergy
             | Self::StateOfEnergy
             | Self::UsableCapacity => UnitOfMeasurement::Wh,
-            Self::Temperature => UnitOfMeasurement::DegC,
+            Self::Temperature | Self::DhwTemperature => UnitOfMeasurement::DegC,
             Self::DcPower => UnitOfMeasurement::W,
             Self::DcCurrent => UnitOfMeasurement::A,
             Self::DcVoltage => UnitOfMeasurement::V,
@@ -240,8 +252,17 @@ impl Measurand {
     }
 
     /// The `commodityType` of the description, which is `electricity` throughout.
+    /// The `commodityType` of the `Measurement` description.
+    ///
+    /// Electricity for everything this crate measures but one: MDT Table 7 fixes
+    /// `domesticHotWater` for the hot water temperature, and it is `M`. A client filtering
+    /// on the commodity — which is the point of the element — would not see a tank
+    /// published as electricity.
     pub const fn commodity_type(&self) -> CommodityType {
-        CommodityType::Electricity
+        match self.quantity {
+            Quantity::DhwTemperature => CommodityType::DomesticHotWater,
+            _ => CommodityType::Electricity,
+        }
     }
 
     /// The `scopeType` of the `Measurement` description.
@@ -274,6 +295,7 @@ impl Measurand {
             Quantity::YieldYear => ScopeType::AcYieldYear,
             Quantity::YieldTotal => ScopeType::AcYieldTotal,
             Quantity::Temperature => ScopeType::ComponentTemperature,
+            Quantity::DhwTemperature => ScopeType::DhwTemperature,
             Quantity::DcPower => ScopeType::DcPower,
             Quantity::DcCurrent => ScopeType::DcCurrent,
             Quantity::DcVoltage => ScopeType::DcVoltage,
@@ -339,6 +361,7 @@ impl Measurand {
             Quantity::YieldYear => "yieldYear",
             Quantity::YieldTotal => "yieldTotal",
             Quantity::Temperature => "temperature",
+            Quantity::DhwTemperature => "dhwTemperature",
             Quantity::DcPower => "dcPower",
             Quantity::DcCurrent => "dcCurrent",
             Quantity::DcVoltage => "dcVoltage",

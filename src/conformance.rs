@@ -19,10 +19,12 @@
 //!   under the same name, and a reviewer can look it up.
 //!
 //! What the catalogue deliberately does *not* claim is that a passing test here would
-//! pass there. Roughly a third of the abstract test cases are about the device rather
-//! than the protocol — that a factory reset restores defaults, that a value survives a
-//! power cut, that a reboot completes inside the declared start-up time — and no library
-//! can answer those for the device it is linked into. [`AbstractTestCase::level`] and
+//! pass there. Fourteen of the two hundred and three abstract test cases — seven each in
+//! LPC and LPP, and none in the two measurement use cases — are about the device rather
+//! than the protocol: that a factory reset restores defaults, that a value survives a
+//! power cut, that a reboot completes inside the declared start-up time. No library can
+//! answer those for the device it is linked into, and [`DEVICE_LEVEL`] is the list, with
+//! the reason each one is the device's. [`AbstractTestCase::level`] and
 //! [`AbstractTestCase::raised_when`] say when a test case applies at all; the honest
 //! answer for the rest is the reason recorded alongside them in the consuming suite.
 //!
@@ -2758,11 +2760,12 @@ pub mod device {
 
 /// The test cases no library can answer, with the reason each is the device's.
 ///
-/// Roughly a third of the LPC and LPP catalogues are about the device rather than the
-/// protocol — a factory reset, a power cut, a start-up duration, what the appliance
-/// actually draws. `cargo test` here does not count them as covered, and a consumer's
-/// harness driving a real device is where they are answered: this table is that
-/// harness's checklist, one row per `ATC_…` identifier.
+/// Seven of each of the LPC and LPP catalogues — fourteen of the two hundred and three
+/// test cases across all four certifiable use cases, or seven per cent — are about the
+/// device rather than the protocol: a factory reset, a power cut, a start-up duration,
+/// what the appliance actually draws. `cargo test` here does not count them as covered,
+/// and a consumer's harness driving a real device is where they are answered: this table
+/// is that harness's checklist, one row per `ATC_…` identifier.
 ///
 /// The seven are the same for LPC and LPP, so there are fourteen rows.
 pub static DEVICE_LEVEL: &[(&str, &str)] = &[

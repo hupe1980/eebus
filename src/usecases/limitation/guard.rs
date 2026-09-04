@@ -34,8 +34,8 @@ use crate::model::{
     AddressDevice, CmdData, DeviceConfigurationKeyValueData, DeviceConfigurationKeyValueListData,
     DeviceConfigurationKeyValueValue, FeatureAddress, FeatureType, Filter, FilterElements,
     FilterSelectors, Function, LoadControlLimitData, LoadControlLimitDataElements,
-    LoadControlLimitListData, LoadControlLimitListDataSelectors, MsgCounter, Role, ScaledNumber,
-    TimePeriod, TimePeriodElements,
+    LoadControlLimitId, LoadControlLimitListData, LoadControlLimitListDataSelectors, MsgCounter,
+    Role, ScaledNumber, TimePeriod, TimePeriodElements,
 };
 use crate::spine::{
     Engine, ErrorNumber, HeartbeatMonitor, HeartbeatProducer, LocalFeature, RemoteDevice,
@@ -43,7 +43,7 @@ use crate::spine::{
 };
 
 use super::Direction;
-use super::actor::{FAILSAFE_DURATION_KEY, FAILSAFE_LIMIT_KEY, LIMIT_ID, NominalMax};
+use super::actor::{NominalMax, PeerIds};
 use super::audit::{AuditLog, LimitRecord};
 use super::state::{FAILSAFE_DURATION_RANGE, LimitWrite, NackReason, WriteOutcome};
 
@@ -126,8 +126,8 @@ pub fn locate(remote: &RemoteDevice, direction: Direction) -> Option<Controllabl
 /// What the Energy Guard learned about one Controllable System.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GuardEvent {
-    /// The pre-scenario communication finished: both bindings are held and the limit can
-    /// be written.
+    /// The pre-scenario communication finished: both bindings are held, the peer's own
+    /// `limitId` has been read, and the limit can be written.
     Ready {
         /// The peer.
         device: AddressDevice,
@@ -177,6 +177,55 @@ pub enum GuardEvent {
         /// The peer.
         device: AddressDevice,
     },
+    /// The peer answered with a `LoadControl` feature that publishes no limit this guard
+    /// can write to, so no limit will be sent.
+    ///
+    /// The peer's limit description named no `signDependentAbsValueLimit` obligation in
+    /// this guard's direction (LPC/LPP Table 22), which is what a Controllable System is
+    /// required to publish. Usually one of two installations: a device that implements
+    /// the *other* direction — an LPP appliance an LPC guard has attached to — or one
+    /// whose actor was built and never installed, which answers discovery and describes
+    /// no limit.
+    ///
+    /// Reported once per attach, and worth surfacing rather than logging: an installation
+    /// that stops here looks commissioned from both ends and is not. Nothing on the wire
+    /// says so, which is the whole reason this event exists.
+    NoLimitPublished {
+        /// The peer.
+        device: AddressDevice,
+    },
+    /// A request to this peer went unanswered through the whole of the SPINE
+    /// implementation guide §2.6.2 escalation path.
+    ///
+    /// Not a refusal — that is a completed exchange, and arrives as
+    /// [`LimitRefused`](Self::LimitRefused). This is silence, and whatever the request was
+    /// holding has been released, so the guard carries on rather than waiting for an
+    /// acknowledgement that is not coming.
+    ///
+    /// Worth surfacing (§2.6.4): under §14a EnWG a control box whose limit writes are being
+    /// swallowed has stopped controlling, and looks from the outside exactly like one the
+    /// grid is asking nothing of.
+    PeerUnresponsive {
+        /// The peer.
+        device: AddressDevice,
+        /// What went unanswered.
+        outstanding: Unanswered,
+    },
+}
+
+/// What a peer failed to answer ([`GuardEvent::PeerUnresponsive`]).
+///
+/// The three are not equally bad, which is what an installer's one line has to say: a lost
+/// limit is a grid instruction that went nowhere, a lost description is an installation
+/// that never started, and a lost binding is retried on the next attach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unanswered {
+    /// A limit write. The limit has been let go and will be written again.
+    Limit,
+    /// A description read. Until one arrives, no limit can be addressed at all.
+    Description,
+    /// A binding request. Without it the peer will accept no write.
+    Binding,
 }
 
 /// One Controllable System, and where the guard has got to with it.
@@ -185,7 +234,15 @@ struct Tracked {
     peer: ControllableSystemPeer,
     bound_load_control: bool,
     bound_configuration: bool,
-    subscribed: bool,
+    /// Whether [`GuardEvent::Ready`] has been reported for this attach.
+    ready_reported: bool,
+    /// The identifiers this peer chose for the limit and the two failsafe keys.
+    ///
+    /// Empty until the description reads come back. Nothing may be written before the
+    /// limit is in here: the numbers are the peer's, not this crate's.
+    ids: PeerIds,
+    /// Whether the peer has answered with a limit description that named no usable limit.
+    reported_no_limit: bool,
     /// The limit the grid situation requires of this peer.
     required: Option<LimitWrite>,
     /// The limit whose acknowledgement is outstanding.
@@ -208,6 +265,12 @@ struct Tracked {
     monitor: HeartbeatMonitor,
     /// The binding requests still outstanding, by counter.
     pending_bindings: Vec<(MsgCounter, FeatureAddress)>,
+    /// The description reads still outstanding, by counter.
+    ///
+    /// These gate every write — without the peer's `limitId` and `keyId`s there is no
+    /// address to write to — so an unanswered one is an installation that never starts.
+    /// Tracked so a give-up can be told from a read still in flight.
+    pending_reads: Vec<(MsgCounter, FeatureAddress)>,
     /// When this peer was attached, for the subscription grace period.
     attached_at: Duration,
     /// Whether the peer has subscribed to this guard's heartbeat (scenario 3).
@@ -237,7 +300,9 @@ impl Tracked {
             peer,
             bound_load_control: false,
             bound_configuration: false,
-            subscribed: false,
+            ready_reported: false,
+            ids: PeerIds::new(),
+            reported_no_limit: false,
             required: None,
             outstanding: None,
             applied: None,
@@ -247,6 +312,7 @@ impl Tracked {
             refusals: 0,
             monitor: HeartbeatMonitor::new(),
             pending_bindings: Vec::new(),
+            pending_reads: Vec::new(),
             attached_at: now,
             watches_heartbeat: false,
             nominal_max: None,
@@ -255,8 +321,14 @@ impl Tracked {
         }
     }
 
+    /// Whether everything a limit write needs is in place.
+    ///
+    /// Both bindings, and the peer's own `limitId`. The identifier belongs here rather
+    /// than beside the write because a guard that is "ready" without one is ready to
+    /// address nothing: the alternative to waiting is writing to whatever the peer keeps
+    /// under a number this crate chose for itself.
     fn is_ready(&self) -> bool {
-        self.bound_load_control && self.bound_configuration
+        self.bound_load_control && self.bound_configuration && self.ids.can_write_limit()
     }
 
     /// Whether a limit written now would find the peer listening for the heartbeat that
@@ -340,7 +412,8 @@ impl EnergyGuardActor {
         self.peers.iter().map(|t| &t.peer)
     }
 
-    /// Whether a peer's pre-scenario communication has finished.
+    /// Whether a peer's pre-scenario communication has finished: both bindings held and
+    /// the peer's own `limitId` known.
     pub fn is_ready(&self, device: &AddressDevice) -> bool {
         self.tracked(device).is_some_and(Tracked::is_ready)
     }
@@ -353,9 +426,15 @@ impl EnergyGuardActor {
     /// Starts controlling a Controllable System.
     ///
     /// Sends the binding requests the use case needs — `LoadControl` for the limit,
-    /// `DeviceConfiguration` for the failsafe values — and subscribes to the peer's
+    /// `DeviceConfiguration` for the failsafe values — reads the two description
+    /// functions that say how this peer numbers its data, and subscribes to the peer's
     /// heartbeat where it serves one. Calling it again for a peer already tracked
     /// restarts the pre-scenario communication, which is what a reconnection needs.
+    ///
+    /// The description reads are not optional and not an optimisation. `limitId` and the
+    /// failsafe `keyId`s are the peer's own (LPC/LPP Tables 22 and 24 spell them
+    /// `<l1#(1..1)>`, `<k1#(1..1)>`, `<k2#(1..1)>`), so until they come back this guard
+    /// has no address to write to — see [`PeerIds`](super::PeerIds).
     pub fn attach(&mut self, engine: &mut Engine, peer: ControllableSystemPeer, now: Duration) {
         let device = peer.device.clone();
         self.peers.retain(|t| t.peer.device != device);
@@ -372,6 +451,23 @@ impl EnergyGuardActor {
         ] {
             let counter = engine.request_binding(&self.client, &feature, now);
             tracked.pending_bindings.push((counter, feature));
+        }
+        // How this peer numbers its data. Reads, not writes, so they need no binding and
+        // go out with the binding requests rather than behind them. Their counters are
+        // kept: nothing is written until they come back, so an unanswered one has to be
+        // something the application is told about rather than a silence.
+        for (feature, function) in [
+            (
+                tracked.peer.load_control.clone(),
+                Function::LoadControlLimitDescriptionListData,
+            ),
+            (
+                tracked.peer.device_configuration.clone(),
+                Function::DeviceConfigurationKeyValueDescriptionListData,
+            ),
+        ] {
+            let counter = engine.read(&feature, &self.client, function, now);
+            tracked.pending_reads.push((counter, feature));
         }
         // The limit itself is worth watching: a Controllable System that leaves the
         // limited state on its own notifies the change.
@@ -391,6 +487,15 @@ impl EnergyGuardActor {
             );
         }
         self.peers.push(tracked);
+    }
+
+    /// The identifiers a peer chose for the data this guard addresses.
+    ///
+    /// Filled from the description reads [`attach`](Self::attach) sends. Worth showing in
+    /// a commissioning log: a peer whose `limit` is [`None`] is one no limit will be
+    /// written to, and the reason is not otherwise visible on the wire.
+    pub fn peer_ids(&self, device: &AddressDevice) -> Option<PeerIds> {
+        Some(self.tracked(device)?.ids)
     }
 
     /// What a peer reported as its nominal maximum in scenario 4, once it has.
@@ -458,6 +563,13 @@ impl EnergyGuardActor {
     ///
     /// Implementation guide §2.15 makes this mandatory for a Controllable System to
     /// accept: a device stuck on its factory default cannot protect anything.
+    ///
+    /// [`None`] until the peer's own `keyId` for it is known — the description read
+    /// [`attach`](Self::attach) sends is what supplies it. `keyId` is the device's
+    /// (`<k1#(1..1)>`, LPC/LPP Table 24) and the fixed element is the `keyName`, so a
+    /// write addressed by this crate's own numbering would land on whatever key that peer
+    /// keeps at that index. A `DeviceConfiguration` feature holds every configuration key
+    /// a device has, not only this use case's two.
     pub fn write_failsafe_limit(
         &mut self,
         engine: &mut Engine,
@@ -469,10 +581,11 @@ impl EnergyGuardActor {
         if !tracked.bound_configuration {
             return None;
         }
+        let key = tracked.ids.failsafe_limit?;
         let data =
             CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
-                    key_id: Some(FAILSAFE_LIMIT_KEY),
+                    key_id: Some(key),
                     value: Some(DeviceConfigurationKeyValueValue {
                         scaled_number: Some(ScaledNumber::from_f64(watts.max(0.0), 0)),
                         ..Default::default()
@@ -489,6 +602,9 @@ impl EnergyGuardActor {
     /// A value outside two to twenty-four hours is refused here rather than on the wire:
     /// the range is the specification's, and a Controllable System would answer with a
     /// NACK the guard would then have to interpret.
+    ///
+    /// [`None`] until the peer's own `keyId` for it is known, for the reason given on
+    /// [`write_failsafe_limit`](Self::write_failsafe_limit).
     pub fn write_failsafe_duration(
         &mut self,
         engine: &mut Engine,
@@ -503,10 +619,11 @@ impl EnergyGuardActor {
         if !tracked.bound_configuration {
             return None;
         }
+        let key = tracked.ids.failsafe_duration?;
         let data =
             CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
-                    key_id: Some(FAILSAFE_DURATION_KEY),
+                    key_id: Some(key),
                     value: Some(DeviceConfigurationKeyValueValue {
                         duration: Some(crate::model::format_iso8601_duration(duration)),
                         ..Default::default()
@@ -599,6 +716,7 @@ impl EnergyGuardActor {
                 let index = self.peers.iter().position(|t| {
                     t.peer.device_diagnosis.as_ref() == Some(feature)
                         || &t.peer.load_control == feature
+                        || &t.peer.device_configuration == feature
                         || t.peer.electrical_connection.as_ref() == Some(feature)
                 })?;
                 if self.peers[index].peer.electrical_connection.as_ref() == Some(feature) {
@@ -612,6 +730,12 @@ impl EnergyGuardActor {
                         device: tracked.peer.device.clone(),
                         nominal_max,
                     });
+                }
+                // How this peer numbers its data, from either description function.
+                // Until the `limitId` is here the peer is not ready and nothing is
+                // written, so this is what releases the opening write of §2.11.
+                if let Some(event) = self.learn_ids(engine, index, feature, data, now) {
+                    return Some(event);
                 }
                 if self.peers[index].monitor.observe_data(data, now) {
                     return None;
@@ -641,20 +765,130 @@ impl EnergyGuardActor {
             SpineEvent::ResultReceived { request, error } => {
                 self.resolve(engine, *request, *error, now)
             }
-            SpineEvent::RequestTimedOut { request, .. } => {
-                // A timeout is an unresponsive peer, not a refusal (SPINE IG §2.6.1);
-                // the binding is simply not held, and the next attach retries it.
-                let index = self
-                    .peers
-                    .iter()
-                    .position(|t| t.pending_bindings.iter().any(|(c, _)| c == request))?;
-                self.peers[index]
-                    .pending_bindings
-                    .retain(|(c, _)| c != request);
-                None
-            }
+            SpineEvent::RequestTimedOut { request, .. } => self.give_up(*request, now),
             _ => None,
         }
+    }
+
+    /// Lets go of a request the peer never answered.
+    ///
+    /// The engine raises this only once SPINE IG §2.6.2's escalation path is exhausted, so
+    /// the peer is absent rather than slow and holding the slot buys nothing. The limit
+    /// write is the one that matters: an outstanding one blocks every later write to that
+    /// peer.
+    fn give_up(&mut self, request: MsgCounter, now: Duration) -> Option<GuardEvent> {
+        let index = self.peers.iter().position(|t| {
+            t.outstanding.is_some_and(|(c, _)| c == request)
+                || t.pending_bindings.iter().any(|(c, _)| *c == request)
+                || t.pending_reads.iter().any(|(c, _)| *c == request)
+        })?;
+        let tracked = &mut self.peers[index];
+        let device = tracked.peer.device.clone();
+
+        if let Some((counter, limit)) = tracked.outstanding
+            && counter == request
+        {
+            tracked.outstanding = None;
+            // The limit is still required, so it is still owed. §2.5's backoff is for a
+            // peer that *refused*; this one said nothing, and the retry is due as soon as
+            // the rate limit allows.
+            tracked.write_due_at = Some(now);
+            // §4.1.5: the record has to show a limit that was never acknowledged, because
+            // an unacknowledged limit is one the operator cannot claim was applied.
+            self.audit.record(
+                LimitRecord::new(
+                    now,
+                    request,
+                    limit,
+                    WriteOutcome::Rejected(NackReason::Unstated),
+                )
+                .with_peer(device.clone())
+                .on_basis("unanswered through the whole of SPINE IG §2.6.2"),
+            );
+            return Some(GuardEvent::PeerUnresponsive {
+                device,
+                outstanding: Unanswered::Limit,
+            });
+        }
+
+        if tracked.pending_reads.iter().any(|(c, _)| *c == request) {
+            tracked.pending_reads.retain(|(c, _)| *c != request);
+            return Some(GuardEvent::PeerUnresponsive {
+                device,
+                outstanding: Unanswered::Description,
+            });
+        }
+
+        tracked.pending_bindings.retain(|(c, _)| *c != request);
+        Some(GuardEvent::PeerUnresponsive {
+            device,
+            outstanding: Unanswered::Binding,
+        })
+    }
+
+    /// Learns a peer's own identifiers from a description payload.
+    ///
+    /// Returns the event that follows, if any: [`GuardEvent::Ready`] when this was the
+    /// last thing the pre-scenario communication was waiting for, or
+    /// [`GuardEvent::NoLimitPublished`] when the peer answered the limit description read
+    /// with a feature that carries no limit for this direction.
+    fn learn_ids(
+        &mut self,
+        engine: &mut Engine,
+        index: usize,
+        feature: &FeatureAddress,
+        data: &CmdData,
+        now: Duration,
+    ) -> Option<GuardEvent> {
+        let tracked = &self.peers[index];
+        if feature != &tracked.peer.load_control && feature != &tracked.peer.device_configuration {
+            return None;
+        }
+        let direction = self.direction;
+        let tracked = &mut self.peers[index];
+        let learned = tracked.ids.learn(data, direction);
+        if learned {
+            // Answered, so no longer something a timeout could be about.
+            tracked
+                .pending_reads
+                .retain(|(_, address)| address != feature);
+        }
+
+        // A limit description that named nothing usable is a dead installation, and the
+        // only place it is visible is here: the read succeeded, so no error is reported,
+        // and the guard simply never writes. Said once per attach.
+        if matches!(data, CmdData::LoadControlLimitDescriptionListData(_))
+            && tracked.ids.limit.is_none()
+            && !tracked.reported_no_limit
+        {
+            tracked.reported_no_limit = true;
+            return Some(GuardEvent::NoLimitPublished {
+                device: tracked.peer.device.clone(),
+            });
+        }
+        learned
+            .then(|| self.become_ready(engine, index, now))
+            .flatten()
+    }
+
+    /// Reports [`GuardEvent::Ready`] the first time everything a write needs is in place.
+    ///
+    /// Both the bindings and the description reads can be the last to arrive, so the
+    /// check lives here rather than in whichever path happens to complete it.
+    fn become_ready(
+        &mut self,
+        engine: &mut Engine,
+        index: usize,
+        now: Duration,
+    ) -> Option<GuardEvent> {
+        let tracked = &mut self.peers[index];
+        if !tracked.is_ready() || tracked.ready_reported {
+            return None;
+        }
+        tracked.ready_reported = true;
+        let device = tracked.peer.device.clone();
+        self.write_limit_if_due(engine, index, now);
+        Some(GuardEvent::Ready { device })
     }
 
     /// Takes what a peer reports about its own limit as the truth about it.
@@ -665,7 +899,13 @@ impl EnergyGuardActor {
         data: &CmdData,
         now: Duration,
     ) {
-        let Some(reported) = super::actor::read_limit_write(data) else {
+        // The peer's own `limitId`. A guard that read this with its own numbering would
+        // either see nothing — and keep rewriting a limit already in force — or read some
+        // other limit of the peer's as the answer to its own.
+        let Some(limit_id) = self.peers[index].ids.limit else {
+            return;
+        };
+        let Some(reported) = super::actor::read_limit_write(data, limit_id) else {
             return;
         };
         let tracked = &mut self.peers[index];
@@ -713,13 +953,7 @@ impl EnergyGuardActor {
                     tracked.bound_configuration = true;
                 }
             }
-            if tracked.is_ready() && !tracked.subscribed {
-                tracked.subscribed = true;
-                let device = tracked.peer.device.clone();
-                self.write_limit_if_due(engine, index, now);
-                return Some(GuardEvent::Ready { device });
-            }
-            return None;
+            return self.become_ready(engine, index, now);
         }
 
         // A limit write coming back.
@@ -858,11 +1092,16 @@ impl EnergyGuardActor {
             .required
             .unwrap_or_else(LimitWrite::deactivated);
         let target = self.peers[index].peer.load_control.clone();
+        // `is_ready` is what guarantees this: a peer whose limit description has not come
+        // back is not ready, and nothing is written to it.
+        let Some(limit_id) = self.peers[index].ids.limit else {
+            return;
+        };
         let counter = engine.write_filtered(
             &target,
             &self.client,
-            limit_payload(&limit),
-            limit_filters(&limit),
+            limit_payload(&limit, limit_id),
+            limit_filters(&limit, limit_id),
             now,
         );
 
@@ -950,14 +1189,14 @@ fn normalise(mut limit: LimitWrite) -> LimitWrite {
 /// deleting an element that is not there is a no-op, and the alternative is tracking the
 /// peer's stored state well enough to be sure — which, after a reconnection, this side
 /// cannot be.
-fn limit_filters(limit: &LimitWrite) -> Vec<Filter> {
+fn limit_filters(limit: &LimitWrite, limit_id: LoadControlLimitId) -> Vec<Filter> {
     if limit.duration.is_some() {
         return alloc::vec![Filter::partial()];
     }
     let withdraw_end_time = Filter::delete()
         .select(FilterSelectors::LoadControlLimitListDataSelectors(
             LoadControlLimitListDataSelectors {
-                limit_id: Some(LIMIT_ID),
+                limit_id: Some(limit_id),
             },
         ))
         .covering(FilterElements::LoadControlLimitDataElements(
@@ -973,10 +1212,10 @@ fn limit_filters(limit: &LimitWrite) -> Vec<Filter> {
 }
 
 /// The `loadControlLimitListData` payload of a limit write (LPC/LPP Table 23).
-fn limit_payload(limit: &LimitWrite) -> CmdData {
+fn limit_payload(limit: &LimitWrite, limit_id: LoadControlLimitId) -> CmdData {
     CmdData::LoadControlLimitListData(LoadControlLimitListData {
         load_control_limit_data: Some(vec![LoadControlLimitData {
-            limit_id: Some(LIMIT_ID),
+            limit_id: Some(limit_id),
             is_limit_active: Some(limit.is_active),
             value: Some(ScaledNumber::from_f64(limit.watts, 0)),
             time_period: limit.duration.map(|d| TimePeriod {
@@ -992,12 +1231,19 @@ fn limit_payload(limit: &LimitWrite) -> CmdData {
 mod tests {
     use super::*;
 
+    /// A peer's identifier, deliberately not the one this crate publishes for itself.
+    ///
+    /// Every test here addresses the limit by a number the *peer* chose, because that is
+    /// the only thing the wire ever carries: a guard that assumed [`super::super::LIMIT_ID`]
+    /// would write into whatever that peer keeps under `1`.
+    const PEER_LIMIT: LoadControlLimitId = LoadControlLimitId(7);
+
     /// §3.4.1.4: a limit without a duration carries the delete that withdraws the old
     /// `endTime`, because an omitted element means "unchanged" and would leave the
     /// previous duration in force.
     #[test]
     fn a_limit_without_a_duration_withdraws_the_old_end_time() {
-        let filters = limit_filters(&LimitWrite::active(4_200.0));
+        let filters = limit_filters(&LimitWrite::active(4_200.0), PEER_LIMIT);
         assert_eq!(filters.len(), 2, "one delete, then the partial update");
 
         let delete = &filters[0];
@@ -1011,7 +1257,7 @@ mod tests {
             Some(
                 &[FilterSelectors::LoadControlLimitListDataSelectors(
                     LoadControlLimitListDataSelectors {
-                        limit_id: Some(LIMIT_ID),
+                        limit_id: Some(PEER_LIMIT),
                     }
                 )][..]
             ),
@@ -1036,8 +1282,10 @@ mod tests {
         assert!(filters[1].is_partial());
 
         // A limit that *has* a duration writes it, so there is nothing to withdraw.
-        let with_duration =
-            limit_filters(&LimitWrite::active_for(4_200.0, Duration::from_secs(900)));
+        let with_duration = limit_filters(
+            &LimitWrite::active_for(4_200.0, Duration::from_secs(900)),
+            PEER_LIMIT,
+        );
         assert_eq!(with_duration.len(), 1);
         assert!(with_duration[0].is_partial());
     }
@@ -1070,12 +1318,15 @@ mod tests {
 
     #[test]
     fn a_limit_payload_carries_the_identifier_and_the_duration() {
-        let data = limit_payload(&LimitWrite::active_for(3_000.0, Duration::from_secs(900)));
+        let data = limit_payload(
+            &LimitWrite::active_for(3_000.0, Duration::from_secs(900)),
+            PEER_LIMIT,
+        );
         let CmdData::LoadControlLimitListData(list) = data else {
             panic!("expected the limit list");
         };
         let entry = &list.load_control_limit_data.as_ref().unwrap()[0];
-        assert_eq!(entry.limit_id, Some(LIMIT_ID));
+        assert_eq!(entry.limit_id, Some(PEER_LIMIT));
         assert_eq!(entry.is_limit_active, Some(true));
         assert_eq!(
             entry.value.as_ref().and_then(ScaledNumber::to_f64),

@@ -451,7 +451,11 @@ fn abs_f64(v: f64) -> f64 {
 }
 
 /// Rounds halfway cases away from zero, as `f64::round` does.
-fn round_half_away(v: f64) -> f64 {
+///
+/// `f64::round` is a `std` method and this crate builds without it, so every rounding in
+/// the crate goes through here. Public because the use cases round too — a setpoint step
+/// size, say.
+pub fn round_half_away(v: f64) -> f64 {
     let shifted = if v >= 0.0 { v + 0.5 } else { v - 0.5 };
     // A cast to `i64` truncates toward zero, which is what turns the shift into a round.
     (shifted as i64) as f64

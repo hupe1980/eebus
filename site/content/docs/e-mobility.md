@@ -93,6 +93,22 @@ ev.charging().source();              // Curtailed | GuardSilent | GuardFailed
 A manager that goes quiet and a manager that announces a failure mean the same thing to the
 car: fall back to a current that cannot overload anything, now.
 
+### Which `limitId` is which phase is the car's to say
+
+Table 6 spells the three identifiers `<x1>`, `<x2>`, `<x3>` — placeholders. Nothing on the
+wire ties a `limitId` to a phase directly: the limit description points at a
+`measurementId`, and the *parameter* descriptions give that `measurementId` its phase. A
+manager has to read both and compose them, which is what `PhaseLimits` does and what
+`OverloadGuardActor::attach` now waits for before it writes anything.
+
+Getting it wrong is quiet. Curtailing "phase A" by writing to `limitId` 1 on a car that
+numbers them the other way limits a phase the supply was not worried about, leaves the one
+that was at full current, and is acknowledged — which is the fuse this use case exists to
+protect. A car that serves OPEV *and* OSCEV makes it worse: the same feature then carries
+two limits per phase, an `obligation` and a `recommendation`, so `PhaseLimits` matches on
+the category and scope too. Writing the fuse's ceiling into the recommendation tells the car
+it may ignore it.
+
 ## Saying "no curtailment needed"
 
 An empty limit list says nothing — it cannot be distinguished from a message that lost its

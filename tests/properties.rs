@@ -416,7 +416,7 @@ fn an_unrepresentable_limit_value_is_refused() {
         }]),
     });
     assert_eq!(
-        eebus::usecases::limitation::read_limit_write(&data),
+        eebus::usecases::limitation::read_limit_write(&data, LoadControlLimitId(1)),
         None,
         "an overflowing value makes the whole write unusable"
     );

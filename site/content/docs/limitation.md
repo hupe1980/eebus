@@ -35,6 +35,10 @@ sequenceDiagram
     EG->>CS: bindingRequest LoadControl
     EG->>CS: bindingRequest DeviceConfiguration
     CS-->>EG: granted
+    EG->>CS: read loadControlLimitDescriptionListData
+    CS-->>EG: limitId 7 · obligation · consume
+    EG->>CS: read deviceConfigurationKeyValueDescriptionListData
+    CS-->>EG: failsafe keys 5 and 6
     EG->>CS: subscriptionRequest DeviceDiagnosis
     CS-->>EG: granted
     CS->>EG: subscriptionRequest DeviceDiagnosis
@@ -43,7 +47,7 @@ sequenceDiagram
 
   EG->>CS: notify deviceDiagnosisHeartbeatData
   Note right of CS: §2.11 — a limit is evaluated only<br>with a heartbeat inside 60 s
-  EG->>CS: write loadControlLimitListData 4200 W
+  EG->>CS: write loadControlLimitListData limitId 7 · 4200 W
   Note left of CS: the appliance decides:<br>can it follow this?
   CS-->>EG: result errorNumber 0
   Note over EG,CS: under §14a EnWG that acknowledgement<br>*is* the record the operator must produce
@@ -151,6 +155,13 @@ either — a limit asked for before the peer is reachable is held, not discarded
 
 Behind that line:
 
+* the peer's own identifiers, read before anything is written. `limitId` is `<l1#(1..1)>`
+  in Table 22 and the two failsafe `keyId`s are `<k1#(1..1)>` and `<k2#(1..1)>` in Table 24:
+  the numbers belong to the device, and what the specification fixes is the limit's type,
+  category, direction and scope, and the keys' names. A guard that assumed its own numbering
+  would write a consumption limit into the production limit of an appliance that serves both
+  — and be acknowledged. Nothing is written until the descriptions come back, which is what
+  `is_ready` means and what `peer_ids` reports;
 * a heartbeat immediately before the write, and only once the peer has subscribed to it
   (§2.11) — and the heartbeat that counts is one *this* peer could have received, not
   merely one this guard sent, because a notification reaches subscribers and nobody else;
@@ -162,6 +173,12 @@ Behind that line:
 * a refusal retried a minute later, and a minute later again, with the device kept (§2.5);
 * and no more than one write every five minutes otherwise (§2.10) — the opening write
   excepted, since a limit that follows it must not wait five minutes behind a deactivation.
+
+A peer whose `LoadControl` feature describes no limit for this guard's direction reports
+`GuardEvent::NoLimitPublished` and is then left alone. That installation looks commissioned
+from both ends and is not — usually a device that implements the *other* direction, or an
+actor that was built and never installed — and because the read itself succeeds, this event
+is the only place it is visible.
 
 ## Scenario 4: what the Energy Guard is limiting
 

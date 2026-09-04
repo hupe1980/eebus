@@ -254,6 +254,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 GuardEvent::PeerHeartbeatLost { device } => {
                     println!("[box]  no heartbeat from {}", device.as_str());
                 }
+                GuardEvent::NoLimitPublished { device } => {
+                    // The installation looks finished from both ends and is not: the
+                    // device answered discovery and describes no limit for this
+                    // direction. An installer needs to be told; nothing else will.
+                    println!(
+                        "[box]  {} publishes no limit for this direction — nothing will be written",
+                        device.as_str()
+                    );
+                }
+                GuardEvent::PeerUnresponsive {
+                    device,
+                    outstanding,
+                } => {
+                    // SPINE IG §2.6.4: a use case that has failed persistently is
+                    // something the user is told about. Twenty minutes of retries have
+                    // already gone by silently before this arrives.
+                    println!(
+                        "[box]  {} answered nothing at all ({outstanding:?}) — check the device",
+                        device.as_str()
+                    );
+                }
             }
         }
     }

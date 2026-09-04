@@ -203,12 +203,23 @@ fn the_manager_learns_the_band_and_then_curtails() {
         .guard_events
         .iter()
         .find_map(|e| match e {
-            GuardEvent::Ready { range, .. } => Some(*range),
+            GuardEvent::Ready { band, .. } => Some(band.clone()),
             _ => None,
         })
         .expect("the binding and the band both arrived");
-    assert_eq!(ready, RANGE, "Table 9 round-tripped over the wire");
-    assert_eq!(pair.guard.range_of(&device), Some(RANGE));
+    assert_eq!(
+        ready.narrowest(),
+        Some(RANGE),
+        "Table 9 round-tripped over the wire"
+    );
+    // Per phase, resolved through the car's own parameter descriptions.
+    for phase in eebus::usecases::emobility::charging::PHASES {
+        assert_eq!(ready.for_phase(&phase), Some(RANGE));
+    }
+    assert_eq!(
+        pair.guard.band_of(&device).and_then(|b| b.narrowest()),
+        Some(RANGE)
+    );
 
     // [OPEV-002]: a different current on each phase.
     pair.guard

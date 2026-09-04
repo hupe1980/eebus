@@ -41,6 +41,13 @@ pub struct Pair {
     /// `"box"` for the Energy Guard's, `"pump"` for the Controllable System's. Filled by
     /// [`Pair::settle`], and what `golden_vectors.rs` compares against a checked-in file.
     pub trace: Vec<(&'static str, Datagram)>,
+    /// While set, everything the Controllable System sends is thrown away.
+    ///
+    /// An unresponsive peer, as SPINE IG §2.6.1 means it: the datagrams the guard sends
+    /// arrive, and nothing comes back. The guard cannot tell this from a peer that has
+    /// been switched off mid-sentence, which is the point — §2.6.2's escalation path is
+    /// what a client has instead of knowing.
+    pub pump_is_deaf: bool,
 }
 
 impl Pair {
@@ -111,6 +118,7 @@ impl Pair {
             reports: Vec::new(),
             decisions: Vec::new(),
             trace: Vec::new(),
+            pump_is_deaf: false,
         }
     }
 
@@ -151,6 +159,10 @@ impl Pair {
             }
             while let Some(datagram) = self.pump_engine.poll_transmit() {
                 self.trace.push(("pump", datagram.clone()));
+                if self.pump_is_deaf {
+                    moved = true;
+                    continue;
+                }
                 self.guard_engine
                     .handle_datagram(&round_trip(&datagram), self.now);
                 moved = true;
@@ -280,6 +292,13 @@ pub struct MonitoringPair {
     pub unit_engine: Engine,
     pub unit: MonitoredUnit,
     pub readings: Readings,
+    /// MGCP scenario 1, as the *manager* has resolved it.
+    ///
+    /// The factor's `keyId` is the connection point's own, so this holds the description
+    /// beside the value exactly as a real Monitoring Appliance has to.
+    pub curtailment: mgcp::Curtailment,
+    /// The unit's `DeviceConfiguration` feature, where it serves scenario 1.
+    pub curtailment_feature: Option<FeatureAddress>,
     pub now: Duration,
     /// Every datagram that crossed, in order, for the golden vector.
     pub trace: Vec<(&'static str, Datagram)>,
@@ -386,11 +405,15 @@ impl MonitoringPair {
         let mut manager = Engine::new(manager_device);
         manager.add_use_case([1], 1, client);
 
+        let curtailment_feature = curtailment.then(|| unit_engine.device().address_of(&[1], 3));
+
         Self {
             manager,
             unit_engine,
             unit,
             readings: Readings::new(),
+            curtailment: mgcp::Curtailment::new(),
+            curtailment_feature,
             now: Duration::ZERO,
             trace: Vec::new(),
         }
@@ -435,11 +458,24 @@ impl MonitoringPair {
                 // `resolved`, not `data`: what a peer notified may be a fragment, and
                 // this harness stands in for a Monitoring Appliance, which reads the
                 // merged value.
-                if let SpineEvent::ReplyReceived { resolved, .. }
-                | SpineEvent::DataNotified { resolved, .. } = &event
+                if let SpineEvent::ReplyReceived {
+                    feature, resolved, ..
+                }
+                | SpineEvent::DataNotified {
+                    feature, resolved, ..
+                } = &event
                 {
-                    self.readings.describe(resolved);
-                    self.readings.apply(resolved);
+                    if self.curtailment_feature.as_ref() == Some(feature) {
+                        // Scenario 1 is a `DeviceConfiguration` key, not a measurement,
+                        // and the manager learns its identifier from the description the
+                        // connection point published — never from this crate's own.
+                        if !self.curtailment.describe(resolved) {
+                            self.curtailment.apply(resolved);
+                        }
+                    } else {
+                        self.readings.describe(resolved);
+                        self.readings.apply(resolved);
+                    }
                 }
                 moved = true;
             }
@@ -488,6 +524,22 @@ impl MonitoringPair {
         );
         self.manager
             .request_subscription(&client, &measurement, self.now);
+        // MGCP scenario 1, where the connection point serves it. Both functions and a
+        // subscription, which is what a Monitoring Appliance actually does — the previous
+        // harness read the factor out of the *unit's* own store, so nothing about
+        // scenario 1 ever crossed the wire and every `ATC_MGCP_SCE1_…` case was scored on
+        // an exchange that did not happen.
+        if let Some(configuration) = self.curtailment_feature.clone() {
+            for function in [
+                Function::DeviceConfigurationKeyValueDescriptionListData,
+                Function::DeviceConfigurationKeyValueListData,
+            ] {
+                self.manager
+                    .read(&configuration, &client, function, self.now);
+            }
+            self.manager
+                .request_subscription(&client, &configuration, self.now);
+        }
         self.exchange();
     }
 
@@ -505,15 +557,9 @@ impl MonitoringPair {
         self.exchange();
     }
 
-    /// The manager reads the curtailment factor it has been told about.
+    /// The curtailment factor **the manager** holds, resolved from what crossed the wire.
     pub fn curtailment(&self) -> Option<f64> {
-        let feature = self.unit_engine.device().address_of(&[1], 3);
-        let data = self
-            .unit_engine
-            .device()
-            .resolve(&feature)?
-            .data(&Function::DeviceConfigurationKeyValueListData)?;
-        mgcp::read_curtailment(data)
+        self.curtailment.factor_percent()
     }
 
     /// The unit takes a reading and notifies its subscribers.

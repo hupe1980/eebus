@@ -30,7 +30,7 @@
 //! [`LocalDevice`](crate::spine::LocalDevice) and detailed discovery already do.
 //!
 //! ```
-//! use eebus::usecases::emobility::evcc::{self, CommunicationStandard, EvProfile};
+//! use eebus::usecases::emobility::evcc::{self, CommunicationStandard, EvProfile, EvReader};
 //!
 //! // What a car publishes about itself.
 //! let car = EvProfile::new()
@@ -38,11 +38,13 @@
 //!     .asymmetric_charging(true)
 //!     .charging_power(1_400.0, 11_000.0);
 //!
-//! // And what the energy manager reads back.
-//! let mut learned = EvProfile::new();
-//! learned.apply(&car.key_descriptions());
-//! learned.apply(&car.key_values());
+//! // And what the energy manager reads back. The descriptions are not optional: they
+//! // are what say which of the car's `keyId`s is which.
+//! let mut reader = EvReader::new();
+//! reader.apply(&car.key_descriptions());
+//! reader.apply(&car.key_values());
 //!
+//! let learned = reader.profile();
 //! assert_eq!(learned.communication_standard, Some(CommunicationStandard::Iso15118Ed2));
 //! assert_eq!(learned.asymmetric_charging, Some(true));
 //! assert!(evcc::EV.defines_scenario(8));
@@ -66,6 +68,7 @@ use crate::model::{
     ScaledNumberRange, ScaledNumberSet, ScopeType,
 };
 use crate::spine::{LocalFeature, Operations};
+use crate::usecases::addressing::{KeyIds, ParameterIds};
 use crate::usecases::descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
 
 use super::{actors, names};
@@ -200,8 +203,9 @@ impl EvIdentification {
 
 /// Everything scenarios 2 to 7 say about one car.
 ///
-/// The car fills it in and publishes it; the energy manager starts with an empty one and
-/// [`apply`](Self::apply)s what arrives. Every field is optional in both directions, and
+/// The car fills it in and publishes it; an energy manager reads one back out of
+/// [`EvReader`], which is what resolves the car's own identifiers into these fields. Every
+/// field is optional in both directions, and
 /// deliberately: Table 1 marks scenarios 4, 5, 6 and 7 `R` for the car, so a manager that
 /// required any of them would refuse to work with a conforming car.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -412,77 +416,6 @@ impl EvProfile {
         })
     }
 
-    /// Takes in whatever a car has published, whichever scenario it belongs to.
-    ///
-    /// Returns whether anything changed, so a manager can act on the change rather than on
-    /// every notification. A payload of a kind this use case does not carry is ignored,
-    /// not an error: the same features carry other use cases' data.
-    pub fn apply(&mut self, data: &CmdData) -> bool {
-        let before = self.clone();
-        match data {
-            CmdData::DeviceConfigurationKeyValueListData(list) => {
-                for entry in list.device_configuration_key_value_data.iter().flatten() {
-                    let Some(value) = entry.value.as_ref() else {
-                        continue;
-                    };
-                    match entry.key_id {
-                        Some(COMMUNICATION_STANDARD_KEY) => {
-                            self.communication_standard = value
-                                .string
-                                .as_ref()
-                                .and_then(|value| CommunicationStandard::read(value.as_str()));
-                        }
-                        Some(ASYMMETRIC_CHARGING_KEY) => {
-                            self.asymmetric_charging = value.boolean;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            CmdData::IdentificationListData(list) => {
-                if let Some(entry) = list.identification_data.iter().flatten().next()
-                    && let (Some(kind), Some(value)) = (
-                        entry.identification_type.clone(),
-                        entry.identification_value.as_ref(),
-                    )
-                {
-                    self.identification = Some(EvIdentification {
-                        kind,
-                        value: value.as_str().to_string(),
-                    });
-                }
-            }
-            CmdData::DeviceClassificationManufacturerData(manufacturer) => {
-                self.manufacturer = Some(manufacturer.clone());
-            }
-            CmdData::ElectricalConnectionPermittedValueSetListData(list) => {
-                if let Some(range) = list
-                    .electrical_connection_permitted_value_set_data
-                    .iter()
-                    .flatten()
-                    .filter(|set| set.parameter_id == Some(POWER_PARAMETER))
-                    .filter_map(|set| set.permitted_value_set.as_ref())
-                    .flatten()
-                    .filter_map(|set| set.range.as_ref())
-                    .flatten()
-                    .next()
-                    && let Some(min) = range.min.as_ref().and_then(ScaledNumber::to_f64)
-                {
-                    self.charging_power =
-                        Some((min, range.max.as_ref().and_then(ScaledNumber::to_f64)));
-                }
-            }
-            CmdData::DeviceDiagnosisStateData(state) => {
-                if let Some(operating) = state.operating_state.as_ref() {
-                    self.asleep = Some(*operating == DeviceDiagnosisOperatingState::Standby);
-                }
-            }
-            // The descriptions carry no values, only the identifiers this module fixes.
-            _ => {}
-        }
-        *self != before
-    }
-
     /// Whether the car can be asked for more than a current.
     ///
     /// Scenario 2 is the gate on everything richer: `false` for a car on IEC 61851, and
@@ -491,6 +424,191 @@ impl EvProfile {
     pub fn supports_data_exchange(&self) -> bool {
         self.communication_standard
             .is_some_and(CommunicationStandard::has_data_link)
+    }
+}
+
+/// The manager's side of EVCC: what a car has published, resolved.
+///
+/// [`EvProfile`] is the value — the car builds one and publishes it, and a manager reads
+/// one. This is what turns the car's payloads back into it, and it exists separately
+/// because the two directions are not symmetrical: a car knows what its own `keyId` 1
+/// means, and a manager does not.
+///
+/// Scenarios 2 and 3 are `DeviceConfiguration` keys and scenario 6 is an
+/// `ElectricalConnection` parameter. All three are addressed by identifiers the *car*
+/// chose (`<k1#(1..1)>`, `<p1#(1..1)>`), with the meaning in a description function
+/// beside them — `keyName`, `scopeType`. So this holds the descriptions, keeps the raw
+/// values that arrive before them, and resolves the two against each other whenever
+/// either moves. Reading `keyId` 1 as the communication standard would take whatever that
+/// car keeps there; on a car with several configuration keys that is another key's string,
+/// and a manager would conclude the car speaks ISO 15118 when it does not.
+///
+/// ```
+/// use eebus::usecases::emobility::evcc::{self, CommunicationStandard, EvProfile, EvReader};
+///
+/// let car = EvProfile::new().communication_standard(CommunicationStandard::Iso15118Ed2);
+///
+/// // The values arrive before the descriptions, which is allowed and survivable.
+/// let mut reader = EvReader::new();
+/// reader.apply(&car.key_values());
+/// assert_eq!(reader.profile().communication_standard, None);
+///
+/// reader.apply(&car.key_descriptions());
+/// assert_eq!(
+///     reader.profile().communication_standard,
+///     Some(CommunicationStandard::Iso15118Ed2)
+/// );
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct EvReader {
+    profile: EvProfile,
+    keys: KeyIds,
+    parameters: ParameterIds,
+    /// Configuration values as they arrived, by the car's own `keyId`.
+    key_values: Vec<(DeviceConfigurationKeyId, DeviceConfigurationKeyValueValue)>,
+    /// Permitted value sets as they arrived, by the car's own `parameterId`.
+    ranges: Vec<(ElectricalConnectionParameterId, (f64, Option<f64>))>,
+}
+
+impl EvReader {
+    /// Nothing known yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What has been learned so far.
+    pub fn profile(&self) -> &EvProfile {
+        &self.profile
+    }
+
+    /// The identifiers this car chose for its configuration keys.
+    pub fn keys(&self) -> &KeyIds {
+        &self.keys
+    }
+
+    /// The identifiers this car chose for its electrical-connection parameters.
+    pub fn parameters(&self) -> &ParameterIds {
+        &self.parameters
+    }
+
+    /// Takes in whatever a car has published, whichever scenario it belongs to.
+    ///
+    /// Returns whether the *profile* changed — not whether a payload was understood — so
+    /// a manager can act on the change rather than on every notification. A description
+    /// that completes a value that arrived earlier therefore returns `true`, and a
+    /// notification that repeats a value returns `false`. A payload of a kind this use
+    /// case does not carry is ignored, not an error: the same features carry other use
+    /// cases' data.
+    pub fn apply(&mut self, data: &CmdData) -> bool {
+        let before = self.profile.clone();
+        match data {
+            CmdData::DeviceConfigurationKeyValueListData(list) => {
+                for entry in list.device_configuration_key_value_data.iter().flatten() {
+                    let (Some(id), Some(value)) = (entry.key_id, entry.value.as_ref()) else {
+                        continue;
+                    };
+                    match self.key_values.iter_mut().find(|(known, _)| *known == id) {
+                        Some((_, stored)) => *stored = value.clone(),
+                        None => self.key_values.push((id, value.clone())),
+                    }
+                }
+                self.resolve_keys();
+            }
+            CmdData::ElectricalConnectionPermittedValueSetListData(list) => {
+                for entry in list
+                    .electrical_connection_permitted_value_set_data
+                    .iter()
+                    .flatten()
+                {
+                    let Some(id) = entry.parameter_id else {
+                        continue;
+                    };
+                    let Some(range) = entry
+                        .permitted_value_set
+                        .iter()
+                        .flatten()
+                        .filter_map(|set| set.range.as_ref())
+                        .flatten()
+                        .next()
+                    else {
+                        continue;
+                    };
+                    let Some(min) = range.min.as_ref().and_then(ScaledNumber::to_f64) else {
+                        continue;
+                    };
+                    let band = (min, range.max.as_ref().and_then(ScaledNumber::to_f64));
+                    match self.ranges.iter_mut().find(|(known, _)| *known == id) {
+                        Some((_, stored)) => *stored = band,
+                        None => self.ranges.push((id, band)),
+                    }
+                }
+                self.resolve_ranges();
+            }
+            CmdData::IdentificationListData(list) => {
+                if let Some(entry) = list.identification_data.iter().flatten().next()
+                    && let (Some(kind), Some(value)) = (
+                        entry.identification_type.clone(),
+                        entry.identification_value.as_ref(),
+                    )
+                {
+                    self.profile.identification = Some(EvIdentification {
+                        kind,
+                        value: value.as_str().to_string(),
+                    });
+                }
+            }
+            CmdData::DeviceClassificationManufacturerData(manufacturer) => {
+                self.profile.manufacturer = Some(manufacturer.clone());
+            }
+            CmdData::DeviceDiagnosisStateData(state) => {
+                if let Some(operating) = state.operating_state.as_ref() {
+                    self.profile.asleep =
+                        Some(*operating == DeviceDiagnosisOperatingState::Standby);
+                }
+            }
+            // A description says what the identifiers mean, which may make sense of
+            // values that arrived before it.
+            _ => {
+                if self.keys.learn(data) {
+                    self.resolve_keys();
+                } else if self.parameters.learn(data) {
+                    self.resolve_ranges();
+                }
+            }
+        }
+        self.profile != before
+    }
+
+    /// Re-reads the stored configuration values against the names now known.
+    fn resolve_keys(&mut self) {
+        for (id, value) in &self.key_values {
+            match self.keys.name_of(*id) {
+                Some(DeviceConfigurationKeyName::CommunicationsStandard) => {
+                    self.profile.communication_standard = value
+                        .string
+                        .as_ref()
+                        .and_then(|value| CommunicationStandard::read(value.as_str()));
+                }
+                Some(DeviceConfigurationKeyName::AsymmetricChargingSupported) => {
+                    self.profile.asymmetric_charging = value.boolean;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Re-reads the stored permitted value sets against the parameters now known.
+    ///
+    /// Scenario 6's parameter is the one describing total AC power (Table 11). A car that
+    /// also publishes a per-phase current parameter has two, and taking whichever came
+    /// first would clamp a charging power to a band in amperes.
+    fn resolve_ranges(&mut self) {
+        let Some(parameter) = self.parameters.by_scope(&ScopeType::AcPowerTotal) else {
+            return;
+        };
+        if let Some((_, band)) = self.ranges.iter().find(|(id, _)| *id == parameter) {
+            self.profile.charging_power = Some(*band);
+        }
     }
 }
 
@@ -780,16 +898,19 @@ mod tests {
     #[test]
     fn a_profile_survives_the_round_trip_through_every_scenario() {
         let car = a_car();
-        let mut learned = EvProfile::new();
+        let mut reader = EvReader::new();
 
         for payload in [
+            car.key_descriptions(),
             car.key_values(),
+            car.power_parameter_description(),
             car.identification_data(),
             car.power_limits(),
             car.state_data(),
         ] {
-            learned.apply(&payload);
+            reader.apply(&payload);
         }
+        let learned = reader.profile();
 
         assert_eq!(
             learned.communication_standard,
@@ -809,10 +930,79 @@ mod tests {
     #[test]
     fn applying_the_same_payload_twice_reports_no_change() {
         let car = a_car();
-        let mut learned = EvProfile::new();
+        let mut reader = EvReader::new();
+        reader.apply(&car.key_descriptions());
 
-        assert!(learned.apply(&car.key_values()));
-        assert!(!learned.apply(&car.key_values()));
+        assert!(reader.apply(&car.key_values()));
+        assert!(!reader.apply(&car.key_values()));
+    }
+
+    /// A car that numbers its configuration keys its own way is read correctly.
+    ///
+    /// `keyId` 1 here is a key this use case knows nothing about, holding a string. Read
+    /// by number it would be handed to `CommunicationStandard::read`, and a manager that
+    /// happened to find a matching word there would conclude the car speaks a protocol it
+    /// does not — and then ask it for a state of charge nothing answers.
+    #[test]
+    fn a_cars_configuration_keys_are_found_by_name() {
+        let descriptions = CmdData::DeviceConfigurationKeyValueDescriptionListData(
+            DeviceConfigurationKeyValueDescriptionListData {
+                device_configuration_key_value_description_data: Some(vec![
+                    DeviceConfigurationKeyValueDescriptionData {
+                        key_id: Some(DeviceConfigurationKeyId(1)),
+                        key_name: Some(DeviceConfigurationKeyName::PeakPowerOfPvSystem),
+                        value_type: Some(DeviceConfigurationKeyValueType::String),
+                        ..Default::default()
+                    },
+                    DeviceConfigurationKeyValueDescriptionData {
+                        key_id: Some(DeviceConfigurationKeyId(6)),
+                        key_name: Some(DeviceConfigurationKeyName::CommunicationsStandard),
+                        value_type: Some(DeviceConfigurationKeyValueType::String),
+                        ..Default::default()
+                    },
+                ]),
+            },
+        );
+        let values =
+            CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
+                device_configuration_key_value_data: Some(vec![
+                    DeviceConfigurationKeyValueData {
+                        key_id: Some(DeviceConfigurationKeyId(1)),
+                        value: Some(DeviceConfigurationKeyValueValue {
+                            string: Some("iec61851".to_string().into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    DeviceConfigurationKeyValueData {
+                        key_id: Some(DeviceConfigurationKeyId(6)),
+                        value: Some(DeviceConfigurationKeyValueValue {
+                            string: Some("iso15118-2ed2".to_string().into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+            });
+
+        let mut reader = EvReader::new();
+        reader.apply(&values);
+        assert_eq!(
+            reader.profile().communication_standard,
+            None,
+            "nothing can be read until the car says what its keys are"
+        );
+
+        assert!(
+            reader.apply(&descriptions),
+            "the description completes the value, which is a change"
+        );
+        assert_eq!(
+            reader.profile().communication_standard,
+            Some(CommunicationStandard::Iso15118Ed2),
+            "key 6, not the `iec61851` string sitting on key 1"
+        );
+        assert!(reader.profile().supports_data_exchange());
     }
 
     /// [EVCC-004]: the communication standard decides what else the car can be asked.

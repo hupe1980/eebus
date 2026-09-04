@@ -31,21 +31,30 @@ pub enum ReadingState {
     /// A value within its constraints. `valueState` absent or `normal`.
     Normal,
     /// A value outside the constraints the unit published.
+    ///
+    /// **To be ignored, exactly as [`Error`](Self::Error) is.** MPC §2.5.2 and MDT §2.5.1
+    /// list the three states together and say the same thing about both of the abnormal
+    /// ones: "out of range: value is out of range and SHALL be ignored by the Monitoring
+    /// Appliance". It is tempting to read `outOfRange` as "high but real" — a meter
+    /// reporting 14 kW against an 11 kW constraint looks like a number worth having — and
+    /// the specification does not permit it.
     OutOfRange,
     /// The unit could not measure. Any value sent with this is to be ignored.
     Error,
 }
 
 impl Reading {
-    /// The value, unless the unit flagged it as an error.
+    /// The value, if the unit did not flag it.
     ///
-    /// [MPC-003]: where `valueState` is `error` the content of `value` `SHALL` be
-    /// ignored, so a caller that wants a number it can act on should ask for it here
-    /// rather than reading the field.
+    /// [MPC-003], [MDT-005]: where `valueState` is `error` **or** `outOfRange` the content
+    /// of `value` SHALL be ignored, so a caller that wants a number it can act on asks for
+    /// it here rather than reading the field. [`value`](Self::value) is still there for a
+    /// caller that wants to show the flagged number to a person — which is a different
+    /// thing from acting on it.
     pub fn usable(&self) -> Option<f64> {
         match self.state {
-            ReadingState::Error => None,
-            _ => self.value,
+            ReadingState::Error | ReadingState::OutOfRange => None,
+            ReadingState::Normal => self.value,
         }
     }
 }
@@ -246,6 +255,13 @@ pub struct MonitoredUnitPeer {
     pub electrical_connection: crate::model::FeatureAddress,
     /// Its `Measurement` feature, which says what each measurement is and what it reads.
     pub measurement: crate::model::FeatureAddress,
+    /// Its `DeviceConfiguration` feature, where MGCP scenario 1 keeps the PV feed-in
+    /// curtailment factor.
+    ///
+    /// [`None`] for a peer that serves none — every MPC Monitored Unit, and a Grid
+    /// Connection Point that does not implement scenario 1, which MGCP Table 1 leaves
+    /// optional. Scenario 1 is the one row of MGCP that is not a measurement.
+    pub curtailment: Option<crate::model::FeatureAddress>,
 }
 
 /// Finds a peer's monitoring features from its detailed discovery and use-case data.
@@ -269,6 +285,9 @@ pub fn locate(
             Role::Server,
         )?,
         measurement: remote.address_of(found, &FeatureType::Measurement, Role::Server)?,
+        // Optional, and absent for MPC entirely: a `DeviceConfiguration` server inside
+        // this use case is MGCP scenario 1 and nothing else.
+        curtailment: remote.address_of(found, &FeatureType::DeviceConfiguration, Role::Server),
     })
 }
 
@@ -291,6 +310,8 @@ struct TrackedUnit {
     peer: MonitoredUnitPeer,
     readings: Readings,
     described: bool,
+    /// MGCP scenario 1, where the peer serves it.
+    curtailment: crate::usecases::mgcp::Curtailment,
 }
 
 /// What a Monitoring Appliance learned.
@@ -308,10 +329,42 @@ pub enum MonitoringEvent {
         /// What changed.
         readings: Vec<Reading>,
     },
+    /// A Grid Connection Point's PV feed-in curtailment factor changed (MGCP scenario 1).
+    ///
+    /// The factor is a percentage of the building's cumulated nominal PV peak power, and
+    /// only the two together are a number of watts ([MGCP-011]) — which is what a §9 EEG
+    /// export ceiling is. Turn it into one with
+    /// [`FeedInLimit`](crate::usecases::mgcp::FeedInLimit), or ask the actor for
+    /// [`feed_in_limit`](MonitoringApplianceActor::feed_in_limit).
+    ///
+    /// MPC units never report this: it is the one MGCP scenario that is not a
+    /// measurement.
+    CurtailmentChanged {
+        /// The connection point.
+        device: crate::model::AddressDevice,
+        /// The factor, as a percentage in `0..=100`.
+        factor_percent: f64,
+    },
 }
 
 impl MonitoringApplianceActor {
     /// An appliance reading from `client`, the actor's single `Generic` client feature.
+    ///
+    /// One feature for every server it talks to, whatever their types: the LPC
+    /// implementation guide §3.3 asks an actor to "use a client Feature with featureType
+    /// `Generic` for all its client functionality" rather than mirroring each server
+    /// feature it reads. Build it with
+    /// [`limitation::client_feature`](crate::usecases::limitation::client_feature), which
+    /// is the same one-line constructor an Energy Guard uses. There is deliberately no
+    /// per-feature-type client constructor here — a `DeviceConfiguration` client for
+    /// MGCP scenario 1 and a `Measurement` client for the rest would make "which feature
+    /// is the Monitoring Appliance" a question with two answers.
+    ///
+    /// The one typed client feature in this crate,
+    /// [`limitation::device_diagnosis_client_feature`](crate::usecases::limitation::device_diagnosis_client_feature),
+    /// is the exception and has its own reason: a Controllable System holds no `Generic`
+    /// client at all, and real devices in `tests/fixtures/devices` carry a
+    /// `DeviceDiagnosis` server and client side by side.
     pub fn new(client: crate::model::FeatureAddress) -> Self {
         Self {
             client,
@@ -350,10 +403,24 @@ impl MonitoringApplianceActor {
         }
         engine.request_subscription(&self.client, &peer.measurement, now);
 
+        // MGCP scenario 1, where this peer serves it. The description read is not
+        // optional: it is what says which `keyId` carries the factor, and that number is
+        // the peer's own (MGCP Table 23 spells it `<k1#(1..1)>`).
+        if let Some(configuration) = peer.curtailment.clone() {
+            for function in [
+                Function::DeviceConfigurationKeyValueDescriptionListData,
+                Function::DeviceConfigurationKeyValueListData,
+            ] {
+                engine.read(&configuration, &self.client, function, now);
+            }
+            engine.request_subscription(&self.client, &configuration, now);
+        }
+
         self.peers.push(TrackedUnit {
             peer,
             readings: Readings::new(),
             described: false,
+            curtailment: crate::usecases::mgcp::Curtailment::new(),
         });
     }
 
@@ -373,6 +440,36 @@ impl MonitoringApplianceActor {
             .iter()
             .find(|t| &t.peer.device == device)
             .map(|t| &t.readings)
+    }
+
+    /// A Grid Connection Point's PV feed-in curtailment factor, as a percentage.
+    ///
+    /// [`None`] for a peer that does not serve MGCP scenario 1, and for one whose
+    /// description and value have not both arrived. Not zero, ever: a factor that has not
+    /// been read is not a curtailment, and treating it as one stops a roof exporting.
+    pub fn curtailment(&self, device: &crate::model::AddressDevice) -> Option<f64> {
+        self.peers
+            .iter()
+            .find(|t| &t.peer.device == device)?
+            .curtailment
+            .factor_percent()
+    }
+
+    /// The same factor as a feed-in ceiling in watts ([MGCP-011]).
+    ///
+    /// `nominal_peak_watts` is the cumulated nominal peak power of the building's PV
+    /// systems, which no EEBUS message carries — it is a property of the installation and
+    /// the caller's to supply.
+    pub fn feed_in_limit(
+        &self,
+        device: &crate::model::AddressDevice,
+        nominal_peak_watts: f64,
+    ) -> Option<crate::usecases::mgcp::FeedInLimit> {
+        self.peers
+            .iter()
+            .find(|t| &t.peer.device == device)?
+            .curtailment
+            .limit(nominal_peak_watts)
     }
 
     /// Feeds one engine event to the actor.
@@ -396,6 +493,27 @@ impl MonitoringApplianceActor {
         let index = self.peers.iter().position(|t| &t.peer.device == device)?;
         let tracked = &mut self.peers[index];
 
+        // MGCP scenario 1: a `DeviceConfiguration` payload from the feature this peer
+        // serves it from. Neither half is a measurement, so it is settled before the
+        // measurement layer sees it.
+        if tracked.peer.curtailment.as_ref() == Some(feature) {
+            let before = tracked.curtailment.factor_percent();
+            if tracked.curtailment.describe(data) {
+                // A description can complete a value that arrived before it.
+                return changed(before, tracked.curtailment.factor_percent()).map(|factor| {
+                    MonitoringEvent::CurtailmentChanged {
+                        device: device.clone(),
+                        factor_percent: factor,
+                    }
+                });
+            }
+            let after = tracked.curtailment.apply(data);
+            return changed(before, after).map(|factor| MonitoringEvent::CurtailmentChanged {
+                device: device.clone(),
+                factor_percent: factor,
+            });
+        }
+
         if tracked.readings.describe(data) {
             // The descriptions are what make a value legible; a unit is "described" once
             // at least one measurement has both a meaning and its phases.
@@ -417,6 +535,16 @@ impl MonitoringApplianceActor {
             readings,
         })
     }
+}
+
+/// The new factor, if it is both known and different from what was known before.
+///
+/// A connection point notifies its whole `DeviceConfiguration` feature, so a change to
+/// some other key of its own arrives here too; reporting the same factor again would have
+/// an application re-deriving an export ceiling that did not move.
+fn changed(before: Option<f64>, after: Option<f64>) -> Option<f64> {
+    let after = after?;
+    (before != Some(after)).then_some(after)
 }
 
 /// Whether a scope is inherently about the whole connection rather than some phases.
@@ -447,6 +575,7 @@ fn phasing_of(scope: &ScopeType) -> Option<Option<ElectricalConnectionPhaseName>
         | ScopeType::LoadCycleCount
         | ScopeType::InsulationResistance
         | ScopeType::ComponentTemperature
+        | ScopeType::DhwTemperature
         | ScopeType::TravelRange => Some(None),
         // Apparent and reactive power split into a total and a per-phase scope, like
         // active power: the phase-specific ones wait for the parameter description.
@@ -478,6 +607,9 @@ fn quantity_of(scope: &ScopeType) -> Option<Quantity> {
         ScopeType::AcYieldYear => Quantity::YieldYear,
         ScopeType::AcYieldTotal => Quantity::YieldTotal,
         ScopeType::ComponentTemperature => Quantity::Temperature,
+        // The one measurement here that is not electricity, and has no phases: a tank is
+        // a tank (MDT Table 7).
+        ScopeType::DhwTemperature => Quantity::DhwTemperature,
         ScopeType::DcPower => Quantity::DcPower,
         ScopeType::DcCurrent => Quantity::DcCurrent,
         ScopeType::DcVoltage => Quantity::DcVoltage,

@@ -94,6 +94,23 @@ for (case, reason) in conformance::device_level()
 The catalogue is behind the default-on `conformance` feature, which a build with
 `default-features = false` has to name.
 
+### What a passing suite still cannot see
+
+Both ends of every test in this repository are this crate, and that hides a whole class of
+defect: anything where the two sides agree on a convention the *specification* left to the
+device. Identifiers are the sharp edge. `limitId`, the failsafe `keyId`s, MGCP's curtailment
+key and a car's per-phase limits are all placeholders — `<l1#(1..1)>`, `<k1#(1..1)>`,
+`<x1>`…`<x3>` — and a client that assumes its own numbering writes a well-formed message to
+a real entry of the peer's and is acknowledged. Four such defects were found by reading the
+tables rather than by running anything, and every abstract test case still passed while they
+were there.
+
+Two things guard against it now. `tests/interop.rs` runs against a live `eebus-go` peer, and
+`tests/foreign_identifiers.rs` builds a Controllable System by hand that numbers everything
+differently — its limit on `7`, its failsafe keys on `5` and `6`, and both directions on one
+`LoadControl` feature so that `limitId` 1 is the *production* limit an LPC guard must not
+touch. Neither is a conformance test; both catch what conformance cannot.
+
 The report prints one softer case alongside them: the library notifies a change the moment
 the application publishes it (SPINE IG §2.4), but whether the *measured* value reaches it
 inside the 120 seconds MPC and MGCP allow is the application's own publish cadence.

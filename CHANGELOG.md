@@ -4,7 +4,248 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.4.0] — unreleased
+## [0.5.0] — unreleased
+
+### Fixed
+
+- **A single unanswered message stopped a use case for good, in silence.** The SPINE
+  implementation guide §2.6.2 gives an escalation path for an unresponsive peer — retry
+  after 30 s, then 5 min, then 15 min — and three places in this crate cited it as the
+  reason `SpineEvent::RequestTimedOut` exists while nothing implemented it. The engine now
+  walks it. A request outlives the transmissions that carry it: each retry goes out under a
+  fresh `msgCounter`, because a repeated one is a duplicate a conformant receiver drops
+  (`TC_SPINE_DATA_003`), and the request keeps the first counter as the name every event
+  uses — so a caller's acknowledgement still arrives under the counter it was handed and
+  `RETRY_SCHEDULE` is invisible to it.
+
+  What made this expensive rather than merely incomplete was reading every identifier from
+  the peer's own description: once a write waits on a description read, a lost read is a use
+  case that never starts, and an outstanding write already blocked the next one, so a lost
+  acknowledgement was a use case that stopped. The Energy Guard was the worst of it — write
+  a limit, drop the acknowledgement, and it heartbeats forever without writing another,
+  which under § 14a is a control box that has silently stopped controlling. Actors now
+  release what they were holding when the path is exhausted, write the limit that is still
+  owed, and report the peer: `GuardEvent::PeerUnresponsive` with what went unanswered, and
+  `charging::GuardEvent::Unresponsive`. An unacknowledged limit is recorded in the audit log
+  as unaccepted, because the acknowledgement is the evidence and its absence is the fact.
+  (D92)
+
+- **`outOfRange` measurements were handed back as numbers to act on.** MPC §2.5.2 and MDT
+  §2.5.1 list the three value states together and say the same of both abnormal ones: "out
+  of range: value is out of range and **SHALL be ignored** by the Monitoring Appliance",
+  "error: value is erroneous and SHALL be ignored". `Reading::usable()` filtered only
+  `error`, and a test asserted the mistake in as many words — "out of range is still a
+  reading; only `error` invalidates the number". It is not. An out-of-range grid connection
+  point reading was reaching an energy manager as a number to plan with; it now returns
+  `None`, and the raw `value` field still carries the number for a display, which is a
+  different act. Found while implementing MDT, whose §2.5.1 is the same paragraph. (D91)
+
+**Every identifier a client writes to is the peer's, and four of them were this crate's
+own.** Found by asking what a peer that is not built out of this crate would do with the
+datagrams we send it — which no test in this repository could have answered, because both
+ends of every one of them are this crate and so both ends agreed on the numbers.
+
+The specification is explicit and consistent about this. `limitId` is `<l1#(1..1)>` (LPC/LPP
+Table 22), the failsafe keys are `<k1#(1..1)>` and `<k2#(1..1)>` (Table 24), the curtailment
+factor's key is `<k1#(1..1)>` (MGCP Table 23), a car's per-phase limits are `<x1>`…`<x3>`
+(OPEV/OSCEV Table 6). "SHALL be used as the primary identifier" says the *device* keeps its
+number stable; it does not say what the number is. What the specification fixes instead is
+what each entry *means* — a limit's type, category, direction and scope; a configuration
+key's `keyName` — and that is what a client has to match on.
+
+None of these failures produce an error. The write is well-formed, it names a real entry of
+the peer's, and the peer acknowledges it.
+
+- **An Energy Guard wrote the §14a limit to `limitId` 1** and never read the peer's limit
+  description at all. A Controllable System that serves LPC *and* LPP from one `LoadControl`
+  feature — an appliance with a battery — publishes two limits, and which of them is `1` is
+  its own business: the guard would limit the wrong direction, be acknowledged, and record
+  a limitation that never happened. `EnergyGuardActor::attach` now reads
+  `loadControlLimitDescriptionListData` and `deviceConfigurationKeyValueDescriptionListData`
+  alongside the bindings, and nothing is written until the identifiers come back. New
+  `limitation::PeerIds`, `limitation::find_limit_id`, `limitation::find_key_id` and
+  `EnergyGuardActor::peer_ids`.
+- **The failsafe values went to `keyId` 1 and 2.** A `DeviceConfiguration` feature holds
+  every configuration key a device has, not this use case's two; on a heat pump, key 1 is
+  as likely to be something else entirely. `write_failsafe_limit` and
+  `write_failsafe_duration` now resolve the peer's keys by `keyName` and return `None`
+  until they are known.
+- **A guard read a peer's own reported limit by `limitId` 1 too**, so `observe_applied`
+  either saw nothing — and kept rewriting a limit already in force — or read some other
+  limit of the peer's as the answer to its own.
+- **A Monitoring Appliance read MGCP scenario 1 from `keyId` 1.** `mgcp::read_curtailment`
+  matched this crate's own key rather than the `pvCurtailmentLimitFactor` name the
+  specification fixes. Against a connection point with several configuration keys it
+  returns another key's number — in range, plausible, and on its way to becoming a §9 EEG
+  export ceiling. It now takes the identifier it is reading; new `mgcp::Curtailment` holds
+  the description beside the value and finds it, and `mgcp::find_curtailment_key` is the
+  pure form.
+- **An Overload Protection manager wrote a car's per-phase currents to `limitId` 1, 2 and
+  3.** A car that numbers them differently has phase B curtailed while phase A — the one
+  the supply was worried about — stays at full current, and acknowledges it. New
+  `charging::PhaseLimits` composes the car's limit descriptions with its parameter
+  descriptions to get phase → `limitId`, keeping `obligation` and `recommendation` apart
+  so an overload limit is never written as advice; `OverloadGuardActor::attach` reads what
+  it needs and writes nothing until it has it.
+
+A second sweep, of every remaining place a client reads or writes a peer's list, found
+four more:
+
+- **An energy manager read a car's commissioning data by `keyId` 1 and 2** (EVCC scenarios
+  2 and 3). `keyName` is what Table 6 fixes — `communicationStandard`,
+  `asymmetricChargingSupported` — and a car with other configuration keys has its own
+  numbering. Reading key 1 hands whatever string is there to
+  `CommunicationStandard::read`, and a manager that finds a matching word concludes the car
+  speaks ISO 15118 when it does not, then asks it for a state of charge nothing answers.
+- **And a car's charging power band by `parameterId` 1** (EVCC scenario 6, Table 11). The
+  parameter is the one whose description says `acPowerTotal`.
+- **`charging::read_permitted_range` took the first permitted value set in the list**,
+  whatever parameter it belonged to. Table 9's sets are per phase and addressed by
+  `parameterId`; a car that also publishes a power parameter would have its charging
+  currents clamped into a range in watts, and be written a "curtailment" of 11 000 A.
+- **`cob::control_mode_payload` addressed the inverter's Active Control Mode by `keyId`
+  1** (COB Table 20, `<k1#(1..1)>`), and `read_control_mode` read it back the same way.
+
+`tests/foreign_identifiers.rs` is the regression test the crate could not previously have
+had: a Controllable System built by hand, serving both directions from one feature, with
+its limit on `7` and its failsafe keys on `5` and `6`. The same shape is tested for MGCP in
+`tests/monitoring_both_actors.rs` — a connection point with a decoy `peakPowerOfPvSystem`
+on key 1 — and for EVCC and OPEV in their modules' own tests.
+
+- **The conformance suite scored MGCP scenario 1 on an exchange that never happened.**
+  `MonitoringPair::curtailment` read the factor out of the *Grid Connection Point's own*
+  store, and nothing was subscribed to the feature it is served from, so
+  `ATC_MGCP_SCE1_PT_MAPowerLimitFactor_001` — a Monitoring **Appliance** test case — passed
+  without a datagram crossing. The harness now reads the description, subscribes, and
+  resolves the factor from what arrived. The reported coverage is unchanged (189/203, 93 %);
+  what changed is that the MGCP Monitoring Appliance's 29/29 is now true.
+- **`conformance`'s own documentation said "roughly a third of the LPC and LPP catalogues"
+  are device-level.** It is seven of each — fourteen of the two hundred and three cases, or
+  seven per cent. A consumer scoping a device harness from that sentence would have planned
+  for four times the work.
+- The changelog dated 0.4.0 as unreleased after it had been tagged.
+
+### Added
+
+- **The DHW pair (`usecases::hvac`), all four actors.** The first HVAC use cases here, and
+  between them the only *control* lever in the crate that can ask an appliance for **more**:
+  LPC, LPP, OPEV, OSCEV and COB all set ceilings, and a ceiling an appliance is already
+  under changes nothing. A hot water tank is the cheapest thermal battery most buildings
+  have, and raising its setpoint while the roof exports is not expressible as a limit.
+
+  **`hvac::mdsf` — Monitoring of DHW System Function.** Which operation mode the circuit is
+  in (`auto`, `on`, `off`, `eco`, exactly one enabled [MDSF-001]) and whether a one-time
+  heating is overriding it. `DhwSystemFunction` reads all six functions; the system function
+  is found by `systemFunctionType: dhw` because a heat pump serves heating and hot water
+  from one `HVAC` feature, and reading the heating circuit's mode as the tank's is a manager
+  that thinks the water is off while the house is being heated. `OverrunReport` encodes
+  Table 14's transient: `finished` **may only be a notification, sent once**, becoming
+  `inactive` afterwards and never appearing in a reply — a circuit that leaves it standing
+  tells every later reader that a heating has just completed, repeatedly. The status is
+  modelled as three resting states with the announcement handed back separately.
+
+  **`hvac::cdt` — Configuration of DHW Temperature.** The first HVAC use
+  case here, and the only *control* use case in the crate that can ask an appliance for
+  **more**: LPC, LPP, OPEV, OSCEV and COB all set ceilings, and a ceiling an appliance is
+  already under changes nothing. A hot water tank is the cheapest thermal battery in most
+  buildings, and raising its setpoint while the roof is exporting is not expressible as a
+  limit.
+
+  One scenario, mandatory for both actors. `DhwSetpoints` is the Configuration Appliance's
+  reader: a `Setpoint` feature carries every setpoint the device has — a room air
+  temperature is the same `valueAbsolute` in the same `degC` — so which identifier is the
+  hot water comes from `scopeType: dhwTemperature`, its range and step from
+  `setpointConstraintsListData`, and which mode uses it from
+  `hvacSystemFunctionSetpointRelationListData`. `write` refuses a temperature outside the
+  published range rather than letting the circuit answer with a bare error number; a value
+  off the *step size* is not refused, because Table 8 makes rounding the server's job.
+  `relation_is_valid` holds §2.3.1.1's three different rules on how many setpoints each
+  operation mode may relate to.
+
+  **Why both.** CDT §2.4.2–2.4.3: a DHW Circuit that does not serve "Monitoring of DHW
+  System Function" SHALL serve "Configuration of DHW System Function" [CDT-005]. One of the
+  two is mandatory, because CDT's setpoints are addressed *through* the operation modes —
+  Table 10 relates each mode to the setpoints it reads, so "write 60 °C" is only a complete
+  instruction once the mode is known. `DhwSystemFunction::current_setpoints` is that join,
+  and without it a write lands on a setpoint the circuit is not reading, is acknowledged,
+  and changes nothing measurable. Both specifications also give an entity one `HVAC` feature
+  (§3.2.2.2.1), so `mdsf::with_cdt` is the single feature a circuit serving both publishes.
+  `tests/hot_water_over_the_wire.rs` runs all of it against a circuit that keeps its room
+  air temperature on setpoint `1` and its hot water on `3`.
+
+  **`hvac::mdt` — Monitoring of DHW Temperature.** What the water actually got to, which is
+  a different number from what was asked for: it depends on the mode, on the circuit's own
+  step size, and on whether somebody has just had a shower. It has no reader of its own —
+  it is a `Measurement`, so the machinery that resolves MPC and MGCP resolves this too, via
+  the new `monitoring::Quantity::DhwTemperature`. That quantity is deliberately distinct
+  from `Temperature`, which is a `componentTemperature` on electricity: MDT Table 7 fixes
+  `commodityType: domesticHotWater`, the one measurement in this crate that is not power,
+  and a client filtering on the commodity would not find a tank published as electricity.
+  CDT's setpoint `measurementId` is required to be the one MDT publishes (§3.2.1.2.2.1), so
+  `cdt::setpoint_description_measuring` takes `mdt::MEASUREMENT_ID` and an appliance can tie
+  a reading to the setpoint that governs it.
+- **`usecases::addressing`.** The two resolvers that are not specific to one use case, in
+  one place with the reasoning written down once: `KeyIds` for a peer's
+  `DeviceConfiguration` keys and `ParameterIds` for its `ElectricalConnection`
+  parameters. `KeyIds::name_of` is the direction a reader needs — a
+  `deviceConfigurationKeyValueListData` carries identifiers and no names at all — and
+  `ParameterIds::by_scope` deliberately answers `None` when *several* parameters match,
+  because an ambiguous answer is the one case where guessing is worst: both candidates are
+  real and only one is meant.
+- **`emobility::charging::ChargingBand`** — a car's permitted band **per phase**, which is
+  how Table 9 is actually published. `ChargingCurrents::clamped` now holds each phase
+  inside its own band, falling back to the band permitted everywhere for a phase the car
+  did not describe.
+- **`emobility::evcc::EvReader`** — the manager's side of EVCC, split from the value type.
+  It keeps the car's descriptions, keeps values that arrive before them, and resolves the
+  two against each other whenever either moves, so neither reply has to be the one that
+  comes second.
+- `cob::CONTROL_MODE_KEY_NAME`, the fixed half of COB Table 20.
+- **`GuardEvent::NoLimitPublished`.** A Controllable System whose `LoadControl` feature
+  describes no limit for this guard's direction is an installation that looks commissioned
+  from both ends and is not — a device that implements the other direction, or an actor
+  built and never installed. The read succeeds, so nothing is reported as an error and the
+  guard simply never writes. This is the one place that is visible, and it is reported once
+  per attach. Both simulators print it.
+- **MGCP scenario 1 in `MonitoringApplianceActor`.** `MonitoredUnitPeer` gains
+  `curtailment`, which `monitoring::locate` fills from discovery; `attach` reads the
+  description and subscribes; the factor arrives as `MonitoringEvent::CurtailmentChanged`
+  and is available as `curtailment` and `feed_in_limit`. A consumer playing the Monitoring
+  Appliance no longer builds a feature or parses a payload for itself. The reason there is
+  no `mgcp::curtailment_client_feature` beside `curtailment_feature` is now written where
+  it is looked for: LPC IG §3.3 asks an actor to hold **one** `Generic` client feature for
+  all of its client functionality, and `limitation::client_feature` is it.
+
+### Changed
+
+**Breaking.** The crate is unpublished; each of these removes a way to address the wrong
+data.
+
+- `limitation::read_limit_write` takes the `limitId` it is reading.
+- `mgcp::read_curtailment` and `mgcp::FeedInLimit::from_data` take the `keyId` they are
+  reading. Prefer `mgcp::Curtailment`, which finds it.
+- `charging::limit_data` and `charging::deactivated` take a `&PhaseLimits`;
+  `charging::EvPeer` gains `purpose`, because a car serving both use cases publishes two
+  limits per phase and they must not be confused.
+- `EnergyGuardActor::is_ready` is false until the peer's `limitId` is known, and
+  `GuardEvent::Ready` follows the description read where it arrives after the bindings.
+- `limitation::LIMIT_ID`, `FAILSAFE_LIMIT_KEY`, `FAILSAFE_DURATION_KEY`,
+  `mgcp::CURTAILMENT_KEY` and `charging::limit_id` are documented as what this
+  implementation publishes for itself, and are not to be used to address a peer.
+- `GuardEvent` gains a variant, so a `match` over it needs a new arm.
+- `evcc::EvProfile::apply` is gone; `EvReader::apply` replaces it and `EvReader::profile`
+  is the value. The car's half of `EvProfile` is unchanged.
+- `charging::read_permitted_range` takes a `&ParameterIds` and returns a `ChargingBand`;
+  `ChargingCurrents::clamped` takes a `&ChargingBand`;
+  `charging::GuardEvent::Ready` carries `band` rather than `range`, and
+  `OverloadGuardActor::range_of` is now `band_of`.
+- `cob::control_mode_payload` and `cob::read_control_mode` take the `keyId` they address.
+- `limitation::find_key_id` moved to `usecases::addressing::find_key_id`, where the other
+  use cases can reach it.
+- `tests/fixtures/golden/lpc_exchange.txt` re-recorded: the guard's two description reads
+  are new on the wire.
+
+## [0.4.0] — 2026-09-03
 
 ### Fixed
 

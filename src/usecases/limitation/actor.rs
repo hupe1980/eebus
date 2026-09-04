@@ -32,10 +32,18 @@ use super::audit::AuditLog;
 use super::state::{ControllableSystem, LimitWrite, LimitationState, LocalDecision, WriteOutcome};
 use super::{Direction, FAILSAFE_DURATION_MINIMUM_KEY};
 
-/// The `limitId` this implementation uses for the active power limit.
+/// The `limitId` **this** implementation publishes the active power limit under.
 ///
-/// The specification's placeholder `<l1#1>` leaves the number to the implementation; it
-/// only has to be stable, because the Energy Guard addresses the limit by it.
+/// The specification's placeholder `<l1#1>` leaves the number to the device, so this is a
+/// local choice and nothing else. **It is not a number to address a peer by.** A client
+/// finds a peer's limit with [`find_limit_id`], which matches on the elements the
+/// specification does fix — the limit type, the category, the direction and the scope.
+///
+/// The failure this prevents is silent and specific. A device that serves LPC *and* LPP
+/// from one `LoadControl` feature publishes two limits, and which of them is `1` is its
+/// own business; an Energy Guard that assumed `1` would write a consumption limit into
+/// the production limit, be acknowledged, and record a §14a limitation that never
+/// happened.
 pub const LIMIT_ID: LoadControlLimitId = LoadControlLimitId(1);
 
 /// The `measurementId` the limit description points at.
@@ -45,10 +53,18 @@ pub const LIMIT_ID: LoadControlLimitId = LoadControlLimitId(1);
 /// has no `Measurement` feature the guide asks for a high number no measurand uses.
 pub const MEASUREMENT_ID: MeasurementId = MeasurementId(1);
 
-/// The `keyId` of the failsafe active power limit.
+/// The `keyId` **this** implementation publishes the failsafe active power limit under.
+///
+/// A local choice, like [`LIMIT_ID`]: the specification's `<k1#1>` is a placeholder and
+/// the fixed element is the `keyName`. Address a peer's key with
+/// [`addressing::find_key_id`](crate::usecases::addressing::find_key_id) — a
+/// `DeviceConfiguration` feature holds whatever keys its device has, and a heat pump's
+/// key `1` is as likely to be something else entirely.
 pub const FAILSAFE_LIMIT_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(1);
 
-/// The `keyId` of the Failsafe Duration Minimum.
+/// The `keyId` **this** implementation publishes the Failsafe Duration Minimum under.
+///
+/// A local choice; see [`FAILSAFE_LIMIT_KEY`].
 pub const FAILSAFE_DURATION_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(2);
 
 /// The `electricalConnectionId` the constraints of scenario 4 are published under.
@@ -327,10 +343,103 @@ pub fn heartbeat(counter: u64, timeout: Duration, timestamp: &str) -> CmdData {
     })
 }
 
+/// Finds the `limitId` a Controllable System publishes this use case's limit under.
+///
+/// Give it a `loadControlLimitDescriptionListData` — the peer's, read during
+/// pre-scenario communication. The specification leaves `limitId` to the device
+/// (`<l1#(1..1)>`, "SHALL be used as the primary identifier") and fixes everything that
+/// says what the limit *is*: `signDependentAbsValueLimit`, `obligation`, the direction,
+/// and the `activePowerLimit` scope (LPC/LPP Table 22). Those four are what this matches
+/// on, and they are what distinguishes the consumption limit from the production one on a
+/// device that serves both.
+///
+/// [`None`] means the peer published no such limit — a device that is not a Controllable
+/// System for this direction, or one that has not answered yet. An Energy Guard must not
+/// write until it has an answer, because the only alternative is guessing at a number
+/// that addresses something else.
+pub fn find_limit_id(data: &CmdData, direction: Direction) -> Option<LoadControlLimitId> {
+    let CmdData::LoadControlLimitDescriptionListData(list) = data else {
+        return None;
+    };
+    list.load_control_limit_description_data
+        .iter()
+        .flatten()
+        .find(|entry| {
+            entry.limit_type == Some(LoadControlLimitType::SignDependentAbsValueLimit)
+                && entry.limit_category == Some(LoadControlCategory::Obligation)
+                && entry.limit_direction == Some(direction.energy_direction())
+                && entry.scope_type == Some(ScopeType::ActivePowerLimit)
+        })
+        .and_then(|entry| entry.limit_id)
+}
+
+/// The identifiers a peer chose for the data this use case addresses.
+///
+/// Every identifier LPC and LPP write to is a placeholder in the specification — `<l1#1>`
+/// for the limit, `<k1#1>` and `<k2#1>` for the two failsafe keys — which means the
+/// *peer* picks the number and publishes what it means in a description function. A
+/// client that assumes its own numbering is not addressing the peer's data; it is
+/// addressing whatever the peer happens to keep at that index, and the acknowledgement it
+/// gets back says the write succeeded.
+///
+/// [`EnergyGuardActor`](super::EnergyGuardActor) keeps one of these per peer and fills it
+/// from the two description reads it sends on [`attach`](super::EnergyGuardActor::attach).
+/// It is public for a guard built by hand.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerIds {
+    /// The peer's `limitId` for this direction's active power limit.
+    pub limit: Option<LoadControlLimitId>,
+    /// The peer's `keyId` for the failsafe active power limit.
+    pub failsafe_limit: Option<DeviceConfigurationKeyId>,
+    /// The peer's `keyId` for the Failsafe Duration Minimum.
+    pub failsafe_duration: Option<DeviceConfigurationKeyId>,
+}
+
+impl PeerIds {
+    /// Nothing known yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Learns what one description payload says, and reports whether anything changed.
+    ///
+    /// Takes either description function and ignores anything else, so a caller can hand
+    /// it every payload that arrives from the peer without sorting them first.
+    pub fn learn(&mut self, data: &CmdData, direction: Direction) -> bool {
+        let mut changed = false;
+        if let Some(limit) = find_limit_id(data, direction)
+            && self.limit != Some(limit)
+        {
+            self.limit = Some(limit);
+            changed = true;
+        }
+        for (slot, name) in [
+            (&mut self.failsafe_limit, direction.failsafe_limit_key()),
+            (&mut self.failsafe_duration, FAILSAFE_DURATION_MINIMUM_KEY),
+        ] {
+            if let Some(key) = crate::usecases::addressing::find_key_id(data, &name)
+                && *slot != Some(key)
+            {
+                *slot = Some(key);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether the limit can be addressed, which is what a limit write needs.
+    pub fn can_write_limit(&self) -> bool {
+        self.limit.is_some()
+    }
+}
+
 /// Reads a `loadControlLimitListData` payload as a limit change.
 ///
-/// Returns [`None`] when the payload names a different limit, which the Controllable
-/// System refuses rather than guesses at.
+/// `limit_id` is the identifier the limit is published under **on the device the payload
+/// belongs to**: this device's own [`LIMIT_ID`] when a Controllable System reads a write
+/// addressed to it, and the peer's — from [`find_limit_id`] — when an Energy Guard reads
+/// what a peer reports about itself. Returns [`None`] when the payload names a different
+/// limit, which the Controllable System refuses rather than guesses at.
 ///
 /// **Give this the resolved state, not a partial update.** It reads the payload as a
 /// complete description of the limit, so an absent `isLimitActive` reads as *not active*.
@@ -342,7 +451,7 @@ pub fn heartbeat(counter: u64, timeout: Duration, timestamp: &str) -> CmdData {
 ///
 /// [`WriteRequest::resolved`]: crate::spine::WriteRequest::resolved
 /// [`WriteRequest::data`]: crate::spine::WriteRequest::data
-pub fn read_limit_write(data: &CmdData) -> Option<LimitWrite> {
+pub fn read_limit_write(data: &CmdData, limit_id: LoadControlLimitId) -> Option<LimitWrite> {
     let CmdData::LoadControlLimitListData(list) = data else {
         return None;
     };
@@ -350,7 +459,7 @@ pub fn read_limit_write(data: &CmdData) -> Option<LimitWrite> {
         .load_control_limit_data
         .as_ref()?
         .iter()
-        .find(|e| e.limit_id == Some(LIMIT_ID))?;
+        .find(|e| e.limit_id == Some(limit_id))?;
 
     // A `value` that is present but unreadable — a `scale` that overflows `f64`, say —
     // makes the whole write unusable. Refusing it produces a NACK; substituting a number
@@ -946,9 +1055,11 @@ impl ControllableSystemActor {
         // `data` says whether this write addresses the active power limit at all;
         // `resolved` says what that limit becomes, with anything the partial write left
         // out filled in from what is stored (SPINE IG §3.3).
-        let addressed = read_limit_write(data).is_some();
+        // The identifier is this device's own: the write arrived at a feature this
+        // device published, under the `limitId` it published there.
+        let addressed = read_limit_write(data, LIMIT_ID).is_some();
         let write = if addressed {
-            read_limit_write(resolved)
+            read_limit_write(resolved, LIMIT_ID)
         } else {
             None
         };

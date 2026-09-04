@@ -3,7 +3,7 @@ title = "eebus"
 template = "index.html"
 [extra]
 landing = true
-lede = """An unofficial EEBUS implementation in Rust: the SHIP transport, the SPINE information model, and fourteen use cases on top — built to pass certification, not merely to interoperate."""
+lede = """An unofficial EEBUS implementation in Rust: the SHIP transport, the SPINE information model, and seventeen use cases on top — built to pass certification, not merely to interoperate."""
 status = "Under construction. The stack is complete from the socket to the use case; the API will change and nothing is published to crates.io yet."
 
 hero_code = """
@@ -26,7 +26,7 @@ if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
 value = "830"
 label = "SPINE types, generated"
 [[extra.stats]]
-value = "14"
+value = "17"
 label = "use cases, both actors"
 [[extra.stats]]
 value = "no_std"
@@ -49,7 +49,7 @@ body = "A command carries a payload choice, so two payloads in one command canno
 
 [[extra.features]]
 title = "One implementation per pair"
-body = "LPC and LPP are the same use case pointed in opposite directions, as are OPEV and OSCEV. Seven use cases share one measurement layer. Each is written once, so a fix to one is a fix to all."
+body = "LPC and LPP are the same use case pointed in opposite directions, as are OPEV and OSCEV. Nine use cases share one measurement layer. Each is written once, so a fix to one is a fix to all."
 
 [[extra.features]]
 title = "Runs on the controller"

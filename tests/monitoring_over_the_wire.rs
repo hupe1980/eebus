@@ -207,8 +207,13 @@ fn a_value_outside_its_constraints_is_flagged_and_the_range_is_published() {
     assert_eq!(reading.state, ReadingState::OutOfRange);
     assert_eq!(
         reading.usable(),
+        None,
+        "§2.5.2 says an out-of-range value SHALL be ignored, exactly as an error is"
+    );
+    assert_eq!(
+        reading.value,
         Some(14_000.0),
-        "out of range is still a reading; only `error` invalidates the number"
+        "the number is still there to show a person, just not to act on"
     );
 
     // And the constraints say what the range was.

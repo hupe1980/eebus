@@ -15,9 +15,9 @@
 //! * [`limitation`] serves [`lpc`] and [`lpp`], the same state machine pointed in
 //!   opposite directions.
 //! * [`monitoring`] serves [`mpc`] and [`mgcp`], the same measurements named from the
-//!   appliance's side or the grid's — and [`moi`], [`mob`], [`mps`] and two of the
-//!   [`emobility`] family besides, which are the same "describe a measurement twice and
-//!   read it back" with a wider vocabulary.
+//!   appliance's side or the grid's — and [`moi`], [`mob`], [`mps`], [`cob`],
+//!   [`hvac::mdt`] and two of the [`emobility`] family besides, which are the same
+//!   "describe a measurement twice and read it back" with a wider vocabulary.
 //! * [`emobility::charging`] serves [`emobility::opev`] and [`emobility::oscev`], the same
 //!   per-phase current ceiling for opposite reasons.
 //!
@@ -32,10 +32,20 @@
 //! | | [`mps`] | PV String, Monitoring Appliance |
 //! | | [`mob`] | Battery, Monitoring Appliance |
 //! | | [`cob`] | Inverter, CEM — the only *control* use case outside the grid pair |
+//! | **Heating** | [`hvac::cdt`] | DHW Circuit, Configuration Appliance — a hot water *setpoint* |
+//! | | [`hvac::mdsf`] | DHW Circuit, Monitoring Appliance — which mode it is in |
+//! | | [`hvac::mdt`] | DHW Circuit, Monitoring Appliance — what the water got to |
+//!
+//! Every control use case here but one can only ask an appliance to do **less**: a limit,
+//! a ceiling, a current not to exceed. [`hvac`] is the exception, and that is why it is
+//! here — a hot water tank is a thermal battery, and asking it for a higher temperature
+//! while the roof is exporting is something no limit can express.
 
+pub mod addressing;
 pub mod cob;
 pub mod descriptor;
 pub mod emobility;
+pub mod hvac;
 pub mod limitation;
 pub mod lpc;
 pub mod lpp;

@@ -30,10 +30,10 @@ of an `Inverter`, and an installation with two roofs has two `PVString` entities
 inverter — which is the point of MPS rather than MGCP. A shaded or failing string is
 invisible in a building's total and obvious in its own measurement.
 
-## One measurement layer, seven use cases
+## One measurement layer, nine use cases
 
 MOI, MPS and MOB are built on the same `usecases::monitoring` machinery as MPC, MGCP,
-EVCEM and EVSOC. What they added was vocabulary, not mechanism:
+EVCEM, EVSOC, COB and MDT. What they add is vocabulary, not mechanism:
 
 ```rust
 use eebus::usecases::mob;

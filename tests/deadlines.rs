@@ -179,10 +179,24 @@ fn the_engine_expires_on_its_own_deadlines() {
         Engine::poll_timeout,
         Engine::handle_timeout,
     );
-    assert_eq!(turns, 1, "one deadline, fired once");
+    // One request, but seven deadlines: the response deadline and then, for each rung of
+    // the SPINE implementation guide §2.6.2 ladder, the delay before the retry and the
+    // response deadline of the retry itself. The last one has no rung left and gives up.
+    assert_eq!(turns, 1 + 2 * eebus::spine::RETRY_SCHEDULE.len());
+
+    let events: Vec<_> = core::iter::from_fn(|| engine.poll_event()).collect();
+    let retries: Vec<usize> = events
+        .iter()
+        .filter_map(|e| match e {
+            eebus::spine::SpineEvent::RequestRetried { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries, vec![1, 2, 3], "the three retries, in order");
     assert!(
-        core::iter::from_fn(|| engine.poll_event())
+        events
+            .iter()
             .any(|e| matches!(e, eebus::spine::SpineEvent::RequestTimedOut { .. })),
-        "and the request was reported timed out"
+        "and only then is the request reported timed out"
     );
 }

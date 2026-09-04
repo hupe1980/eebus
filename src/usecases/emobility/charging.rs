@@ -69,6 +69,7 @@ use crate::model::{
     ScaledNumber, ScaledNumberRange, ScaledNumberSet, ScopeType, UnitOfMeasurement,
 };
 use crate::spine::{LocalFeature, Operations};
+use crate::usecases::addressing::ParameterIds;
 use crate::usecases::descriptor::FunctionUse;
 
 use super::{actors, names};
@@ -163,11 +164,14 @@ const DECIMALS: u8 = 1;
 /// The three phases, in the order the limits are numbered.
 pub const PHASES: [Phase; 3] = [Phase::A, Phase::B, Phase::C];
 
-/// The `limitId` of each phase's current limit.
+/// The `limitId` **this** implementation gives each phase's current limit.
 ///
-/// Fixed rather than discovered, because the Energy Guard addresses a limit by it and the
-/// specification leaves the number to the implementation. `<x1>`, `<x2>`, `<x3>` of
-/// Table 6.
+/// `<x1>`, `<x2>`, `<x3>` of Table 6, which is to say a placeholder: the number is the
+/// car's to choose. This is what [`EvActor`] publishes for itself and **no peer's
+/// numbering**. A manager finds a car's with [`PhaseLimits`], because curtailing phase A
+/// by writing to `limitId` 1 on a car that numbers them differently limits a phase the
+/// supply was not worried about and leaves the one that was at full current — which is
+/// the fuse this use case exists to protect.
 pub fn limit_id(phase: Phase) -> Option<LoadControlLimitId> {
     Some(LoadControlLimitId(match phase {
         Phase::A => 1,
@@ -175,6 +179,111 @@ pub fn limit_id(phase: Phase) -> Option<LoadControlLimitId> {
         Phase::C => 3,
         _ => return None,
     }))
+}
+
+/// Which `limitId` a car keeps each phase's current limit under.
+///
+/// Two functions say it between them and neither says it alone. The limit descriptions
+/// (Table 6) give `limitId` and the `measurementId` it points at; the parameter
+/// descriptions (Table 8) give that `measurementId` a phase. A manager that skipped the
+/// correlation and used its own numbering would be writing to real limits of the car's —
+/// acknowledged, applied, and on the wrong phase.
+///
+/// Feed it both description payloads, in either order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PhaseLimits {
+    /// What each parameter describes, which is where a `measurementId` gets its phase.
+    parameters: ParameterIds,
+    /// `limitId` to `measurementId`, from the limit descriptions of this purpose.
+    limits: Vec<(LoadControlLimitId, MeasurementId)>,
+}
+
+impl PhaseLimits {
+    /// Nothing known yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The numbering **this** implementation publishes, for a device describing itself.
+    ///
+    /// [`EvActor`] uses it to write its own `loadControlLimitListData`. A manager must
+    /// not: the car on the other end chose its own, and [`learn`](Self::learn) is how it
+    /// is found.
+    pub fn own(phases: &[Phase]) -> Self {
+        let mut limits = Self::new();
+        limits.learn(
+            &parameter_descriptions(ELECTRICAL_CONNECTION, phases),
+            Purpose::OverloadProtection,
+        );
+        for phase in phases {
+            let Some(id) = limit_id(phase.clone()) else {
+                continue;
+            };
+            limits.limits.push((id, MeasurementId(id.get())));
+        }
+        limits
+    }
+
+    /// Learns what one description payload says, and reports whether it was one.
+    ///
+    /// `purpose` is what keeps the two use cases apart: a car curtailed for overload
+    /// protection *and* offered surplus publishes two limits per phase, an `obligation`
+    /// and a `recommendation`, and writing a recommendation where an obligation was meant
+    /// tells the car it may ignore the fuse.
+    pub fn learn(&mut self, data: &CmdData, purpose: Purpose) -> bool {
+        match data {
+            CmdData::LoadControlLimitDescriptionListData(list) => {
+                for entry in list.load_control_limit_description_data.iter().flatten() {
+                    let (Some(limit), Some(measurement)) = (entry.limit_id, entry.measurement_id)
+                    else {
+                        continue;
+                    };
+                    if entry.limit_type != Some(LoadControlLimitType::MaxValueLimit)
+                        || entry.limit_category != Some(purpose.limit_category())
+                        || entry.scope_type != Some(purpose.scope_type())
+                    {
+                        continue;
+                    }
+                    match self.limits.iter_mut().find(|(id, _)| *id == limit) {
+                        Some((_, stored)) => *stored = measurement,
+                        None => self.limits.push((limit, measurement)),
+                    }
+                }
+                true
+            }
+            _ => self.parameters.learn(data),
+        }
+    }
+
+    /// What this car said each of its electrical-connection parameters describes.
+    pub fn parameters(&self) -> &ParameterIds {
+        &self.parameters
+    }
+
+    /// The car's `limitId` for one phase, once both descriptions have arrived.
+    pub fn limit_for(&self, phase: &Phase) -> Option<LoadControlLimitId> {
+        self.limits
+            .iter()
+            .find(|(_, measurement)| {
+                self.parameters.phase_of_measurement(*measurement) == Some(phase)
+            })
+            .map(|(limit, _)| *limit)
+    }
+
+    /// The phases this car publishes a limit for, in the order the limits are numbered.
+    pub fn phases(&self) -> Vec<Phase> {
+        let mut found: Vec<(LoadControlLimitId, Phase)> = PHASES
+            .iter()
+            .filter_map(|phase| Some((self.limit_for(phase)?, phase.clone())))
+            .collect();
+        found.sort_by_key(|(id, _)| id.get());
+        found.into_iter().map(|(_, phase)| phase).collect()
+    }
+
+    /// Whether any phase can be addressed at all.
+    pub fn is_known(&self) -> bool {
+        PHASES.iter().any(|phase| self.limit_for(phase).is_some())
+    }
 }
 
 /// The phase a `limitId` belongs to.
@@ -272,11 +381,22 @@ impl ChargingCurrents {
     /// the cable and the wallbox impose; a limit outside that band is one it cannot
     /// follow, and clamping is what it does instead of stopping.
     #[must_use]
-    pub fn clamped(mut self, min: f64, max: f64) -> Self {
+    /// Holds every current inside what the car said it can take.
+    ///
+    /// Each phase is clamped to **its own** band. A phase the car published no band for
+    /// falls back to [`ChargingBand::narrowest`] — the band permitted everywhere — because
+    /// a value that is safe on every described phase is the most that can be justified
+    /// about an undescribed one. With nothing described at all the currents are left as
+    /// they are, and the car applies its own limits.
+    pub fn clamped(mut self, band: &ChargingBand) -> Self {
         for phase in PHASES {
-            if let Some(value) = self.get_ref(&phase) {
-                self.set(phase, Some(value.clamp(min.min(max), max.max(min))));
-            }
+            let Some(value) = self.get_ref(&phase) else {
+                continue;
+            };
+            let Some((min, max)) = band.for_phase(&phase).or_else(|| band.narrowest()) else {
+                continue;
+            };
+            self.set(phase, Some(value.clamp(min, max)));
         }
         self
     }
@@ -405,14 +525,17 @@ pub fn limit_descriptions(purpose: Purpose, phases: &[Phase]) -> CmdData {
 }
 
 /// The current limits, as `loadControlLimitListData` (Table 7).
-pub fn limit_data(currents: &ChargingCurrents, active: bool) -> CmdData {
+///
+/// `limits` says which `limitId` the car keeps each phase under. A phase the car
+/// published no limit for is left out rather than guessed at.
+pub fn limit_data(currents: &ChargingCurrents, active: bool, limits: &PhaseLimits) -> CmdData {
     CmdData::LoadControlLimitListData(LoadControlLimitListData {
         load_control_limit_data: Some(
             currents
                 .phases()
                 .filter_map(|(phase, amperes)| {
                     Some(LoadControlLimitData {
-                        limit_id: Some(limit_id(phase)?),
+                        limit_id: Some(limits.limit_for(&phase)?),
                         is_limit_changeable: Some(true),
                         is_limit_active: Some(active),
                         value: Some(ScaledNumber::from_f64(amperes, DECIMALS)),
@@ -432,14 +555,14 @@ pub fn limit_data(currents: &ChargingCurrents, active: bool) -> CmdData {
 /// it to infer that from silence — which is what a lost heartbeat already means. Table 7
 /// makes the value of a deactivated limit ignorable, so the phases are named and the
 /// numbers are not.
-pub fn deactivated(phases: &[Phase]) -> CmdData {
+pub fn deactivated(phases: &[Phase], limits: &PhaseLimits) -> CmdData {
     CmdData::LoadControlLimitListData(LoadControlLimitListData {
         load_control_limit_data: Some(
             phases
                 .iter()
                 .filter_map(|phase| {
                     Some(LoadControlLimitData {
-                        limit_id: Some(limit_id(phase.clone())?),
+                        limit_id: Some(limits.limit_for(phase)?),
                         is_limit_changeable: Some(true),
                         is_limit_active: Some(false),
                         ..Default::default()
@@ -485,6 +608,70 @@ pub fn parameter_descriptions(connection: u32, phases: &[Phase]) -> CmdData {
             ),
         },
     )
+}
+
+/// The band a car can charge in, per phase, in amperes (Table 9).
+///
+/// Per phase, and not one band for the car, because Table 9's permitted value sets are
+/// addressed by `parameterId` and a car publishes one per phase. Reading the *first* set in
+/// the list takes whichever parameter the car happened to describe first, so a car that also
+/// publishes a power parameter has its charging currents clamped to a range in watts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChargingBand {
+    per_phase: Vec<(Phase, (f64, f64))>,
+}
+
+impl ChargingBand {
+    /// An empty band: the car has said nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The same band on all three phases, for a car that charges symmetrically.
+    pub fn uniform(min: f64, max: f64) -> Self {
+        PHASES
+            .into_iter()
+            .fold(Self::new(), |band, phase| band.with(phase, min, max))
+    }
+
+    /// Records one phase's band.
+    #[must_use]
+    pub fn with(mut self, phase: Phase, min: f64, max: f64) -> Self {
+        let band = (min.min(max), max.max(min));
+        match self.per_phase.iter_mut().find(|(known, _)| known == &phase) {
+            Some((_, stored)) => *stored = band,
+            None => self.per_phase.push((phase, band)),
+        }
+        self
+    }
+
+    /// The band on one phase, where the car published one.
+    pub fn for_phase(&self, phase: &Phase) -> Option<(f64, f64)> {
+        self.per_phase
+            .iter()
+            .find(|(known, _)| known == phase)
+            .map(|(_, band)| *band)
+    }
+
+    /// The band that is permitted on **every** phase the car published one for.
+    ///
+    /// The highest minimum and the lowest maximum. What a caller wants for a single
+    /// number to show a user, and what a phase with no band of its own falls back to.
+    pub fn narrowest(&self) -> Option<(f64, f64)> {
+        let mut bands = self.per_phase.iter().map(|(_, band)| *band);
+        let first = bands.next()?;
+        Some(bands.fold(first, |(lo, hi), (min, max)| (lo.max(min), hi.min(max))))
+    }
+
+    /// The phases the car published a band for.
+    pub fn phases(&self) -> impl Iterator<Item = &Phase> {
+        self.per_phase.iter().map(|(phase, _)| phase)
+    }
+
+    /// Whether the car has published any band at all.
+    pub fn is_empty(&self) -> bool {
+        self.per_phase.is_empty()
+    }
 }
 
 /// What the car can actually take, per phase (Table 9).
@@ -553,23 +740,46 @@ pub fn read_limit_write(data: &CmdData) -> Option<ChargingCurrents> {
 }
 
 /// Reads the range a car said it can charge in, per phase (Table 9).
-pub fn read_permitted_range(data: &CmdData) -> Option<(f64, f64)> {
+pub fn read_permitted_range(data: &CmdData, parameters: &ParameterIds) -> Option<ChargingBand> {
     let CmdData::ElectricalConnectionPermittedValueSetListData(list) = data else {
         return None;
     };
-    list.electrical_connection_permitted_value_set_data
+    let mut band = ChargingBand::new();
+    for entry in list
+        .electrical_connection_permitted_value_set_data
         .iter()
         .flatten()
-        .filter_map(|entry| entry.permitted_value_set.as_ref())
-        .flatten()
-        .filter_map(|set| set.range.as_ref())
-        .flatten()
-        .find_map(|range| {
-            Some((
-                range.min.as_ref().and_then(ScaledNumber::to_f64)?,
-                range.max.as_ref().and_then(ScaledNumber::to_f64)?,
-            ))
-        })
+    {
+        // Which phase this set is for is in the *parameter* description, never here.
+        let Some(id) = entry.parameter_id else {
+            continue;
+        };
+        let Some(phase) = parameters
+            .all()
+            .find(|known| known.parameter == id)
+            .and_then(|known| known.phases.clone())
+        else {
+            continue;
+        };
+        let Some(range) = entry
+            .permitted_value_set
+            .iter()
+            .flatten()
+            .filter_map(|set| set.range.as_ref())
+            .flatten()
+            .next()
+        else {
+            continue;
+        };
+        let (Some(min), Some(max)) = (
+            range.min.as_ref().and_then(ScaledNumber::to_f64),
+            range.max.as_ref().and_then(ScaledNumber::to_f64),
+        ) else {
+            continue;
+        };
+        band = band.with(phase, min, max);
+    }
+    (!band.is_empty()).then_some(band)
 }
 
 // ---- the car's decision ---------------------------------------------------------
@@ -718,7 +928,8 @@ impl EvCharging {
             return true;
         }
         let currents = match self.range {
-            Some((min, max)) => currents.clamped(min, max),
+            // This car's own band, which it knows without being told.
+            Some((min, max)) => currents.clamped(&ChargingBand::uniform(min, max)),
             None => currents,
         };
         self.limit = Some(currents);
@@ -792,6 +1003,142 @@ mod tests {
     }
 
     /// Table 6: a ceiling on current for the sake of a fuse, in amperes.
+    /// A car whose phases are not numbered the way this crate numbers its own.
+    ///
+    /// Table 6's `<x1>`…`<x3>` are placeholders, so this is ordinary. The manager has to
+    /// read the car's two description functions and compose them; using its own numbering
+    /// would curtail phase B while leaving phase A — the one the fuse was worried
+    /// about — at full current, and the car would acknowledge it.
+    #[test]
+    fn a_cars_phases_are_found_from_its_own_descriptions() {
+        // This car: phase B on limit 1, phase A on 2, phase C on 3.
+        let mut limits = PhaseLimits::new();
+        limits.learn(
+            &CmdData::LoadControlLimitDescriptionListData(LoadControlLimitDescriptionListData {
+                load_control_limit_description_data: Some(vec![
+                    described(1, 10, Purpose::OverloadProtection),
+                    described(2, 20, Purpose::OverloadProtection),
+                    described(3, 30, Purpose::OverloadProtection),
+                ]),
+            }),
+            Purpose::OverloadProtection,
+        );
+        limits.learn(
+            &CmdData::ElectricalConnectionParameterDescriptionListData(
+                ElectricalConnectionParameterDescriptionListData {
+                    electrical_connection_parameter_description_data: Some(vec![
+                        parameter(10, Phase::B),
+                        parameter(20, Phase::A),
+                        parameter(30, Phase::C),
+                    ]),
+                },
+            ),
+            Purpose::OverloadProtection,
+        );
+
+        assert_eq!(limits.limit_for(&Phase::A), Some(LoadControlLimitId(2)));
+        assert_eq!(limits.limit_for(&Phase::B), Some(LoadControlLimitId(1)));
+        assert_eq!(limits.limit_for(&Phase::C), Some(LoadControlLimitId(3)));
+
+        // And a write lands where the car keeps each phase.
+        let currents = ChargingCurrents::single(Phase::A, 6.0);
+        let CmdData::LoadControlLimitListData(list) = limit_data(&currents, true, &limits) else {
+            panic!("expected the limits");
+        };
+        let entries = list.load_control_limit_data.as_ref().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].limit_id,
+            Some(LoadControlLimitId(2)),
+            "phase A is limit 2 on this car, not limit 1"
+        );
+    }
+
+    /// A car offered surplus *and* held under the fuse publishes two limits per phase.
+    ///
+    /// Writing the obligation into the recommendation tells the car it may ignore the
+    /// number, which is the difference between a protected supply and a tripped one.
+    #[test]
+    fn an_obligation_is_not_written_into_a_recommendation() {
+        let descriptions =
+            CmdData::LoadControlLimitDescriptionListData(LoadControlLimitDescriptionListData {
+                load_control_limit_description_data: Some(vec![
+                    described(1, 10, Purpose::SelfConsumption),
+                    described(4, 10, Purpose::OverloadProtection),
+                ]),
+            });
+        let parameters = CmdData::ElectricalConnectionParameterDescriptionListData(
+            ElectricalConnectionParameterDescriptionListData {
+                electrical_connection_parameter_description_data: Some(vec![parameter(
+                    10,
+                    Phase::A,
+                )]),
+            },
+        );
+
+        let mut obligation = PhaseLimits::new();
+        obligation.learn(&descriptions, Purpose::OverloadProtection);
+        obligation.learn(&parameters, Purpose::OverloadProtection);
+        assert_eq!(
+            obligation.limit_for(&Phase::A),
+            Some(LoadControlLimitId(4)),
+            "overload protection is the obligation"
+        );
+
+        let mut recommendation = PhaseLimits::new();
+        recommendation.learn(&descriptions, Purpose::SelfConsumption);
+        recommendation.learn(&parameters, Purpose::SelfConsumption);
+        assert_eq!(
+            recommendation.limit_for(&Phase::A),
+            Some(LoadControlLimitId(1)),
+            "self-consumption is the recommendation"
+        );
+    }
+
+    /// Neither description is usable alone.
+    #[test]
+    fn a_phase_with_only_half_its_description_is_not_addressed() {
+        let mut limits = PhaseLimits::new();
+        limits.learn(
+            &CmdData::LoadControlLimitDescriptionListData(LoadControlLimitDescriptionListData {
+                load_control_limit_description_data: Some(vec![described(
+                    1,
+                    10,
+                    Purpose::OverloadProtection,
+                )]),
+            }),
+            Purpose::OverloadProtection,
+        );
+        assert!(!limits.is_known(), "no phase has been named yet");
+        assert_eq!(limits.limit_for(&Phase::A), None);
+    }
+
+    fn described(
+        limit: u32,
+        measurement: u32,
+        purpose: Purpose,
+    ) -> LoadControlLimitDescriptionData {
+        LoadControlLimitDescriptionData {
+            limit_id: Some(LoadControlLimitId(limit)),
+            limit_type: Some(LoadControlLimitType::MaxValueLimit),
+            limit_category: Some(purpose.limit_category()),
+            measurement_id: Some(MeasurementId(measurement)),
+            unit: Some(UnitOfMeasurement::A),
+            scope_type: Some(purpose.scope_type()),
+            ..Default::default()
+        }
+    }
+
+    fn parameter(measurement: u32, phase: Phase) -> ElectricalConnectionParameterDescriptionData {
+        ElectricalConnectionParameterDescriptionData {
+            electrical_connection_id: Some(ElectricalConnectionId(1)),
+            parameter_id: Some(ElectricalConnectionParameterId(measurement)),
+            measurement_id: Some(MeasurementId(measurement)),
+            ac_measured_phases: Some(phase),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn the_limit_description_says_amperes_and_overload_protection() {
         let CmdData::LoadControlLimitDescriptionListData(list) =
@@ -824,7 +1171,7 @@ mod tests {
     #[test]
     fn opev_002_each_phase_is_limited_on_its_own() {
         let currents = ChargingCurrents::new(16.0, 6.0, 10.0);
-        let written = limit_data(&currents, true);
+        let written = limit_data(&currents, true, &PhaseLimits::own(&PHASES));
         let back = read_limit_write(&written).expect("the same function");
         assert_eq!(back, currents);
         assert_eq!(back.smallest(), Some(6.0), "what a symmetric charger takes");
@@ -833,7 +1180,11 @@ mod tests {
     /// Table 7: a deactivated limit's value is ignored.
     #[test]
     fn a_deactivated_limit_carries_no_current() {
-        let written = limit_data(&ChargingCurrents::same(16.0), false);
+        let written = limit_data(
+            &ChargingCurrents::same(16.0),
+            false,
+            &PhaseLimits::own(&PHASES),
+        );
         let back = read_limit_write(&written).expect("still the function");
         assert_eq!(back, ChargingCurrents::default(), "nothing is curtailed");
     }
@@ -926,8 +1277,88 @@ mod tests {
     /// Table 9 round-trips, which is how the manager learns the band.
     #[test]
     fn the_permitted_range_round_trips() {
+        let mut parameters = ParameterIds::new();
+        parameters.learn(&parameter_descriptions(1, &PHASES));
+
         let published = permitted_value_sets(1, 6.0, 16.0, &PHASES);
-        assert_eq!(read_permitted_range(&published), Some((6.0, 16.0)));
+        let band = read_permitted_range(&published, &parameters).expect("a band");
+        for phase in PHASES {
+            assert_eq!(band.for_phase(&phase), Some((6.0, 16.0)));
+        }
+        assert_eq!(band.narrowest(), Some((6.0, 16.0)));
+    }
+
+    /// The set that belongs to another quantity is not read as a charging band.
+    ///
+    /// A car that publishes a power parameter alongside its per-phase currents used to
+    /// have whichever set came first taken as the band, so a manager could clamp amperes
+    /// into a range in watts — and then write a "curtailment" of 11 000 A.
+    #[test]
+    fn a_permitted_set_for_another_parameter_is_not_the_charging_band() {
+        let mut parameters = ParameterIds::new();
+        // Parameter 1 is total AC power; the per-phase currents are 2, 3 and 4.
+        parameters.learn(&CmdData::ElectricalConnectionParameterDescriptionListData(
+            ElectricalConnectionParameterDescriptionListData {
+                electrical_connection_parameter_description_data: Some(vec![
+                    ElectricalConnectionParameterDescriptionData {
+                        electrical_connection_id: Some(ElectricalConnectionId(1)),
+                        parameter_id: Some(ElectricalConnectionParameterId(1)),
+                        scope_type: Some(ScopeType::AcPowerTotal),
+                        ..Default::default()
+                    },
+                    ElectricalConnectionParameterDescriptionData {
+                        electrical_connection_id: Some(ElectricalConnectionId(1)),
+                        parameter_id: Some(ElectricalConnectionParameterId(2)),
+                        measurement_id: Some(MeasurementId(2)),
+                        ac_measured_phases: Some(Phase::A),
+                        scope_type: Some(ScopeType::AcCurrent),
+                        ..Default::default()
+                    },
+                ]),
+            },
+        ));
+
+        let published = CmdData::ElectricalConnectionPermittedValueSetListData(
+            ElectricalConnectionPermittedValueSetListData {
+                electrical_connection_permitted_value_set_data: Some(vec![
+                    // The power band, first in the list.
+                    ElectricalConnectionPermittedValueSetData {
+                        electrical_connection_id: Some(ElectricalConnectionId(1)),
+                        parameter_id: Some(ElectricalConnectionParameterId(1)),
+                        permitted_value_set: Some(vec![ScaledNumberSet {
+                            range: Some(vec![ScaledNumberRange {
+                                min: Some(ScaledNumber::from_f64(1_400.0, 0)),
+                                max: Some(ScaledNumber::from_f64(11_000.0, 0)),
+                            }]),
+                            ..Default::default()
+                        }]),
+                    },
+                    ElectricalConnectionPermittedValueSetData {
+                        electrical_connection_id: Some(ElectricalConnectionId(1)),
+                        parameter_id: Some(ElectricalConnectionParameterId(2)),
+                        permitted_value_set: Some(vec![ScaledNumberSet {
+                            range: Some(vec![ScaledNumberRange {
+                                min: Some(ScaledNumber::from_f64(6.0, 0)),
+                                max: Some(ScaledNumber::from_f64(16.0, 0)),
+                            }]),
+                            ..Default::default()
+                        }]),
+                    },
+                ]),
+            },
+        );
+
+        let band = read_permitted_range(&published, &parameters).expect("a band");
+        assert_eq!(
+            band.for_phase(&Phase::A),
+            Some((6.0, 16.0)),
+            "amperes, not the watts on parameter 1"
+        );
+        assert_eq!(
+            band.phases().count(),
+            1,
+            "the power parameter covers no phase, so it contributes no band"
+        );
     }
 
     /// Table 8 binds each phase to its own parameter.
@@ -1066,8 +1497,10 @@ impl EvActor {
         // report a number the manager never wrote as though it had.
         let in_force = self.charging.source() == CurrentSource::Curtailed;
         let payload = match self.charging.limit() {
-            Some(limit) if limit.phases().next().is_some() => limit_data(&limit, in_force),
-            _ => deactivated(&self.phases),
+            Some(limit) if limit.phases().next().is_some() => {
+                limit_data(&limit, in_force, &PhaseLimits::own(&self.phases))
+            }
+            _ => deactivated(&self.phases, &PhaseLimits::own(&self.phases)),
         };
 
         let mut changed = false;
@@ -1247,6 +1680,12 @@ pub struct EvPeer {
     pub load_control: FeatureAddress,
     /// Its `ElectricalConnection` feature, which says what it can take.
     pub electrical_connection: FeatureAddress,
+    /// Which of the two use cases this peer was found under.
+    ///
+    /// A car may serve both, and the same `LoadControl` feature then carries two limits
+    /// per phase — an `obligation` and a `recommendation`. Everything addressed on this
+    /// peer has to name which, or the fuse's ceiling is written as advice.
+    pub purpose: Purpose,
 }
 
 /// Finds the Energy Guard's `DeviceDiagnosis` from its discovery data.
@@ -1270,6 +1709,7 @@ pub fn locate(remote: &RemoteDevice, purpose: Purpose) -> Option<EvPeer> {
             &FeatureType::ElectricalConnection,
             Role::Server,
         )?,
+        purpose,
     })
 }
 
@@ -1280,8 +1720,8 @@ pub enum GuardEvent {
     Ready {
         /// The car.
         device: AddressDevice,
-        /// The band it can charge in, in amperes.
-        range: (f64, f64),
+        /// The band it can charge in, per phase, in amperes.
+        band: ChargingBand,
     },
     /// The car accepted a curtailment.
     Accepted {
@@ -1297,6 +1737,18 @@ pub enum GuardEvent {
         /// What it reported.
         error: ErrorNumber,
     },
+    /// A request to this car went unanswered through the whole of the SPINE
+    /// implementation guide §2.6.2 escalation path.
+    ///
+    /// Silence, not a refusal. Whatever the request was holding has been released and an
+    /// outstanding curtailment goes out afresh, so the guard carries on.
+    ///
+    /// Worth surfacing (§2.6.4): a car that has stopped answering is one whose current the
+    /// supply can no longer bound, which is a question about the fuse.
+    Unresponsive {
+        /// The car.
+        device: AddressDevice,
+    },
 }
 
 /// One car, and where the Energy Guard has got to with it.
@@ -1305,9 +1757,20 @@ struct TrackedEv {
     peer: EvPeer,
     bound: bool,
     binding_request: Option<MsgCounter>,
-    range: Option<(f64, f64)>,
+    /// The band this car said it can charge in, per phase.
+    band: ChargingBand,
+    /// Table 9 exactly as it arrived.
+    ///
+    /// Kept because it cannot be read until the parameter descriptions say which set
+    /// covers which phase, and the two replies may come back in either order. Re-resolved
+    /// whenever either moves, so neither has to be the one that arrives second.
+    permitted: Option<CmdData>,
     /// The phases this car charges on, from its parameter descriptions.
     phases: Vec<Phase>,
+    /// Which `limitId` this car keeps each of those phases under.
+    ///
+    /// Nothing is written until at least one phase is in here: the numbers are the car's.
+    limits: PhaseLimits,
     required: Option<ChargingCurrents>,
     outstanding: Option<(MsgCounter, ChargingCurrents)>,
     applied: Option<ChargingCurrents>,
@@ -1391,16 +1854,30 @@ impl OverloadGuardActor {
         }
     }
 
-    /// Starts curtailing a car: binds to its `LoadControl` and reads what it can take.
+    /// Starts curtailing a car: binds to its `LoadControl`, reads what it can take, and
+    /// reads how it numbers its per-phase limits.
+    ///
+    /// The limit description read is what makes the write addressable at all — see
+    /// [`PhaseLimits`]. Until it and the parameter descriptions have both come back there
+    /// is no `limitId` for any phase, and the guard writes nothing.
     pub fn attach(&mut self, engine: &mut Engine, peer: EvPeer, now: Duration) {
         let device = peer.device.clone();
         self.peers.retain(|t| t.peer.device != device);
 
         let binding_request = engine.request_binding(&self.client, &peer.load_control, now);
         engine.request_subscription(&self.client, &peer.load_control, now);
+        engine.read(
+            &peer.load_control,
+            &self.client,
+            Function::LoadControlLimitDescriptionListData,
+            now,
+        );
         for function in [
-            Function::ElectricalConnectionPermittedValueSetListData,
+            // The descriptions first: they are what says which set covers which phase.
+            // Order is a courtesy rather than a guarantee, which is why the reader keeps
+            // the value payload and re-resolves it — see `TrackedEv::permitted`.
             Function::ElectricalConnectionParameterDescriptionListData,
+            Function::ElectricalConnectionPermittedValueSetListData,
         ] {
             engine.read(&peer.electrical_connection, &self.client, function, now);
         }
@@ -1409,8 +1886,10 @@ impl OverloadGuardActor {
             peer,
             bound: false,
             binding_request: Some(binding_request),
-            range: None,
+            band: ChargingBand::new(),
+            permitted: None,
             phases: PHASES.to_vec(),
+            limits: PhaseLimits::new(),
             required: None,
             outstanding: None,
             applied: None,
@@ -1423,9 +1902,10 @@ impl OverloadGuardActor {
         self.peers.retain(|t| &t.peer.device != device);
     }
 
-    /// The band a car said it can charge in, once it has.
-    pub fn range_of(&self, device: &AddressDevice) -> Option<(f64, f64)> {
-        self.peers.iter().find(|t| &t.peer.device == device)?.range
+    /// The band a car said it can charge in, per phase, once it has.
+    pub fn band_of(&self, device: &AddressDevice) -> Option<&ChargingBand> {
+        let band = &self.peers.iter().find(|t| &t.peer.device == device)?.band;
+        (!band.is_empty()).then_some(band)
     }
 
     /// Sets the currents the supply can carry for one car ([OPEV-001]).
@@ -1470,23 +1950,63 @@ impl OverloadGuardActor {
                 resolved: data,
                 ..
             } => {
-                let index = self
-                    .peers
-                    .iter()
-                    .position(|t| &t.peer.electrical_connection == feature)?;
-                if let Some(phases) = read_phases(data) {
-                    self.peers[index].phases = phases;
+                let index = self.peers.iter().position(|t| {
+                    &t.peer.electrical_connection == feature || &t.peer.load_control == feature
+                })?;
+                // How this car numbers its per-phase limits, from either half.
+                let purpose = self.peers[index].peer.purpose;
+                if self.peers[index].limits.learn(data, purpose) {
+                    if let Some(phases) = read_phases(data) {
+                        self.peers[index].phases = phases;
+                    }
+                    // A parameter description may be what makes sense of a Table 9 reply
+                    // that arrived before it.
+                    self.resolve_band(index);
+                    return self.report_ready(engine, index, now);
+                }
+                if !matches!(
+                    data,
+                    CmdData::ElectricalConnectionPermittedValueSetListData(_)
+                ) {
                     return None;
                 }
-                let range = read_permitted_range(data)?;
-                self.peers[index].range = Some(range);
+                self.peers[index].permitted = Some(data.clone());
+                self.resolve_band(index);
                 self.report_ready(engine, index, now)
             }
             SpineEvent::ResultReceived { request, error } => {
                 self.resolve(engine, *request, *error, now)
             }
+            SpineEvent::RequestTimedOut { request, .. } => self.give_up(engine, *request, now),
             _ => None,
         }
+    }
+
+    /// Lets go of a request the car never answered.
+    ///
+    /// The engine raises this only once SPINE IG §2.6.2's escalation path is exhausted, so
+    /// the car is absent rather than slow. The curtailment matters most: an outstanding one
+    /// blocks every later write to that car.
+    fn give_up(
+        &mut self,
+        engine: &mut Engine,
+        request: MsgCounter,
+        now: Duration,
+    ) -> Option<GuardEvent> {
+        let index = self.peers.iter().position(|t| {
+            t.outstanding.is_some_and(|(c, _)| c == request) || t.binding_request == Some(request)
+        })?;
+        let tracked = &mut self.peers[index];
+        let device = tracked.peer.device.clone();
+        if tracked.binding_request == Some(request) {
+            tracked.binding_request = None;
+        }
+        if tracked.outstanding.is_some_and(|(c, _)| c == request) {
+            tracked.outstanding = None;
+            // Still required, so still owed.
+            self.write_if_due(engine, index, now);
+        }
+        Some(GuardEvent::Unresponsive { device })
     }
 
     fn resolve(
@@ -1519,6 +2039,21 @@ impl OverloadGuardActor {
         Some(GuardEvent::Refused { device, error })
     }
 
+    /// Re-reads Table 9 against the parameter descriptions known so far.
+    ///
+    /// Which permitted value set covers which phase is in the descriptions and nowhere
+    /// else, so this does nothing useful until they have arrived — and everything, the
+    /// moment they do.
+    fn resolve_band(&mut self, index: usize) {
+        let Some(data) = self.peers[index].permitted.clone() else {
+            return;
+        };
+        let parameters = self.peers[index].limits.parameters().clone();
+        if let Some(band) = read_permitted_range(&data, &parameters) {
+            self.peers[index].band = band;
+        }
+    }
+
     /// Reports that a car can now be curtailed, once the binding and the band are both in.
     fn report_ready(
         &mut self,
@@ -1527,19 +2062,25 @@ impl OverloadGuardActor {
         now: Duration,
     ) -> Option<GuardEvent> {
         let tracked = &self.peers[index];
-        let (true, Some(range), false) = (tracked.bound, tracked.range, tracked.ready_reported)
-        else {
+        let (true, false, false, true) = (
+            tracked.bound,
+            tracked.band.is_empty(),
+            tracked.ready_reported,
+            // Nothing is addressable until the car has said how it numbers its limits.
+            tracked.limits.is_known(),
+        ) else {
             return None;
         };
         self.peers[index].ready_reported = true;
         let device = self.peers[index].peer.device.clone();
+        let band = self.peers[index].band.clone();
         self.write_if_due(engine, index, now);
-        Some(GuardEvent::Ready { device, range })
+        Some(GuardEvent::Ready { device, band })
     }
 
     fn write_if_due(&mut self, engine: &mut Engine, index: usize, now: Duration) {
         let tracked = &self.peers[index];
-        if !tracked.bound || tracked.outstanding.is_some() {
+        if !tracked.bound || tracked.outstanding.is_some() || !tracked.limits.is_known() {
             return;
         }
         let Some(required) = tracked.required else {
@@ -1551,17 +2092,14 @@ impl OverloadGuardActor {
         // A car cannot charge below its minimum, so a limit under it would stop the
         // charge rather than slow it. Clamping here means the guard asks for something
         // the car can actually do, and knows what it asked for.
-        let required = match tracked.range {
-            Some((min, max)) => required.clamped(min, max),
-            None => required,
-        };
+        let required = required.clamped(&tracked.band);
         let target = tracked.peer.load_control.clone();
         // [OPEV-004]: "no curtailment needed" is written on every phase the car charges
         // on, deactivated — not sent as an empty list that says nothing.
         let payload = if required.phases().next().is_some() {
-            limit_data(&required, true)
+            limit_data(&required, true, &tracked.limits)
         } else {
-            deactivated(&tracked.phases)
+            deactivated(&tracked.phases, &tracked.limits)
         };
         let counter = engine.write(&target, &self.client, payload, true, now);
         self.peers[index].outstanding = Some((counter, required));

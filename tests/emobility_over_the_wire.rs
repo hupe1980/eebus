@@ -152,8 +152,15 @@ fn a_car_describes_itself_and_the_manager_learns_it() {
     link.discover();
 
     // What the manager reads.
-    let mut learned = evcc::EvProfile::new();
+    let mut reader = evcc::EvReader::new();
     for (feature, function) in [
+        // The descriptions first, because they are what say which of *this car's*
+        // identifiers is which. Reading the values alone leaves them unaddressable.
+        (1, Function::DeviceConfigurationKeyValueDescriptionListData),
+        (
+            5,
+            Function::ElectricalConnectionParameterDescriptionListData,
+        ),
         (1, Function::DeviceConfigurationKeyValueListData),
         (2, Function::IdentificationListData),
         (5, Function::ElectricalConnectionPermittedValueSetListData),
@@ -162,9 +169,10 @@ fn a_car_describes_itself_and_the_manager_learns_it() {
         let replies = link.read(feature, function.clone());
         assert!(!replies.is_empty(), "no reply to {function:?}");
         for reply in &replies {
-            learned.apply(reply);
+            reader.apply(reply);
         }
     }
+    let learned = reader.profile();
 
     assert_eq!(
         learned.communication_standard,

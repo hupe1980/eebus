@@ -21,8 +21,37 @@
 //! [`crate::usecases::monitoring`]; what differs is that a grid connection point names
 //! the two energies from the grid's side — `gridConsumption` and `gridFeedIn` — which is
 //! what [`NAMING`] selects.
+//!
+//! # The two sides
+//!
+//! **Grid Connection Point.** [`curtailment_feature`] builds the `DeviceConfiguration`
+//! feature scenario 1 is served from; [`curtailment_description`] and
+//! [`curtailment_value`] are what goes in it. Scenarios 2 to 7 come from
+//! [`MonitoredUnit`](crate::usecases::monitoring::MonitoredUnit).
+//!
+//! **Monitoring Appliance.** There is deliberately no `curtailment_client_feature` beside
+//! [`curtailment_feature`], and the asymmetry is the specification's rather than an
+//! omission: the LPC implementation guide §3.3 asks that "each Actor SHOULD use a client
+//! Feature with featureType `Generic` for all its client functionality", so an appliance
+//! holds **one** client feature for every server it reads — the `Measurement` of scenarios
+//! 2 to 7 and the `DeviceConfiguration` of scenario 1 alike. Build it with
+//! [`limitation::client_feature`](crate::usecases::limitation::client_feature), which is
+//! the same constructor an Energy Guard uses, and hand it to
+//! [`MonitoringApplianceActor`](crate::usecases::monitoring::MonitoringApplianceActor).
+//! That actor now serves the whole use case: [`monitoring::locate`] finds the connection
+//! point's `DeviceConfiguration` feature alongside its measurements, and the factor
+//! arrives as
+//! [`MonitoringEvent::CurtailmentChanged`](crate::usecases::monitoring::MonitoringEvent::CurtailmentChanged).
+//!
+//! Reading scenario 1 by hand is [`Curtailment`], which is what the actor holds
+//! internally. Either way the `keyId` comes from the connection point's own description —
+//! see [`CURTAILMENT_KEY`] for why assuming it is a §9 export ceiling built on the wrong
+//! number.
+//!
+//! [`monitoring::locate`]: crate::usecases::monitoring::locate
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::model::{
     CmdData, DeviceConfigurationKeyId, DeviceConfigurationKeyName, DeviceConfigurationKeyValueData,
@@ -47,7 +76,14 @@ pub const NAMING: Naming = Naming::GridConnectionPoint;
 pub const PV_CURTAILMENT_LIMIT_FACTOR: DeviceConfigurationKeyName =
     DeviceConfigurationKeyName::PvCurtailmentLimitFactor;
 
-/// The `keyId` this implementation gives the limitation factor.
+/// The `keyId` **this** implementation publishes the limitation factor under.
+///
+/// A local choice and nothing more. MGCP Table 23 spells the identifier `<k1#(1..1)>` —
+/// the device picks it — and fixes the `keyName` instead. A Monitoring Appliance that
+/// assumed this number would be reading whatever the connection point happens to keep at
+/// index 1, which on a device with several configuration keys is some other key's value
+/// carried into a §9 export ceiling as though it were a percentage. Find a peer's key
+/// with [`find_curtailment_key`], or let [`Curtailment`] do it.
 pub const CURTAILMENT_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(1);
 
 /// The range the factor may take, as a percentage (MGCP Table 23).
@@ -104,21 +140,131 @@ pub fn curtailment_value(percent: f64) -> CmdData {
     })
 }
 
+/// Finds the `keyId` a Grid Connection Point publishes the limitation factor under.
+///
+/// Give it that peer's `deviceConfigurationKeyValueDescriptionListData`, read once at
+/// commissioning. `keyName` is the element MGCP Table 23 fixes —
+/// `pvCurtailmentLimitFactor` — and the `keyId` beside it is the device's own.
+pub fn find_curtailment_key(data: &CmdData) -> Option<DeviceConfigurationKeyId> {
+    crate::usecases::addressing::find_key_id(data, &PV_CURTAILMENT_LIMIT_FACTOR)
+}
+
 /// Reads the limitation factor out of a `deviceConfigurationKeyValueListData`.
+///
+/// `key` is the identifier **on the device the payload came from** — this device's own
+/// [`CURTAILMENT_KEY`] when reading back what it published, and the peer's, from
+/// [`find_curtailment_key`], when reading a Grid Connection Point. [`Curtailment`] pairs
+/// the two for you and is what a Monitoring Appliance should use.
 ///
 /// Returns the percentage. On its own a percentage is not actionable — see
 /// [`FeedInLimit`] for the value an inverter or an energy manager can hold itself to.
-pub fn read_curtailment(data: &CmdData) -> Option<f64> {
+pub fn read_curtailment(data: &CmdData, key: DeviceConfigurationKeyId) -> Option<f64> {
     let CmdData::DeviceConfigurationKeyValueListData(list) = data else {
         return None;
     };
     list.device_configuration_key_value_data
         .iter()
         .flatten()
-        .find(|entry| entry.key_id == Some(CURTAILMENT_KEY))
+        .find(|entry| entry.key_id == Some(key))
         .and_then(|entry| entry.value.as_ref())
         .and_then(|value| value.scaled_number.as_ref())
         .and_then(ScaledNumber::to_f64)
+}
+
+/// Scenario 1 as a Monitoring Appliance sees it: a description, then values.
+///
+/// The two halves arrive in separate functions and in either order, and neither is usable
+/// alone — the description says which `keyId` is the curtailment factor, the value list
+/// says what the numbers are. Holding them together is the whole job, and doing it wrong
+/// is silent: a factor read out of the wrong key is still a number in the range 0 to 100,
+/// and it becomes an export ceiling.
+///
+/// Feed it every payload that arrives from the connection point's `DeviceConfiguration`
+/// feature, in whatever order they come.
+///
+/// ```
+/// use eebus::usecases::mgcp::{self, Curtailment};
+///
+/// let mut factor = Curtailment::new();
+/// factor.describe(&mgcp::curtailment_description());
+/// assert_eq!(factor.apply(&mgcp::curtailment_value(70.0)), Some(70.0));
+/// assert_eq!(factor.factor_percent(), Some(70.0));
+/// assert_eq!(factor.limit(12_000.0).map(|l| l.watts()), Some(8_400.0));
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Curtailment {
+    key: Option<DeviceConfigurationKeyId>,
+    values: Vec<(DeviceConfigurationKeyId, f64)>,
+}
+
+impl Curtailment {
+    /// Nothing known yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Learns which `keyId` carries the factor, from a description payload.
+    ///
+    /// Returns whether this payload was one — a caller can hand it everything and use the
+    /// answer to tell a description from a value list.
+    pub fn describe(&mut self, data: &CmdData) -> bool {
+        if !matches!(
+            data,
+            CmdData::DeviceConfigurationKeyValueDescriptionListData(_)
+        ) {
+            return false;
+        }
+        if let Some(key) = find_curtailment_key(data) {
+            self.key = Some(key);
+        }
+        true
+    }
+
+    /// Applies a value payload, returning the factor if it is now known.
+    ///
+    /// Values for keys this appliance has no description for are kept rather than
+    /// dropped: the two functions may arrive in either order, and a value that came first
+    /// would otherwise be lost until the connection point next notified one.
+    pub fn apply(&mut self, data: &CmdData) -> Option<f64> {
+        let CmdData::DeviceConfigurationKeyValueListData(list) = data else {
+            return None;
+        };
+        for entry in list.device_configuration_key_value_data.iter().flatten() {
+            let (Some(id), Some(value)) = (entry.key_id, entry.value.as_ref()) else {
+                continue;
+            };
+            let Some(number) = value.scaled_number.as_ref().and_then(ScaledNumber::to_f64) else {
+                continue;
+            };
+            match self.values.iter_mut().find(|(known, _)| *known == id) {
+                Some((_, stored)) => *stored = number,
+                None => self.values.push((id, number)),
+            }
+        }
+        self.factor_percent()
+    }
+
+    /// The `keyId` the connection point published the factor under, once described.
+    pub fn key(&self) -> Option<DeviceConfigurationKeyId> {
+        self.key
+    }
+
+    /// The factor, as a percentage, once both halves have arrived.
+    ///
+    /// [`None`] while either is missing. Not zero: an unread message is not a
+    /// curtailment, and the difference is a roof that stops exporting.
+    pub fn factor_percent(&self) -> Option<f64> {
+        let key = self.key?;
+        self.values
+            .iter()
+            .find(|(known, _)| *known == key)
+            .map(|(_, value)| value.clamp(*CURTAILMENT_RANGE.start(), *CURTAILMENT_RANGE.end()))
+    }
+
+    /// The factor as a ceiling in watts, given the building's installed peak power.
+    pub fn limit(&self, nominal_peak_watts: f64) -> Option<FeedInLimit> {
+        Some(FeedInLimit::new(self.factor_percent()?, nominal_peak_watts))
+    }
 }
 
 /// The ceiling scenario 1 puts on feed-in, in watts.
@@ -167,10 +313,18 @@ impl FeedInLimit {
 
     /// A ceiling read straight off a `deviceConfigurationKeyValueListData`.
     ///
+    /// `key` is the identifier on the device the payload came from; see
+    /// [`read_curtailment`], and prefer [`Curtailment`], which finds it from the peer's
+    /// own description rather than asking a caller to have it already.
+    ///
     /// [`None`] when the payload carries no factor — which is not the same as a factor of
     /// zero, and must not be treated as one: an unread message is not a curtailment.
-    pub fn from_data(data: &CmdData, nominal_peak_watts: f64) -> Option<Self> {
-        read_curtailment(data).map(|factor| Self::new(factor, nominal_peak_watts))
+    pub fn from_data(
+        data: &CmdData,
+        key: DeviceConfigurationKeyId,
+        nominal_peak_watts: f64,
+    ) -> Option<Self> {
+        read_curtailment(data, key).map(|factor| Self::new(factor, nominal_peak_watts))
     }
 
     /// The factor as it crossed the wire, as a percentage.
@@ -394,21 +548,97 @@ mod tests {
     #[test]
     fn mgcp_011_the_curtailment_factor_round_trips() {
         let published = curtailment_value(70.0);
-        assert_eq!(read_curtailment(&published), Some(70.0));
+        assert_eq!(read_curtailment(&published, CURTAILMENT_KEY), Some(70.0));
 
         // MGCP Table 23 fixes the range at 0 to 100.
-        assert_eq!(read_curtailment(&curtailment_value(140.0)), Some(100.0));
-        assert_eq!(read_curtailment(&curtailment_value(-5.0)), Some(0.0));
+        assert_eq!(
+            read_curtailment(&curtailment_value(140.0), CURTAILMENT_KEY),
+            Some(100.0)
+        );
+        assert_eq!(
+            read_curtailment(&curtailment_value(-5.0), CURTAILMENT_KEY),
+            Some(0.0)
+        );
 
         // A fraction of a percent survives, which whole-number rounding would lose.
-        assert_eq!(read_curtailment(&curtailment_value(62.5)), Some(62.5));
+        assert_eq!(
+            read_curtailment(&curtailment_value(62.5), CURTAILMENT_KEY),
+            Some(62.5)
+        );
+    }
+
+    /// The `keyId` comes from the peer's description, never from this crate's own.
+    ///
+    /// A connection point with several configuration keys keeps the factor wherever it
+    /// likes. Reading key 1 there returns another key's number — in range, plausible, and
+    /// on its way to becoming a §9 export ceiling.
+    #[test]
+    fn the_factor_is_found_by_its_name_and_not_by_our_own_identifier() {
+        let their_key = DeviceConfigurationKeyId(4);
+        let description = CmdData::DeviceConfigurationKeyValueDescriptionListData(
+            DeviceConfigurationKeyValueDescriptionListData {
+                device_configuration_key_value_description_data: Some(vec![
+                    DeviceConfigurationKeyValueDescriptionData {
+                        key_id: Some(CURTAILMENT_KEY),
+                        key_name: Some(DeviceConfigurationKeyName::PeakPowerOfPvSystem),
+                        ..Default::default()
+                    },
+                    DeviceConfigurationKeyValueDescriptionData {
+                        key_id: Some(their_key),
+                        key_name: Some(PV_CURTAILMENT_LIMIT_FACTOR),
+                        value_type: Some(DeviceConfigurationKeyValueType::ScaledNumber),
+                        unit: Some(UnitOfMeasurement::Pct),
+                        ..Default::default()
+                    },
+                ]),
+            },
+        );
+        assert_eq!(find_curtailment_key(&description), Some(their_key));
+
+        let values =
+            CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
+                device_configuration_key_value_data: Some(vec![
+                    DeviceConfigurationKeyValueData {
+                        key_id: Some(CURTAILMENT_KEY),
+                        value: Some(DeviceConfigurationKeyValueValue {
+                            scaled_number: Some(ScaledNumber::from_f64(9.0, 0)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    DeviceConfigurationKeyValueData {
+                        key_id: Some(their_key),
+                        value: Some(DeviceConfigurationKeyValueValue {
+                            scaled_number: Some(ScaledNumber::from_f64(60.0, 2)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+            });
+
+        let mut factor = Curtailment::new();
+        assert!(factor.describe(&description));
+        assert_eq!(factor.apply(&values), Some(60.0), "not the 9 kWp on key 1");
+        assert_eq!(factor.key(), Some(their_key));
+    }
+
+    /// The value list may arrive before the description, and must not be lost.
+    #[test]
+    fn a_value_that_arrives_before_its_description_is_kept() {
+        let mut factor = Curtailment::new();
+        assert_eq!(factor.apply(&curtailment_value(55.0)), None);
+        assert_eq!(factor.factor_percent(), None, "nothing is known yet");
+        factor.describe(&curtailment_description());
+        assert_eq!(factor.factor_percent(), Some(55.0));
     }
 
     /// The equation of [MGCP-011], with the numbers a German §9 installation uses.
     #[test]
     fn mgcp_011_the_ceiling_is_the_factor_times_the_installed_peak_power() {
         let published = curtailment_value(70.0);
-        let limit = FeedInLimit::from_data(&published, 12_000.0).expect("a factor");
+        let limit =
+            FeedInLimit::from_data(&published, CURTAILMENT_KEY, 12_000.0).expect("a factor");
         assert_eq!(limit.watts(), 8_400.0);
         assert_eq!(limit.factor_percent(), 70.0);
         assert_eq!(limit.nominal_peak_watts(), 12_000.0);
@@ -426,7 +656,10 @@ mod tests {
             CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
                 device_configuration_key_value_data: Some(vec![]),
             });
-        assert_eq!(FeedInLimit::from_data(&empty, 12_000.0), None);
+        assert_eq!(
+            FeedInLimit::from_data(&empty, CURTAILMENT_KEY, 12_000.0),
+            None
+        );
     }
 
     /// A building with no PV has no feed-in to limit, and a negative array is not a

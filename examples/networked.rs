@@ -182,6 +182,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     done = true;
                 }
                 GuardEvent::PeerHeartbeatLost { .. } => {}
+                GuardEvent::NoLimitPublished { .. } => {
+                    println!("[box]  it publishes no limit to write to — not commissioned");
+                    done = true;
+                }
+                GuardEvent::PeerUnresponsive { outstanding, .. } => {
+                    println!("[box]  the pump stopped answering ({outstanding:?})");
+                }
             }
         }
         if done {

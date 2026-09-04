@@ -119,7 +119,7 @@ minutes otherwise (§2.10).
 **Two use cases, one implementation.** LPC and LPP are the same use case pointed in opposite
 directions — the same four scenarios, table numbers and thirteen transitions — so the state
 machine and both actors are written once and pointed by a `Direction`. OPEV and OSCEV are
-the same pair on the e-mobility side, pointed by a `Purpose`; seven use cases share one
+the same pair on the e-mobility side, pointed by a `Purpose`; nine use cases share one
 measurement layer. The reference implementations duplicate each; here a fix to one is a fix
 to all.
 
@@ -223,16 +223,19 @@ in that position loses it, which is the interoperable answer.
 | | a peer's partial notifications and replies merged into the state they update | §7.4, SPINE IG §3.2.2, §3.3 |
 | | acknowledgements, error numbers, counters, `specificationVersion` | §5.2.4–5.2.5, SPINE IG §2.5 |
 | | `maxResponseDelay`: honoured on what a peer announced, announced for what a feature needs | §5.2.5.3 |
+| | unanswered requests retried at 30 s, 5 min and 15 min under fresh counters, then given up on | SPINE IG §2.6.1–2.6.4 |
 | | bindings and subscriptions, single-writer policy, group lock | §5.3.5–5.3.6, LPC IG §3.5 |
 | | the binding and subscription tables, served from the live relations | §7.3.2, §7.4.2 |
 | | heartbeat producer and monitor; deferred writes on the merged state | LPC/LPP scenario 3, LPC IG §4.1.5 |
-| **Use cases** | 14 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
+| **Use cases** | 17 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
 | | LPC and LPP: state machine, both actors, the §14a record | UC TS §2.3, §3.3 + the 2026 IGs |
+| | every identifier a client addresses is read from the peer's own descriptions, never assumed | the `<l1#…>`, `<k1#…>`, `<p1#…>` placeholders |
 | | scenario 4 constraints: the nameplate for a device, the contract for a CEM | [LPC/LPP-041], [LPC/LPP-042], UC TS §2.6.4.1 |
 | | MPC and MGCP: both actors, incl. the PV curtailment factor as a ceiling in watts | MPC/MGCP UC TS §3.2.2, [MGCP-011] |
 | | six e-mobility use cases; OPEV and OSCEV as one machine, told apart by `limitCategory` | EVSECC/EVCC/OPEV/OSCEV/EVCEM 1.0.1, EVSOC 1.0.0 |
 | | inverter, PV string and battery monitoring | MOI/MPS/MOB 1.0.0 |
 | | Control of Battery: six states, twenty transitions, both control modes | COB 1.0.0 §2.4 |
+| | the DHW trio: the hot water setpoint, the mode that says whether a write reaches it, and the temperature it got to | CDT/MDSF/MDT 1.0.0 |
 | **Certification** | the 203 abstract test cases of the four HLTS as data, all driven: 189/203 | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
 | | runtime signals for a laboratory's debug interface | the HLTS "e.g. via debug interface" footnote |
 | **Transport** | node certificates, TLS 1.2 with mutual auth | SHIP §9, §12 (`cert`, `tls`) |

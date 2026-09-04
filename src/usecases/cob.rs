@@ -122,6 +122,13 @@ pub const SETPOINT_ID: SetpointId = SetpointId(1);
 /// The `keyId` of the Active Control Mode.
 pub const CONTROL_MODE_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(1);
 
+/// The `keyName` the Active Control Mode is published under (COB Table 20).
+///
+/// This is the fixed half — the element the specification pins — and what an energy
+/// manager resolves an inverter's own `keyId` from.
+pub const CONTROL_MODE_KEY_NAME: DeviceConfigurationKeyName =
+    DeviceConfigurationKeyName::BatteryActiveControlMode;
+
 /// The `keyId` of the default setpoint.
 pub const DEFAULT_KEY: DeviceConfigurationKeyId = DeviceConfigurationKeyId(2);
 
@@ -882,7 +889,7 @@ pub fn configuration_descriptions(config: &CobConfig, mode: ControlMode) -> CmdD
             device_configuration_key_value_description_data: Some(vec![
                 DeviceConfigurationKeyValueDescriptionData {
                     key_id: Some(CONTROL_MODE_KEY),
-                    key_name: Some(DeviceConfigurationKeyName::BatteryActiveControlMode),
+                    key_name: Some(CONTROL_MODE_KEY_NAME),
                     value_type: Some(DeviceConfigurationKeyValueType::String),
                     ..Default::default()
                 },
@@ -956,24 +963,36 @@ pub fn configuration_values(control: &BatteryControl) -> CmdData {
 }
 
 /// Reads the Active Control Mode out of a `deviceConfigurationKeyValueListData`.
-pub fn read_control_mode(data: &CmdData) -> Option<ControlMode> {
+///
+/// `key` is the identifier **on the device the payload came from**: this inverter's own
+/// [`CONTROL_MODE_KEY`] when reading back what it published, and the peer's — from
+/// [`addressing::find_key_id`](crate::usecases::addressing::find_key_id) with
+/// [`CONTROL_MODE_KEY_NAME`] — when an energy manager reads an inverter it did not build.
+pub fn read_control_mode(data: &CmdData, key: DeviceConfigurationKeyId) -> Option<ControlMode> {
     let CmdData::DeviceConfigurationKeyValueListData(list) = data else {
         return None;
     };
     list.device_configuration_key_value_data
         .iter()
         .flatten()
-        .find(|entry| entry.key_id == Some(CONTROL_MODE_KEY))
+        .find(|entry| entry.key_id == Some(key))
         .and_then(|entry| entry.value.as_ref())
         .and_then(|value| value.string.as_ref())
         .and_then(|value| ControlMode::read(value.as_str()))
 }
 
 /// A control-mode write an energy manager sends.
-pub fn control_mode_payload(mode: ControlMode) -> CmdData {
+///
+/// `key` is the **inverter's** `keyId` for the Active Control Mode, from its
+/// `deviceConfigurationKeyValueDescriptionListData`. It is not [`CONTROL_MODE_KEY`]
+/// unless the inverter happens to number its keys the way this crate numbers its own:
+/// COB Table 20 spells it `<k1#(1..1)>`, and a `DeviceConfiguration` feature carries every
+/// configuration key the inverter has. Writing a control mode into another key is a write
+/// the inverter accepts and applies.
+pub fn control_mode_payload(mode: ControlMode, key: DeviceConfigurationKeyId) -> CmdData {
     CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
         device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
-            key_id: Some(CONTROL_MODE_KEY),
+            key_id: Some(key),
             value: Some(DeviceConfigurationKeyValueValue {
                 string: Some(mode.as_str().to_string().into()),
                 ..Default::default()
@@ -1374,8 +1393,14 @@ mod tests {
         assert_eq!(read.watts, -2_500.0);
         assert!(read.is_active);
 
-        let mode = control_mode_payload(ControlMode::Pcc);
-        assert_eq!(read_control_mode(&mode), Some(ControlMode::Pcc));
+        // The inverter's own key, resolved from what it published rather than assumed.
+        let key = crate::usecases::addressing::find_key_id(
+            &configuration_descriptions(inverter.config(), ControlMode::Power),
+            &CONTROL_MODE_KEY_NAME,
+        )
+        .expect("the inverter describes its control-mode key");
+        let mode = control_mode_payload(ControlMode::Pcc, key);
+        assert_eq!(read_control_mode(&mode, key), Some(ControlMode::Pcc));
     }
 
     /// [COB-044/3]: two to twenty-four hours, and nothing else.

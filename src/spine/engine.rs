@@ -160,11 +160,30 @@ pub enum SpineEvent {
         /// The local feature it no longer watches.
         server: FeatureAddress,
     },
-    /// A request went unanswered for longer than the maximum response delay.
+    /// A request went unanswered, and is being sent again ([`RETRY_SCHEDULE`]).
     ///
-    /// The SPINE implementation guide §2.6.1 distinguishes this from a refusal: a
-    /// refusal is a completed exchange, a timeout is an unresponsive peer, and only the
-    /// second one calls for the staggered retry of §2.6.2.
+    /// Informational: the request is still live and its acknowledgement still arrives under
+    /// the counter the caller was handed. It exists for the implementation guide §2.6.4 —
+    /// "notify the user about degraded states" — which needs the degradation visible before
+    /// it is permanent.
+    RequestRetried {
+        /// The counter of the request being retried.
+        request: MsgCounter,
+        /// Where it is being sent.
+        destination: FeatureAddress,
+        /// Which retry this is, counting from one.
+        attempt: usize,
+    },
+    /// A request stayed unanswered through the whole of [`RETRY_SCHEDULE`].
+    ///
+    /// The implementation guide §2.6.1 distinguishes this from a refusal: a refusal is a
+    /// completed exchange, and silence is an unresponsive peer. The escalation path is
+    /// exhausted by the time this is raised, so an actor may safely release whatever it
+    /// held for this request.
+    ///
+    /// §2.6.2's last step, closing the SHIP connection, is the application's: an engine
+    /// owns none, and §2.6.4 says one unresponsive use case is not a reason to drop a
+    /// connection carrying others.
     RequestTimedOut {
         /// The counter of the request that went unanswered.
         request: MsgCounter,
@@ -324,12 +343,54 @@ impl WriteOps {
     }
 }
 
+/// The staggered retry of the SPINE implementation guide §2.6.2.
+///
+/// > If a peer is considered unresponsive (timeout), the device SHOULD implement a
+/// > staggered retry mechanism rather than immediately dropping the connection.
+///
+/// These are the guide's own delays, and they are delays *before* each retry rather than
+/// response deadlines: an answer is awaited for the peer's `maxResponseDelay` (§5.2.5.3)
+/// first. A request therefore lives a little over twenty minutes before
+/// [`SpineEvent::RequestTimedOut`] gives up on it.
+pub const RETRY_SCHEDULE: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+];
+
+/// What a [`Pending`] request's deadline is counting down to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Awaiting {
+    /// A transmission is in flight and the peer has until the deadline to answer it.
+    Answer,
+    /// The peer did not answer, and the next retry goes out at the deadline.
+    Retry,
+}
+
 /// A request this device sent and is still waiting on.
+///
+/// A *request* outlives the transmissions that carry it. SPINE has no retransmission of its
+/// own — a repeated `msgCounter` is a duplicate a conformant receiver drops
+/// (`TC_SPINE_DATA_003`) — so each retry goes out under a counter of its own while the
+/// request keeps the first as its name. That is what makes §2.6.2's escalation path
+/// invisible to a caller.
 #[derive(Clone, Debug)]
 struct Pending {
-    counter: MsgCounter,
+    /// The counter the caller was handed, and the request's identity for its whole life.
+    request: MsgCounter,
+    /// Every counter this request has gone out under, oldest first.
+    ///
+    /// An answer to an earlier attempt is still an answer: a peer that was merely slow
+    /// rather than absent replies to the transmission it saw, and dropping that reply
+    /// because a retry has since gone out would turn a working exchange into a timeout.
+    transmissions: Vec<MsgCounter>,
     destination: FeatureAddress,
+    /// The datagram to send again, its `msgCounter` rewritten for each attempt.
+    datagram: Datagram,
+    /// How many retries have gone out. Zero is the original transmission.
+    retries: usize,
     deadline: Duration,
+    awaiting: Awaiting,
 }
 
 /// What this device knows about one peer.
@@ -358,6 +419,18 @@ struct Peer {
 /// the number is far above what a real device notifies — the largest use case here watches
 /// four functions on two features.
 pub const MAX_REMOTE_FUNCTIONS: usize = 32;
+
+/// How many requests one engine waits on at a time.
+///
+/// [`RETRY_SCHEDULE`] keeps an unanswered request for twenty minutes, and each entry holds
+/// the datagram it may have to send again, so this is a memory budget rather than a count —
+/// the one to revisit first on a device with tighter limits than this crate assumes.
+///
+/// It is grown by *this* device rather than by a peer, so reaching the cap means the
+/// application is asking faster than the peers are answering. The oldest request is given
+/// up on and reported through [`SpineEvent::RequestTimedOut`] — the same event it would
+/// have raised on its own a little later.
+pub const MAX_PENDING_REQUESTS: usize = 64;
 
 /// How many peers one engine tracks.
 ///
@@ -521,14 +594,57 @@ impl Engine {
             .min()
     }
 
-    /// Expires requests that went unanswered.
+    /// Retries requests that went unanswered, and gives up on the ones that stay that way.
+    ///
+    /// The escalation path is [`RETRY_SCHEDULE`]. A request whose response deadline passes
+    /// is re-sent after a growing delay rather than abandoned, so a lost datagram recovers
+    /// on its own and [`SpineEvent::RequestTimedOut`] is reserved for the peer that answers
+    /// none of the attempts.
     pub fn handle_timeout(&mut self, now: Duration) {
-        let (expired, waiting): (Vec<_>, Vec<_>) =
-            self.pending.drain(..).partition(|p| now >= p.deadline);
-        self.pending = waiting;
-        for request in expired {
+        let mut still_pending = Vec::with_capacity(self.pending.len());
+        let mut abandoned = Vec::new();
+        let due: Vec<Pending> = core::mem::take(&mut self.pending);
+        for mut request in due {
+            if now < request.deadline {
+                still_pending.push(request);
+                continue;
+            }
+            match request.awaiting {
+                // The peer did not answer in time. §2.6.2 waits rather than retrying at
+                // once: an immediate retry against a peer that is busy or gone is what
+                // "clog the network" names.
+                Awaiting::Answer => match RETRY_SCHEDULE.get(request.retries) {
+                    Some(delay) => {
+                        request.awaiting = Awaiting::Retry;
+                        request.deadline = now + *delay;
+                        still_pending.push(request);
+                    }
+                    None => abandoned.push(request),
+                },
+                // The delay has run out: the same request, under a counter of its own.
+                Awaiting::Retry => {
+                    let counter = self.counters.next();
+                    request.retries += 1;
+                    request.transmissions.push(counter);
+                    if let Some(header) = request.datagram.header.as_mut() {
+                        header.msg_counter = Some(counter);
+                    }
+                    request.awaiting = Awaiting::Answer;
+                    request.deadline = now + self.response_delay_of(&request.destination);
+                    self.outbox.push_back(request.datagram.clone());
+                    self.events.push_back(SpineEvent::RequestRetried {
+                        request: request.request,
+                        destination: request.destination.clone(),
+                        attempt: request.retries,
+                    });
+                    still_pending.push(request);
+                }
+            }
+        }
+        self.pending = still_pending;
+        for request in abandoned {
             self.events.push_back(SpineEvent::RequestTimedOut {
-                request: request.counter,
+                request: request.request,
                 destination: request.destination,
             });
         }
@@ -871,10 +987,25 @@ impl Engine {
     ) {
         if let Some((destination, counter)) = awaiting {
             let deadline = now + self.response_delay_of(&destination);
+            // The oldest first, so that what is dropped is what was closest to being
+            // given up on anyway.
+            while self.pending.len() >= MAX_PENDING_REQUESTS {
+                let oldest = self.pending.remove(0);
+                self.events.push_back(SpineEvent::RequestTimedOut {
+                    request: oldest.request,
+                    destination: oldest.destination,
+                });
+            }
             self.pending.push(Pending {
-                counter,
+                request: counter,
+                transmissions: alloc::vec![counter],
                 destination,
+                // Kept so §2.6.2's retry is the *same* request rather than a new one the
+                // peer has no reason to connect to the first.
+                datagram: datagram.clone(),
+                retries: 0,
                 deadline,
+                awaiting: Awaiting::Answer,
             });
         }
         self.outbox.push_back(datagram);
@@ -1108,7 +1239,7 @@ impl Engine {
     ) -> Option<Pending> {
         let reference = reference?;
         let index = self.pending.iter().position(|p| {
-            p.counter == reference
+            p.transmissions.contains(&reference)
                 && p.destination
                     .device
                     .as_ref()
@@ -1682,7 +1813,7 @@ impl Engine {
             return;
         };
         self.events.push_back(SpineEvent::ResultReceived {
-            request: request.counter,
+            request: request.request,
             error,
         });
     }

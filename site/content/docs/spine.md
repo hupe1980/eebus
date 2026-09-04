@@ -191,6 +191,24 @@ it, and it is also how long the engine holds a *deferred write* on that feature 
 Controllable System that must ask a compressor controller before it can answer a limit needs
 both halves.
 
+## When a peer says nothing at all
+
+A refusal and a silence are different facts. A `resultData` carrying an error is a completed
+exchange, and §2.6.1 forbids retrying it. No answer at all is the other thing, and §2.6.2
+gives the escalation path in numbers: retry after 30 seconds, then 5 minutes, then 15, then
+give up. `RETRY_SCHEDULE` is those numbers, and the engine walks them so no use case has to.
+
+A *request* outlives the transmissions carrying it. SPINE has no retransmission of its own
+and a repeated `msgCounter` is a duplicate a conformant receiver drops, so each retry goes
+out under a counter of its own — but the counter you were handed is still the one your
+acknowledgement arrives under. `SpineEvent::RequestRetried` reports the rungs;
+`SpineEvent::RequestTimedOut` fires only at the end, so it means an unresponsive peer rather
+than a lost datagram, and an actor can safely release what it was holding for that request.
+
+The engine does not close the connection — §2.6.2's fourth step — because it owns none, and
+§2.6.4 says one unresponsive use case is not a reason to drop a connection carrying others.
+`Hub` passes the event up, which is where that decision belongs.
+
 ## Restricted Function Exchange
 
 RFE is how SPINE reads and writes *part* of a function: a **selector** says which entries,

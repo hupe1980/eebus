@@ -38,6 +38,41 @@ The answer says which use cases the peer plays, in which actor role, and which s
 each. Only then does an application know whether the peer is a heat pump it may limit or a
 display that merely watches.
 
+## Addressing a peer's data
+
+Knowing which feature to talk to is only half of it. Almost every list in SPINE is keyed by
+an identifier the **device** chooses, and the specifications write those identifiers as
+placeholders: `<l1#(1..1)>` for a load-control limit, `<k1#(1..1)>` for a configuration
+key, `<p1#(1..1)>` for an electrical-connection parameter. "SHALL be used as the primary
+identifier" is a promise that the device keeps *its own* number stable. It is not a number
+a peer may assume.
+
+What the specifications fix instead is what each entry **describes** — a key's `keyName`, a
+parameter's `scopeType` and phases, a limit's type and category and direction — and every
+such list has a description function beside it. Reading that description is the only way to
+address the peer rather than a coincidence:
+
+```rust
+use eebus::model::DeviceConfigurationKeyName;
+use eebus::usecases::addressing::KeyIds;
+
+let mut keys = KeyIds::new();
+keys.learn(&description_payload);              // keyId ⇄ keyName
+
+let failsafe = keys.get(&DeviceConfigurationKeyName::FailsafeDurationMinimum);
+let what_is_it = keys.name_of(some_key_from_a_value_list);
+```
+
+This is the one class of protocol error that produces no error. The write is well-formed,
+it names a real entry of the peer's, the peer applies it and acknowledges it, and the value
+has gone somewhere else. Nine such defects were fixed in 0.5.0 and every one of them was
+invisible to a test whose other end was this same crate.
+
+Each use case wraps the resolver its own data needs — `limitation::PeerIds`,
+`mgcp::Curtailment`, `charging::PhaseLimits`, `evcc::EvReader` — and the actors do it for
+you. What is left for an application is to *let* the actor read the descriptions before
+expecting it to write anything, which is what `EnergyGuardActor::is_ready` reports.
+
 ## What is implemented
 
 | Use case | Actors | Specification |
@@ -56,6 +91,9 @@ display that merely watches.
 | **MPS** — Monitoring of PV String | PVString, Monitoring Appliance | MPS 1.0.0 |
 | **MOB** — Monitoring of Battery | Battery, Monitoring Appliance | MOB 1.0.0 |
 | **COB** — Control of Battery | Inverter, CEM | COB 1.0.0 |
+| **CDT** — Configuration of DHW Temperature | DHW Circuit, Configuration Appliance | CDT 1.0.0 |
+| **MDSF** — Monitoring of DHW System Function | DHW Circuit, Monitoring Appliance | MDSF 1.0.0 |
+| **MDT** — Monitoring of DHW Temperature | DHW Circuit, Monitoring Appliance | MDT 1.0.0 |
 
 The first four are the ones certifiable since July 2026. Every one of them is implemented
 on **both** sides — the appliance's and the manager's — which is where most of the
@@ -94,9 +132,9 @@ Three more pairs work the same way:
   by a `Purpose`: `obligation`/`overloadProtection` against
   `recommendation`/`selfConsumption`. Two words, and a car that confuses them charges on
   solar only.
-* **EVCEM, EVSOC, MOI, MPS and MOB** are built on the same `monitoring` machinery as MPC
-  and MGCP — one implementation of "describe a measurement twice and read it back", serving
-  seven use cases. What each of them added was vocabulary, not mechanism.
+* **EVCEM, EVSOC, MOI, MPS, MOB, COB and MDT** are built on the same `monitoring`
+  machinery as MPC and MGCP — one implementation of "describe a measurement twice and read
+  it back", serving nine use cases. What each adds is vocabulary, not mechanism.
 
 The reference implementations duplicate each pair; here a fix to one is a fix to both, and
 the only thing the direction changes is what the tests assert.

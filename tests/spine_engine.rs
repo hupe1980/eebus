@@ -104,6 +104,25 @@ fn events(engine: &mut Engine) -> Vec<SpineEvent> {
     core::iter::from_fn(|| engine.poll_event()).collect()
 }
 
+/// Runs the SPINE IG §2.6.2 escalation path to its end, and returns everything it raised.
+///
+/// A request no longer times out at its first response deadline: it is retried three
+/// times on a growing delay, and only the last silence gives up. A test about the giving
+/// up has to walk the whole ladder, and one that stopped at the first deadline would be
+/// asserting the behaviour this crate deliberately no longer has.
+fn exhaust_retries(engine: &mut Engine) -> Vec<SpineEvent> {
+    let mut raised = Vec::new();
+    for _ in 0..=(2 * eebus::spine::RETRY_SCHEDULE.len()) {
+        let Some(deadline) = engine.poll_timeout() else {
+            break;
+        };
+        engine.handle_timeout(deadline);
+        raised.extend(events(engine));
+        while engine.poll_transmit().is_some() {}
+    }
+    raised
+}
+
 /// `TC_SPINE_DDISC_001`: a node discovers a partner it knows nothing about, and finds
 /// its entities, features and use cases.
 #[test]
@@ -747,14 +766,31 @@ fn an_unanswered_request_times_out() {
         Some(Duration::from_secs(10)),
         "the default maximum response delay"
     );
+    // But the first silence is a retry, not a verdict (SPINE IG §2.6.2).
     guard.handle_timeout(Duration::from_secs(10));
+    assert!(
+        !events(&mut guard)
+            .iter()
+            .any(|e| matches!(e, SpineEvent::RequestTimedOut { .. })),
+        "one lost datagram is not an unresponsive peer"
+    );
 
+    let raised = exhaust_retries(&mut guard);
     assert_eq!(
-        events(&mut guard).into_iter().find_map(|e| match e {
+        raised
+            .iter()
+            .filter(|e| matches!(e, SpineEvent::RequestRetried { .. }))
+            .count(),
+        eebus::spine::RETRY_SCHEDULE.len(),
+        "every rung of the ladder was tried"
+    );
+    assert_eq!(
+        raised.into_iter().find_map(|e| match e {
             SpineEvent::RequestTimedOut { request, .. } => Some(request),
             _ => None,
         }),
-        Some(request)
+        Some(request),
+        "and the give-up names the counter the caller was handed, not a retry's"
     );
     assert_eq!(guard.poll_timeout(), None, "and it is not waited on twice");
 }
@@ -1622,11 +1658,11 @@ fn a_result_from_the_wrong_peer_does_not_answer_the_request() {
         "another peer's result was filed against this request"
     );
 
-    // And the request is still outstanding, so it times out honestly.
-    let deadline = guard.poll_timeout().expect("the read is still pending");
-    guard.handle_timeout(deadline);
+    // And the request is still outstanding, so it times out honestly — once the whole of
+    // §2.6.2's escalation path has been walked.
+    guard.poll_timeout().expect("the read is still pending");
     assert!(
-        events(&mut guard).iter().any(
+        exhaust_retries(&mut guard).iter().any(
             |e| matches!(e, SpineEvent::RequestTimedOut { request, .. } if *request == counter)
         ),
         "the unanswered read was never reported"
@@ -2024,9 +2060,11 @@ fn a_feature_that_announced_a_longer_delay_is_given_it() {
         "the peer was called unresponsive while it was still within its own deadline"
     );
 
+    // Past it, the ladder starts — and each retry is given the peer's own delay again,
+    // which is why walking it takes the announced sixty seconds three more times.
     guard.handle_timeout(now + Duration::from_secs(61));
     assert!(
-        events(&mut guard).iter().any(
+        exhaust_retries(&mut guard).iter().any(
             |e| matches!(e, SpineEvent::RequestTimedOut { request, .. } if *request == counter)
         ),
         "and past it, the timeout still fires"
