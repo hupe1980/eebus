@@ -36,12 +36,13 @@
 
 #![cfg(all(feature = "interop", feature = "runtime"))]
 
+use std::net::IpAddr;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use eebus::cert::{self, CertParams};
 use eebus::model::{DeviceType, EntityType};
-use eebus::runtime::{Hub, HubEvent, Node, TrustStore};
+use eebus::runtime::{ConnectionError, Hub, HubEvent, Node, TrustStore};
 use eebus::ship::Ski;
 use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::tls::ShipTls;
@@ -224,6 +225,66 @@ fn has_host_networking() -> bool {
     info.starts_with("linux/") && !info.contains("docker desktop")
 }
 
+/// Whether this host can see its own `_ship._tcp` announcement.
+///
+/// Asked only once the exchange has already failed, to say which half of it did: a browse
+/// that resolves `ours` proves a multicast query left this machine and its answer came
+/// back, which is what the container has to do one namespace over. Not a precondition —
+/// this exchange has worked on the runner, so an announcement nothing can see is a finding
+/// rather than a reason to opt out.
+fn announcement_is_visible(mdns: &eebus::mdns::Mdns, ours: &Ski) -> bool {
+    use eebus::mdns::BrowseEvent;
+
+    let Ok(browse) = mdns.browse() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match browse.recv_timeout(left) {
+            Some(BrowseEvent::Found(found)) if &found.ski == ours => return true,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The addresses to put in the `_ship._tcp` announcement.
+///
+/// DNS-SD resolves an instance to a host name and the host name to an address, so a
+/// service announced with none is one the peer finds and cannot dial — indistinguishable,
+/// from this side, from never having been found. `--network host` puts the container in
+/// this namespace, so loopback is genuinely reachable from it; the routable address goes
+/// in too, because `ship-go` picks from what it resolves and need not pick loopback.
+fn announced_addresses() -> Vec<IpAddr> {
+    let mut addresses = vec![IpAddr::from([127, 0, 0, 1])];
+    // Nothing is sent: connecting a UDP socket only selects a route, and the local
+    // address of that route is the one a peer on this network reaches us at.
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("203.0.113.1:9").is_ok()
+        && let Ok(local) = socket.local_addr()
+        && !local.ip().is_loopback()
+    {
+        addresses.push(local.ip());
+    }
+    addresses
+}
+
+/// [`Hub::next`], bounded by what is left of a test's budget.
+///
+/// Each loop below checks its deadline *between* events, which is no deadline at all
+/// against a peer that never connects: `next()` waits on the socket, nothing arrives, and
+/// the test sits there until the harness kills it with no log to read. `None` is the budget
+/// running out, and the caller turns it into a failure carrying the container's own output.
+async fn next_within(
+    hub: &mut Hub,
+    started: Instant,
+    budget: Duration,
+) -> Option<Result<HubEvent, ConnectionError>> {
+    let left = budget.checked_sub(started.elapsed())?;
+    tokio::time::timeout(left, hub.next()).await.ok()
+}
+
 /// A heat pump with the four features LPC asks of a Controllable System.
 fn heat_pump() -> (Engine, ControllableSystemBuilder) {
     let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)
@@ -298,8 +359,11 @@ async fn eebus_go_writes_a_limit_and_this_crate_applies_it() {
     let mut limited = None;
     let started = std::time::Instant::now();
     let budget = Duration::from_secs(60);
-    while started.elapsed() < budget && limited.is_none() {
-        let event = match hub.next().await {
+    while limited.is_none() {
+        let Some(next) = next_within(&mut hub, started, budget).await else {
+            break;
+        };
+        let event = match next {
             Ok(event) => event,
             Err(e) => panic!("the session ended after {:?}: {e}", started.elapsed()),
         };
@@ -422,8 +486,11 @@ async fn this_crate_writes_a_limit_and_eebus_go_applies_it() {
     let mut asked = false;
     let mut peer_device = None;
 
-    while started.elapsed() < budget && accepted.is_none() {
-        let event = match hub.next().await {
+    while accepted.is_none() {
+        let Some(next) = next_within(&mut hub, started, budget).await else {
+            break;
+        };
+        let event = match next {
             Ok(event) => event,
             Err(e) => {
                 let logs = docker(&["logs", &peer.id]).unwrap_or_default();
@@ -554,20 +621,28 @@ async fn eebus_go_dials_this_crate_listening() {
     // The announcement, without which `-remoteski` has nothing to resolve.
     let mut mdns = Mdns::new().expect("mDNS is available");
     let record = ShipTxtRecord::new(ship_id.parse::<ShipId>().expect("a SHIP ID"), ours);
-    mdns.announce(ship_id, &record, address.port(), &[])
+    mdns.announce(ship_id, &record, address.port(), &announced_addresses())
         .expect("the announcement went out");
 
     let peer = start_peer_on_host_network("controlbox", &ours).expect("the control box started");
     println!("control box SKI {} dialling us on {address}", peer.ski);
     trust.trust(peer.ski);
 
+    // A tick from the first turn of the loop, so the actor's own timeouts run while we
+    // wait to be found rather than only after the first event arrives.
+    let first = hub.now() + Duration::from_millis(200);
+    hub.wake_at(first);
+
     let mut limited = None;
     let started = std::time::Instant::now();
     // Longer than the dialling tests: the peer has to discover us first, and mDNS
     // announcements are not instantaneous.
     let budget = Duration::from_secs(120);
-    while started.elapsed() < budget && limited.is_none() {
-        let event = match hub.next().await {
+    while limited.is_none() {
+        let Some(next) = next_within(&mut hub, started, budget).await else {
+            break;
+        };
+        let event = match next {
             Ok(event) => event,
             Err(e) => panic!("the session ended after {:?}: {e}", started.elapsed()),
         };
@@ -593,15 +668,22 @@ async fn eebus_go_dials_this_crate_listening() {
         let next = hub.now() + Duration::from_millis(200);
         hub.wake_at(next);
     }
-    let _ = mdns.withdraw();
-
     let limit = limited.unwrap_or_else(|| {
+        // Which half failed is the first thing to know, and this side can answer for
+        // itself: if our own responder cannot resolve the record we just published, the
+        // container never had anything to find and the peer's log is beside the point.
+        let seen = if announcement_is_visible(&mdns, &ours) {
+            "could resolve"
+        } else {
+            "could NOT resolve"
+        };
         let logs = docker(&["logs", &peer.id]).unwrap_or_default();
         panic!(
-            "eebus-go never found us. It discovers its peer over mDNS, so the usual cause \
-             is that the announcement did not reach the container.\n--- peer log ---\n{logs}"
+            "eebus-go never found us within {budget:?}. It discovers its peer over mDNS, \
+             and this host {seen} its own announcement.\n--- peer log ---\n{logs}"
         );
     });
+    let _ = mdns.withdraw();
 
     println!("eebus-go dialled in and wrote {limit:?}");
     assert_eq!(

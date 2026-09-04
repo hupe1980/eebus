@@ -112,6 +112,13 @@ API stopped it looking.
 
 ### Fixed
 
+- **`Mdns::announce` refuses an announcement with no address.** DNS-SD resolves an instance
+  to a host name and the host name to an address, so a service registered with none is one a
+  peer finds, reads the SKI from, and cannot dial. `mdns-sd` accepts the registration and
+  nothing reports an error at either end: the announcing node simply waits for a connection
+  that can never be made. It is now `MdnsError::NoAddress` at the call, and it is what the
+  `eebus-go`-dials-us interop test was tripping over.
+
 - **One unapproved peer could fill the whole pending-trust table by dialling repeatedly.**
   `MAX_PENDING_TRUST` counted handshakes, and the question is deduplicated by SKI — so a
   device dialling four times was asked about once and spent four slots, leaving no room for

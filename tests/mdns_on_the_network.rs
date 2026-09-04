@@ -9,7 +9,7 @@
 
 use core::time::Duration;
 
-use eebus::mdns::{BrowseEvent, Mdns};
+use eebus::mdns::{BrowseEvent, Mdns, MdnsError};
 use eebus::ship::{DeviceCategory, ShipId, ShipTxtRecord, Ski};
 
 fn record(ski: Ski) -> ShipTxtRecord {
@@ -79,4 +79,24 @@ fn a_node_announces_itself_and_is_found() {
             None => eprintln!("no removal reached this process; skipping the assertion"),
         }
     }
+}
+
+/// An announcement with no address is refused rather than published.
+///
+/// DNS-SD resolves an instance to a host name and the host name to an address; with no
+/// address the last step has no answer, so a peer finds the service, reads the SKI it
+/// carries, and has nowhere to dial. The daemon accepts such a registration happily and
+/// nothing goes wrong that anybody can see — the announcing node waits for a connection
+/// that cannot be made, which is why this is an error and not a warning.
+#[test]
+fn an_announcement_with_no_address_is_refused() {
+    let ski: Ski = "5555AAAAFFFF1111CCCC3333EEEEDDDD99992222".parse().unwrap();
+    let Ok(mut responder) = Mdns::new() else {
+        eprintln!("no mDNS on this machine; skipping");
+        return;
+    };
+    assert!(matches!(
+        responder.announce("eebus-test-unreachable", &record(ski), 4712, &[]),
+        Err(MdnsError::NoAddress)
+    ));
 }

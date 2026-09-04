@@ -76,9 +76,11 @@ COPY --from=build /out/controlbox /out/evse /usr/local/bin/
 #      checks the daemon with `docker info --format {{.OSType}}/{{.OperatingSystem}}` and
 #      skips with that reason rather than reporting a pass.
 #
-#   3. **The listener has to announce itself.** `Hub::listen` opens a socket and says
-#      nothing. Announce `_ship._tcp` with `eebus::mdns::Mdns::announce`, carrying the
-#      listener's SKI in the TXT record, or the peer has nothing to resolve.
+#   3. **The listener has to announce itself, with an address.** `Hub::listen` opens a
+#      socket and says nothing. Announce `_ship._tcp` with `eebus::mdns::Mdns::announce`,
+#      carrying the listener's SKI in the TXT record — and name the addresses it accepts
+#      connections on. DNS-SD resolves an instance to a host name and the host name to an
+#      address, so an announcement with none is one the peer finds and cannot dial.
 #
 # The two SKIs still have to be exchanged first, in both directions: pass the listener's to
 # the container with `-remoteski`, and trust the container's — which it prints as

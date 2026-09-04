@@ -56,6 +56,14 @@ pub enum MdnsError {
     /// The TXT record could not be built.
     #[error("the TXT record is invalid: {0}")]
     Record(#[from] DiscoveryError),
+    /// The announcement named no address to reach the node at.
+    ///
+    /// DNS-SD resolves an instance to a host name and a port, and the host name to an
+    /// address. With no address there is no last step: a peer finds the service, reads
+    /// the SKI, and has nowhere to dial — which looks from the announcing side exactly
+    /// like never having been found at all.
+    #[error("an announcement with no address is a service no peer can dial")]
+    NoAddress,
 }
 
 /// What a [`Browse`] reported.
@@ -142,7 +150,8 @@ impl Mdns {
     ///
     /// `instance` is the service instance name, which SHIP leaves to the implementation;
     /// the SHIP ID makes a good one, being unique and meaningful to a person reading a
-    /// packet capture.
+    /// packet capture. `addresses` are the ones the node accepts connections on, and at
+    /// least one is required — see [`MdnsError::NoAddress`].
     pub fn announce(
         &mut self,
         instance: &str,
@@ -187,6 +196,9 @@ impl Mdns {
         port: u16,
         addresses: &[IpAddr],
     ) -> Result<(), MdnsError> {
+        if addresses.is_empty() {
+            return Err(MdnsError::NoAddress);
+        }
         let host = alloc::format!("{}.local.", sanitise(instance));
         let service = mdns_sd::ServiceInfo::new(
             &alloc::format!("{service_type}{LOCAL}"),
