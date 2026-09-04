@@ -469,6 +469,104 @@ fn the_current_mode_says_whether_a_write_will_do_anything() {
     );
 }
 
+/// [F3] The gate: a write into a mode the circuit is not in is refused rather than sent.
+///
+/// The failure it exists to stop is the quiet one — the circuit accepts the write,
+/// acknowledges it, and heats nothing, because Table 10 says that mode reads some other
+/// setpoint. `write` still builds it, for a manager deliberately pre-loading the setpoint
+/// of a mode it is about to ask for; `write_effective` is for the manager that expects hot
+/// water now.
+#[test]
+fn a_write_into_a_mode_the_circuit_is_not_in_is_refused() {
+    use eebus::usecases::hvac::cdt::SetpointEffect;
+
+    let mut pair = Pair::new();
+    pair.commission();
+
+    // In `auto` the circuit reads the hot water setpoint.
+    assert_eq!(
+        pair.known.effect_of(THEIR_DHW, &pair.state),
+        SetpointEffect::Effective
+    );
+    assert!(
+        pair.known
+            .write_effective(THEIR_DHW, 60.0, &pair.state)
+            .is_ok()
+    );
+
+    // The room air setpoint is a real setpoint of this circuit and is read by no DHW mode.
+    assert_eq!(
+        pair.known.effect_of(THEIR_ROOM, &pair.state),
+        SetpointEffect::NotInCurrentMode,
+        "writing it would heat a living room, and the circuit would say yes"
+    );
+
+    // Switch the circuit off, where it reads no setpoint at all [CDT-003/3].
+    set(
+        &mut pair.circuit,
+        &pair.hvac_feature.clone(),
+        mdsf::system_function_state(off(), false, Some(false)),
+    );
+    let feature = pair.hvac_feature.clone();
+    pair.circuit
+        .notify(&feature, &Function::HvacSystemFunctionListData, pair.now);
+    pair.settle();
+
+    assert_eq!(
+        pair.known.effect_of(THEIR_DHW, &pair.state),
+        SetpointEffect::NotInCurrentMode
+    );
+    assert_eq!(
+        pair.known.write_effective(THEIR_DHW, 60.0, &pair.state),
+        Err(WriteRefused::NotInCurrentMode),
+        "the write never reaches the wire"
+    );
+    assert!(
+        pair.known.write(THEIR_DHW, 60.0).is_ok(),
+        "and the unconditional write is still there for a caller that means it"
+    );
+
+    // A one-time heating is not a refusal: the write lands where it was meant to.
+    set(
+        &mut pair.circuit,
+        &pair.hvac_feature.clone(),
+        mdsf::system_function_state(auto(), true, Some(false)),
+    );
+    pair.circuit
+        .notify(&feature, &Function::HvacSystemFunctionListData, pair.now);
+    pair.settle();
+    assert_eq!(pair.state.overrun_active(), Some(true));
+    assert_eq!(
+        pair.known.effect_of(THEIR_DHW, &pair.state),
+        SetpointEffect::OverriddenByOverrun
+    );
+    assert!(
+        pair.known
+            .write_effective(THEIR_DHW, 60.0, &pair.state)
+            .is_ok(),
+        "it takes effect when the overrun finishes, which is not the same as never"
+    );
+}
+
+/// Before MDSF has spoken, the gate says so rather than guessing.
+#[test]
+fn the_gate_refuses_while_the_mode_is_unknown() {
+    use eebus::usecases::hvac::cdt::SetpointEffect;
+
+    let known = DhwSetpoints::new();
+    let state = DhwSystemFunction::new();
+    assert_eq!(
+        known.effect_of(THEIR_DHW, &state),
+        SetpointEffect::Unknown,
+        "nothing has been read yet"
+    );
+    assert_eq!(
+        known.write_effective(THEIR_DHW, 60.0, &state),
+        Err(WriteRefused::ModeUnknown),
+        "and a manager writing a temperature into that is guessing"
+    );
+}
+
 /// [MDSF-002]: a one-time heating overrides the mode, and `finished` is announced once.
 ///
 /// A manager that sees the tank drawing power while the mode says `off` is not looking at
@@ -605,4 +703,109 @@ fn the_setpoint_points_at_the_measurement_that_governs_it() {
         Some(mdt::MEASUREMENT_ID),
         "a FOREIGN IDENTIFIER that points somewhere"
     );
+}
+
+/// [B4] `mdt::locate` finds the tank, and the monitoring actor reads it.
+///
+/// A DHW circuit has no `ElectricalConnection`, so `monitoring::locate` cannot describe
+/// it: searching for a feature the use case does not define finds whatever else the
+/// device happens to serve, or nothing, and either answer is wrong. This is the use
+/// case's own lookup, and what it returns goes into the same
+/// `MonitoringApplianceActor` a grid connection point does — one actor, one client
+/// feature, both kinds of peer.
+#[test]
+fn the_tank_is_located_by_its_own_use_case_and_read_by_the_monitoring_actor() {
+    use eebus::usecases::monitoring::{MonitoringApplianceActor, MonitoringEvent};
+
+    let mut pair = Pair::new();
+    // Discovery only: this test does the reading through the actor rather than by hand.
+    let ours = node_management(pair.manager.device().address());
+    let theirs = node_management(pair.circuit.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        pair.manager.read(&theirs, &ours, function, pair.now);
+    }
+    pair.settle();
+
+    let device = pair.circuit.device().address().clone();
+    let remote = pair.manager.peer(&device).expect("the circuit");
+    let tank = mdt::locate(remote).expect("a DHW circuit that announced MDT");
+    assert_eq!(
+        tank.measurement.as_ref(),
+        Some(&pair.measurement_feature),
+        "the one feature Table 6 gives this use case"
+    );
+    assert!(
+        tank.electrical_connection.is_none() && tank.curtailment.is_none(),
+        "a tank has neither, and locating it must not invent them"
+    );
+
+    let mut appliance = MonitoringApplianceActor::new(pair.client.clone());
+    appliance.attach(&mut pair.manager, tank, pair.now);
+
+    // The actor's own settling: every engine event goes to it rather than to the
+    // hand-written readers `Pair::settle` feeds.
+    fn pump(
+        pair: &mut Pair,
+        appliance: &mut MonitoringApplianceActor,
+        seen: &mut Vec<MonitoringEvent>,
+    ) {
+        for _ in 0..64 {
+            let mut moved = false;
+            while let Some(datagram) = pair.manager.poll_transmit() {
+                moved = true;
+                pair.circuit
+                    .handle_datagram(&round_trip(&datagram), pair.now);
+            }
+            while let Some(datagram) = pair.circuit.poll_transmit() {
+                moved = true;
+                pair.manager
+                    .handle_datagram(&round_trip(&datagram), pair.now);
+            }
+            while let Some(event) = pair.manager.poll_event() {
+                moved = true;
+                seen.extend(appliance.handle_event(&event));
+            }
+            while pair.circuit.poll_event().is_some() {
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("the exchange did not settle");
+    }
+
+    let mut seen = Vec::new();
+    pump(&mut pair, &mut appliance, &mut seen);
+
+    assert_eq!(
+        appliance
+            .readings(&device)
+            .and_then(|r| r.value(&mdt::MEASURAND)),
+        Some(49.0),
+        "the actor read the descriptions and the value with no electrical connection"
+    );
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, MonitoringEvent::UnitDescribed { .. })),
+        "the tank counts as described from the measurement descriptions alone: \
+         `dhwTemperature` has no phases to wait for"
+    );
+
+    // And it keeps reading: the subscription it asked for carries the next value.
+    let feature = pair.measurement_feature.clone();
+    set(&mut pair.circuit, &feature, mdt::temperature(58.5));
+    pair.circuit
+        .notify(&feature, &Function::MeasurementListData, pair.now);
+
+    seen.clear();
+    pump(&mut pair, &mut appliance, &mut seen);
+    let measured = seen.iter().find_map(|event| match event {
+        MonitoringEvent::Measured { readings, .. } => readings.first().and_then(|r| r.usable()),
+        _ => None,
+    });
+    assert_eq!(measured, Some(58.5), "the subscription delivered it");
 }

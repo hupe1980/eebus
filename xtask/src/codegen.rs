@@ -1088,17 +1088,110 @@ fn single_repeated_item(ctx: &Ctx<'_>, def: &ComplexDef) -> Result<Option<String
     }
 }
 
-/// The leading run of elements whose type is a numeric identifier.
+/// Every identifier type SPINE defines, and the element name it is used as.
 ///
-/// SPINE places an entry's primary and sub identifiers first, ahead of its payload; a
-/// later identifier — `loadControlLimitDescriptionData.measurementId`, say — is a
-/// *foreign* key into another feature and does not take part in this entry's identity.
+/// **Transcribed from the Resource Specification's Annex B.7, Table 358**, which is the
+/// authority: "The following table list all identifiers that belong to the identifiers
+/// concept as described in section 3.4." A naming convention is not a substitute for it —
+/// `MessagingNumberType` and `PowerTimeSlotNumberType` are identifiers whose names end in
+/// neither `IdType` nor anything else predictable, and `timeTableId` is declared in one
+/// place as `ns_p:TimeTableIdType` and in another as a bare `xs:unsignedInt`.
+///
+/// Three rows of the table are deliberately absent, and each absence is a decision:
+///
+/// * `AbsoluteOrRelativeTimeType`/`timestamp`. §3.4.2.3 gives it rules of its own and the
+///   per-function element tables mark it PRIMARY or SUB in a handful of series-shaped
+///   functions (`sensingListData`, `measurementListData`) and plain metadata everywhere
+///   else. Treating it as identity everywhere would split a list by timestamp; treating it
+///   as identity nowhere is what the functions this crate exchanges want, and is what the
+///   `identifier_classification` test pins.
+/// * `AddressDeviceType`/`AddressEntityType`/`AddressFeatureType`. A SPINE address is
+///   "indivisible information" (§3.4.1), and the lists keyed by one hold it as a nested
+///   `deviceAddress`/`featureAddress` structure rather than as leading scalars, so the
+///   leading-run rule below never reaches it.
+const IDENTIFIER_TYPES: &[(&str, &str)] = &[
+    ("AlarmIdType", "alarmId"),
+    ("AlternativesIdType", "alternativesId"),
+    ("BillCostIdType", "costId"),
+    ("BillIdType", "billId"),
+    ("BillPositionIdType", "positionId"),
+    ("BillValueIdType", "valueId"),
+    ("BindingIdType", "bindingId"),
+    ("CommodityIdType", "commodityId"),
+    ("ConditionIdType", "conditionId"),
+    ("DeviceConfigurationKeyIdType", "keyId"),
+    ("ElectricalConnectionIdType", "electricalConnectionId"),
+    (
+        "ElectricalConnectionCharacteristicIdType",
+        "characteristicId",
+    ),
+    ("ElectricalConnectionParameterIdType", "parameterId"),
+    ("HvacOperationModeIdType", "operationModeId"),
+    ("HvacOverrunIdType", "overrunId"),
+    ("HvacSystemFunctionIdType", "systemFunctionId"),
+    ("IdentificationIdType", "identificationId"),
+    ("IncentiveIdType", "incentiveId"),
+    ("LoadControlEventIdType", "eventId"),
+    ("LoadControlLimitIdType", "limitId"),
+    ("MeasurementIdType", "measurementId"),
+    ("MessagingNumberType", "messagingNumber"),
+    ("PowerSequenceIdType", "sequenceId"),
+    ("PowerTimeSlotNumberType", "slotNumber"),
+    ("SessionIdType", "sessionId"),
+    ("SetpointIdType", "setpointId"),
+    ("StateInformationIdType", "stateInformationId"),
+    ("SubscriptionIdType", "subscriptionId"),
+    ("TariffIdType", "tariffId"),
+    ("TaskManagementJobIdType", "jobId"),
+    ("ThresholdIdType", "thresholdId"),
+    ("TierBoundaryIdType", "boundaryId"),
+    ("TierIdType", "tierId"),
+    ("TimeSeriesIdType", "timeSeriesId"),
+    ("TimeSeriesSlotIdType", "timeSeriesSlotId"),
+    ("TimeSlotIdType", "timeSlotId"),
+    ("TimeTableIdType", "timeTableId"),
+];
+
+/// The leading run of elements that identify one entry of a list.
+///
+/// SPINE §3.4.2.1 names three kinds of identifier and only two of them are identity:
+///
+/// * **PRIMARY** and **SUB** identifiers address the entry — "one or more SUB IDENTIFIERS
+///   MAY be used within a function to identify the further dimensions of list entries".
+/// * A **FOREIGN** identifier refers to other functionality on the same entity and "is not
+///   used to create further dimensions of list entries". `setpointDescriptionData` carries
+///   a `measurementId` and a `timeTableId`, both marked FOREIGN by Table 117;
+///   `hvacSystemFunctionData` carries a `currentOperationModeId` marked FOREIGN by
+///   Table 64 — and that one is not even constant, it is *the mode the function is in*.
+///   Counting it as identity makes a mode change look like a second system function.
+///
+/// The specification carries the distinction in prose, per function. Two mechanical tests
+/// reproduce it, and between them they agree with every element-rules table checked:
+///
+/// 1. **The element is named what Table 358 says it is named.** `operationModeId` is an
+///    identifier; `currentOperationModeId` is a reference to one. Likewise
+///    `currentSetpointId` against `setpointId`.
+/// 2. **A *following* identifier comes from the same SPINE class as the first.** The
+///    first identifier is the function's PRIMARY wherever its type happens to be declared
+///    — `nodeManagementBindingData` is keyed by a `BindingIdType` from BindingManagement,
+///    `smartEnergyManagementPsPriceData` by a `PowerSequenceIdType` from PowerSequences —
+///    so nothing constrains it. What a *further* dimension has to be is a further
+///    dimension of the same thing: `{electricalConnectionId, parameterId}` are both
+///    ElectricalConnection, `{systemFunctionId, operationModeId}` both HVAC,
+///    `{timeTableId, timeSlotId}` both TimeTable. A `MeasurementIdType` after a
+///    `SetpointIdType` is a link into another class, which is what FOREIGN means, and
+///    Table 117 says so in as many words.
+///
+/// The run stops at the first element that fails either test, which is what keeps a
+/// trailing FOREIGN identifier — the common shape — out of the identity.
 fn leading_identifiers(
     ctx: &Ctx<'_>,
     owner: &str,
     def: &ComplexDef,
 ) -> Result<Vec<String>, String> {
+    let _ = owner;
     let mut out = Vec::new();
+    let mut class: Option<&String> = None;
     for particle in &def.particles {
         let Particle::Element {
             wire, ty, repeated, ..
@@ -1110,23 +1203,30 @@ fn leading_identifiers(
             break;
         }
         let resolved = resolve(ctx, ty)?;
-        if !is_identifier_type(ctx, &resolved) {
+        // Case-insensitively: the schema spells one of them `stateInformationIdType`,
+        // with a lowercase initial, where Table 358 and every other declaration use an
+        // initial capital. Matching exactly would drop `stateInformationListData`'s
+        // identity over a typo in the specification's own XSD.
+        let Some((_, element)) = IDENTIFIER_TYPES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(resolved.as_str()))
+        else {
             break;
+        };
+        if element != wire {
+            // Table 358 records the element an identifier type is *used as*; anything
+            // else carrying that type is a reference to one (§3.4.2.1, FOREIGN).
+            break;
+        }
+        let owning = ctx.schema.module_of.get(&resolved);
+        match class {
+            // The first identifier is this function's own, whatever declares its type.
+            None => class = owning,
+            // A further dimension of the same thing, or a link out of it.
+            Some(first) if owning == Some(first) => {}
+            Some(_) => break,
         }
         out.push(field_name(wire));
     }
-    let _ = owner;
     Ok(out)
-}
-
-/// True for a simple type named `*IdType` that restricts an integer.
-fn is_identifier_type(ctx: &Ctx<'_>, ty: &str) -> bool {
-    if !ty.ends_with("IdType") {
-        return false;
-    }
-    matches!(
-        ctx.schema.simple.get(ty),
-        Some(SimpleDef::Restrict { base })
-            if builtin(base).is_some_and(|p| p.starts_with('u') || p.starts_with('i'))
-    )
 }

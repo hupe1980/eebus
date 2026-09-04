@@ -2445,3 +2445,653 @@ fn discovery_is_filed_under_the_header_address_not_the_payloads() {
         "and nothing was filed under the name in the payload"
     );
 }
+
+// ---- §7.1.5, changes during runtime -------------------------------------------------
+
+/// An entity that goes away is observable, and only from the device that removes it.
+///
+/// SPINE §7.1.5 rule 4: the removal is a **notify** carrying
+/// `entityInformation.description.lastStateChange = "removed"` and no `featureInformation`
+/// at all. There is no other way for a peer to learn it — a discovery document merges, so
+/// a shorter re-send says nothing about what went — which is what makes an *arrival*
+/// visible everywhere and a *departure* visible only here. EVCC scenario 8, the car that
+/// drove away, is this message.
+#[test]
+fn an_entity_that_is_removed_is_announced_and_disappears_from_the_peer() {
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    // The compressor a heat pump can decommission, inside the appliance that holds it.
+    pump_station
+        .device_mut()
+        .add_entity(
+            LocalEntity::new([1, 1], EntityType::Compressor).with_feature(LocalFeature::new(
+                1,
+                FeatureType::Measurement,
+                eebus::model::Role::Server,
+            )),
+        )
+        .unwrap();
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+    manager.read(
+        &theirs,
+        &ours,
+        Function::NodeManagementDetailedDiscoveryData,
+        now,
+    );
+    // The manager subscribes to NodeManagement, which is what §7.1.5's notify goes to.
+    manager.request_subscription(&ours, &theirs, now);
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+
+    let device = pump_station.device().address().clone();
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(
+        remote.entity(&[1, 1]).is_some(),
+        "the compressor was discovered"
+    );
+    assert!(remote.entity(&[1]).is_some(), "and so was its parent");
+
+    // It is decommissioned.
+    let gone = pump_station
+        .remove_entity(&[1, 1], now)
+        .expect("an entity that is there");
+    assert_eq!(gone.len(), 1);
+    pump(&mut pump_station, &mut manager, now);
+
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(
+        remote.entity(&[1, 1]).is_none(),
+        "the peer heard the departure"
+    );
+    assert!(
+        remote.entity(&[1]).is_some(),
+        "and kept everything the message did not mention — rule 3 leaves it out"
+    );
+    assert!(
+        remote
+            .entity(&[1])
+            .and_then(|e| e.feature(&FeatureType::LoadControl, eebus::model::Role::Server))
+            .is_some(),
+        "the appliance's own features are untouched"
+    );
+    assert!(
+        events(&mut manager)
+            .iter()
+            .any(|e| matches!(e, SpineEvent::DiscoveryUpdated { .. })),
+        "and the application was told the tree moved"
+    );
+
+    // And the merged document a consumer can ask for reflects it too, rather than the
+    // fragment the notification carried.
+    let held = manager
+        .remote_data(&theirs, &Function::NodeManagementDetailedDiscoveryData)
+        .expect("the merged discovery document");
+    let CmdData::NodeManagementDetailedDiscoveryData(document) = held else {
+        panic!("expected the discovery function");
+    };
+    let addressed: Vec<Vec<u32>> = document
+        .entity_information
+        .iter()
+        .flatten()
+        .filter_map(|entry| entry.description.as_ref())
+        .filter_map(|d| d.entity_address.as_ref())
+        .filter_map(|a| a.entity.as_ref())
+        .map(|entity| entity.iter().map(|e| e.get()).collect())
+        .collect();
+    assert_eq!(
+        addressed,
+        vec![vec![0u32], vec![1]],
+        "the compressor is gone from the document, and the rest of the tree is not"
+    );
+}
+
+/// Removing the parent takes the sub-entity with it, on both sides.
+#[test]
+fn removing_an_entity_removes_everything_addressed_beneath_it() {
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    pump_station
+        .device_mut()
+        .add_entity(LocalEntity::new([1, 1], EntityType::Compressor))
+        .unwrap();
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        manager.read(&theirs, &ours, function, now);
+    }
+    manager.request_subscription(&ours, &theirs, now);
+    // And a subscription to a feature of the entity that is about to go.
+    let load_control = pump_station.device().address_of(&[1], 1);
+    let client = manager.device().address_of(&[1], 1);
+    manager.request_subscription(&client, &load_control, now);
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+    assert!(
+        pump_station
+            .relations()
+            .is_subscribed(&client, &load_control),
+        "the subscription was granted"
+    );
+
+    assert!(
+        manager
+            .peer(&pump_station.device().address().clone())
+            .and_then(|r| r.use_case("limitationOfPowerConsumption", "ControllableSystem"))
+            .is_some(),
+        "the appliance announced the use case"
+    );
+
+    let gone = pump_station.remove_entity(&[1], now).expect("it is there");
+    assert_eq!(gone.len(), 2, "the appliance and the compressor inside it");
+    assert_eq!(gone[0].address(), [1], "the named entity first");
+    assert!(
+        !pump_station
+            .relations()
+            .is_subscribed(&client, &load_control),
+        "a subscription to a feature that is gone is a promise this device cannot keep"
+    );
+    pump(&mut pump_station, &mut manager, now);
+
+    let device = pump_station.device().address().clone();
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(remote.entity(&[1]).is_none());
+    assert!(remote.entity(&[1, 1]).is_none());
+    assert!(
+        remote
+            .use_case("limitationOfPowerConsumption", "ControllableSystem")
+            .is_none(),
+        "and the use case the entity announced went with it"
+    );
+}
+
+/// Entity [0] carries the primary NodeManagement instance and cannot be removed.
+#[test]
+fn the_node_management_entity_cannot_be_removed() {
+    let mut pump_station = heat_pump();
+    assert_eq!(
+        pump_station.remove_entity(&[0], Duration::ZERO),
+        Err(eebus::spine::DeviceError::EntityZeroIsMandatory)
+    );
+    assert_eq!(
+        pump_station.remove_entity(&[9], Duration::ZERO),
+        Err(eebus::spine::DeviceError::UnknownEntity)
+    );
+}
+
+/// An entity added at runtime arrives without taking the rest of the tree with it.
+///
+/// §7.1.5 rule 3 has the device send only what changed, so the update names one entity.
+/// Merged as an ordinary partial write, `entityInformation` would be *replaced* by that
+/// one-entry list and the peer would forget everything else it had discovered.
+#[test]
+fn an_entity_added_at_runtime_does_not_erase_the_rest_of_the_tree() {
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+    manager.read(
+        &theirs,
+        &ours,
+        Function::NodeManagementDetailedDiscoveryData,
+        now,
+    );
+    manager.request_subscription(&ours, &theirs, now);
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+
+    pump_station
+        .add_entity(
+            LocalEntity::new([2], EntityType::Compressor).with_feature(LocalFeature::new(
+                1,
+                FeatureType::Measurement,
+                eebus::model::Role::Server,
+            )),
+            now,
+        )
+        .expect("a fresh address");
+    pump(&mut pump_station, &mut manager, now);
+
+    let device = pump_station.device().address().clone();
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(remote.entity(&[2]).is_some(), "the new entity arrived");
+    assert_eq!(
+        remote.entity(&[2]).map(|e| e.features.len()),
+        Some(1),
+        "rule 5b: with its features, or there is nothing to bind to"
+    );
+    assert!(
+        remote.entity(&[1]).is_some() && remote.entity(&[0]).is_some(),
+        "and the entities the message did not mention are still there"
+    );
+    assert_eq!(
+        remote.entity(&[1]).map(|e| e.features.len()),
+        Some(2),
+        "with their features"
+    );
+}
+
+/// A peer that says "gone" with `cmdClassifier: delete` is understood as saying that.
+///
+/// §7.1.5 prescribes `lastStateChange: removed` inside a notify, so nothing conformant
+/// arrives this way — but a delete is the obvious other reading of "remove this entity",
+/// and the generic delete path would have cleared the *whole* document: a peer meaning
+/// "this entity is gone" would have been heard as "I have no entities at all".
+#[test]
+fn a_delete_on_detailed_discovery_removes_what_it_names_and_no_more() {
+    use eebus::model::{
+        Cmd, Filter, NodeManagementDetailedDiscoveryData,
+        NodeManagementDetailedDiscoveryEntityInformation,
+        NodeManagementDetailedDiscoveryEntityInformationDescription,
+        NodeManagementDetailedDiscoveryEntityInformationDescriptionEntityAddress,
+    };
+
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    pump_station
+        .device_mut()
+        .add_entity(LocalEntity::new([1, 1], EntityType::Compressor))
+        .unwrap();
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+    manager.read(
+        &theirs,
+        &ours,
+        Function::NodeManagementDetailedDiscoveryData,
+        now,
+    );
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+
+    let device = pump_station.device().address().clone();
+    assert!(manager.peer(&device).unwrap().entity(&[1, 1]).is_some());
+
+    // Hand-built, because this crate does not send it: the entity, addressed, deleted.
+    let payload = NodeManagementDetailedDiscoveryData {
+        entity_information: Some(vec![NodeManagementDetailedDiscoveryEntityInformation {
+            description: Some(
+                NodeManagementDetailedDiscoveryEntityInformationDescription {
+                    entity_address: Some(
+                        NodeManagementDetailedDiscoveryEntityInformationDescriptionEntityAddress {
+                            entity: Some(vec![
+                                eebus::model::AddressEntity(1),
+                                eebus::model::AddressEntity(1),
+                            ]),
+                        },
+                    ),
+                    ..Default::default()
+                },
+            ),
+        }]),
+        ..Default::default()
+    };
+    let datagram = Datagram {
+        header: Some(eebus::model::Header {
+            specification_version: Some("1.3.0".into()),
+            address_source: Some(theirs.clone()),
+            address_destination: Some(ours.clone()),
+            msg_counter: Some(MsgCounter(9_001)),
+            cmd_classifier: Some(CmdClassifier::Notify),
+            ..Default::default()
+        }),
+        payload: Some(Payload {
+            cmd: Some(vec![
+                Cmd::with_data(CmdData::NodeManagementDetailedDiscoveryData(payload))
+                    .with_filter(Filter::delete()),
+            ]),
+        }),
+    };
+    manager.handle_datagram(&round_trip(&datagram), now);
+
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(
+        remote.entity(&[1, 1]).is_none(),
+        "the entity the delete named is gone"
+    );
+    assert!(
+        remote.entity(&[1]).is_some() && remote.entity(&[0]).is_some(),
+        "and nothing else went with it"
+    );
+    assert_eq!(
+        remote.entity(&[1]).map(|e| e.features.len()),
+        Some(2),
+        "including the features it did not name"
+    );
+}
+
+/// §7.5.4: a use case added at runtime does not erase the ones already announced.
+///
+/// "During runtime, a device MAY add/remove/modify one or more use cases. Therefore, a
+/// device that uses use case discovery should always subscribe to use case discovery."
+/// A subscriber that cannot survive a *partial* notification is worse off subscribed than
+/// not: `useCaseInformation` is a list the generic merge cannot address — its `address` is
+/// optional on the wire and its `actor` is not an identifier type — so merged the ordinary
+/// way, one changed use case replaces every use case the peer plays.
+#[test]
+fn a_use_case_announced_at_runtime_does_not_erase_the_others() {
+    use eebus::model::{
+        Cmd, Filter, NodeManagementUseCaseData, NodeManagementUseCaseDataUseCaseInformation,
+        NodeManagementUseCaseDataUseCaseInformationUseCaseSupport, UseCaseActor, UseCaseName,
+    };
+
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        manager.read(&theirs, &ours, function, now);
+    }
+    manager.request_subscription(&ours, &theirs, now);
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+
+    let device = pump_station.device().address().clone();
+    assert!(
+        manager
+            .peer(&device)
+            .and_then(|r| r.use_case("limitationOfPowerConsumption", "ControllableSystem"))
+            .is_some(),
+        "the Controllable System was announced"
+    );
+
+    // The heat pump grows a second actor and notifies only that one, as rule 3 of §7.1.5
+    // asks its sibling to and as any sane device would.
+    let added = NodeManagementUseCaseData {
+        use_case_information: Some(vec![NodeManagementUseCaseDataUseCaseInformation {
+            actor: Some(UseCaseActor::from("MonitoredUnit")),
+            use_case_support: Some(vec![
+                NodeManagementUseCaseDataUseCaseInformationUseCaseSupport {
+                    use_case_name: Some(UseCaseName::from("monitoringOfPowerConsumption")),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }]),
+    };
+    let datagram = Datagram {
+        header: Some(eebus::model::Header {
+            specification_version: Some("1.3.0".into()),
+            address_source: Some(theirs.clone()),
+            address_destination: Some(ours.clone()),
+            msg_counter: Some(MsgCounter(9_100)),
+            cmd_classifier: Some(CmdClassifier::Notify),
+            ..Default::default()
+        }),
+        payload: Some(Payload {
+            cmd: Some(vec![
+                Cmd::with_data(CmdData::NodeManagementUseCaseData(added))
+                    .with_filter(Filter::partial()),
+            ]),
+        }),
+    };
+    manager.handle_datagram(&round_trip(&datagram), now);
+
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(
+        remote
+            .use_case("monitoringOfPowerConsumption", "MonitoredUnit")
+            .is_some(),
+        "the new use case arrived"
+    );
+    assert!(
+        remote
+            .use_case("limitationOfPowerConsumption", "ControllableSystem")
+            .is_some(),
+        "and the one the message did not mention is still there"
+    );
+    assert!(
+        events(&mut manager)
+            .iter()
+            .any(|e| matches!(e, SpineEvent::UseCasesUpdated { .. })),
+        "the application was told"
+    );
+}
+
+/// The subscription that makes any of §7.1.5 and §7.5.4 observable is asked for.
+///
+/// One subscription covers both discovery functions — §7.4.1 permits only whole-feature
+/// subscriptions and both live on the primary NodeManagement instance — and without it a
+/// peer's runtime changes are announced to nobody.
+#[test]
+fn a_node_subscribes_to_its_peers_discovery() {
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+    manager.read(
+        &theirs,
+        &ours,
+        Function::NodeManagementDetailedDiscoveryData,
+        now,
+    );
+    pump(&mut manager, &mut pump_station, now);
+
+    let device = pump_station.device().address().clone();
+    manager.subscribe_to_discovery(&device, now);
+    pump(&mut manager, &mut pump_station, now);
+
+    assert!(
+        pump_station.relations().is_subscribed(&ours, &theirs),
+        "the peer granted a subscription to its NodeManagement"
+    );
+    assert!(
+        manager.relations().holds_subscription(&ours, &theirs),
+        "and this side recorded it: §7.4.1 rule 4 keeps it on both partners"
+    );
+    assert!(
+        !manager.relations().is_subscribed(&ours, &theirs),
+        "which is not the same as having granted one — that direction decides who may \
+         write to us and who we notify"
+    );
+
+    // §7.4.3: what each side serves is tailored to the recipient. The manager reports the
+    // relation to the peer it concerns…
+    manager.read(
+        &theirs,
+        &ours,
+        Function::NodeManagementSubscriptionData,
+        now,
+    );
+    pump(&mut manager, &mut pump_station, now);
+    let reported = events(&mut manager)
+        .into_iter()
+        .find_map(|event| match event {
+            SpineEvent::ReplyReceived {
+                resolved: CmdData::NodeManagementSubscriptionData(data),
+                ..
+            } => Some(data),
+            _ => None,
+        })
+        .expect("the peer answered with its subscription table");
+    assert_eq!(
+        reported.subscription_entry.as_ref().map(Vec::len),
+        Some(1),
+        "the peer reports the one subscription that concerns this manager"
+    );
+}
+
+/// §7.4.3: a peer is never told about this device's relations with a third device.
+///
+/// "Between two devices A and B only those subscription entries are exchanged that concern
+/// the devices A and B. I.e. no subscription entries of a third device C are exchanged
+/// between A and B." On a §14a box the whole table is the grid operator's relationship
+/// with the household, and handing it to whatever else is on the LAN is a leak with no
+/// upside.
+#[test]
+fn a_peer_is_not_told_about_this_devices_relations_with_a_third_device() {
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let mut meter = sub_meter();
+    let now = Duration::ZERO;
+
+    let pump_nm = node_management(pump_station.device().address());
+    let manager_nm = node_management(manager.device().address());
+    let meter_nm = node_management(meter.device().address());
+
+    // The heat pump grants a subscription to the manager…
+    manager.request_subscription(&manager_nm, &pump_nm, now);
+    pump(&mut manager, &mut pump_station, now);
+    // …and one to the meter.
+    meter.request_subscription(&meter_nm, &pump_nm, now);
+    pump(&mut meter, &mut pump_station, now);
+    assert_eq!(
+        pump_station.relations().subscriptions().len(),
+        2,
+        "the heat pump granted both"
+    );
+
+    // The manager reads the heat pump's table and sees only its own.
+    manager.read(
+        &pump_nm,
+        &manager_nm,
+        Function::NodeManagementSubscriptionData,
+        now,
+    );
+    pump(&mut manager, &mut pump_station, now);
+    let table = events(&mut manager)
+        .into_iter()
+        .find_map(|event| match event {
+            SpineEvent::ReplyReceived {
+                resolved: CmdData::NodeManagementSubscriptionData(data),
+                ..
+            } => Some(data),
+            _ => None,
+        })
+        .expect("a reply");
+    let entries = table.subscription_entry.as_ref().expect("one entry");
+    assert_eq!(entries.len(), 1, "not the meter's: {entries:?}");
+    assert_eq!(
+        entries[0]
+            .client_address
+            .as_ref()
+            .and_then(|a| a.device.as_ref()),
+        manager.device().address().into(),
+        "and it is this manager's own"
+    );
+}
+
+/// Table 18: an empty table is *absent*, not an empty list.
+///
+/// "SHALL be present if subscription entries are available for the recipient. Otherwise,
+/// it SHALL not be present." A peer that reads `[]` and a peer that reads nothing are
+/// being told the same thing by a specification that took the trouble to distinguish them.
+#[test]
+fn a_relation_table_with_nothing_for_the_recipient_is_absent_rather_than_empty() {
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    let pump_nm = node_management(pump_station.device().address());
+    let manager_nm = node_management(manager.device().address());
+    manager.read(
+        &pump_nm,
+        &manager_nm,
+        Function::NodeManagementSubscriptionData,
+        now,
+    );
+    pump(&mut manager, &mut pump_station, now);
+
+    let table = events(&mut manager)
+        .into_iter()
+        .find_map(|event| match event {
+            SpineEvent::ReplyReceived {
+                resolved: CmdData::NodeManagementSubscriptionData(data),
+                ..
+            } => Some(data),
+            _ => None,
+        })
+        .expect("a reply");
+    assert!(
+        table.subscription_entry.is_none(),
+        "nothing concerns this recipient, so the element is not there: {table:?}"
+    );
+}
+
+/// §7.5.3: a partial use-case read narrows the answer without narrowing what is known.
+///
+/// "In most cases a device is only interested to discover matching use case actors", so a
+/// client filters on `actor` and `useCaseName` and gets a subset back — marked partial, as
+/// §5.3.4.5 requires. A receiver that merged that subset the ordinary way would *replace*
+/// its whole record of the peer with it, so asking a second, narrower question would make
+/// the first answer disappear.
+#[test]
+fn a_partial_use_case_read_narrows_the_answer_and_not_the_record() {
+    use eebus::model::{Filter, FilterSelectors, NodeManagementUseCaseDataSelectors, UseCaseActor};
+
+    let mut pump_station = heat_pump();
+    let mut manager = control_box();
+    let now = Duration::ZERO;
+
+    // The heat pump plays two actors on the same entity.
+    pump_station.add_use_case([1], 1, &eebus::usecases::mpc::MONITORED_UNIT);
+
+    let theirs = node_management(pump_station.device().address());
+    let ours = node_management(manager.device().address());
+
+    // The whole table first, so the manager knows both.
+    manager.read(&theirs, &ours, Function::NodeManagementUseCaseData, now);
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+    let device = pump_station.device().address().clone();
+    assert_eq!(
+        manager.peer(&device).map(|r| r.use_cases.len()),
+        Some(2),
+        "both actors were discovered"
+    );
+
+    // Now a narrower question: "do you play the Controllable System?"
+    let filter = Filter::partial().select(FilterSelectors::NodeManagementUseCaseDataSelectors(
+        NodeManagementUseCaseDataSelectors {
+            use_case_information: Some(
+                eebus::model::NodeManagementUseCaseDataSelectorsUseCaseInformation {
+                    actor: Some(UseCaseActor::from("ControllableSystem")),
+                    ..Default::default()
+                },
+            ),
+        },
+    ));
+    manager.read_filtered(
+        &theirs,
+        &ours,
+        Function::NodeManagementUseCaseData,
+        vec![filter],
+        now,
+    );
+    pump(&mut manager, &mut pump_station, now);
+    let _ = events(&mut manager);
+
+    let remote = manager.peer(&device).expect("the heat pump");
+    assert!(
+        remote
+            .use_case("limitationOfPowerConsumption", "ControllableSystem")
+            .is_some(),
+        "the answer to the narrow question"
+    );
+    assert!(
+        remote
+            .use_case("monitoringOfPowerConsumption", "MonitoredUnit")
+            .is_some(),
+        "and the answer to the wide one is not thrown away by asking a narrow one"
+    );
+}

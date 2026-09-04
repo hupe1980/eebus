@@ -250,6 +250,8 @@ fn the_corpus_demand_signal_is_current() {
         "optimizationOfSelfConsumptionDuringEvCharging",
         "measurementOfElectricityDuringEvCharging",
         "evStateOfCharge",
+        "evChargingSummary",
+        "optimizationOfSelfConsumptionByHeatPumpCompressorFlexibility",
         "monitoringOfInverter",
         "monitoringOfPvString",
         "monitoringOfBattery",
@@ -294,13 +296,8 @@ fn the_corpus_demand_signal_is_current() {
     // implement — worth knowing before a consumer discovers it.
     let expected: Vec<(usize, String)> = vec![
         (4, "coordinatedEvCharging".into()),
-        (4, "evChargingSummary".into()),
         (1, "flexibleStartForWhiteGoods".into()),
         (1, "monitoringAndControlOfSmartGridReadyConditions".into()),
-        (
-            1,
-            "optimizationOfSelfConsumptionByHeatPumpCompressorFlexibility".into(),
-        ),
         (1, "visualizationOfAggregatedBatteryData".into()),
         (1, "visualizationOfAggregatedPhotovoltaicData".into()),
     ];
@@ -549,6 +546,145 @@ fn a_use_case_without_an_address_still_locates_its_features() {
             );
         }
     }
+}
+
+/// [F5] The corpus turns up `evChargingSummary`, and `evcs::locate` finds it on all of
+/// them — including the one that announces the wrong actor.
+///
+/// Four of the eight devices announce this use case, and they do not agree about who they
+/// are: Elli and Spelsberg say `EVSE`, which is what §3.2.1.1 fixes; Kostal says `CEM`,
+/// which §3.2.2.1 explicitly permits for the *client* side; the Porsche Mobile Charger
+/// Connect says `EV`, which the specification does not define for this use case at all.
+/// Matching on the actor name alone would find two of the four, so `locate` matches on the
+/// **role** — §3.2.2 gives the Energy Broker "only client functionality", so a peer serving
+/// a `Bill` is the EVSE whatever it calls itself.
+#[test]
+fn the_charging_summary_is_located_on_every_wallbox_that_announces_it() {
+    use core::time::Duration;
+    use eebus::model::{DeviceType, EntityType};
+    use eebus::spine::{Engine, LocalDevice, LocalEntity, RemoteDevice};
+    use eebus::usecases::emobility::evcs;
+
+    fn resolve(prefix: &str) -> RemoteDevice {
+        let mut device =
+            LocalDevice::new("i:46925", "Corpus-CEM", DeviceType::EnergyManagementSystem)
+                .expect("an address");
+        device
+            .add_entity(LocalEntity::new([1], EntityType::CEM))
+            .expect("one entity");
+        let local = device.address().clone();
+        let mut engine = Engine::new(device);
+        let mut peer = None;
+
+        for (name, wire) in corpus() {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            let mut datagram = parse(&name, &wire);
+            let header = datagram.header.as_mut().expect("a header");
+            let canonical = peer
+                .clone()
+                .or_else(|| {
+                    header
+                        .address_source
+                        .as_ref()
+                        .and_then(|a| a.device.clone())
+                })
+                .expect("a source device");
+            peer = Some(canonical.clone());
+            if let Some(source) = header.address_source.as_mut() {
+                source.device = Some(canonical);
+            }
+            if let Some(destination) = header.address_destination.as_mut() {
+                destination.device = Some(local.clone());
+            }
+            engine.handle_datagram(&datagram, Duration::ZERO);
+        }
+        engine
+            .peer(&peer.unwrap_or_else(|| panic!("no captures for {prefix}")))
+            .unwrap_or_else(|| panic!("{prefix}: the peer was not recorded"))
+            .clone()
+    }
+
+    // Which devices announce it, and under which actor.
+    let mut announced: Vec<(String, String)> = Vec::new();
+    for (name, wire) in corpus() {
+        if !name.contains(".usecase.") {
+            continue;
+        }
+        let datagram = parse(&name, &wire);
+        let Some(CmdData::NodeManagementUseCaseData(data)) = datagram
+            .payload
+            .as_ref()
+            .and_then(|p| p.cmd.as_ref())
+            .and_then(|c| c.first())
+            .and_then(|c| c.data.as_ref())
+        else {
+            continue;
+        };
+        for information in data.use_case_information.iter().flatten() {
+            for support in information.use_case_support.iter().flatten() {
+                if support.use_case_name.as_ref().map(|n| n.as_str()) == Some(evcs::NAME) {
+                    announced.push((
+                        name.split(".usecase.").next().unwrap().to_string(),
+                        information
+                            .actor
+                            .as_ref()
+                            .map(|a| a.as_str().to_string())
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+    }
+    announced.sort();
+    assert_eq!(
+        announced,
+        [
+            ("elli_charger-connect-pro".to_string(), "EVSE".to_string()),
+            (
+                "kostal_kostal-smart-energy-meter".to_string(),
+                "CEM".to_string()
+            ),
+            (
+                "porsche_mobile-charger-connect".to_string(),
+                "EV".to_string()
+            ),
+            (
+                "spelsberg_wallbox-smart-pro".to_string(),
+                "EVSE".to_string()
+            ),
+        ],
+        "the set of devices announcing evChargingSummary, and what each calls itself, \
+         changed"
+    );
+
+    // The three wallboxes serve a `Bill`, so they are located whatever the actor says.
+    for prefix in [
+        "elli_charger-connect-pro",
+        "porsche_mobile-charger-connect",
+        "spelsberg_wallbox-smart-pro",
+    ] {
+        let remote = resolve(prefix);
+        let peer = evcs::locate(&remote)
+            .unwrap_or_else(|| panic!("{prefix}: the Bill feature was not located"));
+        assert_eq!(peer.device, remote.address.clone().unwrap());
+    }
+
+    // The Kostal meter is the *client* of this use case: it announces the name and serves
+    // no `Bill`, so it is not a wallbox and must not be taken for one.
+    let kostal = resolve("kostal_kostal-smart-energy-meter");
+    assert!(
+        kostal
+            .use_cases
+            .iter()
+            .any(|u| u.name.as_str() == evcs::NAME),
+        "it does announce the use case"
+    );
+    assert!(
+        evcs::locate(&kostal).is_none(),
+        "and it serves no Bill, which is what says it is the broker rather than the EVSE"
+    );
 }
 
 /// Every address in the corpus is usable, and **two of them are not conformant**.

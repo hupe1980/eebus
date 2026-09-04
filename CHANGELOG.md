@@ -4,6 +4,253 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [0.6.0] — unreleased
+
+Everything in this release came out of one round of feedback from a consumer (`hems`), and
+half of it is bugs that consumer could not have found from the outside — the shape of the
+API stopped it looking.
+
+### Added
+
+- **`ship::TrustLevel` — SHIP §12.3.2's trust model, with the rules that read it.** Three
+  independent categories and Table 10 transcribed, so `permits_communication`,
+  `permits_pin_transmission` and `permits_ship_commissioning` are the specification's own
+  sentences rather than an assumption. `Trust::Trusted` and `TrustedPeer` carry one;
+  `TrustStore::award_pin_trust` applies §12.5's once-only second factor — the first peer to
+  prove the PIN since a factory reset may act as a SHIP commissioning tool, every later one
+  is capped at 16 — and `HubEvent::PinVerified` / `PinWithheld` report both halves, because
+  a withheld PIN looks from the far end exactly like having none.
+
+- **`Engine::read_filtered` — the partial *read* the crate could serve and not send.**
+  §7.1.3 and §7.5.3 both ask for one by name: "where is your `LoadControl` feature?" and
+  "do you play the Controllable System?", each a few hundred bytes instead of a large
+  device's whole tree. `write_filtered` had existed since 0.5; the read half had not, so the
+  claim that Restricted Function Exchange was "sent as well as served" was only half true.
+
+- **`usecases::ohpcf` — Optimization of Self-Consumption by Heat Pump Compressor
+  Flexibility**, both actors, both scenarios. The second lever in this crate that can ask an
+  appliance for *more*, and a different mechanism from the first: `hvac::cdt` raises a hot
+  water **setpoint** and leaves the circuit's controller to decide, while this **starts a
+  process** — the compressor's optional power consumption — at a time the CEM names, then
+  stops, pauses or resumes it. A tank already at temperature will not run for a higher
+  setpoint; it will run for this, which is what makes pre-heating on surplus PV expressible
+  at all.
+
+  `Flexibility` is the compressor's side: a six-state machine that **refuses before it
+  acknowledges**, the shape LPC's Controllable System established. A pause on a process that
+  is not running, a stop on one never announced as stoppable, a re-schedule after it has
+  started — each is a `Refused` with an `errorNumber`. `Interrupt` has no empty case because
+  [OHPCF-011/7] has none: a compressor always offers at least one way out, and a peer that
+  announces neither is reported rather than assumed. `CompressorOffer` is the CEM's side,
+  and it tells apart four phases of one function — an offer, a process, an ending, and
+  "there is no process" [OHPCF-003], which is a fact rather than an unreadable payload.
+
+  The SMA Home Manager 2 in `tests/fixtures/devices` announces this use case, which is what
+  moved it from specified to deployed.
+
+- **`usecases::emobility::evcs` — EV Charging Summary**, both actors. What a charging
+  session cost and where its energy came from, split into the share off the roof and the
+  share off the grid. It is the one function in this crate a *client* actor writes for
+  somebody else's screen: the EVSE serves a writeable `Bill` and the energy manager fills it
+  in, because only the manager knows what the tariff was.
+
+  Four of the eight devices in the corpus announce it, and they do not agree about who they
+  are — `EVSE` (Elli, Spelsberg), `CEM` (Kostal, which §3.2.2.1 explicitly permits for the
+  client side) and `EV` (the Porsche Mobile Charger Connect, which the specification does not
+  define for this use case at all). So `evcs::locate` matches on the **role**: §3.2.2 gives
+  the Energy Broker "only client functionality", so a peer serving a `Bill` is the EVSE
+  whatever it calls itself, and a CEM announcing the name is excluded by the same rule.
+
+- **`conformance::harness` — the device-level half of the suite, runnable against a box.**
+  Fourteen of the 203 abstract test cases are about the device rather than the protocol, and
+  until now the crate named them and stopped. Seven procedures now carry the High-Level Test
+  Specification's own steps and expected results (tables 15, 17, 19, 28, 31, 33, 34), each
+  answering the LPC case and its LPP twin, and **judge** what a consumer observed against
+  what the device declared in its parameter sheet: the failsafe defaults a factory reset must
+  restore, the `StartUpDur` of §6.11.8 a black start has to come back inside, the sixty
+  seconds a rebooted Energy Guard has to send a heartbeat and the limit that follows it.
+
+  `Verdict::Inconclusive` is the variant that earns its place: a persistence test that writes
+  back the value the device already held proves nothing, and counting it as either a pass or
+  a failure would be a lie in one direction or the other.
+
+- **`Engine::add_entity`, `remove_entity` and `modify_entity`, and SPINE §7.1.5 on both
+  sides.** A
+  device may add, remove or modify its entities while a peer is connected, and neither half
+  of that existed. `LocalDevice::remove_entity` removes an entity and everything addressed
+  beneath it; the engine announces the change as §7.1.5 requires — a notify, restricted, with
+  `lastStateChange: removed` and no `featureInformation` (rule 4) — and releases the bindings,
+  subscriptions and use cases that named the entity's features.
+
+  This is the one message an arrival is not: a peer learns of a new entity from any re-read
+  of discovery, and of a *departure* only from a device that sends this, because a merged
+  discovery document cannot shrink on its own. EVCC scenario 8, the car that drove away, is
+  unobservable without it — in this crate and in a simulator built on it alike.
+
+- **`Node::pending_peers`, `Node::watch_pending`, and public `accept_reporting` /
+  `connect_reporting` / `connect_over_reporting`.** A peer waiting on a trust decision was
+  visible only through `Hub`, and a driver that owns its own `Engine` — because it has to be
+  testable without a socket — could not learn the SKI of the box asking to pair. It can now,
+  told or asked, with a plain `accept` filling the list in either way. Field reports make the
+  SKI exchange the commonest §14a commissioning failure there is, and a box that cannot
+  *display* the number cannot take part in it.
+
+- **`hvac::mdt::locate`**, and `hvac::cdt`'s mode gate: `DhwSetpoints::write_effective` and
+  `effect_of`. A setpoint the circuit's current operation mode does not read is written,
+  acknowledged and changes nothing, and nothing on the wire says so — the gate refuses it,
+  the same shape as the limitation actor refusing a limit with no recent heartbeat. An
+  overrun in progress is reported as a distinct effect rather than refused: the write lands
+  where it was meant to, and takes effect when the one-time heating ends.
+
+- **An interop direction that had never been run: `eebus-go` dialling *this* crate's
+  listener.** Both existing interop tests dial a container that listens, which is the wrong
+  way round for the installation §14a describes and means the accept path had never met an
+  implementation it did not share code with. It needs `--network host` on a native Linux
+  daemon — `eebus-go`'s examples discover their peer over mDNS rather than taking an address,
+  so `host.docker.internal` does not help — and the test skips with that reason rather than
+  reporting a pass where the daemon cannot do it.
+
+### Fixed
+
+- **One unapproved peer could fill the whole pending-trust table by dialling repeatedly.**
+  `MAX_PENDING_TRUST` counted handshakes, and the question is deduplicated by SKI — so a
+  device dialling four times was asked about once and spent four slots, leaving no room for
+  a peer a user might actually want to approve. It is now one slot per SKI, which is safe to
+  enforce because a SKI came out of a completed TLS handshake and an address proves nothing.
+  (R13)
+
+- **This node's PIN was sent to any peer that asked for one.** SHIP §12.5: "The PIN is an
+  authentication secret that must be kept confidential and SHALL only be shared with
+  authenticated and authorized communication partners. Therefore, the SHIP node PIN SHALL
+  NOT be transmitted if the public key of the corresponding communication partner has a
+  user trust level that is less than '32'." Trust here was a boolean, so there was nothing
+  to check against — safe only because `TrustStore` has no auto-accept mode, which is an
+  invariant nothing checked and nothing wrote down. SHIP §12.3.2's trust model is now
+  implemented: three categories, Table 10 transcribed, and the three rules that read the
+  numbers. (D97)
+
+- **What identifies a list entry was guessed from a naming convention, and was wrong in
+  both directions.** The generator took an entry's identity to be the leading run of
+  elements typed `*IdType`. SPINE §3.4.2.1 distinguishes an identifier that *addresses* an
+  entry — PRIMARY, SUB — from a FOREIGN one that refers to another feature and "is **not**
+  used to create further dimensions of list entries", and the convention cannot see the
+  difference. Every way it was wrong produced no error anywhere: a partial update whose
+  entry matches nothing stored is *appended*.
+
+  * `hvacSystemFunctionData` was identified by `{systemFunctionId, currentOperationModeId}`
+    — the second being *the mode the DHW circuit is in*, which Table 64 marks FOREIGN. A
+    circuit notifying `auto → off` partially left the appliance holding **two** system
+    functions and `mdsf::DhwSystemFunction` reading whichever came first, for ever.
+  * `setpointDescriptionData` demanded `measurementId` and `timeTableId`, both marked
+    FOREIGN by Table 117 and both conditional — "Otherwise it SHALL be omitted" — so a
+    conformant description that links to neither had no identity and was refused with
+    `errorNumber` 7.
+  * `powerTimeSlotScheduleData` was identified by `{sequenceId}` alone, because
+    `PowerTimeSlotNumberType` does not end in `IdType` — losing the case §3.4.1 uses as its
+    own worked example: "a 'slot' with number 2 of 'sequence' 5 is different to 'slot' 2 of
+    'sequence' 7".
+
+  The generator now reads the specification's own answer: **Annex B.7, Table 358** lists
+  every identifier type and the element it is used as, and two tests derived from §3.4.2.1
+  separate identity from reference. Six entry types changed, each checked against the
+  element-rules table that governs it, and `tests/list_identifiers.rs` writes the answers
+  down. (D93)
+
+- **Nothing subscribed to discovery, so a peer's runtime changes were announced to nobody.**
+  §7.5.4 says it outright — "a device that uses use case discovery **should always
+  subscribe** to use case discovery" — and §7.1.5 gives it teeth: a peer's *departing*
+  entity is announced only to subscribers, because a discovery document merges and a shorter
+  re-send says nothing about what went. `Hub` now asks for one when discovery completes,
+  which is the first moment the peer's device address is known; `Engine::subscribe_to_discovery`
+  is the same thing for a driver that owns its engine. One subscription covers both
+  functions — §7.4.1 permits only whole-feature subscriptions. (D94)
+
+- **A partial `nodeManagementUseCaseData` erased every use case a peer plays.** The same
+  defect as the discovery tree below and for the same reason: its entries are keyed by an
+  `address` the wire makes optional — absent from every SPINE 1.1.1 peer in the corpus — and
+  an `actor`, which is not an identifier type, so the generic merge replaced the list. It is
+  now merged by §7.5.4's own rules, beside detailed discovery. (D94)
+
+- **The binding and subscription tables were sent to every peer in full.** §7.4.3: "between
+  two devices A and B only those subscription entries are exchanged that concern the devices
+  A and B. I.e. no subscription entries of a third device C are exchanged between A and B."
+  Serving the whole table tells every peer which other peers this device is talking to and
+  how — on a §14a box, the grid operator's relationship with the household, handed to
+  whatever else is on the LAN. The tables are now built per recipient, and the list element
+  is *absent* rather than empty when nothing concerns them, which Table 18 distinguishes
+  deliberately. (D95)
+
+- **A relation this device held existed only inside whichever actor asked for it.** §7.4.1
+  rule 4 — "Subscription information SHALL be kept persistently by **both** subscription
+  partners" — and §7.4.3 has each entry describe an own feature's relation to a partner's,
+  in either direction. `Relations` now records which side this device is on, and the engine
+  records a held relation when the `result` for its own request comes back clean. A held
+  relation carries no identifier, because Table 18 makes `subscriptionId` optional and says
+  the value is the *server's* to assign. (D95)
+
+- **An accepted partial write on OHPCF's feature notified every subscriber of a compressor
+  that had withdrawn everything it announced.** `smartEnergyManagementPsData` is one value
+  rather than a list SPINE can address entries within, and OHPCF's Table 10 makes the
+  partial write mandatory — so storing the CEM's two-field fragment replaced the
+  compressor's whole `alternatives` element, and §7.4.1 notified every subscriber of the
+  result, the writer included. `Engine::accept_write_with` stores the document the
+  *application* says the write results in and notifies once; `accept_write` is unchanged and
+  stays right for every list function, which is every other writeable function here. (D96)
+
+- **A peer's discovery tree was destroyed by any conformant runtime update to it.**
+  `nodeManagementDetailedDiscoveryData` is not a list in SPINE's sense — it is three parallel
+  lists inside one value — so the generic partial merge *replaced* `entityInformation`
+  wholesale. §7.1.5 rule 3 has a device send only what changed, so a peer announcing one new
+  entity would have taken every other entity it had ever announced with it. The engine now
+  merges this one function by §7.1.5's own rules and keeps it outside the bounded per-peer
+  table, where an eviction would have left the next fragment merging into nothing. A
+  `cmdClassifier: delete` — which the specification does not prescribe here, but which a peer
+  meaning "this entity is gone" might send — removes what it names instead of clearing the
+  whole document.
+
+- **`RemoteDevice::feature_for` located nothing on three of the eight devices in the
+  corpus.** A use case may announce its address as a device with no entity part, and the
+  entity path of such an address is `[]` — which named an entity no device has, so every
+  `locate` in the crate returned `None` for the Elli Charger Connect Pro, the Spelsberg
+  Wallbox Smart Pro and the Kostal Smart Energy Meter. An address that names no entity now
+  takes the same route as no address at all: the feature is what says where the actor is.
+  Found while implementing EVCS against the corpus.
+
+- **`monitoring::locate` required features MGCP ties to optional scenarios.**
+  §3.2.2.2.1 says the feature table's presence indications are "meant relative to the ones of
+  the according Scenario stated in Table 1", and Table 1 marks those separately per actor:
+  `DeviceConfiguration` belongs to scenario 1, `Measurement` and `ElectricalConnection` to
+  scenarios 2 to 7. All three fields of `MonitoredUnitPeer` are now `Option`, `attach` reads
+  only what the peer serves, and `locate` requires only that it serve at least one of them —
+  a peer announcing the use case and none of its features is still reported as `None`,
+  because there would be nothing to read from it.
+
+### Changed
+
+- **Every enum this crate *reports* through is `#[non_exhaustive]`.** `HubEvent`,
+  `SpineEvent`, `ship::Event`, every actor's event type, `ConnectionError`, `AbortReason`,
+  `Disconnect`: a `match` on one now needs a `_` arm. Enums the **specification** closes —
+  `LimitationState`'s five states, `Trust`, `PinState`, every generated enumeration — stay
+  exhaustive, because a new variant there means the standard moved and a consumer should be
+  made to look. This release alone added five `HubEvent` variants; without the attribute
+  each was a breaking change for a consumer that had done nothing. (D98)
+- **`Trust::Trusted` carries a `TrustLevel`.** `Trust::VERIFIED` is the old meaning — a
+  person approved the SKI, Table 10's `user verified`.
+- **`Handshake::send_pin` returns `bool`** and is gated by §12.5;
+  `send_pin_if_permitted` sends what `HandshakeConfig::peer_pin` holds under the same rule
+  and discards it afterwards, which §12.5 asks for.
+- **`Relation` says which side of a relation this device is on.** `id` is now
+  `Option<u32>` — a relation this device holds carries the peer's identifier, which it does
+  not know — and `held` says which direction it is. `is_bound` and `is_subscribed` still
+  mean *granted*, because they answer "may this peer write to us?" and "who do we notify?";
+  `holds_binding` and `holds_subscription` are the other question.
+- **`HubEvent::TrustRequested` carries a `PendingPeer` instead of a bare `ski`.** Both
+  identities SHIP knows a node by, both proved rather than claimed: the SKI printed on the
+  box, and the certificate fingerprint a QR code carries as `FPH256`. Match on `peer.ski`
+  where you matched on `ski`.
+- **`runtime::TrustReporter` is public** and takes a `PendingPeer`.
+- **`LocalDevice`, `LocalEntity`, `LocalFeature` and `FunctionEntry` derive `PartialEq`.**
+
 ## [0.5.0] — unreleased
 
 ### Fixed

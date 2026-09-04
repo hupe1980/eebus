@@ -3,7 +3,7 @@ title = "eebus"
 template = "index.html"
 [extra]
 landing = true
-lede = """An unofficial EEBUS implementation in Rust: the SHIP transport, the SPINE information model, and seventeen use cases on top — built to pass certification, not merely to interoperate."""
+lede = """An unofficial EEBUS implementation in Rust: the SHIP transport, the SPINE information model, and nineteen use cases on top — built to pass certification, not merely to interoperate."""
 status = "Under construction. The stack is complete from the socket to the use case; the API will change and nothing is published to crates.io yet."
 
 hero_code = """
@@ -26,7 +26,7 @@ if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
 value = "830"
 label = "SPINE types, generated"
 [[extra.stats]]
-value = "17"
+value = "19"
 label = "use cases, both actors"
 [[extra.stats]]
 value = "no_std"
@@ -57,7 +57,7 @@ body = "Everything below the runtime builds for no_std + alloc, checked in CI ag
 
 [[extra.features]]
 title = "Checked against other implementations"
-body = "Fifteen datagrams captured from eight real devices by seven manufacturers are driven through an engine, resolved into a device model, and used to seed the fuzzers. An opt-in suite runs eebus-go's own examples in a container and drives the whole §14a exchange against them, in both directions."
+body = "Fifteen datagrams captured from eight real devices by seven manufacturers are driven through an engine, resolved into a device model, and used to seed the fuzzers. An opt-in suite runs eebus-go's own examples in a container and drives the whole §14a exchange against them — this crate dialling, and the peer dialling in."
 
 [[extra.features]]
 title = "The wire format, directly"

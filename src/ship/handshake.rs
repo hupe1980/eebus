@@ -11,8 +11,8 @@
 //! use eebus::ship::{Handshake, HandshakeConfig, Role, ShipMessage, Trust};
 //!
 //! let t0 = Duration::ZERO;
-//! let mut client = Handshake::new(Role::Client, HandshakeConfig::default(), Trust::Trusted, t0);
-//! let mut server = Handshake::new(Role::Server, HandshakeConfig::default(), Trust::Trusted, t0);
+//! let mut client = Handshake::new(Role::Client, HandshakeConfig::default(), Trust::VERIFIED, t0);
+//! let mut server = Handshake::new(Role::Server, HandshakeConfig::default(), Trust::VERIFIED, t0);
 //!
 //! // Pump both sides until neither has anything left to say.
 //! let mut now = t0;
@@ -55,7 +55,7 @@ use super::{
     FORMAT_JSON_UTF8, KeyMaterialState, KeyMaterialStateRequest, KeyMaterialStateResponse,
     MessageProtocolFormat, MessageProtocolFormats, MessageProtocolHandshake,
     MessageProtocolHandshakeError, MessageProtocolHandshakeVersion, PinInputPermission, PinState,
-    ProtocolHandshakeType, ShipMessage,
+    ProtocolHandshakeType, ShipMessage, TrustLevel,
 };
 
 /// Which end of the TCP connection this node is.
@@ -74,12 +74,34 @@ pub enum Role {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trust {
     /// The key is known and accepted; the hello phase can complete immediately.
-    Trusted,
+    ///
+    /// The [`TrustLevel`] is not decoration. §12.3.2 states three rules about the *numbers*
+    /// — talk at all, send a PIN, commission — and a stack that only knows "trusted" cannot
+    /// apply any of them. [`TrustLevel::USER_VERIFIED`] is what a person approving a SKI
+    /// amounts to, and what [`TrustStore`](crate::runtime::TrustStore) records.
+    ///
+    /// A level below [`MIN_USER_TRUST`](super::MIN_USER_TRUST) aborts the handshake rather
+    /// than opening it: "if the 'user trust' is less than '8', the communication SHALL be
+    /// aborted".
+    Trusted(TrustLevel),
     /// A person still has to approve the key. The peer is told to wait, and
     /// [`Handshake::set_trust`] delivers the answer when it arrives.
     Pending,
     /// The key is refused; the handshake aborts.
     Rejected,
+}
+
+impl Trust {
+    /// A peer a person approved: [`TrustLevel::USER_VERIFIED`], Table 10's `user verified`.
+    pub const VERIFIED: Self = Self::Trusted(TrustLevel::USER_VERIFIED);
+
+    /// What this peer is trusted at, or [`TrustLevel::UNTRUSTED`] if it is not.
+    pub fn level(self) -> TrustLevel {
+        match self {
+            Self::Trusted(level) => level,
+            Self::Pending | Self::Rejected => TrustLevel::UNTRUSTED,
+        }
+    }
 }
 
 /// Whether this node demands a PIN before it will exchange data (SHIP §13.4.4.3.5.1).
@@ -275,6 +297,7 @@ pub enum Phase {
 
 /// Something the application needs to know about.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     /// The peer's key is not yet trusted and the peer has been told to wait. Show the
     /// SKI to the user and answer with [`Handshake::set_trust`].
@@ -293,6 +316,24 @@ pub enum Event {
     },
     /// The peer reported its PIN requirement.
     PeerPinState(PinState),
+    /// The peer proved it holds this node's PIN (§12.5).
+    ///
+    /// Worth acting on rather than logging: it is a *second factor*, and §12.5 makes the
+    /// first peer to present one since a factory default eligible for the trust that lets
+    /// it act as a SHIP commissioning tool. Answer it with
+    /// [`TrustStore::award_pin_trust`](crate::runtime::TrustStore::award_pin_trust), which
+    /// applies the once-only rule because only a store that outlives the connection can.
+    PeerPinVerified,
+    /// This node's PIN was **not** sent, because the peer is not trusted enough (§12.5).
+    ///
+    /// "the SHIP node PIN SHALL NOT be transmitted if the public key of the corresponding
+    /// communication partner has a user trust level that is less than '32'". The connection
+    /// carries on and the peer keeps data exchange restricted, which looks exactly like
+    /// having no PIN at all — so this says which it was.
+    PinWithheld {
+        /// What the peer is trusted at, which was not enough.
+        level: TrustLevel,
+    },
     /// The peer supplied its access methods.
     PeerAccessMethods(AccessMethods),
     /// The peer's `hello` announced the state of its key material (SHIP §12.1.3.4).
@@ -321,6 +362,7 @@ pub enum Event {
 
 /// Why a handshake ended early.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AbortReason {
     /// A timer expired.
     #[error("timeout in the {0:?} phase")]
@@ -562,22 +604,55 @@ impl Handshake {
     /// It stays available after this node's own data exchange has opened: §13.4.4.3.5.2
     /// lets each side decide for itself, so a node with no PIN of its own is already in
     /// data exchange while the peer is still holding back for one.
-    pub fn send_pin(&mut self, pin: impl Into<String>) {
+    /// Returns whether it went. §12.5 forbids sending a PIN to a peer below user trust 32
+    /// — see [`send_pin_if_permitted`](Self::send_pin_if_permitted), which this defers to
+    /// — and the phase and the peer's own state have to allow it.
+    pub fn send_pin(&mut self, pin: impl Into<String>) -> bool {
+        self.config.peer_pin = Some(pin.into());
+        self.send_pin_if_permitted()
+    }
+
+    /// Sends [`HandshakeConfig::peer_pin`] if §12.5 permits it, and reports whether it did.
+    ///
+    /// **The PIN is an authentication secret.** §12.5: "the SHIP node PIN SHALL NOT be
+    /// transmitted if the public key of the corresponding communication partner has a user
+    /// trust level that is less than '32'." A peer admitted by auto-accept alone is at 8,
+    /// and sending it a PIN hands the secret to whoever answered the socket — which is the
+    /// whole reason the QR-code flow of §12.5 exists.
+    ///
+    /// Withholding it is reported as [`Event::PinWithheld`] rather than passed over in
+    /// silence: from the peer's side the connection simply stays restricted, and the
+    /// difference between "we have no PIN" and "we will not give this peer ours" is one an
+    /// installer has to be able to see.
+    ///
+    /// The PIN is **discarded** once sent, which §12.5 asks for — "After the SHIP node PIN
+    /// was transmitted, the sender SHOULD discard the PIN" — so it does not sit in memory
+    /// for the life of the connection.
+    pub fn send_pin_if_permitted(&mut self) -> bool {
         if !matches!(self.phase, Phase::Pin | Phase::DataExchange) {
-            return;
+            return false;
         }
         if !matches!(
             self.peer_pin_state,
             Some(PinState::Required | PinState::Optional)
         ) {
-            return;
+            return false;
         }
+        let level = self.trust.level();
+        if !level.permits_pin_transmission() {
+            self.events.push_back(Event::PinWithheld { level });
+            return false;
+        }
+        let Some(pin) = self.config.peer_pin.take() else {
+            return false;
+        };
         self.outbox
             .push_back(ShipMessage::Control(ControlMessage::ConnectionPinInput(
                 ConnectionPinInput {
-                    pin: Some(super::PinValue(pin.into())),
+                    pin: Some(super::PinValue(pin)),
                 },
             )));
+        true
     }
 
     /// Sends this node's key material to the peer (SHIP §12.1.3.2).
@@ -785,7 +860,22 @@ impl Handshake {
         let waiting = self.config.hello_init;
         let key_material_state = self.hello_key_material();
         let hello = match self.trust {
-            Trust::Trusted => {
+            // §12.3.2: "if the 'user trust' is less than '8', the communication SHALL be
+            // aborted". A caller that hands back a level below the floor has said "I
+            // accept this key" and "nothing vouches for it" in one breath; the
+            // specification settles which wins.
+            Trust::Trusted(level) if !level.permits_communication() => {
+                self.outbox
+                    .push_back(ShipMessage::Control(ControlMessage::ConnectionHello(
+                        ConnectionHello {
+                            phase: Some(ConnectionHelloPhase::Aborted),
+                            ..Default::default()
+                        },
+                    )));
+                self.abort(AbortReason::TrustRejected);
+                return;
+            }
+            Trust::Trusted(_) => {
                 self.hello_local_ready = true;
                 ConnectionHello {
                     phase: Some(ConnectionHelloPhase::Ready),
@@ -1181,14 +1271,9 @@ impl Handshake {
         // data exchange restricted, which is its right.
         if matches!(pin_state, PinState::Required | PinState::Optional)
             && state.input_permission != Some(PinInputPermission::Busy)
-            && let Some(pin) = self.config.peer_pin.clone()
+            && self.config.peer_pin.is_some()
         {
-            self.outbox
-                .push_back(ShipMessage::Control(ControlMessage::ConnectionPinInput(
-                    ConnectionPinInput {
-                        pin: Some(super::PinValue(pin)),
-                    },
-                )));
+            self.send_pin_if_permitted();
         }
 
         self.try_finish_pin(now);
@@ -1214,6 +1299,11 @@ impl Handshake {
 
         if matches_pin {
             self.local_pin_state = PinState::PinOk;
+            // §12.5: proving it holds the PIN earns the peer a *second factor* trust, and
+            // with it the right to commission over SHIP. How much is the store's to say —
+            // only the first peer since a factory default may have 32 — so the fact is
+            // reported and the decision is not taken here.
+            self.events.push_back(Event::PeerPinVerified);
             self.outbox
                 .push_back(ShipMessage::Control(ControlMessage::ConnectionPinState(
                     ConnectionPinState {

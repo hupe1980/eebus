@@ -121,7 +121,7 @@ impl Operations {
 }
 
 /// One function of a feature: what it is, what may be done with it, and its data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FunctionEntry {
     /// The function's name.
     pub function: Function,
@@ -153,7 +153,7 @@ pub enum WriteApproval {
 }
 
 /// A feature of a local entity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalFeature {
     address: AddressFeature,
     feature_type: FeatureType,
@@ -466,7 +466,7 @@ impl FeatureError {
 }
 
 /// An entity of the local device.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalEntity {
     address: Vec<u32>,
     entity_type: EntityType,
@@ -569,6 +569,16 @@ pub enum DeviceError {
     /// Two entities claim the same address.
     #[error("an entity with that address already exists")]
     DuplicateEntityAddress,
+    /// No entity of this device has that address.
+    #[error("this device has no entity at that address")]
+    UnknownEntity,
+    /// Entity `[0]` was asked to be removed.
+    ///
+    /// §7.1.2 makes it the primary NodeManagement instance, which is how every peer
+    /// reaches this device at all: without it there is nothing to read discovery from,
+    /// and nothing to notify the removal *to*.
+    #[error("entity [0] carries the primary NodeManagement instance and cannot be removed")]
+    EntityZeroIsMandatory,
     /// The device address did not match the pattern of §7.1.1.2.
     #[error(transparent)]
     Address(#[from] super::AddressError),
@@ -595,7 +605,7 @@ pub enum DeviceError {
 /// assert_eq!(device.entities().len(), 2);
 /// assert!(device.node_management().is_some());
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalDevice {
     address: AddressDevice,
     device_type: DeviceType,
@@ -698,6 +708,60 @@ impl LocalDevice {
         }
         self.entities.push(entity);
         Ok(())
+    }
+
+    /// Removes an entity and everything beneath it.
+    ///
+    /// The counterpart of [`add_entity`](Self::add_entity), and the half a device that
+    /// changes at runtime needs: SPINE §7.1.5 lets a device "add/remove/modify one or
+    /// more of its entities or features" while a peer is connected — a heat pump whose
+    /// DHW circuit is decommissioned, an EVSE whose car drives away, a simulator asked to
+    /// produce the case. Announcing it is [`Engine::remove_entity`](super::Engine::remove_entity),
+    /// which is what a peer hears; this is the model change alone.
+    ///
+    /// **Sub-entities go with it.** SPINE entity addresses nest, and `[1, 1]` is a part of
+    /// `[1]` rather than a neighbour of it — a compressor inside a heat pump appliance,
+    /// say. An entity whose parent is gone is unreachable, so removing the parent removes
+    /// it too; every removed entity is returned, the named one first, so a caller can see
+    /// what went and announce all of it.
+    ///
+    /// Returns [`DeviceError::EntityZeroIsMandatory`] for entity `[0]`, and
+    /// [`DeviceError::UnknownEntity`] where there is nothing at that address.
+    ///
+    /// ```
+    /// use eebus::prelude::*;
+    ///
+    /// let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)?;
+    /// device.add_entity(LocalEntity::new([1], EntityType::HeatPumpAppliance))?;
+    /// device.add_entity(LocalEntity::new([1, 1], EntityType::Compressor))?;
+    ///
+    /// let gone = device.remove_entity(&[1])?;
+    /// assert_eq!(gone.len(), 2, "the compressor cannot outlive the appliance");
+    /// assert_eq!(device.entities().len(), 1, "entity [0] is still there");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn remove_entity(&mut self, address: &[u32]) -> Result<Vec<LocalEntity>, DeviceError> {
+        if address == [NODE_MANAGEMENT_ENTITY] {
+            return Err(DeviceError::EntityZeroIsMandatory);
+        }
+        if !self.entities.iter().any(|e| e.address == address) {
+            return Err(DeviceError::UnknownEntity);
+        }
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.entities.len());
+        for entity in core::mem::take(&mut self.entities) {
+            if entity.address == address {
+                // The named entity first, whatever order the list is in: it is the one a
+                // caller asked about and the one an announcement leads with.
+                removed.insert(0, entity);
+            } else if entity.address.starts_with(address) {
+                removed.push(entity);
+            } else {
+                kept.push(entity);
+            }
+        }
+        self.entities = kept;
+        Ok(removed)
     }
 
     /// The device's entities, entity `[0]` first.

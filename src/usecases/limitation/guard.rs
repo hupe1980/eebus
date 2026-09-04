@@ -125,6 +125,7 @@ pub fn locate(remote: &RemoteDevice, direction: Direction) -> Option<Controllabl
 
 /// What the Energy Guard learned about one Controllable System.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum GuardEvent {
     /// The pre-scenario communication finished: both bindings are held, the peer's own
     /// `limitId` has been read, and the limit can be written.

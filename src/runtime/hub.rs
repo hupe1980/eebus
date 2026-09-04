@@ -24,7 +24,7 @@
 //!
 //! loop {
 //!     match hub.next().await? {
-//!         HubEvent::TrustRequested { ski, .. } => hub.approve(ski), // or show it to a user
+//!         HubEvent::TrustRequested { peer, .. } => hub.approve(peer.ski), // or show it
 //!         HubEvent::PeerDiscovered { device, .. } => println!("found {}", device.as_str()),
 //!         HubEvent::Spine(event) => { /* hand it to a use case */ }
 //!         HubEvent::Disconnected { ski, .. } => println!("lost {ski}"),
@@ -120,6 +120,7 @@ const MAX_SIGHTINGS: usize = 64;
 
 /// Why a connection ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Disconnect {
     /// The peer closed it, or the socket failed.
     Remote,
@@ -187,6 +188,7 @@ impl core::fmt::Display for Origin {
 // sake of a stack frame nobody is short of.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum HubEvent {
     /// A peer this node has not approved has connected and is waiting for a decision.
     ///
@@ -198,10 +200,37 @@ pub enum HubEvent {
     /// the [`TrustStore`](super::TrustStore) directly, or scanned from a QR code — gets
     /// through just the same.
     TrustRequested {
-        /// The peer, as its certificate proved it.
-        ski: Ski,
+        /// The peer, as its certificate proved it: both the SKI a user compares against
+        /// the label and the fingerprint a QR code carries.
+        peer: super::PendingPeer,
         /// Which end dialled, and where the peer is.
         origin: Origin,
+    },
+    /// A peer proved it holds this node's PIN (SHIP §12.5).
+    ///
+    /// A second factor, and §12.5 makes the *first* peer to present one since a factory
+    /// default eligible to act as a SHIP commissioning tool. The hub has already applied
+    /// that rule through [`TrustStore::award_pin_trust`](super::TrustStore::award_pin_trust);
+    /// this reports what came of it, so a device can persist the store and show somebody
+    /// which peer is now the commissioning tool.
+    PinVerified {
+        /// The peer.
+        ski: Ski,
+        /// What it is trusted at now. [`None`] if it is not in the trust store.
+        level: Option<crate::ship::TrustLevel>,
+    },
+    /// This node's PIN was **not** sent to a peer, because §12.5 forbids it.
+    ///
+    /// "the SHIP node PIN SHALL NOT be transmitted if the public key of the corresponding
+    /// communication partner has a user trust level that is less than '32'". From the
+    /// peer's side this looks exactly like having no PIN at all — the connection carries on
+    /// with data exchange restricted — so an installer watching a commissioning fail needs
+    /// this to tell the two apart.
+    PinWithheld {
+        /// The peer.
+        ski: Ski,
+        /// What it is trusted at, which was not enough.
+        level: crate::ship::TrustLevel,
     },
     /// A peer completed the SHIP handshake and is now connected.
     Connected {
@@ -333,7 +362,10 @@ enum Inbound {
     /// The listener accepted a socket; the hub decides whether to run it.
     Accepted(TcpStream),
     /// A handshake in progress found the peer unapproved and told it to wait.
-    TrustRequested { ski: Ski, origin: Origin },
+    TrustRequested {
+        peer: super::PendingPeer,
+        origin: Origin,
+    },
     /// A handshake reached the data phase.
     Established {
         connection: Box<ShipConnection>,
@@ -790,8 +822,8 @@ impl Hub {
     /// A callback that turns a handshake's trust request into an event on this hub.
     fn reporter(&self, origin: Origin) -> TrustReporter {
         let inbox = self.inbox_tx.clone();
-        Box::new(move |ski| {
-            let _ = inbox.send(Inbound::TrustRequested { ski, origin });
+        Box::new(move |peer| {
+            let _ = inbox.send(Inbound::TrustRequested { peer, origin });
         })
     }
 
@@ -1276,9 +1308,9 @@ impl Hub {
     ///
     /// hub.listen("0.0.0.0:4712").await?;
     /// hub.run(|hub, event| {
-    ///     if let HubEvent::TrustRequested { ski, .. } = event {
-    ///         println!("approve {ski}?"); // a real device asks its user
-    ///         hub.approve(ski);
+    ///     if let HubEvent::TrustRequested { peer, .. } = event {
+    ///         println!("approve {}?", peer.ski); // a real device asks its user
+    ///         hub.approve(peer.ski);
     ///     }
     ///     ControlFlow::Continue(())
     /// })
@@ -1475,13 +1507,24 @@ impl Hub {
     fn handle_inbound(&mut self, inbound: Inbound) {
         match inbound {
             Inbound::Accepted(stream) => self.accept(stream),
-            Inbound::TrustRequested { ski, origin } => {
+            Inbound::TrustRequested { peer, origin } => {
+                let ski = peer.ski;
                 if self.awaiting_trust.iter().any(|(held, _)| held == &origin) {
                     // The same handshake reporting twice, which it does not, but a
                     // duplicate must not consume a second slot.
                     return;
                 }
-                if self.awaiting_trust.len() >= MAX_PENDING_TRUST {
+                // **One slot per SKI.** One peer is one decision — answering it releases
+                // every handshake that SKI is holding, because the trust store is what
+                // they all watch — so a second pending handshake from the same peer buys
+                // nothing and spends a slot. Without this, a single device dialling four
+                // times fills the table on its own and no other peer can ask to be paired.
+                //
+                // Keying on the SKI rather than on the source address is what makes this
+                // safe to enforce: the SKI came out of a completed TLS handshake, so the
+                // peer proved it holds the key. An address proves nothing.
+                let already_waiting = self.awaiting_trust.iter().any(|(_, held)| held == &ski);
+                if !already_waiting && self.awaiting_trust.len() >= MAX_PENDING_TRUST {
                     // Refused rather than queued: the peer is told `hello: aborted` and
                     // its slot comes back at once, where leaving it pending would hold a
                     // connection for minutes on nobody's authority. It may ask again.
@@ -1493,20 +1536,15 @@ impl Hub {
                     });
                     return;
                 }
-                self.awaiting_trust.push((origin, ski));
-                // The peer whose SKI is *already* waiting on a decision is not asked
-                // about twice: one peer is one decision, and answering it releases every
-                // handshake it is holding, because the trust store is what they watch.
-                if self
-                    .awaiting_trust
-                    .iter()
-                    .filter(|(_, waiting)| waiting == &ski)
-                    .count()
-                    == 1
-                {
-                    self.pending
-                        .push_back(HubEvent::TrustRequested { ski, origin });
+                if already_waiting {
+                    // The same peer on a second connection. It keeps the slot it has and
+                    // the one decision already outstanding; this handshake waits on the
+                    // same answer, so there is nothing to ask and nothing to record.
+                    return;
                 }
+                self.awaiting_trust.push((origin, ski));
+                self.pending
+                    .push_back(HubEvent::TrustRequested { peer, origin });
             }
             #[cfg(all(feature = "mdns", feature = "pairing"))]
             Inbound::Pairing(event) => self.evaluate_pairing(event),
@@ -1713,6 +1751,17 @@ impl Hub {
         {
             link.announced = true;
             let ski = link.ski;
+            // §7.5.4: "a device that uses use case discovery should always subscribe to
+            // use case discovery", and §7.1.5 makes the same subscription the only way to
+            // hear that one of the peer's entities has *gone*. One subscription covers
+            // both — §7.4.1 permits only whole-feature subscriptions, and the two
+            // discovery functions live on the same NodeManagement instance.
+            //
+            // Here rather than beside the opening reads, because those are addressed
+            // without a device part (§2.7) and a subscription request needs one. A peer
+            // that declines answers with a `result`, which reaches the application as a
+            // `SpineEvent` and changes nothing else.
+            self.engine.subscribe_to_discovery(&device, now);
             self.pending
                 .push_back(HubEvent::PeerDiscovered { ski, device });
         }
@@ -1727,6 +1776,14 @@ impl Hub {
 
         for index in 0..self.links.len() {
             let ski = self.links[index].ski;
+            for outcome in self.links[index].connection.take_pin_events() {
+                moved = true;
+                self.pending.push_back(match outcome {
+                    super::PinOutcome::Verified { level } => HubEvent::PinVerified { ski, level },
+                    super::PinOutcome::Withheld { level } => HubEvent::PinWithheld { ski, level },
+                });
+            }
+
             let announced = self.links[index].connection.take_peer_key_material();
             for state in announced {
                 // The curve is the one this connection negotiated. This backend offers

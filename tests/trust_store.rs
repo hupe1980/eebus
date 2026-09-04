@@ -104,3 +104,42 @@ fn forgetting_one_peer_leaves_the_others() {
     assert!(store.is_trusted(&ski(2)));
     assert_eq!(store.all(), [ski(2)]);
 }
+
+/// §12.5: only the first peer to present a valid PIN may become the commissioning tool.
+///
+/// "In SHIP, it is not possible that two SHIP nodes may gain a second factor trust of '32'
+/// with the SHIP node PIN. Any SHIP node that sends the PIN afterwards SHALL only get a
+/// second factor trust of '16'. If another communication partner should be the one with a
+/// second factor trust of '32', a factory reset must be performed."
+#[test]
+fn only_the_first_peer_to_prove_the_pin_may_commission() {
+    use eebus::ship::TrustLevel;
+
+    let first: Ski = "1111111111111111111111111111111111111111".parse().unwrap();
+    let second: Ski = "2222222222222222222222222222222222222222".parse().unwrap();
+    let store = TrustStore::restored([TrustedPeer::new(first), TrustedPeer::new(second)]);
+
+    let awarded = store.award_pin_trust(&first).expect("a known peer");
+    assert_eq!(awarded.second_factor, TrustLevel::SECOND_FACTOR_PIN_FIRST);
+    assert!(awarded.permits_ship_commissioning());
+
+    let later = store.award_pin_trust(&second).expect("a known peer");
+    assert_eq!(
+        later.second_factor,
+        TrustLevel::SECOND_FACTOR_PIN_LATER,
+        "the second peer gets 16, and no factory reset has happened"
+    );
+
+    // A key the store does not hold gains nothing: a second factor is trust added to a
+    // key, not a way in on its own.
+    let stranger: Ski = "3333333333333333333333333333333333333333".parse().unwrap();
+    assert_eq!(store.award_pin_trust(&stranger), None);
+
+    // And after the reset §12.5 names, the next peer may be the commissioning tool again.
+    store.forget_all();
+    let store = TrustStore::restored([TrustedPeer::new(second)]);
+    assert_eq!(
+        store.award_pin_trust(&second).map(|l| l.second_factor),
+        Some(TrustLevel::SECOND_FACTOR_PIN_FIRST)
+    );
+}

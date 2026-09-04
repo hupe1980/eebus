@@ -322,3 +322,168 @@ fn a_car_without_a_data_link_is_not_asked_about_its_battery() {
     battery.apply(&evsoc::nominal_capacity(77_000.0), &readings);
     assert_eq!(battery.energy_to_full(), Some(46_200.0));
 }
+
+/// [F5] The summary goes the other way: the manager writes it into the wallbox.
+///
+/// Every other use case in this family has the wallbox serving and the manager reading.
+/// EVCS inverts it — the EVSE serves a **writeable** `Bill` and the Energy Broker fills it
+/// in, because only the manager knows what the roof was producing and what the tariff was.
+/// This is that write over real datagrams, plus the wallbox asking for it with
+/// `updateRequired` [EVCS-009] and setting the flag back once it has arrived.
+#[test]
+fn the_energy_broker_writes_a_charging_summary_into_the_wallbox() {
+    use eebus::model::Currency;
+    use eebus::usecases::emobility::evcs::{self, ChargingSummary, Share};
+
+    let now = Duration::ZERO;
+
+    // The wallbox: an EVSE entity with the one feature this use case needs.
+    let mut evse_device =
+        LocalDevice::new("i:46925", "Wallbox-2", DeviceType::ChargingStation).unwrap();
+    evse_device
+        .add_entity(LocalEntity::new([1], EntityType::EVSE).with_feature(evcs::bill_feature(1)))
+        .unwrap();
+    let bill = evse_device.address_of(&[1], 1);
+    let mut evse = Engine::new(evse_device);
+    evse.add_use_case([1], 1, &evcs::EVSE);
+    // The wallbox is asking: the session just ended and it wants the numbers.
+    for payload in [
+        evcs::summary_description(true),
+        evcs::summary_constraints(2),
+    ] {
+        evse.device_mut()
+            .resolve_mut(&bill)
+            .expect("the feature")
+            .set_data(payload)
+            .expect("publishable");
+    }
+
+    // The manager: one `Generic` client feature, as the LPC IG §3.3 asks for.
+    let mut manager_device =
+        LocalDevice::new("i:46925", "CEM-2", DeviceType::EnergyManagementSystem).unwrap();
+    manager_device
+        .add_entity(
+            LocalEntity::new([1], EntityType::CEM)
+                .with_feature(eebus::usecases::limitation::client_feature(1)),
+        )
+        .unwrap();
+    let client = manager_device.address_of(&[1], 1);
+    let mut manager = Engine::new(manager_device);
+    // This CEM entity is the Energy Guard too, so §3.2.2.1 names the actor `CEM`.
+    manager.add_use_case([1], 1, &evcs::CEM);
+
+    let settle = |manager: &mut Engine, evse: &mut Engine| {
+        for _ in 0..64 {
+            let mut moved = false;
+            while let Some(datagram) = manager.poll_transmit() {
+                evse.handle_datagram(&datagram, now);
+                moved = true;
+            }
+            while let Some(datagram) = evse.poll_transmit() {
+                manager.handle_datagram(&datagram, now);
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("the exchange did not settle");
+    };
+
+    // Discovery, then the description read that says which `billId` and whether the
+    // wallbox is asking.
+    let evse_nm = node_management(evse.device().address());
+    let manager_nm = node_management(manager.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        manager.read(&evse_nm, &manager_nm, function, now);
+    }
+    settle(&mut manager, &mut evse);
+
+    let device = evse.device().address().clone();
+    let remote = manager.peer(&device).expect("the wallbox");
+    let peer = evcs::locate(remote).expect("a wallbox that serves a Bill");
+    assert_eq!(peer.bill, bill);
+    assert_eq!(
+        remote
+            .use_cases
+            .iter()
+            .find(|u| u.name.as_str() == evcs::NAME)
+            .map(|u| u.actor.as_str()),
+        Some(evcs::EVSE_ACTOR),
+    );
+
+    manager.read(
+        &peer.bill.clone(),
+        &client,
+        Function::BillDescriptionListData,
+        now,
+    );
+    settle(&mut manager, &mut evse);
+    let described = core::iter::from_fn(|| manager.poll_event())
+        .filter_map(|event| match event {
+            SpineEvent::ReplyReceived { resolved, .. } => evcs::find_summary(&resolved),
+            _ => None,
+        })
+        .next()
+        .expect("the wallbox published its bill description");
+    assert_eq!(
+        described,
+        (evcs::BILL_ID, true),
+        "the wallbox is asking for the summary [EVCS-009]"
+    );
+
+    // A binding first: the guide requires one before a client may write.
+    manager.request_binding(&client, &peer.bill.clone(), now);
+    settle(&mut manager, &mut evse);
+    assert!(
+        evse.relations().is_bound(&client, &peer.bill),
+        "the wallbox granted it"
+    );
+
+    // 18 kWh at €4.20, three quarters of it off the roof.
+    let summary = ChargingSummary::new(18_000.0, 4.20, Currency::EUR)
+        .from_grid(Share::new(25.0, 90.0))
+        .self_produced(Share::new(75.0, 10.0))
+        .for_bill(described.0);
+    let request = manager.write(&peer.bill.clone(), &client, summary.write(), false, now);
+    settle(&mut manager, &mut evse);
+
+    // The wallbox acknowledged it, and holds it.
+    let accepted = core::iter::from_fn(|| manager.poll_event()).any(|event| {
+        matches!(
+            event,
+            SpineEvent::ResultReceived { request: held, error }
+                if held == request && error == eebus::spine::ErrorNumber::None
+        )
+    });
+    assert!(accepted, "the write was acknowledged");
+
+    let held = evse
+        .device()
+        .resolve(&bill)
+        .and_then(|feature| feature.data(&Function::BillListData))
+        .cloned()
+        .expect("the wallbox stored it");
+    let read = ChargingSummary::read(&held).expect("a charging summary");
+    assert_eq!(read.energy_wh, 18_000.0);
+    assert_eq!(read.grid_energy_wh(), Some(4_500.0));
+    assert!((read.self_produced_cost().unwrap() - 0.42).abs() < 1e-9);
+    assert!(read.shares_add_up());
+
+    // Table 6: having been written, the wallbox stops asking.
+    evse.device_mut()
+        .resolve_mut(&bill)
+        .expect("the feature")
+        .set_data(evcs::summary_description(false))
+        .expect("publishable");
+    let described = evse
+        .device()
+        .resolve(&bill)
+        .and_then(|feature| feature.data(&Function::BillDescriptionListData))
+        .cloned()
+        .expect("a description");
+    assert_eq!(evcs::find_summary(&described), Some((evcs::BILL_ID, false)));
+}

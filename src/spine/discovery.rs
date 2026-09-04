@@ -15,8 +15,8 @@ use alloc::vec::Vec;
 
 use crate::model::{
     AddressDevice, AddressEntity, AddressFeature, DeviceType, EntityType, FeatureAddress,
-    FeatureType, Function, FunctionProperty, NodeManagementDetailedDiscoveryData,
-    NodeManagementDetailedDiscoveryDeviceInformation,
+    FeatureType, Function, FunctionProperty, NetworkManagementStateChange,
+    NodeManagementDetailedDiscoveryData, NodeManagementDetailedDiscoveryDeviceInformation,
     NodeManagementDetailedDiscoveryDeviceInformationDescription,
     NodeManagementDetailedDiscoveryDeviceInformationDescriptionDeviceAddress,
     NodeManagementDetailedDiscoveryEntityInformation,
@@ -32,7 +32,7 @@ use crate::model::{
 };
 use crate::usecases::UseCaseDescriptor;
 
-use super::device::{LocalDevice, entity_addresses};
+use super::device::{LocalDevice, LocalEntity, entity_addresses};
 
 /// The SPINE version this implementation speaks.
 pub const SPINE_VERSION: &str = "1.3.0";
@@ -63,26 +63,7 @@ pub fn detailed_discovery(device: &LocalDevice) -> NodeManagementDetailedDiscove
         });
 
         for feature in entity.features() {
-            feature_information.push(NodeManagementDetailedDiscoveryFeatureInformation {
-                description: Some(NodeManagementDetailedDiscoveryFeatureInformationDescription {
-                    feature_address: Some(
-                        NodeManagementDetailedDiscoveryFeatureInformationDescriptionFeatureAddress {
-                            entity: Some(entity_addresses(entity.address())),
-                            feature: Some(feature.address()),
-                        },
-                    ),
-                    feature_type: Some(feature.feature_type().clone()),
-                    role: Some(feature.role()),
-                    supported_function: Some(device.function_properties(feature)),
-                    // §5.2.5.3: a feature that may take longer than the ten-second default
-                    // says so here, rather than leaving a client to call it unresponsive.
-                    max_response_delay: feature
-                        .max_response_delay()
-                        .map(crate::model::format_iso8601_duration)
-                        .map(crate::model::MaxResponseDelay::from),
-                    ..Default::default()
-                }),
-            });
+            feature_information.push(feature_description(device, entity, feature));
         }
     }
 
@@ -107,6 +88,256 @@ pub fn detailed_discovery(device: &LocalDevice) -> NodeManagementDetailedDiscove
         entity_information: Some(entity_information),
         feature_information: Some(feature_information),
     }
+}
+
+/// One feature's `featureInformation` entry, as every announcement spells it.
+fn feature_description(
+    device: &LocalDevice,
+    entity: &LocalEntity,
+    feature: &super::device::LocalFeature,
+) -> NodeManagementDetailedDiscoveryFeatureInformation {
+    NodeManagementDetailedDiscoveryFeatureInformation {
+        description: Some(
+            NodeManagementDetailedDiscoveryFeatureInformationDescription {
+                feature_address: Some(
+                    NodeManagementDetailedDiscoveryFeatureInformationDescriptionFeatureAddress {
+                        entity: Some(entity_addresses(entity.address())),
+                        feature: Some(feature.address()),
+                    },
+                ),
+                feature_type: Some(feature.feature_type().clone()),
+                role: Some(feature.role()),
+                supported_function: Some(device.function_properties(feature)),
+                // §5.2.5.3: a feature that may take longer than the ten-second default says
+                // so here, rather than leaving a client to call it unresponsive.
+                max_response_delay: feature
+                    .max_response_delay()
+                    .map(crate::model::format_iso8601_duration)
+                    .map(crate::model::MaxResponseDelay::from),
+                ..Default::default()
+            },
+        ),
+    }
+}
+
+/// Announces entities that have just appeared (§7.1.5 rule 5).
+///
+/// The partial `nodeManagementDetailedDiscoveryData` a device notifies when it grows an
+/// entity at runtime: `lastStateChange: added` on each entity description, and **all** of
+/// its features beside it, because a peer that hears about an entity and none of its
+/// features has nothing to bind to.
+///
+/// Unchanged entities are left out, which rule 3 asks for — this is the whole message, not
+/// the whole tree.
+pub fn entities_added(
+    device: &LocalDevice,
+    entities: &[LocalEntity],
+) -> NodeManagementDetailedDiscoveryData {
+    changed(device, entities, NetworkManagementStateChange::Added, true)
+}
+
+/// Announces entities that have just gone (§7.1.5 rule 4).
+///
+/// `lastStateChange: removed` on each entity description and **no** `featureInformation`
+/// at all, which rule 4b requires and rule 4c explains: the peer is told the entity is
+/// gone, and that is sufficient — it does not have to be walked through the removal of
+/// every feature underneath it.
+///
+/// This is what [`Engine::remove_entity`](super::Engine::remove_entity) sends, and what
+/// [`merge_detailed_discovery`] applies at the other end.
+pub fn entities_removed(
+    device: &LocalDevice,
+    entities: &[LocalEntity],
+) -> NodeManagementDetailedDiscoveryData {
+    changed(
+        device,
+        entities,
+        NetworkManagementStateChange::Removed,
+        false,
+    )
+}
+
+/// Announces entities whose features changed (§7.1.5 rule 6).
+///
+/// `lastStateChange: modified`, with every feature of the entity listed. Rule 6b asks for
+/// the *changed* features only and for each to carry its own `lastStateChange`; sending
+/// all of them says the same thing without the device having to remember which ones a
+/// given peer last heard about, and is what a re-send is allowed to be.
+pub fn entities_modified(
+    device: &LocalDevice,
+    entities: &[LocalEntity],
+) -> NodeManagementDetailedDiscoveryData {
+    changed(
+        device,
+        entities,
+        NetworkManagementStateChange::Modified,
+        true,
+    )
+}
+
+fn changed(
+    device: &LocalDevice,
+    entities: &[LocalEntity],
+    change: NetworkManagementStateChange,
+    with_features: bool,
+) -> NodeManagementDetailedDiscoveryData {
+    let mut entity_information = Vec::new();
+    let mut feature_information = Vec::new();
+
+    for entity in entities {
+        entity_information.push(NodeManagementDetailedDiscoveryEntityInformation {
+            description: Some(
+                NodeManagementDetailedDiscoveryEntityInformationDescription {
+                    entity_address: Some(
+                        NodeManagementDetailedDiscoveryEntityInformationDescriptionEntityAddress {
+                            entity: Some(entity_addresses(entity.address())),
+                        },
+                    ),
+                    entity_type: Some(entity.entity_type().clone()),
+                    last_state_change: Some(change),
+                    ..Default::default()
+                },
+            ),
+        });
+        if !with_features {
+            continue;
+        }
+        for feature in entity.features() {
+            feature_information.push(feature_description(device, entity, feature));
+        }
+    }
+
+    NodeManagementDetailedDiscoveryData {
+        // §7.1.5 rule 3: unchanged data stays out, and the device's own description has
+        // not changed. The address is in the datagram's header, which is where the
+        // receiving side files it.
+        specification_version_list: None,
+        device_information: None,
+        entity_information: Some(entity_information),
+        feature_information: (!feature_information.is_empty()).then_some(feature_information),
+    }
+}
+
+/// Applies a §7.1.5 runtime update to the document a peer sent before.
+///
+/// Detailed discovery is not a list in SPINE's sense — it is three parallel lists in one
+/// value — so the generic partial merge cannot address its entries: it would replace
+/// `entityInformation` wholesale, and an update that names one new entity, as rule 3 asks
+/// it to, would take every other entity with it. This is the merge that rule describes.
+///
+/// * An entity marked `removed` goes, and everything addressed beneath it goes with it —
+///   an entity whose parent is gone is unreachable — together with their features. Rule 4c
+///   says the device need not list those features, so the receiver works them out.
+/// * Any other entity is inserted, or replaces the one at its address.
+/// * A feature marked `removed` goes; any other replaces the one at its address, or is
+///   added.
+/// * `deviceInformation` and `specificationVersionList` are taken where the update carries
+///   them and left alone where it does not.
+///
+/// A full (non-partial) document replaces what was stored and does not come through here.
+pub fn merge_detailed_discovery(
+    stored: &mut NodeManagementDetailedDiscoveryData,
+    update: &NodeManagementDetailedDiscoveryData,
+) {
+    if update.specification_version_list.is_some() {
+        stored.specification_version_list = update.specification_version_list.clone();
+    }
+    if update.device_information.is_some() {
+        stored.device_information = update.device_information.clone();
+    }
+
+    let mut entities = stored.entity_information.take().unwrap_or_default();
+    let mut features = stored.feature_information.take().unwrap_or_default();
+
+    for entry in update.entity_information.iter().flatten() {
+        let Some(description) = entry.description.as_ref() else {
+            continue;
+        };
+        let Some(path) = entity_path_of(description) else {
+            // An entry that addresses nothing can neither replace nor remove anything.
+            continue;
+        };
+        if description.last_state_change == Some(NetworkManagementStateChange::Removed) {
+            entities.retain(|held| {
+                held.description
+                    .as_ref()
+                    .and_then(entity_path_of)
+                    .is_none_or(|held| !held.starts_with(&path))
+            });
+            features.retain(|held| {
+                held.description
+                    .as_ref()
+                    .and_then(feature_path_of)
+                    .is_none_or(|(held, _)| !held.starts_with(&path))
+            });
+            continue;
+        }
+        let held = entities.iter().position(|held| {
+            held.description.as_ref().and_then(entity_path_of).as_ref() == Some(&path)
+        });
+        match held {
+            Some(index) => entities[index] = entry.clone(),
+            None if entities.len() < super::device::MAX_LIST_ENTRIES => {
+                entities.push(entry.clone());
+            }
+            // The peer decides how many entities it announces, so the tree it can make
+            // this device hold is bounded the same way a notified list is.
+            None => {}
+        }
+    }
+
+    for entry in update.feature_information.iter().flatten() {
+        let Some(description) = entry.description.as_ref() else {
+            continue;
+        };
+        let Some(address) = feature_path_of(description) else {
+            continue;
+        };
+        if description.last_state_change == Some(NetworkManagementStateChange::Removed) {
+            features.retain(|held| {
+                held.description.as_ref().and_then(feature_path_of) != Some(address.clone())
+            });
+            continue;
+        }
+        let held = features.iter().position(|held| {
+            held.description.as_ref().and_then(feature_path_of) == Some(address.clone())
+        });
+        match held {
+            Some(index) => features[index] = entry.clone(),
+            None if features.len() < super::device::MAX_LIST_ENTRIES => {
+                features.push(entry.clone());
+            }
+            None => {}
+        }
+    }
+
+    stored.entity_information = Some(entities);
+    stored.feature_information = Some(features);
+}
+
+fn entity_path_of(
+    description: &NodeManagementDetailedDiscoveryEntityInformationDescription,
+) -> Option<Vec<u32>> {
+    Some(
+        description
+            .entity_address
+            .as_ref()?
+            .entity
+            .as_ref()?
+            .iter()
+            .map(|e| e.get())
+            .collect(),
+    )
+}
+
+fn feature_path_of(
+    description: &NodeManagementDetailedDiscoveryFeatureInformationDescription,
+) -> Option<(Vec<u32>, AddressFeature)> {
+    let address = description.feature_address.as_ref()?;
+    Some((
+        address.entity.as_ref()?.iter().map(|e| e.get()).collect(),
+        address.feature?,
+    ))
 }
 
 /// Narrows detailed discovery data to what a partial read asked for (§7.1.3).
@@ -374,9 +605,11 @@ pub struct RemoteDevice {
 impl RemoteDevice {
     /// Reads a peer's `nodeManagementDetailedDiscoveryData` into this record.
     ///
-    /// Replaces what was known: §7.1.5 has a peer re-send the whole document when its
-    /// entities or features change, and a partial notification is merged into the
-    /// document before it reaches here.
+    /// **Replaces what was known**, so it takes the whole document rather than a fragment.
+    /// A §7.1.5 runtime update *is* a fragment — rule 3 has the device send only what
+    /// changed — and merging it is [`merge_detailed_discovery`]'s job, which
+    /// `Engine::absorb_discovery` does before calling this. Handing a fragment straight to
+    /// this method replaces the peer's tree with whatever that fragment happened to carry.
     pub fn apply_detailed_discovery(&mut self, data: &NodeManagementDetailedDiscoveryData) {
         if let Some(description) = data
             .device_information
@@ -543,13 +776,26 @@ impl RemoteDevice {
     /// somewhere on the device and the feature is what says where. One entity carrying a
     /// feature of that type and role resolves it; two is ambiguous, and a guess would bind
     /// the wrong entity, so the answer is [`None`].
+    ///
+    /// **An address that names only a device names no entity**, and takes the same route.
+    /// Three of the eight devices in `tests/fixtures/devices` announce their use cases as
+    /// `address: { device: … }` with no `entity` — the Elli Charger Connect Pro, the
+    /// Spelsberg Wallbox Smart Pro and the Kostal Smart Energy Meter — which is what §7.5
+    /// permits and what the guide's §3.3 rule cannot be read off. Taking that as the
+    /// entity path `[]` would look for an entity no device has, and locate nothing on any
+    /// of them.
     pub fn feature_for(
         &self,
         use_case: &RemoteUseCase,
         feature_type: &FeatureType,
         role: Role,
     ) -> Option<&RemoteFeature> {
-        let Some(address) = &use_case.address else {
+        let path = use_case
+            .address
+            .as_ref()
+            .map(super::address::entity_path)
+            .filter(|path| !path.is_empty());
+        let Some(path) = path else {
             let mut candidates = self
                 .entities
                 .iter()
@@ -557,7 +803,6 @@ impl RemoteDevice {
             let only = candidates.next()?;
             return candidates.next().is_none().then_some(only);
         };
-        let path = super::address::entity_path(address);
         self.entity(&path)?.feature(feature_type, role)
     }
 

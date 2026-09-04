@@ -22,6 +22,7 @@ type Socket = WebSocketStream<tokio_rustls::TlsStream<TcpStream>>;
 
 /// Why a connection could not be made or kept.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConnectionError {
     /// The socket failed.
     #[error("the connection failed: {0}")]
@@ -95,6 +96,8 @@ pub struct ShipConnection {
     peer_ship_id: Option<String>,
     started: Instant,
     awaiting_pong: bool,
+    /// What happened about PINs, waiting to be reported (SHIP §12.5).
+    pin_events: Vec<PinOutcome>,
     /// Key material the peer announced, waiting to be taken up (SHIP §12.1.3.3).
     peer_key_material: Vec<crate::ship::KeyMaterialState>,
     /// The `updateCounter` the peer's `hello` carried (§12.1.3.4).
@@ -362,6 +365,15 @@ impl ShipConnection {
                 // node needs to dial it back in the other direction.
                 Event::PeerAccessMethods(methods) => self.peer_ship_id = methods.id,
                 Event::PeerKeyMaterial(state) => self.peer_key_material.push(state),
+                // Only reachable from a `send_pin` the caller made itself, after the
+                // handshake opened: everything during it is handled in `run_handshake`,
+                // which is where the trust store is.
+                Event::PinWithheld { level } => {
+                    self.pin_events.push(PinOutcome::Withheld { level });
+                }
+                Event::PeerPinVerified => {
+                    self.pin_events.push(PinOutcome::Verified { level: None })
+                }
                 Event::PeerKeyMaterialCounter { update_counter } => {
                     self.peer_key_counter = Some(update_counter);
                 }
@@ -376,6 +388,11 @@ impl ShipConnection {
     /// certificate-update mechanism at all.
     pub fn peer_key_counter(&self) -> Option<u16> {
         self.peer_key_counter
+    }
+
+    /// Takes what has happened about PINs since this was last called (SHIP §12.5).
+    pub fn take_pin_events(&mut self) -> Vec<PinOutcome> {
+        core::mem::take(&mut self.pin_events)
     }
 
     /// Takes the key material the peer has announced since this was last called.
@@ -420,12 +437,44 @@ impl ShipConnection {
     }
 }
 
+/// What happened about a PIN on one connection (SHIP §12.5).
+///
+/// Both halves are worth surfacing rather than logging. A withheld PIN looks, from the far
+/// end, exactly like having none — the connection carries on with data exchange restricted
+/// — so an installer watching a commissioning fail needs to be told which it was. And a
+/// verified one is a *second factor*: §12.5 makes the first peer to present a valid PIN
+/// since a factory default eligible to act as a SHIP commissioning tool, and that is a
+/// decision a device may want to show somebody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// The peer proved it holds this node's PIN.
+    Verified {
+        /// What it is trusted at now, after
+        /// [`TrustStore::award_pin_trust`](super::TrustStore::award_pin_trust) applied
+        /// §12.5's once-only rule. [`None`] where the peer is not in the trust store, or
+        /// where the caller sent the PIN itself after the handshake had opened.
+        level: Option<crate::ship::TrustLevel>,
+    },
+    /// This node's PIN was **not** sent: §12.5 forbids it below user trust 32.
+    Withheld {
+        /// What the peer is trusted at, which was not enough.
+        level: crate::ship::TrustLevel,
+    },
+}
+
 /// Tells whoever is driving a node that a peer is waiting on a trust decision.
 ///
 /// Called once per handshake, from the task running it, the moment the peer has been told
 /// `hello: pending`. What a [`Hub`](crate::runtime::Hub) hands in turns it into
-/// [`HubEvent::TrustRequested`](crate::runtime::HubEvent::TrustRequested).
-pub(crate) type TrustReporter = alloc::boxed::Box<dyn Fn(Ski) + Send + Sync>;
+/// [`HubEvent::TrustRequested`](crate::runtime::HubEvent::TrustRequested); a consumer
+/// driving [`Node::accept_reporting`](crate::runtime::Node::accept_reporting) directly
+/// gets the same call.
+///
+/// It runs on the handshake's own task, so it must not block: send on a channel, or set a
+/// flag. Every peer reported here is also in
+/// [`Node::pending_peers`](crate::runtime::Node::pending_peers) for as long as it waits,
+/// which is the answer for a caller that would rather poll than be called.
+pub type TrustReporter = alloc::boxed::Box<dyn Fn(super::PendingPeer) + Send + Sync>;
 
 /// Drives a [`Handshake`] over a socket until it reaches the data phase.
 ///
@@ -448,12 +497,17 @@ pub(crate) async fn run_handshake(
 ) -> Result<ShipConnection, ConnectionError> {
     let started = Instant::now();
     let clock = Instant::now();
+    // Dropped however this function ends — the peer stopped waiting, the socket failed,
+    // the caller's future was cancelled — so a pending entry cannot outlive the handshake
+    // that put it there. `None` until the peer turns out to need a decision.
+    let mut waiting: Option<super::node::PendingGuard<'_>> = None;
     let mut handshake = Handshake::new(role, config, trust, Duration::ZERO);
     let peer_ship_id = None;
     // §12.1.3.4 puts the peer's key-material counter in the `hello`, which happens before
     // there is a `ShipConnection` to hold it. Kept here and handed over below, or the
     // one signal that says "your stored certificate is stale" is thrown away.
     let mut peer_key_counter = None;
+    let mut pin_events: Vec<PinOutcome> = Vec::new();
     // Subscribed before the first check, so a decision made between the two is not lost:
     // `changed` reports every version this receiver has not yet seen.
     let mut decisions = node.trust_store().watch();
@@ -474,9 +528,27 @@ pub(crate) async fn run_handshake(
                 Event::PeerKeyMaterialCounter { update_counter } => {
                     peer_key_counter = Some(update_counter);
                 }
+                // §12.5: proving it holds this node's PIN earns the peer a second factor,
+                // and the store applies the once-only rule because only it survives the
+                // connection. Doing it here rather than leaving it to the application is
+                // the difference between a rule that is stated and one that happens.
+                Event::PeerPinVerified => {
+                    let level = node.trust_store().award_pin_trust(&peer.ski);
+                    pin_events.push(PinOutcome::Verified { level });
+                }
+                Event::PinWithheld { level } => {
+                    pin_events.push(PinOutcome::Withheld { level });
+                }
                 Event::TrustRequired => {
+                    // Registered before the callback: a consumer woken by `report` and
+                    // asking the node what is waiting must not race the bookkeeping.
+                    let pending = super::PendingPeer {
+                        ski: peer.ski,
+                        fingerprint: peer.fingerprint,
+                    };
+                    waiting = Some(node.note_pending(pending));
                     if let Some(report) = &report {
-                        report(peer.ski);
+                        report(pending);
                     }
                 }
                 _ => {}
@@ -484,6 +556,8 @@ pub(crate) async fn run_handshake(
         }
 
         if handshake.is_ready_for_data() {
+            // Approved: it is no longer waiting on anybody.
+            drop(waiting.take());
             // §13.4.6: ask where else the peer can be reached. The answer arrives
             // whenever it arrives; the implementation guide §2.1 forbids waiting for it.
             handshake.request_access_methods();
@@ -496,6 +570,7 @@ pub(crate) async fn run_handshake(
                 peer_ship_id,
                 started,
                 awaiting_pong: false,
+                pin_events: core::mem::take(&mut pin_events),
                 peer_key_material: Vec::new(),
                 peer_key_counter,
             };
@@ -522,10 +597,11 @@ pub(crate) async fn run_handshake(
                 }
                 if node.take_refusal(&peer.ski) {
                     handshake.set_trust(Trust::Rejected, clock.elapsed())?;
-                } else if node.trust_for(&peer) == Trust::Trusted {
+                } else if let Trust::Trusted(level) = node.trust_for(&peer) {
                     // Either way in: a user approved the SKI, or a pairing request named
-                    // the certificate. §10.2 makes the two equivalent at this point.
-                    handshake.set_trust(Trust::Trusted, clock.elapsed())?;
+                    // the certificate. §10.2 makes the two equivalent at this point, and
+                    // the level says which — §12.5 reads it before sending a PIN.
+                    handshake.set_trust(Trust::Trusted(level), clock.elapsed())?;
                 }
                 continue;
             }

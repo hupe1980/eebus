@@ -35,6 +35,9 @@ pub use keys::*;
 mod policy;
 pub use policy::*;
 
+mod trust;
+pub use trust::*;
+
 mod spine;
 pub use spine::*;
 

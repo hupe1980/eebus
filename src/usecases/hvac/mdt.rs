@@ -190,6 +190,40 @@ fn reported(
     })
 }
 
+// ---- what a Monitoring Appliance finds ----------------------------------------------
+
+/// Finds a DHW Circuit's temperature feature from its detailed discovery and use-case
+/// data.
+///
+/// The counterpart of [`monitoring::locate`](crate::usecases::monitoring::locate), and it
+/// returns the same type, so a hot water tank goes into the same
+/// [`MonitoringApplianceActor`](crate::usecases::monitoring::MonitoringApplianceActor) as
+/// a grid connection point. What it does *not* look for is an `ElectricalConnection`:
+/// Table 6 gives this use case one feature, because a tank has no phases and no
+/// connection to describe, and `monitoring::locate` — which searches for one — would find
+/// whatever else the device happens to serve or nothing at all.
+///
+/// ```
+/// use eebus::usecases::hvac::mdt;
+/// # fn example(remote: &eebus::spine::RemoteDevice) -> Option<()> {
+/// let circuit = mdt::locate(remote)?;
+/// assert!(circuit.electrical_connection.is_none()); // a tank has none
+/// # Some(())
+/// # }
+/// ```
+///
+/// Returns [`None`] until the circuit has announced both the use case and the
+/// `Measurement` server that carries it.
+pub fn locate(
+    remote: &crate::spine::RemoteDevice,
+) -> Option<crate::usecases::monitoring::MonitoredUnitPeer> {
+    let found = remote.use_case(NAME, DHW_CIRCUIT_ACTOR)?;
+    Some(crate::usecases::monitoring::MonitoredUnitPeer::measuring(
+        remote.address.clone()?,
+        remote.address_of(found, &FeatureType::Measurement, Role::Server)?,
+    ))
+}
+
 // ---- descriptors ---------------------------------------------------------------------
 
 const DHW_CIRCUIT_ENTITIES: &[EntityType] = &[EntityType::DHWCircuit];

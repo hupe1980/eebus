@@ -200,6 +200,116 @@ async fn an_unapproved_peer_does_not_reach_the_data_phase() {
     server.abort();
 }
 
+/// [B1] A consumer driving `accept` itself can see, and answer, the peer that is waiting.
+///
+/// The SKI is proved by then — the peer completed TLS — and the SHIP pending state exists
+/// so that a person can compare it with the label on the box. A driver that owns its own
+/// engine, because it has to be testable without a socket, cannot use `Hub` to learn it;
+/// this is the same thing without one.
+#[tokio::test]
+async fn a_pending_peer_is_reported_and_can_be_approved_without_a_hub() {
+    use std::sync::Arc;
+
+    let control_box = node("i:46925_u:ControlBox-1", TrustStore::new());
+    let pump_trust = TrustStore::new();
+    let heat_pump = Arc::new(node("i:46925_u:HeatPump-1", pump_trust.clone()));
+    let box_ski = control_box.ski();
+    let box_fingerprint = control_box.fingerprint();
+    // The control box has approved the pump; the pump has approved nobody, so the only
+    // outstanding decision is the one a person is about to be asked.
+    control_box.trust_store().trust(heat_pump.ski());
+
+    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = heat_pump.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        node.accept_reporting(
+            stream,
+            Some(Box::new(move |peer| {
+                let _ = tx.send(peer);
+            })),
+        )
+        .await
+    });
+
+    let dialling = tokio::spawn(async move { control_box.connect(address).await });
+
+    let reported = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the waiting peer was reported")
+        .expect("a peer");
+    assert_eq!(reported.ski, box_ski, "the SKI its certificate proved");
+    assert_eq!(
+        reported.fingerprint, box_fingerprint,
+        "and the fingerprint a QR code would carry"
+    );
+
+    // The same peer is listed for as long as it waits, for a caller that would rather ask.
+    assert_eq!(
+        heat_pump.pending_peers(),
+        vec![reported],
+        "an installer's screen reads this"
+    );
+
+    // A person says yes.
+    pump_trust.trust(box_ski);
+    let connection = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the handshake completed")
+        .expect("the task did not panic")
+        .expect("approving it let it through");
+    assert_eq!(connection.peer(), box_ski);
+    assert!(
+        heat_pump.pending_peers().is_empty(),
+        "and it is no longer waiting on anybody"
+    );
+    dialling.abort();
+}
+
+/// A peer that gives up while waiting leaves nothing behind.
+#[tokio::test]
+async fn a_pending_peer_that_goes_away_is_not_listed_for_ever() {
+    use std::sync::Arc;
+
+    let control_box = node("i:46925_u:ControlBox-1", TrustStore::new());
+    let heat_pump = Arc::new(node("i:46925_u:HeatPump-1", TrustStore::new()));
+
+    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = heat_pump.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = node
+            .accept_reporting(
+                stream,
+                Some(Box::new(move |peer| {
+                    let _ = tx.send(peer);
+                })),
+            )
+            .await;
+    });
+
+    let dialling = tokio::spawn(async move { control_box.connect(address).await });
+    let reported = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("reported")
+        .expect("a peer");
+    assert_eq!(heat_pump.pending_peers(), vec![reported]);
+
+    // The far end walks away mid-decision.
+    dialling.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    assert!(
+        heat_pump.pending_peers().is_empty(),
+        "a decision nobody is waiting for is worse than no list at all"
+    );
+}
+
 /// The trust store is what a user approving a SKI amounts to.
 #[test]
 fn the_trust_store_holds_what_a_user_approved() {
@@ -390,13 +500,13 @@ async fn an_unapproved_peer_is_reported_and_approved_interactively() {
     let control = serve(control);
 
     let (asked, origin) = wait_for(&mut pump, Duration::from_secs(5), |_, event| match event {
-        HubEvent::TrustRequested { ski, origin } => Some((ski, origin)),
+        HubEvent::TrustRequested { peer, origin } => Some((peer, origin)),
         HubEvent::Connected { .. } => panic!("an unapproved peer reached the data phase"),
         _ => None,
     })
     .await;
     assert_eq!(
-        asked, box_ski,
+        asked.ski, box_ski,
         "the SKI the certificate proved, not a claim"
     );
     assert!(matches!(origin, Origin::Accepted { .. }), "it dialled us");
@@ -453,10 +563,10 @@ async fn a_refused_peer_is_told_so_and_the_handshake_ends() {
     while (pump_failed.is_none() || box_failed.is_none()) && std::time::Instant::now() < deadline {
         pump.wake_at(pump.now() + Duration::from_millis(50));
         match pump.next().await.expect("no error") {
-            HubEvent::TrustRequested { ski, .. } => {
-                assert_eq!(ski, box_ski);
+            HubEvent::TrustRequested { peer, .. } => {
+                assert_eq!(peer.ski, box_ski);
                 asked = true;
-                pump.refuse(ski);
+                pump.refuse(peer.ski);
             }
             HubEvent::HandshakeFailed { error, ski, .. } => {
                 assert_eq!(
@@ -1245,8 +1355,8 @@ async fn refusing_a_peer_returns_the_slot_it_was_holding() {
             &mut hub,
             Duration::from_secs(10),
             |hub, event| match event {
-                HubEvent::TrustRequested { ski, .. } => {
-                    hub.refuse(ski);
+                HubEvent::TrustRequested { peer, .. } => {
+                    hub.refuse(peer.ski);
                     None
                 }
                 HubEvent::HandshakeFailed { error, .. } => Some(error),
@@ -1289,8 +1399,8 @@ async fn only_so_many_peers_may_wait_for_approval_at_once() {
 
     let mut waiting = Vec::new();
     let error = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
-        HubEvent::TrustRequested { ski, .. } => {
-            waiting.push(ski);
+        HubEvent::TrustRequested { peer, .. } => {
+            waiting.push(peer.ski);
             None
         }
         HubEvent::HandshakeFailed { error, .. } => Some(error),
@@ -1311,4 +1421,65 @@ async fn only_so_many_peers_may_wait_for_approval_at_once() {
     for caller in callers {
         caller.abort();
     }
+}
+
+/// One peer cannot fill the pending-trust table by dialling repeatedly.
+///
+/// The cap is what stops unapproved peers occupying the connection table, and it is only
+/// worth having if it cannot be spent by one device: a peer asking four times is still one
+/// decision, because answering it releases every handshake that SKI is holding. So each SKI
+/// gets one slot, and the rest of the table stays available for peers a user might actually
+/// want to approve.
+///
+/// Keying on the SKI is what makes the rule safe to enforce — it came out of a completed
+/// TLS handshake, so the peer proved it holds the key. An address would prove nothing.
+#[tokio::test]
+async fn one_peer_dialling_repeatedly_holds_one_pending_slot() {
+    use eebus::runtime::MAX_PENDING_TRUST;
+    use std::sync::Arc;
+
+    let pump_trust = TrustStore::new();
+    let heat_pump = node("i:46925_u:HeatPump-1", pump_trust.clone());
+    let mut hub = Hub::new(heat_pump, pump_engine());
+    hub.set_max_connections(64);
+    let address = hub.listen("127.0.0.1:0").await.unwrap();
+
+    // One caller, dialling more times than the whole table would hold.
+    let caller = Arc::new(node("i:46925_u:Caller-1", TrustStore::with([])));
+    let greedy = caller.ski();
+    let mut dials = Vec::new();
+    for _ in 0..(MAX_PENDING_TRUST + 2) {
+        let caller = caller.clone();
+        dials.push(tokio::spawn(async move { caller.connect(address).await }));
+    }
+
+    // …and one other peer, which must still be able to ask.
+    let other = node("i:46925_u:Caller-2", TrustStore::with([]));
+    let other_ski = other.ski();
+    let second = tokio::spawn(async move { other.connect(address).await });
+
+    let mut asked = Vec::new();
+    let _ = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::TrustRequested { peer, .. } => {
+            asked.push(peer.ski);
+            (asked.len() == 2).then_some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(
+        asked.iter().filter(|ski| **ski == greedy).count(),
+        1,
+        "one peer is one decision, however many times it dials: {asked:?}"
+    );
+    assert!(
+        asked.contains(&other_ski),
+        "and the table still had room for somebody else: {asked:?}"
+    );
+
+    for dial in dials {
+        dial.abort();
+    }
+    second.abort();
 }

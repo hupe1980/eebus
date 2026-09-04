@@ -373,8 +373,7 @@ crate::eebus_struct! {
 
 crate::eebus_identity!(TariffDescriptionData {
     tariff_id,
-    commodity_id,
-    measurement_id
+    commodity_id
 });
 
 crate::eebus_struct! {

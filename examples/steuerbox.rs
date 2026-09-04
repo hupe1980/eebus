@@ -168,12 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             HubEvent::Lost { instance, .. } => println!("lost {instance}"),
-            HubEvent::TrustRequested { ski, origin } => {
+            HubEvent::TrustRequested { peer, origin } => {
                 println!(
-                    "[box]  {} wants to pair, {origin}\n       trust it? [y/N] ",
-                    ski.to_display_string()
+                    "[box]  {} wants to pair, {origin}\n       its certificate is {}\n       trust it? [y/N] ",
+                    peer.ski.to_display_string(),
+                    peer.fingerprint,
                 );
-                answers.ask(ski);
+                answers.ask(peer.ski);
             }
             HubEvent::Connected { ski, .. } => {
                 println!("[box]  connected to {ski}");
@@ -185,6 +186,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             HubEvent::HandshakeFailed { origin, error, .. } => {
                 println!("[box]  a connection {origin} failed: {error}");
+            }
+            // SHIP §12.5. A withheld PIN looks, from the far end, exactly like having
+            // none, so an installer watching a commissioning fail needs to be told.
+            HubEvent::PinVerified { ski, level } => {
+                println!("[box]  {ski} proved the PIN; it is now trusted at {level:?}");
+            }
+            HubEvent::PinWithheld { ski, level } => {
+                println!("[box]  the PIN was NOT sent to {ski}: it is only trusted at {level}");
             }
             HubEvent::PeerDiscovered { device, .. } => {
                 let remote = hub.engine().peer(&device).expect("just discovered");
@@ -231,6 +240,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // This box is `devZ`: it sends pairing requests, it does not receive them.
             HubEvent::Paired { .. } | HubEvent::PairingRefused { .. } => {}
+            // The crate keeps adding events; a consumer that does not need them says so.
+            _ => {}
         }
 
         for report in reports {
@@ -275,6 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         device.as_str()
                     );
                 }
+                // The crate keeps adding events; a consumer that does not need them says so.
+                _ => {}
             }
         }
     }

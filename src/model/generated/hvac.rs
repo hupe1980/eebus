@@ -279,10 +279,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(HvacSystemFunctionData {
-    system_function_id,
-    current_operation_mode_id
-});
+crate::eebus_identity!(HvacSystemFunctionData { system_function_id });
 
 crate::eebus_struct! {
     /// `HvacSystemFunctionDescriptionDataElementsType`.

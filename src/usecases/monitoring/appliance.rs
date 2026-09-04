@@ -246,15 +246,38 @@ impl Readings {
 }
 
 /// Where one Monitored Unit's measurements live.
+///
+/// Every feature is optional, and that is the specification's shape rather than
+/// looseness. MGCP Table 1 marks each scenario `M`, `R` or `O` **per actor**, and
+/// §3.2.2.2.1 then says the feature table's presence indications are "meant relative to
+/// the ones of the according Scenario stated in Table 1" — a feature is required only
+/// where the scenario that uses it is. Scenario 1 needs `DeviceConfiguration` and nothing
+/// else; scenarios 2 to 7 need `Measurement` and `ElectricalConnection`. A peer that
+/// serves one group and not the other is describable here, which is what
+/// [`locate`] returns and what a DHW circuit located through
+/// [`hvac::mdt::locate`](crate::usecases::hvac::mdt::locate) — a tank, with no electrical
+/// connection at all — needs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MonitoredUnitPeer {
     /// The peer's device address.
     pub device: crate::model::AddressDevice,
     /// Its `ElectricalConnection` feature, which says which measurement covers which
     /// phases.
-    pub electrical_connection: crate::model::FeatureAddress,
+    ///
+    /// [`None`] for a peer that serves no phase-specific measurement: a DHW circuit
+    /// ([`hvac::mdt`](crate::usecases::hvac::mdt)), or a Grid Connection Point that serves
+    /// scenario 1 alone. Without it a phase-specific AC measurement stays undescribed —
+    /// `acMeasuredPhases` lives in the parameter descriptions and nowhere else — which is
+    /// why [`Readings`] drops such a value rather than guessing at its phase.
+    pub electrical_connection: Option<crate::model::FeatureAddress>,
     /// Its `Measurement` feature, which says what each measurement is and what it reads.
-    pub measurement: crate::model::FeatureAddress,
+    ///
+    /// [`None`] for a Grid Connection Point that serves MGCP scenario 1 alone. Nothing
+    /// else in this crate produces such a peer, and a real one is unusual: Table 1 marks
+    /// scenarios 2, 3 and 4 mandatory *for the Grid Connection Point*, so a conformant one
+    /// always has this. It is optional because an appliance that cannot read a device at
+    /// all is worse off than one that reads the half the device does serve.
+    pub measurement: Option<crate::model::FeatureAddress>,
     /// Its `DeviceConfiguration` feature, where MGCP scenario 1 keeps the PV feed-in
     /// curtailment factor.
     ///
@@ -264,11 +287,44 @@ pub struct MonitoredUnitPeer {
     pub curtailment: Option<crate::model::FeatureAddress>,
 }
 
+impl MonitoredUnitPeer {
+    /// A peer whose only feature is a `Measurement` server.
+    ///
+    /// What a use case with no electrical connection to describe locates: MDT's DHW
+    /// circuit is the one in this crate.
+    pub fn measuring(
+        device: crate::model::AddressDevice,
+        measurement: crate::model::FeatureAddress,
+    ) -> Self {
+        Self {
+            device,
+            electrical_connection: None,
+            measurement: Some(measurement),
+            curtailment: None,
+        }
+    }
+
+    /// Whether the peer serves anything this actor can read.
+    ///
+    /// A peer that announced the use case and serves none of its three features is a peer
+    /// there is nothing to attach to — which [`locate`] reports as [`None`] rather than as
+    /// an empty peer that would sit in the actor's list producing nothing.
+    pub fn is_usable(&self) -> bool {
+        self.measurement.is_some() || self.curtailment.is_some()
+    }
+}
+
 /// Finds a peer's monitoring features from its detailed discovery and use-case data.
 ///
 /// `actor` is [`crate::usecases::descriptor::actors::MONITORED_UNIT`] for MPC and
 /// [`crate::usecases::descriptor::actors::GRID_CONNECTION_POINT`] for MGCP — the two use
 /// cases publish the same data and differ only in who is publishing it.
+///
+/// Every feature is looked up and none is required, because MGCP ties each of them to a
+/// scenario and Table 1 makes those scenarios `M`, `R` or `O` separately. What *is*
+/// required is that the peer serve at least one of them: a peer announcing the use case
+/// and none of its features is reported as [`None`], since there would be nothing to read
+/// from it. See [`MonitoredUnitPeer`] for which absence means what.
 pub fn locate(
     remote: &crate::spine::RemoteDevice,
     use_case: &str,
@@ -277,18 +333,22 @@ pub fn locate(
     use crate::model::{FeatureType, Role};
 
     let found = remote.use_case(use_case, actor)?;
-    Some(MonitoredUnitPeer {
+    let peer = MonitoredUnitPeer {
         device: remote.address.clone()?,
         electrical_connection: remote.address_of(
             found,
             &FeatureType::ElectricalConnection,
             Role::Server,
-        )?,
-        measurement: remote.address_of(found, &FeatureType::Measurement, Role::Server)?,
+        ),
+        measurement: remote.address_of(found, &FeatureType::Measurement, Role::Server),
         // Optional, and absent for MPC entirely: a `DeviceConfiguration` server inside
         // this use case is MGCP scenario 1 and nothing else.
         curtailment: remote.address_of(found, &FeatureType::DeviceConfiguration, Role::Server),
-    })
+    };
+    // A peer that announces the use case and serves none of its features has nothing to
+    // read. Reporting it as located would put it in the actor's list for good, waiting on
+    // notifications from features that are not there.
+    peer.is_usable().then_some(peer)
 }
 
 /// The Monitoring Appliance, wired to a SPINE engine.
@@ -316,6 +376,7 @@ struct TrackedUnit {
 
 /// What a Monitoring Appliance learned.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum MonitoringEvent {
     /// A unit's descriptions arrived, so its values can now be read.
     UnitDescribed {
@@ -388,20 +449,28 @@ impl MonitoringApplianceActor {
         let device = peer.device.clone();
         self.peers.retain(|t| t.peer.device != device);
 
-        for function in [
-            Function::ElectricalConnectionDescriptionListData,
-            Function::ElectricalConnectionParameterDescriptionListData,
-        ] {
-            engine.read(&peer.electrical_connection, &self.client, function, now);
+        // Each of the three features is read only where the peer serves it. A read
+        // addressed to a feature that is not there is answered with `errorNumber` 7 at
+        // best and dropped at worst, and either way it is a question this side already
+        // knows the answer to — discovery said so.
+        if let Some(electrical) = peer.electrical_connection.clone() {
+            for function in [
+                Function::ElectricalConnectionDescriptionListData,
+                Function::ElectricalConnectionParameterDescriptionListData,
+            ] {
+                engine.read(&electrical, &self.client, function, now);
+            }
         }
-        for function in [
-            Function::MeasurementDescriptionListData,
-            Function::MeasurementConstraintsListData,
-            Function::MeasurementListData,
-        ] {
-            engine.read(&peer.measurement, &self.client, function, now);
+        if let Some(measurement) = peer.measurement.clone() {
+            for function in [
+                Function::MeasurementDescriptionListData,
+                Function::MeasurementConstraintsListData,
+                Function::MeasurementListData,
+            ] {
+                engine.read(&measurement, &self.client, function, now);
+            }
+            engine.request_subscription(&self.client, &measurement, now);
         }
-        engine.request_subscription(&self.client, &peer.measurement, now);
 
         // MGCP scenario 1, where this peer serves it. The description read is not
         // optional: it is what says which `keyId` carries the factor, and that number is

@@ -52,17 +52,48 @@ pub enum BindingPolicy {
 /// is far beyond what a use case needs: the Energy Guard of LPC holds two bindings and
 /// three subscriptions, and an energy manager watching a large inverter a dozen. Beyond it
 /// the answer is `errorNumber` 3 — overload — which is what §5.2.5 defines it for.
+///
+/// The same number bounds the relations this device *holds* on one peer, counted
+/// separately: those are memory this device chose to allocate, and one peer's greed must
+/// not stop this node asking another for what it needs.
 pub const MAX_RELATIONS_PER_PEER: usize = 32;
 
-/// One binding or subscription.
+/// One binding or subscription this device is party to.
+///
+/// §7.3 and §7.4.1 rule 4 are explicit that a relation belongs to **both** partners —
+/// "Subscription information SHALL be kept persistently by both subscription partners" —
+/// and §7.4.3 says the table exchanged with a peer holds "the relation of an own feature to
+/// one feature of a subscription partner", in either direction. So one type covers both,
+/// and [`held`](Self::held) says which way round it is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Relation {
-    /// The identifier the server assigned.
-    pub id: u32,
+    /// The identifier the **server** assigned.
+    ///
+    /// [`None`] for a relation this device holds on a peer. Table 18 makes
+    /// `subscriptionId` optional — "MAY be present. If present it SHALL contain a
+    /// *server's* unique ID" — and that number is the peer's to assign: a node learns it
+    /// only by reading the peer's own table, which nothing here needs to do.
+    pub id: Option<u32>,
     /// The client feature that asked.
     pub client: FeatureAddress,
     /// The server feature it relates to.
     pub server: FeatureAddress,
+    /// Whether **this** device is the client: it asked, and a peer granted.
+    ///
+    /// `false` for the other direction — a peer asked and this device granted — which is
+    /// the one that decides whether a write is permitted and who gets notified.
+    pub held: bool,
+}
+
+impl Relation {
+    /// Whether this relation concerns `device` — either end of it.
+    ///
+    /// §7.4.3: "between two devices A and B only those subscription entries are exchanged
+    /// that concern the devices A and B. I.e. no subscription entries of a third device C
+    /// are exchanged between A and B."
+    pub fn concerns(&self, device: &crate::model::AddressDevice) -> bool {
+        self.client.device.as_ref() == Some(device) || self.server.device.as_ref() == Some(device)
+    }
 }
 
 /// The bindings and subscriptions a local device holds.
@@ -166,9 +197,11 @@ impl Relations {
         if let Some(existing) = self
             .bindings
             .iter()
-            .find(|b| same_feature(&b.client, client) && same_feature(&b.server, server))
+            .find(|b| !b.held && same_feature(&b.client, client) && same_feature(&b.server, server))
         {
-            return Ok(BindingId(existing.id));
+            return Ok(BindingId(
+                existing.id.expect("a granted relation carries its id"),
+            ));
         }
 
         if self.policy == BindingPolicy::SinglePerFeature {
@@ -180,16 +213,17 @@ impl Relations {
                 return Err(ErrorNumber::CommandRejected);
             }
         }
-        if held_by_peer(&self.bindings, client) >= MAX_RELATIONS_PER_PEER {
+        if granted_to(&self.bindings, client) >= MAX_RELATIONS_PER_PEER {
             return Err(ErrorNumber::Overload);
         }
 
         let id = self.next_binding;
         self.next_binding += 1;
         self.bindings.push(Relation {
-            id,
+            id: Some(id),
             client: client.clone(),
             server: server.clone(),
+            held: false,
         });
         Ok(BindingId(id))
     }
@@ -199,15 +233,105 @@ impl Relations {
     /// Releasing one that does not exist succeeds: the caller's intent is already met,
     /// and a peer that retries a delete after a reconnection should not see an error.
     pub fn remove_binding(&mut self, client: &FeatureAddress, server: &FeatureAddress) {
-        self.bindings
-            .retain(|b| !(same_feature(&b.client, client) && same_feature(&b.server, server)));
+        self.bindings.retain(|b| {
+            b.held || !(same_feature(&b.client, client) && same_feature(&b.server, server))
+        });
     }
 
-    /// Whether a client may write to a server feature.
+    /// Whether a peer's client feature may write to one of this device's server features.
+    ///
+    /// Granted relations only. A relation this device *holds* is permission somebody gave
+    /// **it**, and reading it as permission granted would let a peer write to a feature of
+    /// ours because we happen to write to one of theirs.
     pub fn is_bound(&self, client: &FeatureAddress, server: &FeatureAddress) -> bool {
         self.bindings
             .iter()
-            .any(|b| same_feature(&b.client, client) && same_feature(&b.server, server))
+            .any(|b| !b.held && same_feature(&b.client, client) && same_feature(&b.server, server))
+    }
+
+    /// Whether *this* device holds a binding on a peer's feature.
+    ///
+    /// The other direction, and the question an actor asks before it writes: §7.3 requires
+    /// the binding first, and a write sent without one comes back `errorNumber` 9.
+    pub fn holds_binding(&self, client: &FeatureAddress, server: &FeatureAddress) -> bool {
+        self.bindings
+            .iter()
+            .any(|b| b.held && same_feature(&b.client, client) && same_feature(&b.server, server))
+    }
+
+    /// Whether *this* device holds a subscription on a peer's feature.
+    pub fn holds_subscription(&self, client: &FeatureAddress, server: &FeatureAddress) -> bool {
+        self.subscriptions
+            .iter()
+            .any(|s| s.held && same_feature(&s.client, client) && same_feature(&s.server, server))
+    }
+
+    /// Records a relation a peer has just granted this device.
+    ///
+    /// §7.4.1 rule 4 — "Subscription information SHALL be kept persistently by both
+    /// subscription partners" — and §7.3 says the same of bindings. The engine calls this
+    /// when the `result` for its own request comes back clean; the identifier stays
+    /// [`None`] because it is the peer's to assign.
+    ///
+    /// Returns whether it was recorded. A duplicate is not, and neither is one beyond
+    /// [`MAX_RELATIONS_PER_PEER`] for that peer.
+    pub fn record_binding(&mut self, client: &FeatureAddress, server: &FeatureAddress) -> bool {
+        Self::record(&mut self.bindings, client, server)
+    }
+
+    /// The same, for a subscription a peer has granted this device.
+    pub fn record_subscription(
+        &mut self,
+        client: &FeatureAddress,
+        server: &FeatureAddress,
+    ) -> bool {
+        Self::record(&mut self.subscriptions, client, server)
+    }
+
+    fn record(into: &mut Vec<Relation>, client: &FeatureAddress, server: &FeatureAddress) -> bool {
+        if into
+            .iter()
+            .any(|r| r.held && same_feature(&r.client, client) && same_feature(&r.server, server))
+        {
+            return false;
+        }
+        if held_on(into, server) >= MAX_RELATIONS_PER_PEER {
+            return false;
+        }
+        into.push(Relation {
+            id: None,
+            client: client.clone(),
+            server: server.clone(),
+            held: true,
+        });
+        true
+    }
+
+    /// Drops a relation this device holds, after releasing it or being released.
+    pub fn remove_held(&mut self, client: &FeatureAddress, server: &FeatureAddress) {
+        let gone = |r: &Relation| {
+            r.held && same_feature(&r.client, client) && same_feature(&r.server, server)
+        };
+        self.bindings.retain(|b| !gone(b));
+        self.subscriptions.retain(|s| !gone(s));
+    }
+
+    /// The bindings that concern one peer, in either direction (§7.4.3).
+    pub fn bindings_with<'a>(
+        &'a self,
+        device: &'a crate::model::AddressDevice,
+    ) -> impl Iterator<Item = &'a Relation> + 'a {
+        self.bindings.iter().filter(move |b| b.concerns(device))
+    }
+
+    /// The subscriptions that concern one peer, in either direction (§7.4.3).
+    pub fn subscriptions_with<'a>(
+        &'a self,
+        device: &'a crate::model::AddressDevice,
+    ) -> impl Iterator<Item = &'a Relation> + 'a {
+        self.subscriptions
+            .iter()
+            .filter(move |s| s.concerns(device))
     }
 
     /// Grants a subscription, or says why not.
@@ -219,19 +343,22 @@ impl Relations {
         if let Some(existing) = self
             .subscriptions
             .iter()
-            .find(|s| same_feature(&s.client, client) && same_feature(&s.server, server))
+            .find(|s| !s.held && same_feature(&s.client, client) && same_feature(&s.server, server))
         {
-            return Ok(SubscriptionId(existing.id));
+            return Ok(SubscriptionId(
+                existing.id.expect("a granted relation carries its id"),
+            ));
         }
-        if held_by_peer(&self.subscriptions, client) >= MAX_RELATIONS_PER_PEER {
+        if granted_to(&self.subscriptions, client) >= MAX_RELATIONS_PER_PEER {
             return Err(ErrorNumber::Overload);
         }
         let id = self.next_subscription;
         self.next_subscription += 1;
         self.subscriptions.push(Relation {
-            id,
+            id: Some(id),
             client: client.clone(),
             server: server.clone(),
+            held: false,
         });
         Ok(SubscriptionId(id))
     }
@@ -241,15 +368,19 @@ impl Relations {
     /// `TC_SPINE_SUBS_002` requires this to be idempotent: deleting one that is not
     /// there is not an error.
     pub fn remove_subscription(&mut self, client: &FeatureAddress, server: &FeatureAddress) {
-        self.subscriptions
-            .retain(|s| !(same_feature(&s.client, client) && same_feature(&s.server, server)));
+        self.subscriptions.retain(|s| {
+            s.held || !(same_feature(&s.client, client) && same_feature(&s.server, server))
+        });
     }
 
-    /// Whether a client is subscribed to a server feature.
+    /// Whether a peer's client feature is subscribed to one of this device's features.
+    ///
+    /// Granted relations only — see [`is_bound`](Self::is_bound). The held direction is
+    /// [`holds_subscription`](Self::holds_subscription).
     pub fn is_subscribed(&self, client: &FeatureAddress, server: &FeatureAddress) -> bool {
         self.subscriptions
             .iter()
-            .any(|s| same_feature(&s.client, client) && same_feature(&s.server, server))
+            .any(|s| !s.held && same_feature(&s.client, client) && same_feature(&s.server, server))
     }
 
     /// The clients to notify when a server feature's data changes.
@@ -259,8 +390,31 @@ impl Relations {
     ) -> impl Iterator<Item = &'a FeatureAddress> + 'a {
         self.subscriptions
             .iter()
-            .filter(move |s| same_feature(&s.server, server))
+            .filter(move |s| !s.held && same_feature(&s.server, server))
             .map(|s| &s.client)
+    }
+
+    /// Drops everything that named a feature of one of *this* device's entities.
+    ///
+    /// The counterpart of [`remove_device`](Self::remove_device) for the local side:
+    /// SPINE §7.1.5 lets a device remove an entity at runtime, and a binding or
+    /// subscription to a feature that no longer exists is a promise this device cannot
+    /// keep — a notification would be addressed to nothing, and a write would be answered
+    /// `errorNumber` 7 forever.
+    ///
+    /// Sub-entities go with the parent, the same way
+    /// [`LocalDevice::remove_entity`](super::LocalDevice::remove_entity) removes them.
+    /// A relation whose address carries no device part is taken as local, which is what
+    /// the §2.7 exception leaves behind.
+    pub fn remove_local_entity(&mut self, device: &crate::model::AddressDevice, entity: &[u32]) {
+        let ours = |address: &FeatureAddress| {
+            address.device.as_ref().is_none_or(|held| held == device)
+                && crate::spine::address::entity_path(address).starts_with(entity)
+        };
+        self.bindings
+            .retain(|b| !ours(&b.client) && !ours(&b.server));
+        self.subscriptions
+            .retain(|s| !ours(&s.client) && !ours(&s.server));
     }
 
     /// Drops everything belonging to a peer.
@@ -277,12 +431,19 @@ impl Relations {
     }
 }
 
-/// How many of `relations` a peer device holds — the same device as `client`, whichever
-/// of its features asked.
-fn held_by_peer(relations: &[Relation], client: &FeatureAddress) -> usize {
+/// How many relations this device has **granted** to the peer `client` belongs to.
+fn granted_to(relations: &[Relation], client: &FeatureAddress) -> usize {
     relations
         .iter()
-        .filter(|relation| relation.client.device == client.device)
+        .filter(|relation| !relation.held && relation.client.device == client.device)
+        .count()
+}
+
+/// How many relations this device **holds** on the peer `server` belongs to.
+fn held_on(relations: &[Relation], server: &FeatureAddress) -> usize {
+    relations
+        .iter()
+        .filter(|relation| relation.held && relation.server.device == server.device)
         .count()
 }
 

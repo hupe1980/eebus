@@ -51,6 +51,7 @@ fn a_node_announces_itself_and_is_found() {
             Some(found.instance)
         }
         Some(BrowseEvent::Lost { .. }) => panic!("nothing had arrived to be lost"),
+        Some(other) => panic!("an announcement this test does not know about: {other:?}"),
         None => {
             eprintln!("multicast did not reach this process; skipping the assertions");
             None
@@ -69,7 +70,7 @@ fn a_node_announces_itself_and_is_found() {
                     lost = Some(instance);
                     break;
                 }
-                Some(BrowseEvent::Found(_)) => {}
+                Some(_) => {}
                 None => break,
             }
         }

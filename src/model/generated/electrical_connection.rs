@@ -336,8 +336,7 @@ crate::eebus_struct! {
 
 crate::eebus_identity!(ElectricalConnectionParameterDescriptionData {
     electrical_connection_id,
-    parameter_id,
-    measurement_id
+    parameter_id
 });
 
 crate::eebus_struct! {

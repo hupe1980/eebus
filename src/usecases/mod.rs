@@ -41,6 +41,37 @@
 //! here — a hot water tank is a thermal battery, and asking it for a higher temperature
 //! while the roof is exporting is something no limit can express.
 
+//! # Driving an actor
+//!
+//! Every actor here is driven the same way, from the loop that owns the engine:
+//!
+//! ```text
+//! actor.handle_event(&mut engine, &spine_event, now)   // one engine event
+//! actor.handle_timeout(&mut engine, now)               // a deadline came due
+//! actor.poll_timeout()                                 // when the next one is
+//! ```
+//!
+//! `poll_timeout` reports an **absolute** instant on the same monotonic scale as the `now`
+//! passed in, not a delay, and its *type* says something worth reading:
+//!
+//! | | |
+//! |---|---|
+//! | `Duration` | a deadline is always pending, because this actor produces a heartbeat. `ControllableSystemActor`, `EnergyGuardActor`, the guard side of [`emobility::charging`] |
+//! | `Option<Duration>` | there may be nothing to wait for. Every state machine — [`limitation::ControllableSystem`], [`cob::BatteryControl`] — and the actors that produce no heartbeat of their own |
+//! | *absent* | this actor has no timers at all. [`monitoring::MonitoringApplianceActor`] reads descriptions and subscribes; the engine owns the retry ladder for both |
+//!
+//! That is a rule rather than an inconsistency, and it is the reason the types differ: an
+//! actor that must beat has a deadline it cannot be without, and saying so in the type is
+//! worth more than a uniform signature that would make every caller unwrap a `Some` that
+//! is always there.
+//!
+//! A driver with several actors on one engine folds what they report and sleeps until the
+//! earliest, then hands the same `now` to each `handle_timeout`. Order does not matter
+//! between actors; within one, the engine is the only shared state and each actor touches
+//! only its own features.
+//!
+//! [`emobility::charging`]: crate::usecases::emobility::charging
+
 pub mod addressing;
 pub mod cob;
 pub mod descriptor;
@@ -55,6 +86,7 @@ pub mod moi;
 pub mod monitoring;
 pub mod mpc;
 pub mod mps;
+pub mod ohpcf;
 pub mod signals;
 
 pub use descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};

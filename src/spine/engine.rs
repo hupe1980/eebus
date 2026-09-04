@@ -37,13 +37,14 @@ use super::address::{
     self, is_node_management, node_management, node_management_without_device, same_feature,
 };
 use super::counter::{MsgCounterSource, MsgCounterTracker};
-use super::device::{LocalDevice, WriteApproval};
+use super::device::{DeviceError, LocalDevice, LocalEntity, WriteApproval};
 use super::discovery::{RemoteDevice, SPINE_VERSION, detailed_discovery, use_case_data};
 use super::relations::{BindingPolicy, Relations};
 use crate::usecases::UseCaseDescriptor;
 
 /// Something the application needs to know about.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum SpineEvent {
     /// A peer's detailed discovery data arrived or changed.
     DiscoveryUpdated {
@@ -343,6 +344,75 @@ impl WriteOps {
     }
 }
 
+/// Merges a §7.5.4 runtime update into the use cases a peer announced before.
+///
+/// Entries are addressed by `(address, actor)`, which is what §7.5.2 keys them by — "the
+/// Actor SHALL be denoted in the Element `nodeManagementUseCaseData.useCaseInformation.
+/// actor`", one entry per actor per entity. The address is compared as the peer sent it,
+/// including *absent*: a peer that names no address has one `useCaseInformation` per
+/// actor, and a peer that names one has one per (entity, actor). Both are consistent
+/// within a peer, which is all this needs.
+///
+/// `removing` is a `cmdClassifier: delete`. §7.5.4 does not say how a use case is
+/// withdrawn — the implementation guide §2.2 has a *client* actor set
+/// `useCaseAvailable: false` instead — but a delete unambiguously names entries to drop,
+/// and the alternative reading, which the generic path would take, is "I play no use cases
+/// at all".
+fn merge_use_cases(
+    stored: &mut crate::model::NodeManagementUseCaseData,
+    update: &crate::model::NodeManagementUseCaseData,
+    removing: bool,
+) {
+    use crate::model::NodeManagementUseCaseDataUseCaseInformation as Information;
+
+    let key = |entry: &Information| (entry.address.clone(), entry.actor.clone());
+    let mut held = stored.use_case_information.take().unwrap_or_default();
+
+    for entry in update.use_case_information.iter().flatten() {
+        if entry.actor.is_none() {
+            // Nothing to address: §7.5.2 makes the actor the one element that says which
+            // entry this is, and an entry without one can neither replace nor remove.
+            continue;
+        }
+        let at = held.iter().position(|other| key(other) == key(entry));
+        match (removing, at) {
+            (true, Some(index)) => {
+                held.remove(index);
+            }
+            (true, None) => {}
+            (false, Some(index)) => held[index] = entry.clone(),
+            // The peer decides how many actors it announces, so the list it can make this
+            // device hold is bounded the same way a notified list is.
+            (false, None) if held.len() < super::device::MAX_LIST_ENTRIES => {
+                held.push(entry.clone());
+            }
+            (false, None) => {}
+        }
+    }
+
+    stored.use_case_information = Some(held);
+}
+
+/// Marks every entity and feature a payload names as removed.
+///
+/// What a `cmdClassifier: delete` on detailed discovery has to mean. §7.1.5 does not use
+/// one — it prescribes `lastStateChange: removed` inside a notify — but a peer that sends
+/// one is unambiguously saying "these are gone", and the alternative reading, which the
+/// generic delete path would take, is "I have no entities at all".
+fn mark_removed(data: &mut crate::model::NodeManagementDetailedDiscoveryData) {
+    use crate::model::NetworkManagementStateChange::Removed;
+    for entry in data.entity_information.iter_mut().flatten() {
+        if let Some(description) = entry.description.as_mut() {
+            description.last_state_change = Some(Removed);
+        }
+    }
+    for entry in data.feature_information.iter_mut().flatten() {
+        if let Some(description) = entry.description.as_mut() {
+            description.last_state_change = Some(Removed);
+        }
+    }
+}
+
 /// The staggered retry of the SPINE implementation guide §2.6.2.
 ///
 /// > If a peer is considered unresponsive (timeout), the device SHOULD implement a
@@ -403,6 +473,29 @@ struct Peer {
     /// A partial notification is a fragment, and reading a fragment needs the value it is
     /// a fragment *of*. See [`MAX_REMOTE_FUNCTIONS`].
     data: Vec<(FeatureAddress, CmdData)>,
+    /// The peer's detailed discovery document, merged by §7.1.5's rules.
+    ///
+    /// Deliberately not in `data`. Two reasons, and each on its own would be enough:
+    /// the generic partial merge cannot address this function's entries — it replaces
+    /// `entityInformation` wholesale, so a conformant update naming one entity would take
+    /// every other entity with it — and the table above evicts, which would leave the next
+    /// fragment merging into nothing and the device tree replaced by whatever that
+    /// fragment happened to carry. What bounds this one is
+    /// [`MAX_LIST_ENTRIES`](super::device::MAX_LIST_ENTRIES), inside the merge.
+    ///
+    /// Held as a `CmdData` so that [`Engine::remote_data`] can hand it back like any other
+    /// merged function; it is always the `NodeManagementDetailedDiscoveryData` alternative.
+    discovery: CmdData,
+    /// The peer's use-case document, merged by §7.5.4's rules.
+    ///
+    /// Outside the table for the same two reasons discovery is. Its entries are keyed by
+    /// `(address, actor)` and the *address is optional on the wire* — absent from every
+    /// SPINE 1.1.1 peer in `tests/fixtures/devices` — so the generic identifier merge
+    /// cannot address them and replaces the list instead. §7.5.4 lets a device
+    /// "add/remove/modify one or more use cases" at runtime and says a device that uses
+    /// use-case discovery "should always subscribe" to it, so a partial update is a shape
+    /// this has to survive rather than a curiosity.
+    use_cases: CmdData,
 }
 
 /// How many of a peer's functions one engine keeps the merged state of.
@@ -534,6 +627,158 @@ impl Engine {
     /// The local device, for publishing data.
     pub fn device_mut(&mut self) -> &mut LocalDevice {
         &mut self.device
+    }
+
+    /// Adds an entity while peers are connected, and tells them (§7.1.5).
+    ///
+    /// [`LocalDevice::add_entity`] changes the model; this also announces the change, and
+    /// the two are worth keeping apart — a device built before the first connection has
+    /// nobody to tell.
+    ///
+    /// The announcement is a **partial notify** of
+    /// `nodeManagementDetailedDiscoveryData` carrying this entity with
+    /// `lastStateChange: added` and all of its features, which is what rule 5 asks for.
+    /// Every subscriber of the primary NodeManagement instance gets it; a peer that never
+    /// subscribed is told nothing, which is the specification's shape — discovery is
+    /// subscribed to, not pushed.
+    pub fn add_entity(&mut self, entity: LocalEntity, now: Duration) -> Result<(), DeviceError> {
+        let address = entity.address().to_vec();
+        self.device.add_entity(entity)?;
+        let entity = self.device.entity(&address).expect("just added").clone();
+        let data = super::discovery::entities_added(&self.device, &[entity]);
+        self.notify_discovery_change(data, now);
+        Ok(())
+    }
+
+    /// Announces that an entity's features changed (§7.1.5 rule 6).
+    ///
+    /// The third of the runtime changes, and the one with no model change of its own:
+    /// change the entity through [`device_mut`](Self::device_mut) — add a feature, drop
+    /// one, change what a function announces — and then say so. The notify carries
+    /// `lastStateChange: modified` and the entity's features as they now stand.
+    ///
+    /// Rule 6b asks for the *changed* features only, each with its own `lastStateChange`.
+    /// Sending all of them says the same thing without the device having to remember which
+    /// ones each peer last heard about, and a re-send is always permitted.
+    pub fn modify_entity(&mut self, address: &[u32], now: Duration) -> Result<(), DeviceError> {
+        let entity = self
+            .device
+            .entity(address)
+            .ok_or(DeviceError::UnknownEntity)?
+            .clone();
+        let data = super::discovery::entities_modified(&self.device, &[entity]);
+        self.notify_discovery_change(data, now);
+        Ok(())
+    }
+
+    /// Asks a peer to tell this device when its entities or use cases change.
+    ///
+    /// One subscription covers both: §7.4.1 permits a subscription only "on a whole
+    /// feature", and detailed discovery and use-case discovery are two functions of the
+    /// same primary NodeManagement instance. §7.5.4 asks for it in as many words — "a
+    /// device that uses use case discovery **should always subscribe** to use case
+    /// discovery" — and §7.1.5 gives it teeth: a peer's *departing* entity is announced
+    /// only to subscribers, so a node that never asks can watch a car drive away and never
+    /// hear about it.
+    ///
+    /// The peer's device address has to be known, which it is once the opening reads have
+    /// been answered — the two reads of [`start_discovery`](Self::start_discovery) are
+    /// addressed without one, so this cannot be folded into them.
+    /// [`Hub`](crate::runtime::Hub) does it for you when it raises
+    /// [`PeerDiscovered`](crate::runtime::HubEvent::PeerDiscovered).
+    ///
+    /// A peer may decline (§7.4.1 rule 3), and the refusal arrives as a
+    /// [`SpineEvent::ResultReceived`] like any other. Nothing else changes: discovery
+    /// still works, it is only the *changes* that go unheard.
+    pub fn subscribe_to_discovery(&mut self, peer: &AddressDevice, now: Duration) -> MsgCounter {
+        let ours = node_management(self.device.address());
+        let theirs = node_management(peer);
+        self.request_subscription(&ours, &theirs, now)
+    }
+
+    /// Removes an entity while peers are connected, and tells them (§7.1.5).
+    ///
+    /// Three things happen, and leaving out any of them leaves a peer holding something
+    /// this device can no longer honour:
+    ///
+    /// 1. The entity and everything beneath it go from the model
+    ///    ([`LocalDevice::remove_entity`]).
+    /// 2. Every binding and subscription naming one of their features is released, and so
+    ///    is every use case that entity announced. A subscription to a feature that is
+    ///    gone would be a notification addressed to nothing.
+    /// 3. Subscribers are sent a partial notify with `lastStateChange: removed` and no
+    ///    `featureInformation`, per rule 4 — and, where the entity announced use cases, a
+    ///    fresh `nodeManagementUseCaseData` as well.
+    ///
+    /// Returns what was removed, the named entity first.
+    ///
+    /// **This is the one message an arrival is not.** A peer learns of a new entity from
+    /// any discovery re-read; it learns of a *departure* only from a device that sends
+    /// this, because a merged discovery document cannot shrink on its own. EVCC scenario 8
+    /// — the car that drove away — is unobservable without it, in this crate and in a
+    /// simulator built on it alike.
+    pub fn remove_entity(
+        &mut self,
+        address: &[u32],
+        now: Duration,
+    ) -> Result<Vec<LocalEntity>, DeviceError> {
+        let removed = self.device.remove_entity(address)?;
+
+        let device = self.device.address().clone();
+        self.relations.remove_local_entity(&device, address);
+        let announced = self.use_cases.len();
+        self.use_cases
+            .retain(|(entity, ..)| !entity.starts_with(address));
+        let use_cases_changed = self.use_cases.len() != announced;
+
+        let data = super::discovery::entities_removed(&self.device, &removed);
+        self.notify_discovery_change(data, now);
+        if use_cases_changed {
+            let node_management = super::address::node_management(&device);
+            self.notify(&node_management, &Function::NodeManagementUseCaseData, now);
+        }
+        Ok(removed)
+    }
+
+    /// Sends one §7.1.5 change to every subscriber of the primary NodeManagement feature.
+    ///
+    /// Partial, because rule 3 says unchanged entities stay out and a full document would
+    /// say nothing about what *went*: a receiver merging a shorter document into a longer
+    /// one keeps the difference. Rule 2 asks for a restricted function exchange for
+    /// exactly that reason.
+    fn notify_discovery_change(
+        &mut self,
+        data: crate::model::NodeManagementDetailedDiscoveryData,
+        now: Duration,
+    ) {
+        let source = super::address::node_management(self.device.address());
+        let subscribers: Vec<FeatureAddress> =
+            self.relations.subscribers_of(&source).cloned().collect();
+        for subscriber in subscribers {
+            let counter = self.counters.next();
+            self.send(
+                Datagram {
+                    header: Some(self.header(
+                        &source,
+                        &subscriber,
+                        counter,
+                        CmdClassifier::Notify,
+                        false,
+                        None,
+                    )),
+                    payload: Some(Payload {
+                        cmd: Some(vec![
+                            Cmd::with_data(CmdData::NodeManagementDetailedDiscoveryData(
+                                data.clone(),
+                            ))
+                            .with_filter(Filter::partial()),
+                        ]),
+                    }),
+                },
+                None,
+                now,
+            );
+        }
     }
 
     /// The bindings and subscriptions held.
@@ -749,7 +994,72 @@ impl Engine {
         function: Function,
         now: Duration,
     ) -> MsgCounter {
+        self.read_filtered(destination, source, function, Vec::new(), now)
+    }
+
+    /// Reads *part* of a function from a peer (§5.3.4.5).
+    ///
+    /// A **selector** says which entries, an **elements filter** which of their fields.
+    /// The specification asks for this in two places by name, and both are questions a
+    /// client wants to ask a large device without pulling its whole tree across:
+    ///
+    /// * §7.1.3, partial detailed discovery — "where is your `LoadControl` feature?" is a
+    ///   few hundred bytes rather than every entity a heat pump has.
+    /// * §7.5.3, partial use-case discovery — "do you play the Controllable System?"
+    ///   Every device that supports it "SHALL support the selectors `actor` and
+    ///   `useCaseName`".
+    ///
+    /// The peer answers with a subset marked partial, and the engine merges it into what
+    /// that peer has already said — so asking a narrow question does not discard the answer
+    /// to a wide one. A peer that does not announce `read.partial` for the function
+    /// answers `errorNumber` 8 instead, which is why
+    /// [`RemoteFeature::supports_partial_read`](super::RemoteFeature::supports_partial_read)
+    /// is worth asking first.
+    ///
+    /// ```
+    /// # use core::time::Duration;
+    /// # use eebus::prelude::*;
+    /// use eebus::model::{Filter, FilterSelectors, NodeManagementUseCaseDataSelectors,
+    ///     NodeManagementUseCaseDataSelectorsUseCaseInformation, UseCaseActor};
+    /// # let device = LocalDevice::new("i:1", "Cem", DeviceType::EnergyManagementSystem)?;
+    /// # let mut engine = Engine::new(device);
+    /// # let peer = eebus::spine::device_address("i:2", "HeatPump")?;
+    /// # let theirs = eebus::spine::node_management(&peer);
+    /// # let ours = eebus::spine::node_management(engine.device().address());
+    /// let only_controllable_systems = Filter::partial().select(
+    ///     FilterSelectors::NodeManagementUseCaseDataSelectors(
+    ///         NodeManagementUseCaseDataSelectors {
+    ///             use_case_information: Some(NodeManagementUseCaseDataSelectorsUseCaseInformation {
+    ///                 actor: Some(UseCaseActor::from("ControllableSystem")),
+    ///                 ..Default::default()
+    ///             }),
+    ///         },
+    ///     ),
+    /// );
+    /// engine.read_filtered(
+    ///     &theirs,
+    ///     &ours,
+    ///     Function::NodeManagementUseCaseData,
+    ///     vec![only_controllable_systems],
+    ///     Duration::ZERO,
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// An empty `filters` is a whole-function read, which is what [`read`](Self::read) is.
+    pub fn read_filtered(
+        &mut self,
+        destination: &FeatureAddress,
+        source: &FeatureAddress,
+        function: Function,
+        filters: Vec<Filter>,
+        now: Duration,
+    ) -> MsgCounter {
         let counter = self.counters.next();
+        let mut cmd = Cmd::read(function);
+        for filter in filters {
+            cmd = cmd.with_filter(filter);
+        }
         self.send(
             Datagram {
                 header: Some(self.header(
@@ -761,7 +1071,7 @@ impl Engine {
                     None,
                 )),
                 payload: Some(Payload {
-                    cmd: Some(vec![Cmd::read(function)]),
+                    cmd: Some(vec![cmd]),
                 }),
             },
             Some((destination.clone(), counter)),
@@ -853,21 +1163,34 @@ impl Engine {
         // here made a subscription to NodeManagement unserviceable: it is granted, the
         // peer waits for the entity list to change, and no notification can ever be
         // built for it (§7.1.3, §7.3.2, §7.4.2).
-        let computed = is_node_management(feature)
-            .then(|| self.node_management_data(function))
-            .flatten();
-        let Some(data) = computed.or_else(|| {
-            self.device
-                .resolve(feature)
-                .and_then(|f| f.data(function))
-                .cloned()
-        }) else {
+        let node_management = is_node_management(feature);
+        let stored = self
+            .device
+            .resolve(feature)
+            .and_then(|f| f.data(function))
+            .cloned();
+        if !node_management && stored.is_none() {
             return;
-        };
+        }
         let subscribers: Vec<FeatureAddress> =
             self.relations.subscribers_of(feature).cloned().collect();
 
         for subscriber in subscribers {
+            // The relation tables are tailored to their recipient (§7.4.3), so a
+            // NodeManagement notification is built per subscriber rather than once. The
+            // other two functions of this feature — detailed and use-case discovery —
+            // are the same for everybody, and cost one clone each.
+            let data = if node_management {
+                match self.node_management_data(function, subscriber.device.as_ref()) {
+                    Some(data) => Some(data),
+                    None => stored.clone(),
+                }
+            } else {
+                stored.clone()
+            };
+            let Some(data) = data else {
+                continue;
+            };
             let counter = self.counters.next();
             self.send(
                 Datagram {
@@ -880,7 +1203,7 @@ impl Engine {
                         None,
                     )),
                     payload: Some(Payload {
-                        cmd: Some(vec![Cmd::with_data(data.clone())]),
+                        cmd: Some(vec![Cmd::with_data(data)]),
                     }),
                 },
                 None,
@@ -1291,7 +1614,7 @@ impl Engine {
                 let operations = entry.operations;
                 let stored = entry.data.clone();
                 let computed = if is_node_management(destination) {
-                    self.node_management_data(&function)
+                    self.node_management_data(&function, source.device.as_ref())
                 } else {
                     None
                 };
@@ -1465,13 +1788,71 @@ impl Engine {
     /// out. An unknown token — already resolved, abandoned, or never issued — is
     /// [`WriteError::UnknownToken`].
     pub fn accept_write(&mut self, token: WriteToken, now: Duration) -> Result<(), WriteError> {
+        self.finish_write(token, None, now)
+    }
+
+    /// Accepts a deferred write, and stores what the *application* decided rather than
+    /// what the peer sent.
+    ///
+    /// For a function whose document belongs to the application rather than to the peer
+    /// that wrote into it. [OHPCF](crate::usecases::ohpcf) is the shape:
+    /// `smartEnergyManagementPsData` is one value rather than a list SPINE can address
+    /// entries within, so a partial write — which Table 10 makes **mandatory** for that
+    /// use case — replaces the compressor's whole `alternatives` element with the CEM's
+    /// two-field fragment. Accepting it and storing that leaves the feature publishing a
+    /// compressor with no power value and no interrupt options, and §7.4.1 then notifies
+    /// every subscriber of it, the writer included.
+    ///
+    /// So the application hands back the document the write *results in*, and that is what
+    /// is stored and notified. One notification, and it says what the device now is.
+    ///
+    /// ```no_run
+    /// # use core::time::Duration;
+    /// # use eebus::spine::{Engine, SpineEvent};
+    /// # use eebus::usecases::ohpcf::Flexibility;
+    /// # fn example(engine: &mut Engine, compressor: &mut Flexibility, event: SpineEvent, now: Duration) {
+    /// if let SpineEvent::WriteRequested(write) = event {
+    ///     match compressor.apply(&write.resolved) {
+    ///         // The compressor's own document, not the fragment that produced it.
+    ///         Ok(_) => { let _ = engine.accept_write_with(write.token, compressor.data(), now); }
+    ///         Err(refused) => { engine.reject_write(write.token, refused.error_number(), now); }
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// The peer is acknowledged exactly as [`accept_write`](Self::accept_write)
+    /// acknowledges it: what it asked for was accepted, and what the device now holds is
+    /// what it notifies. `data` has to be the same function the write addressed, or the
+    /// store is refused and the peer answered with an error.
+    pub fn accept_write_with(
+        &mut self,
+        token: WriteToken,
+        data: CmdData,
+        now: Duration,
+    ) -> Result<(), WriteError> {
+        self.finish_write(token, Some(data), now)
+    }
+
+    fn finish_write(
+        &mut self,
+        token: WriteToken,
+        replacement: Option<CmdData>,
+        now: Duration,
+    ) -> Result<(), WriteError> {
         let Some(write) = self.take_deferred(token) else {
             return Err(WriteError::UnknownToken);
         };
         let function = Function::from(write.data.key());
-        let outcome = match self.device.resolve_mut(&write.feature) {
-            None => Err(super::device::FeatureError::UnknownFunction),
-            Some(feature) => write.ops.apply_to(feature, write.data),
+        let outcome = match (self.device.resolve_mut(&write.feature), replacement) {
+            (None, _) => Err(super::device::FeatureError::UnknownFunction),
+            // The application's own document replaces what is stored outright: it is the
+            // result of the write, not a fragment to merge into one.
+            (Some(feature), Some(data)) if data.key() == write.data.key() => {
+                feature.set_data(data).map(|_| ())
+            }
+            (Some(_), Some(_)) => Err(super::device::FeatureError::UnknownFunction),
+            (Some(feature), None) => write.ops.apply_to(feature, write.data),
         };
 
         let error = match &outcome {
@@ -1674,48 +2055,25 @@ impl Engine {
             return ErrorNumber::General;
         };
 
+        let ops = WriteOps::of(cmd);
+
         // The peer may have sent a *fragment*: a partial notification, a partial reply, or
         // a delete. What the application needs is the value that fragment is a fragment
         // of, and computing it once here is the same rule the write path follows — the
         // reference implementations pass the fragment alone, and every consumer then
         // reimplements the merge.
-        let resolved = self.resolve_remote(source, &data, &WriteOps::of(cmd));
-
-        // Discovery data updates what we know about the peer — from the merged document,
-        // since §7.1.5's re-send may itself be partial.
-        match &resolved {
-            CmdData::NodeManagementDetailedDiscoveryData(discovery) => {
-                // Filed under the address the *header* carries, which is the one SHIP
-                // authenticated and the one every reply goes back to. The payload names
-                // one too, and a peer whose payload disagreed with its header would
-                // otherwise have its discovery filed under a device that never sent it.
-                // The payload is the fallback for the one message §2.7 lets through
-                // without a device part.
-                let device = source.device.clone().or_else(|| {
-                    discovery
-                        .device_information
-                        .as_ref()
-                        .and_then(|d| d.description.as_ref())
-                        .and_then(|d| d.device_address.as_ref())
-                        .and_then(|a| a.device.clone())
-                });
-                if let Some(device) = device {
-                    let peer = self.peer_entry(&device);
-                    peer.remote.apply_detailed_discovery(discovery);
-                    self.events
-                        .push_back(SpineEvent::DiscoveryUpdated { device });
-                }
+        //
+        // Detailed discovery is merged by its own rules and kept outside the bounded
+        // table — see [`absorb_discovery`](Self::absorb_discovery).
+        let resolved = match &data {
+            CmdData::NodeManagementDetailedDiscoveryData(update) => {
+                self.absorb_discovery(source, update, &ops)
             }
-            CmdData::NodeManagementUseCaseData(use_cases) => {
-                if let Some(device) = source.device.clone() {
-                    let peer = self.peer_entry(&device);
-                    peer.remote.apply_use_case_data(use_cases);
-                    self.events
-                        .push_back(SpineEvent::UseCasesUpdated { device });
-                }
+            CmdData::NodeManagementUseCaseData(update) => {
+                self.absorb_use_cases(source, update, &ops)
             }
-            _ => {}
-        }
+            _ => self.resolve_remote(source, &data, &ops),
+        };
 
         self.events.push_back(match classifier {
             CmdClassifier::Reply => SpineEvent::ReplyReceived {
@@ -1730,6 +2088,119 @@ impl Engine {
             },
         });
         ErrorNumber::None
+    }
+
+    /// Takes a peer's `nodeManagementDetailedDiscoveryData`, whole or as a §7.1.5 update.
+    ///
+    /// The one function in SPINE whose partial exchange the generic merge cannot express.
+    /// It is not a list — it is three parallel lists inside one value — so a partial
+    /// update *replaces* `entityInformation` rather than addressing entries within it,
+    /// and §7.1.5 rule 3 has a device send only what changed. Merged the generic way, a
+    /// device announcing one new entity would erase every other entity it had announced.
+    ///
+    /// So three shapes are told apart here:
+    ///
+    /// * **A full document** replaces what was held. That is the reply to the opening
+    ///   read, and a re-send of the whole tree.
+    /// * **A partial update** is merged by
+    ///   [`merge_detailed_discovery`](super::discovery::merge_detailed_discovery), which
+    ///   is where `lastStateChange: removed` takes an entity out.
+    /// * **A delete** removes what its payload addresses. §7.1.5 prescribes
+    ///   `lastStateChange` rather than a delete filter, so nothing conformant arrives this
+    ///   way — but a delete that fell through to the generic path would clear the whole
+    ///   document, and a peer that means "this entity is gone" would be read as "I have
+    ///   no entities at all".
+    ///
+    /// Returns the merged document, which is what the event carries and what the peer
+    /// record is rebuilt from.
+    fn absorb_discovery(
+        &mut self,
+        source: &FeatureAddress,
+        update: &crate::model::NodeManagementDetailedDiscoveryData,
+        ops: &WriteOps,
+    ) -> CmdData {
+        use super::discovery::merge_detailed_discovery;
+
+        // Filed under the address the *header* carries, which is the one SHIP
+        // authenticated and the one every reply goes back to. The payload names one too,
+        // and a peer whose payload disagreed with its header would otherwise have its
+        // discovery filed under a device that never sent it. The payload is the fallback
+        // for the one message §2.7 lets through without a device part.
+        let device = source.device.clone().or_else(|| {
+            update
+                .device_information
+                .as_ref()
+                .and_then(|d| d.description.as_ref())
+                .and_then(|d| d.device_address.as_ref())
+                .and_then(|a| a.device.clone())
+        });
+        let Some(device) = device else {
+            return CmdData::NodeManagementDetailedDiscoveryData(update.clone());
+        };
+
+        let deletes = !ops.deletes.is_empty();
+        let peer = self.peer_entry(&device);
+        let CmdData::NodeManagementDetailedDiscoveryData(stored) = &mut peer.discovery else {
+            unreachable!("the peer's discovery is always that alternative");
+        };
+        if deletes {
+            // Everything the payload names, as if it had said `lastStateChange: removed`.
+            let mut removal = update.clone();
+            mark_removed(&mut removal);
+            merge_detailed_discovery(stored, &removal);
+        } else if ops.partial {
+            merge_detailed_discovery(stored, update);
+        } else {
+            *stored = update.clone();
+        }
+
+        let merged = stored.clone();
+        peer.remote.apply_detailed_discovery(&merged);
+        let resolved = peer.discovery.clone();
+        self.events
+            .push_back(SpineEvent::DiscoveryUpdated { device });
+        resolved
+    }
+
+    /// Takes a peer's `nodeManagementUseCaseData`, whole or as a §7.5.4 update.
+    ///
+    /// The sibling of [`absorb_discovery`](Self::absorb_discovery), for the same reason: a
+    /// `useCaseInformation` entry is keyed by its `address` and `actor`, the address is
+    /// optional on the wire — no peer in `tests/fixtures/devices` older than SPINE 1.3
+    /// sends one — and `actor` is not an identifier type. So the generic merge cannot
+    /// address entries here and replaces the whole list, which would have a device that
+    /// announces one changed use case erase every other use case it plays.
+    ///
+    /// §7.5.4 is one sentence and it is the reason this matters: "During runtime, a device
+    /// MAY add/remove/modify one or more use cases. Therefore, a device that uses use case
+    /// discovery should always subscribe to use case discovery." A subscriber that cannot
+    /// survive a partial notification is worse off subscribed than not.
+    fn absorb_use_cases(
+        &mut self,
+        source: &FeatureAddress,
+        update: &crate::model::NodeManagementUseCaseData,
+        ops: &WriteOps,
+    ) -> CmdData {
+        let Some(device) = source.device.clone() else {
+            return CmdData::NodeManagementUseCaseData(update.clone());
+        };
+        let peer = self.peer_entry(&device);
+        let CmdData::NodeManagementUseCaseData(stored) = &mut peer.use_cases else {
+            unreachable!("the peer's use cases are always that alternative");
+        };
+
+        if ops.partial || !ops.deletes.is_empty() {
+            merge_use_cases(stored, update, !ops.deletes.is_empty());
+        } else {
+            *stored = update.clone();
+        }
+
+        let merged = stored.clone();
+        peer.remote.apply_use_case_data(&merged);
+        let resolved = peer.use_cases.clone();
+        self.events
+            .push_back(SpineEvent::UseCasesUpdated { device });
+        resolved
     }
 
     /// Merges an incoming payload into what this peer has sent before, and answers with
@@ -1788,10 +2259,20 @@ impl Engine {
     /// application can ask again rather than having to hold the last event.
     pub fn remote_data(&self, feature: &FeatureAddress, function: &Function) -> Option<&CmdData> {
         let device = feature.device.as_ref()?;
-        self.peers
+        let peer = self
+            .peers
             .iter()
-            .find(|p| p.remote.address.as_ref() == Some(device))?
-            .data
+            .find(|p| p.remote.address.as_ref() == Some(device))?;
+        // Both kept outside the bounded table and merged by their own sections' rules
+        // rather than by the generic partial merge — see `absorb_discovery` and
+        // `absorb_use_cases`.
+        if function == &Function::NodeManagementDetailedDiscoveryData {
+            return Some(&peer.discovery);
+        }
+        if function == &Function::NodeManagementUseCaseData {
+            return Some(&peer.use_cases);
+        }
+        peer.data
             .iter()
             .find(|(held, data)| {
                 same_feature(held, feature) && &Function::from(data.key()) == function
@@ -1812,10 +2293,72 @@ impl Engine {
         let Some(request) = self.resolve_pending(reference, from) else {
             return;
         };
+        // §7.3 and §7.4.1 rule 4: a relation is kept by **both** partners. This is where
+        // this device learns its own request was granted — the `result` is the only answer
+        // a request call gets — and the request itself says which relation it was.
+        if error.is_success() {
+            self.record_relation(&request.datagram);
+        }
         self.events.push_back(SpineEvent::ResultReceived {
             request: request.request,
             error,
         });
+    }
+
+    /// Records, or drops, the relation a granted request call asked for.
+    ///
+    /// The identifier stays unknown: a `result` carries an `errorNumber` and nothing else,
+    /// and the id is the server's to assign. Table 18 makes it optional for exactly this
+    /// reason.
+    fn record_relation(&mut self, request: &Datagram) {
+        let Some(data) = request
+            .payload
+            .as_ref()
+            .and_then(|p| p.cmd.as_ref())
+            .and_then(|cmd| cmd.first())
+            .and_then(|cmd| cmd.data.as_ref())
+        else {
+            return;
+        };
+        let (client, server, keep, binding) = match data {
+            CmdData::NodeManagementBindingRequestCall(call) => {
+                let Some(r) = call.binding_request.as_ref() else {
+                    return;
+                };
+                (&r.client_address, &r.server_address, true, true)
+            }
+            CmdData::NodeManagementSubscriptionRequestCall(call) => {
+                let Some(r) = call.subscription_request.as_ref() else {
+                    return;
+                };
+                (&r.client_address, &r.server_address, true, false)
+            }
+            CmdData::NodeManagementBindingDeleteCall(call) => {
+                let Some(r) = call.binding_delete.as_ref() else {
+                    return;
+                };
+                (&r.client_address, &r.server_address, false, true)
+            }
+            CmdData::NodeManagementSubscriptionDeleteCall(call) => {
+                let Some(r) = call.subscription_delete.as_ref() else {
+                    return;
+                };
+                (&r.client_address, &r.server_address, false, false)
+            }
+            _ => return,
+        };
+        let (Some(client), Some(server)) = (client, server) else {
+            return;
+        };
+        match (keep, binding) {
+            (true, true) => {
+                self.relations.record_binding(client, server);
+            }
+            (true, false) => {
+                self.relations.record_subscription(client, server);
+            }
+            (false, _) => self.relations.remove_held(client, server),
+        }
     }
 
     fn send_result(
@@ -1851,7 +2394,11 @@ impl Engine {
     }
 
     /// The NodeManagement functions, which are computed rather than stored.
-    fn node_management_data(&self, function: &Function) -> Option<CmdData> {
+    fn node_management_data(
+        &self,
+        function: &Function,
+        recipient: Option<&AddressDevice>,
+    ) -> Option<CmdData> {
         match function {
             Function::NodeManagementDetailedDiscoveryData => Some(
                 CmdData::NodeManagementDetailedDiscoveryData(detailed_discovery(&self.device)),
@@ -1871,40 +2418,69 @@ impl Engine {
             }
             // §7.3.2 and §7.4.2: the tables report the relations actually held, not a
             // stored copy that would answer an empty list.
-            Function::NodeManagementBindingData => Some(CmdData::NodeManagementBindingData(
-                NodeManagementBindingData {
-                    binding_entry: Some(
-                        self.relations
-                            .bindings()
-                            .iter()
-                            .map(|relation| NodeManagementBindingDataBindingEntry {
-                                binding_id: Some(BindingId(relation.id)),
-                                client_address: Some(relation.client.clone()),
-                                server_address: Some(relation.server.clone()),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    ),
-                },
-            )),
-            Function::NodeManagementSubscriptionData => Some(
-                CmdData::NodeManagementSubscriptionData(NodeManagementSubscriptionData {
-                    subscription_entry: Some(
-                        self.relations
-                            .subscriptions()
-                            .iter()
-                            .map(|relation| NodeManagementSubscriptionDataSubscriptionEntry {
-                                subscription_id: Some(SubscriptionId(relation.id)),
-                                client_address: Some(relation.client.clone()),
-                                server_address: Some(relation.server.clone()),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    ),
-                }),
-            ),
+            //
+            // **Tailored to the recipient.** §7.4.3: "between two devices A and B only
+            // those subscription entries are exchanged that concern the devices A and B.
+            // I.e. no subscription entries of a third device C are exchanged between A
+            // and B." Sending the whole table tells every peer which other peers this
+            // device is talking to, and how — which on a §14a box is the grid operator's
+            // relationship with the household, handed to whatever else is on the LAN.
+            Function::NodeManagementBindingData => {
+                let entries: Vec<_> = self
+                    .relations_with(recipient, |relations, device| {
+                        relations.bindings_with(device).cloned().collect()
+                    })
+                    .into_iter()
+                    .map(|relation| NodeManagementBindingDataBindingEntry {
+                        binding_id: relation.id.map(BindingId),
+                        client_address: Some(relation.client),
+                        server_address: Some(relation.server),
+                        ..Default::default()
+                    })
+                    .collect();
+                Some(CmdData::NodeManagementBindingData(
+                    NodeManagementBindingData {
+                        // Table 18: the list "SHALL be present if [...] entries are
+                        // available for the recipient. Otherwise, it SHALL not be
+                        // present." An empty list is not the same message as no list.
+                        binding_entry: (!entries.is_empty()).then_some(entries),
+                    },
+                ))
+            }
+            Function::NodeManagementSubscriptionData => {
+                let entries: Vec<_> = self
+                    .relations_with(recipient, |relations, device| {
+                        relations.subscriptions_with(device).cloned().collect()
+                    })
+                    .into_iter()
+                    .map(|relation| NodeManagementSubscriptionDataSubscriptionEntry {
+                        subscription_id: relation.id.map(SubscriptionId),
+                        client_address: Some(relation.client),
+                        server_address: Some(relation.server),
+                        ..Default::default()
+                    })
+                    .collect();
+                Some(CmdData::NodeManagementSubscriptionData(
+                    NodeManagementSubscriptionData {
+                        subscription_entry: (!entries.is_empty()).then_some(entries),
+                    },
+                ))
+            }
             _ => None,
         }
+    }
+
+    /// The relations that concern one recipient, or none where the recipient is unknown.
+    ///
+    /// A read that carries no device part in its source is the §2.7 opening exception and
+    /// nothing else; answering it with every relation this device holds would be the leak
+    /// §7.4.3 forbids, so the honest answer is the empty table.
+    fn relations_with(
+        &self,
+        recipient: Option<&AddressDevice>,
+        pick: impl Fn(&Relations, &AddressDevice) -> Vec<super::relations::Relation>,
+    ) -> Vec<super::relations::Relation> {
+        recipient.map_or_else(Vec::new, |device| pick(&self.relations, device))
     }
 
     fn peer_entry(&mut self, device: &AddressDevice) -> &mut Peer {
@@ -1940,6 +2516,8 @@ impl Engine {
             },
             counters: MsgCounterTracker::new(),
             data: Vec::new(),
+            discovery: CmdData::NodeManagementDetailedDiscoveryData(Default::default()),
+            use_cases: CmdData::NodeManagementUseCaseData(Default::default()),
         });
         self.peers.last_mut().expect("just pushed")
     }

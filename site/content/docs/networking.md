@@ -24,7 +24,7 @@ hub.dial("192.0.2.10:4712".parse()?);        // or is told one
 
 loop {
     match hub.next().await? {
-        HubEvent::TrustRequested { ski, .. } => { /* show the SKI; then hub.approve(ski) or hub.refuse(ski) */ }
+        HubEvent::TrustRequested { peer, .. } => { /* show peer.ski; then hub.approve/refuse */ }
         HubEvent::Found { peer, trusted } => { /* mDNS saw one; trusted peers are already being dialled */ }
         HubEvent::Connected { ski, version } => { /* TLS, WebSocket and SHIP are done */ }
         HubEvent::PeerDiscovered { device, .. } => { /* it has said what it is */ }
@@ -68,11 +68,17 @@ rather than claimed — and is then told `hello: pending` and held in the SHIP h
 (§13.4.4.1). The hub reports it:
 
 ```rust
-HubEvent::TrustRequested { ski, origin } => {
-    println!("{} wants to pair, {origin}", ski.to_display_string());
+HubEvent::TrustRequested { peer, origin } => {
+    println!("{} wants to pair, {origin}", peer.ski.to_display_string());
+    println!("its certificate is {}", peer.fingerprint);
     // a real device shows this on a display, or lights a button
 }
 ```
+
+`peer` is a `PendingPeer`: both identities SHIP knows a node by, and both **proved** rather
+than claimed, because the peer completed TLS to get here. The SKI is what §12.2 trusts and
+what is printed on the box; the fingerprint is what a QR code carries as `FPH256`, and what
+the Pairing Service admits a control unit on.
 
 `hub.approve(ski)` adds the SKI to the trust store and **completes the handshake it is
 waiting in** — no reconnection, no timeout, no forty hex digits typed in advance. Adding the
@@ -88,6 +94,44 @@ this node, holds *us* pending while its user decides; `Connected` arrives when t
 A peer `browse` finds but the store does not trust is reported as `Found { trusted: false }`
 and kept aside; `approve` then dials it. That is the whole of commissioning from the
 control box's side: browse, see, approve.
+
+### And a PIN is not sent to just anybody
+
+§12.5: the PIN "SHALL NOT be transmitted if the public key of the corresponding
+communication partner has a user trust level that is less than '32'", and a peer admitted by
+auto-accept alone is at 8 — [trust is a number](@/docs/security.md), not a yes.
+
+```rust
+HubEvent::PinWithheld { ski, level } => { /* only trusted at `level`, so it was not sent */ }
+HubEvent::PinVerified { ski, level } => { /* it proved ours; §12.5 awarded a second factor */ }
+```
+
+The first event matters because from the far end a withheld PIN looks exactly like having
+none: the connection carries on with data exchange restricted either way.
+
+### Without a hub
+
+A driver that owns its own `Engine` — because it has to be testable without a socket — has
+no `Hub` to hear `TrustRequested` from, and needs the SKI just as much: a box that cannot
+*display* it cannot take part in the exchange that most often goes wrong on site. `Node`
+reports it directly, two ways:
+
+```rust
+// Told, on the handshake's own task. Must not block: send it on a channel.
+let connection = node
+    .accept_reporting(stream, Some(Box::new(move |peer| { let _ = tx.send(peer); })))
+    .await?;
+
+// Or asked, at any time, and filled in by a plain `accept` too.
+for peer in node.pending_peers() {
+    println!("approve {}? ({})", peer.ski, peer.fingerprint);
+}
+let mut changes = node.watch_pending();   // `changed().await` rather than polling
+```
+
+`connect_reporting` and `connect_over_reporting` are the dialling halves. An entry
+disappears when its handshake ends — approval, refusal, timeout, dropped socket. Answer with
+`node.trust_store().trust(ski)` or `node.refuse_pairing(ski)`.
 
 ### …or nobody is asked at all
 
@@ -228,6 +272,14 @@ Beyond the cap a socket is dropped before TLS and reported as
 `HandshakeFailed { error: TooManyConnections }`; a connection that completed its handshake
 in the meantime is closed with a `connectionClose`. Nothing already held is dropped to make
 room: a cap decides what is *accepted*.
+
+**A second cap covers the unapproved,** who hold a slot on nobody's authority.
+`MAX_PENDING_TRUST` — four — is how many peers may be waiting for a decision, **one slot per
+SKI**: a peer that dials four times is still one decision, so it keeps the slot it has and
+the table stays open for somebody a user might want to approve. Beyond the cap a peer is told
+`hello: aborted` at once and reported as `TooManyPendingPairings`, so it retries rather than
+squatting. Keying that on the SKI is safe where keying it on an address would not be: the SKI
+came out of a completed TLS handshake.
 
 ## Deciding is not answering
 

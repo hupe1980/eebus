@@ -147,6 +147,83 @@ fn start_peer(role: &str, ours: &Ski) -> Result<Peer, String> {
     }
 }
 
+/// Starts one side of `eebus-go` on the **host's** network, so it can reach a listener
+/// outside the container.
+///
+/// The other direction from [`start_peer`], and the one a household device is actually in:
+/// §14a has the control box dial and the household appliance listen, so the peer has to be
+/// able to reach a `hemsd`-shaped process on the host rather than the other way round.
+///
+/// `eebus-go`'s examples find their peer over **mDNS** — `-remoteski` says which SKI to
+/// trust, not where it is — and multicast does not cross Docker's bridge network. So this
+/// needs `--network host`, which is Linux only in practice: on Docker Desktop the
+/// container runs inside a VM whose network is not the host's, `host.docker.internal`
+/// resolves to the VM's gateway, and no amount of it carries multicast. Where that is not
+/// available the test skips rather than failing, and says which of the two it was.
+fn start_peer_on_host_network(role: &str, ours: &Ski) -> Result<Peer, String> {
+    docker(&["build", "-q", "-t", IMAGE, "tests/interop"])?;
+
+    let ski = ours.to_string();
+    let id = docker(&[
+        "run",
+        "-d",
+        // The whole point: the peer sees the host's interfaces, so the host's mDNS
+        // announcement reaches it and the port it dials is the host's.
+        "--network",
+        "host",
+        IMAGE,
+        role,
+        "-port",
+        "4713",
+        "-remoteski",
+        &ski,
+    ])?
+    .trim()
+    .to_string();
+    let peer_id = id.clone();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let logs = docker(&["logs", &peer_id]).unwrap_or_default();
+        if let Some(hex) = logs
+            .lines()
+            .find_map(|line| line.split("Local SKI:").nth(1))
+            .map(str::trim)
+        {
+            let ski: Ski = hex
+                .parse()
+                .map_err(|e| format!("`{hex}` is not a SKI this crate can read: {e:?}"))?;
+            return Ok(Peer {
+                id: peer_id,
+                // Nothing dials it: it is the one dialling.
+                port: 0,
+                ski,
+            });
+        }
+        if Instant::now() > deadline {
+            let _ = Command::new("docker").args(["rm", "-f", &peer_id]).output();
+            return Err(format!("the peer never announced a SKI:\n{logs}"));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Whether `--network host` actually shares the host's network on this machine.
+///
+/// Docker accepts the flag everywhere and honours it only on a native Linux daemon;
+/// elsewhere the container lands in the VM's network and the mDNS this test turns on
+/// never leaves it. Asking the daemon what it is is the only reliable answer.
+fn has_host_networking() -> bool {
+    let out = Command::new("docker")
+        .args(["info", "--format", "{{.OSType}}/{{.OperatingSystem}}"])
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    let info = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    info.starts_with("linux/") && !info.contains("docker desktop")
+}
+
 /// A heat pump with the four features LPC asks of a Controllable System.
 fn heat_pump() -> (Engine, ControllableSystemBuilder) {
     let mut device = LocalDevice::new("i:46925", "HeatPump-1", DeviceType::HeatGenerationSystem)
@@ -419,4 +496,118 @@ async fn this_crate_writes_a_limit_and_eebus_go_applies_it() {
         guard.audit().records().next().is_some(),
         "nothing was recorded for the operator"
     );
+}
+
+/// [F4] The other direction: **this crate listens** and `eebus-go` dials in.
+///
+/// Both tests above have this crate dialling a container that listens, and that is the
+/// wrong way round for the installation §14a actually describes: the control box goes to
+/// the household appliance, and the appliance is the one holding a listener open. A test
+/// suite that only ever dials has never exercised its own accept path against anything it
+/// did not write — which is the blind spot this closes, and the same one a consumer has one
+/// level up when both ends of its session test are the same crate.
+///
+/// Two things have to be true for `eebus-go` to reach a listener outside its container,
+/// and neither is Docker's default:
+///
+/// * **mDNS has to cross the boundary.** The `eebus-go` examples take `-remoteski` and
+///   then *discover* where that SKI is; there is no address to give them. Multicast does
+///   not traverse Docker's bridge, so the container needs the host's own network stack.
+/// * **The announcement has to exist.** `Hub::listen` opens a socket and says nothing;
+///   this crate announces `_ship._tcp` through [`eebus::mdns`], and without that the peer
+///   has nothing to find.
+///
+/// `--network host` gives the first, and is honoured only by a native Linux daemon. On
+/// Docker Desktop the container is inside a VM: `host.docker.internal` reaches the VM's
+/// gateway, which is enough for a TCP dial to a known address and not enough for
+/// discovery. The test says which case it skipped for rather than reporting a pass.
+#[cfg(feature = "mdns")]
+#[tokio::test(flavor = "multi_thread")]
+async fn eebus_go_dials_this_crate_listening() {
+    use eebus::mdns::Mdns;
+    use eebus::ship::{ShipId, ShipTxtRecord};
+
+    if Command::new("docker").arg("info").output().is_err() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+    if !has_host_networking() {
+        eprintln!(
+            "skipping: `--network host` does not share the host's network on this daemon, \
+             so the container's mDNS cannot see a listener on it. Run this on a native \
+             Linux Docker daemon."
+        );
+        return;
+    }
+
+    let ship_id = "i:46925_HeatPump-2";
+    let identity = cert::self_signed(CertParams::new(ship_id)).expect("a certificate");
+    let trust = TrustStore::new();
+    let node = Node::new(ship_id, ShipTls::new(identity), trust.clone());
+    let ours = node.ski();
+
+    let (engine, actor) = heat_pump();
+    let mut hub = Hub::new(node, engine);
+    let address = hub.listen("0.0.0.0:4712").await.expect("a listener");
+    let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
+
+    // The announcement, without which `-remoteski` has nothing to resolve.
+    let mut mdns = Mdns::new().expect("mDNS is available");
+    let record = ShipTxtRecord::new(ship_id.parse::<ShipId>().expect("a SHIP ID"), ours);
+    mdns.announce(ship_id, &record, address.port(), &[])
+        .expect("the announcement went out");
+
+    let peer = start_peer_on_host_network("controlbox", &ours).expect("the control box started");
+    println!("control box SKI {} dialling us on {address}", peer.ski);
+    trust.trust(peer.ski);
+
+    let mut limited = None;
+    let started = std::time::Instant::now();
+    // Longer than the dialling tests: the peer has to discover us first, and mDNS
+    // announcements are not instantaneous.
+    let budget = Duration::from_secs(120);
+    while started.elapsed() < budget && limited.is_none() {
+        let event = match hub.next().await {
+            Ok(event) => event,
+            Err(e) => panic!("the session ended after {:?}: {e}", started.elapsed()),
+        };
+        let now = hub.now();
+        match event {
+            HubEvent::Spine(event) => {
+                if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
+                    actor.handle_event(hub.engine_mut(), &event, now)
+                    && outcome.is_accepted()
+                {
+                    limited = Some(write);
+                }
+            }
+            HubEvent::Tick => {
+                actor.handle_timeout(hub.engine_mut(), now);
+            }
+            HubEvent::HandshakeFailed { error, .. } => {
+                let logs = docker(&["logs", &peer.id]).unwrap_or_default();
+                panic!("the control box was refused: {error}\n--- peer log ---\n{logs}");
+            }
+            _ => {}
+        }
+        let next = hub.now() + Duration::from_millis(200);
+        hub.wake_at(next);
+    }
+    let _ = mdns.withdraw();
+
+    let limit = limited.unwrap_or_else(|| {
+        let logs = docker(&["logs", &peer.id]).unwrap_or_default();
+        panic!(
+            "eebus-go never found us. It discovers its peer over mDNS, so the usual cause \
+             is that the announcement did not reach the container.\n--- peer log ---\n{logs}"
+        );
+    });
+
+    println!("eebus-go dialled in and wrote {limit:?}");
+    assert_eq!(
+        actor.system().state(),
+        LimitationState::Limited,
+        "a limit was accepted but the state machine did not move"
+    );
+    assert!(limit.watts > 0.0);
 }

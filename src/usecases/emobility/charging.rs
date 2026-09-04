@@ -1404,6 +1404,7 @@ pub const ELECTRICAL_CONNECTION: u32 = 1;
 
 /// What the car's actor did.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum EvEvent {
     /// A curtailment was applied.
     Curtailed {
@@ -1715,6 +1716,7 @@ pub fn locate(remote: &RemoteDevice, purpose: Purpose) -> Option<EvPeer> {
 
 /// What the Energy Guard learned.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum GuardEvent {
     /// The binding is held and the car's band is known, so it can be curtailed.
     Ready {

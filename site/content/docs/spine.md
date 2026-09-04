@@ -67,6 +67,36 @@ Mobile Charger Connect both ship exactly that — and a Controllable System need
 it serves its own heartbeat and subscribes to the Energy Guard's. A subscription runs
 client → server, so the near end of that one must be the client feature.
 
+### When the tree changes underneath you
+
+§7.1.5 and §7.5.4 let a device add, remove or modify its entities and use cases while a peer
+is connected — a car that is plugged in and drives away, a DHW circuit that is
+decommissioned. Both changes are a **notify** carrying only what changed.
+
+```rust
+engine.subscribe_to_discovery(&peer_device, now);  // `Hub` does this for you
+engine.add_entity(LocalEntity::new([2], EntityType::Compressor), now)?;
+let gone = engine.remove_entity(&[1, 1], now)?;    // and everything beneath it
+```
+
+A removal also releases the bindings and subscriptions that named the entity's features, and
+drops the use cases it announced.
+
+Two things here are easy to get wrong, and both decide whether a peer tracks the tree or
+quietly loses it:
+
+* **Subscribe, or hear nothing.** §7.5.4: "a device that uses use case discovery **should
+  always subscribe** to use case discovery". An *arrival* shows up in any re-read; a
+  *departure* does not, because a discovery document merges and a shorter re-send says
+  nothing about what went. `lastStateChange: removed` on a notify is the whole mechanism, and
+  EVCC scenario 8 — the car that left — is that message and nothing else. One subscription
+  covers both functions, since §7.4.1 permits only whole-feature ones.
+* **Neither discovery function is a list the generic merge can address.** Detailed discovery
+  is three parallel lists inside one value; a `useCaseInformation` entry is keyed by an
+  `address` the wire makes optional and an `actor`, which is not an identifier type. Merged
+  the ordinary way, an update naming one new entity *replaces* the list. Both are merged by
+  their own sections' rules instead.
+
 ## Bindings and subscriptions
 
 Two distinct grants, easily confused:
@@ -84,6 +114,25 @@ affordable on a small controller.
 
 Both tables are readable — `nodeManagementBindingData` and `nodeManagementSubscriptionData`
 (§7.3.2, §7.4.2) — and both are answered from the relations actually held.
+
+**A relation belongs to both partners.** §7.4.1 rule 4: "Subscription information SHALL be
+kept persistently by both subscription partners", and §7.4.3 has each entry describe "the
+relation of an own feature to one feature of a subscription partner" — either direction. So
+the two directions are different questions with different answers:
+
+```rust
+relations.is_bound(&their_client, &our_server);      // may this peer write to us?
+relations.holds_binding(&our_client, &their_server); // did a peer grant us one?
+```
+
+A relation this device *holds* carries no identifier: Table 18 makes `subscriptionId`
+optional and says the value is "a **server's** unique ID", which is the peer's to assign.
+
+**And the table is tailored to who is reading it.** §7.4.3: "no subscription entries of a
+third device C are exchanged between A and B". Serving the whole table tells every peer which
+other peers this device is talking to — on a §14a box, the grid operator's relationship with
+the household. Where nothing concerns the recipient the element is *absent* rather than
+empty, a distinction Table 18 makes deliberately.
 
 **A request or a release is honoured only in the sender's own name.** The call names its
 client address in the payload, and the engine accepts it only when that address belongs to
@@ -134,6 +183,20 @@ allocates and the application frees, so at most sixteen may wait; beyond that a 
 answered `errorNumber` 3, overload. One that goes undecided past §5.2.5's maximum response
 delay is abandoned and reported as `SpineEvent::WriteAbandoned` — answering later would
 reach a peer that had already given up.
+
+**A write whose result the application owns is stored as the application says.**
+`accept_write` stores what the peer sent, merged into what was there — right wherever SPINE
+gives entries identifiers, because the merge can address them. For a function that is one
+value rather than a list it is not: [OHPCF](@/docs/hot-water.md)'s partial write is
+mandatory, and merging its two-field fragment replaces everything the compressor announced —
+which §7.4.1 then notifies to every subscriber, the writer included.
+
+```rust
+match compressor.apply(&write.resolved) {
+    Ok(_)        => engine.accept_write_with(write.token, compressor.data(), now)?,
+    Err(refused) => { engine.reject_write(write.token, refused.error_number(), now); }
+}
+```
 
 ## Acknowledgements and errors
 
@@ -243,9 +306,17 @@ with no duration always carries the delete that withdraws the old `endTime`. It 
 an absent element means unchanged, so omitting the `timePeriod` leaves the previous end
 time in force and a limit meant to be open-ended lapses when the old one would have.
 
+**Reads go the same way.** `Engine::read_filtered` asks for part of a function, which §7.1.3
+and §7.5.3 both want by name: "where is your `LoadControl` feature?" and "do you play the
+Controllable System?" are a few hundred bytes instead of a large device's whole tree. The
+peer answers with a subset marked partial, and the merge above is what keeps a narrow
+question from discarding the answer to a wide one.
+
 Nothing in the XML Schemas links a data type to its selectors and elements filters — the
 link is a naming convention — so the generator resolves it into a table covering 141
-functions, and merge, delete and partial read are written once against that table.
+functions, and merge, delete and partial read are written once against that table. Which
+elements *identify* an entry is the schemas' other silence, and is
+[answered from the specification's own table](@/docs/codegen.md) rather than from a pattern.
 
 A filtered request for a function the table does not cover is refused with `errorNumber` 8
 rather than answered approximately. Announcing what you cannot do is worse than announcing

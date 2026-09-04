@@ -15,6 +15,28 @@ as a naming convention.
 **The generated Rust is committed.** Building the crate never needs the specifications, and
 `cargo test` does not depend on a download.
 
+## Two things the schemas do not contain
+
+The XML Schemas describe *shapes*. Two relationships the protocol depends on are stated only
+in prose, and the generator resolves both into tables.
+
+**Which selectors and elements filter address which function.** Every function that supports
+a partial exchange has three related types — the data, its selectors, its elements filter —
+and nothing links them but a naming convention. The table covers 141 functions and is what
+`possibleOperations` is derived from, so the crate announces a partial read exactly where it
+can serve one.
+
+**Which elements identify a list entry.** Merging "entry by entry" needs to know which
+elements *are* the entry, and a wrong answer is silent in both directions: too wide makes
+every change look like a new entry, too narrow refuses a conformant message. So the
+generator uses the Resource Specification's own answer — **Annex B.7, Table 358**, "all
+identifiers that belong to the identifiers concept" — with §3.4.2.1's distinction between an
+identifier that *addresses* an entry (PRIMARY, SUB) and one that refers to another feature
+and "is **not** used to create further dimensions of list entries" (FOREIGN).
+
+`tests/list_identifiers.rs` writes the resulting answers down, each with the specification
+table that governs it.
+
 ## Getting the specifications
 
 They are free but **not redistributable**, so they are not in the repository.

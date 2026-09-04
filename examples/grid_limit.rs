@@ -271,7 +271,7 @@ fn handshake(role: ShipRole, ship_id: &str, now: Duration) -> Handshake {
             ship_id: Some(ship_id.into()),
             ..HandshakeConfig::default()
         },
-        Trust::Trusted,
+        Trust::VERIFIED,
         now,
     )
 }

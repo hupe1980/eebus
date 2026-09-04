@@ -19,6 +19,43 @@ LPC, LPP, MPC and MGCP High-Level Test Specifications are carried as data **and 
 device-level ones — listed with the reason, and held to that by a test. See
 [Certification](@/docs/certification.md).
 
+## The fourteen the library cannot answer
+
+A factory reset, a power cut, a start-up duration, what the appliance actually draws. No
+library can answer those for the device it is linked into. `eebus::conformance::harness` is
+the other half: seven procedures — each covering the LPC case and its LPP twin — carrying the
+High-Level Test Specification's own steps, driven against a consumer's running binary.
+
+```rust
+use eebus::conformance::harness::{DeviceObservation, DeviceParameters, DeviceRun};
+
+// §6.11.8: the start-up duration is not a number the specification fixes. It is one the
+// manufacturer commits to in the parameter sheet, and is then held to.
+let mut run = DeviceRun::new(
+    DeviceParameters::new(Duration::from_secs(45))
+        .failsafe(4_200.0, Duration::from_secs(2 * 3_600)),
+);
+run.observe(DeviceObservation::FactoryReset {
+    limit_active: false,
+    failsafe_watts: 4_200.0,
+    failsafe_duration: Duration::from_secs(2 * 3_600),
+});
+println!("{}", run.report());
+```
+
+It **judges** against what the device declared — the failsafe defaults a reset must restore,
+the `StartUpDur` a black start must return inside, the sixty seconds a rebooted Energy Guard
+has to send a heartbeat and the limit after it. What it does not do is press the button.
+
+`Inconclusive` is the verdict that earns its place: a persistence test that wrote back the
+value the device already held proves nothing, and counting it as either a pass or a failure
+would be a lie. `Skipped` is allowed only where the case is not mandatory for this device —
+the two black starts are `r`, and mandatory only for one that declares itself black-start
+capable.
+
+`report().coverage()` gives the fourteen as a `Coverage`, to add to the protocol-level number
+rather than quoting 189 of 203 for ever.
+
 ## Every claim points at a sentence
 
 Citations live next to the code that satisfies them, not in a separate document that drifts.
@@ -99,10 +136,17 @@ for the entries the write addresses, `resolved` for what they become (SPINE IG �
 reference implementations pass the fragment alone.
 
 **A list entry without its identifiers is refused** — use-case IG §3.1 — rather than
-appended as a new entry, which is what the reference implementations do.
+appended as a new entry, which is what the reference implementations do. Which elements
+*are* the identifiers comes from the Resource Specification's own Annex B.7, not from a
+naming convention.
 
-**The binding and subscription tables are served from the live relations**, so a peer reading
-`nodeManagementBindingData` sees the bindings that are actually held (§7.3.2, §7.4.2).
+**The binding and subscription tables are served from the live relations** (§7.3.2, §7.4.2)
+and **tailored to their recipient** (§7.4.3) — absent rather than empty when nothing concerns
+them (Table 18). Serving the whole table tells every peer which other peers this device is
+talking to.
+
+**Discovery is subscribed to** (§7.5.4), which is the only way a peer's *departing* entity
+is ever heard about.
 
 **A `scaledNumber` that overflows `f64` reads as nothing, not as infinity**, and a value
 that is present but unrepresentable makes the whole write unusable rather than approximate.
@@ -146,14 +190,21 @@ produces.
 **A live peer, in both directions.** An opt-in suite runs `eebus-go`'s own examples in a
 container at a **pinned** revision and drives the whole §14a exchange against them:
 
-| Their example | Their role | This crate's role |
-|---|---|---|
-| `examples/controlbox` | Energy Guard | Controllable System |
-| `examples/evse` | Controllable System | Energy Guard |
+| Their example | Their role | This crate's role | Who dials |
+|---|---|---|---|
+| `examples/controlbox` | Energy Guard | Controllable System | this crate |
+| `examples/evse` | Controllable System | Energy Guard | this crate |
+| `examples/controlbox` | Energy Guard | Controllable System | **`eebus-go`** |
 
 Each run asserts the lot — TLS 1.2 with mutual authentication, the five-phase SHIP
 handshake, SPINE discovery, the binding and the subscription, and a limit written, accepted
 and recorded.
+
+The third row is the direction §14a describes — the control box dials, the household
+appliance listens — and it is the one that exercises this crate's accept path against
+something it did not write. `eebus-go` discovers its peer over mDNS rather than taking an
+address, so it needs the host's own network stack; the test skips with the reason where the
+Docker daemon cannot give it that, and `tests/interop/Dockerfile` carries the recipe.
 
 ```sh
 cargo test --features interop,full --test interop -- --nocapture
@@ -172,7 +223,9 @@ failure legible: it means *this crate* changed, not that the other one did.
 | Both cryptography providers | the whole suite runs on `ring` and on `aws-lc-rs` |
 | Property tests | round trips, the RFE merge laws and the wire arithmetic, via `proptest` |
 | Real devices | fifteen datagrams from eight devices by seven manufacturers, parsed and resolved |
-| A live peer, both ways | `eebus-go`'s own control box and EVSE in a container, at a pinned revision, doing the §14a exchange in each direction — opt-in, `--features interop` |
+| A live peer, both ways | `eebus-go`'s own control box and EVSE in a container, at a pinned revision, doing the §14a exchange in each direction, and once with the peer dialling *in* to this crate's listener — opt-in, `--features interop` |
+| Device-level conformance | `eebus::conformance::harness` — the fourteen cases a library cannot answer, as procedures a consumer runs against its own binary |
+| What identifies a list entry | `tests/list_identifiers.rs` — derived from the Resource Spec's Annex B.7 and pinned per entry type |
 | Fuzzing | five `cargo fuzz` targets, run nightly, seeded from the specification's examples **and** the device captures; their compilation checked on every push |
 | Lints | `cargo clippy --workspace --all-targets --features eebus/full` with `-D warnings` |
 | Documentation | `cargo doc` with `RUSTDOCFLAGS=-D warnings` |

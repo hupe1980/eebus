@@ -189,6 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 GuardEvent::PeerUnresponsive { outstanding, .. } => {
                     println!("[box]  the pump stopped answering ({outstanding:?})");
                 }
+                // The crate keeps adding events; a consumer that does not need them says so.
+                _ => {}
             }
         }
         if done {

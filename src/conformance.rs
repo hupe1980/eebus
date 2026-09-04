@@ -45,6 +45,8 @@
 //! assert_eq!(report.missing(), mandatory.len() - 2);
 //! ```
 
+pub mod harness;
+
 use crate::usecases::descriptor::{Support, actors, names};
 
 /// Whether an abstract test case is a positive or a negative test.

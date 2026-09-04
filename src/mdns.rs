@@ -28,6 +28,7 @@ use crate::ship::{DiscoveryError, PAIRING_SERVICE_TYPE, SERVICE_TYPE, ShipTxtRec
 /// the secret — all of which is [`Receiver`](crate::ship::pairing::Receiver)'s. The host
 /// name and port of the service are deliberately not carried: §5.3 forbids using either.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PairingEvent {
     /// A `_shippairing._tcp` request appeared, or was re-announced.
     Announced {
@@ -65,6 +66,7 @@ pub enum MdnsError {
 // for a stack frame nobody is short of: these arrive one at a time off a channel.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BrowseEvent {
     /// A SHIP node announced itself, or changed what it announces.
     Found(Discovered),

@@ -318,12 +318,66 @@ impl Constraints {
     }
 }
 
+/// What a write to one setpoint would actually do, given the mode the circuit is in.
+///
+/// CDT addresses its setpoints *through* the operation modes: Table 10 relates each mode
+/// to the setpoints it reads, and a setpoint the current mode does not read can be
+/// written, acknowledged, and change nothing anybody can measure. Nothing on the wire
+/// says so — the circuit answers the write the same way either way — which is why this
+/// exists and why [`mdsf`](super::mdsf) is not optional equipment for a manager that
+/// writes temperatures.
+///
+/// Computed by [`DhwSetpoints::effect_of`]; [`DhwSetpoints::write_effective`] refuses
+/// everything but [`Effective`](Self::Effective).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetpointEffect {
+    /// The circuit is in a mode that reads this setpoint. The write changes the water.
+    Effective,
+    /// The circuit is in a mode that reads some other setpoint, or none.
+    ///
+    /// The write would be applied and acknowledged and would heat nothing. `off` relating
+    /// to no setpoint at all is the extreme case, and [CDT-003/3] allows it.
+    NotInCurrentMode,
+    /// A one-time heating is overriding the mode right now (MDSF Table 12).
+    ///
+    /// The setpoint *is* the one the current mode reads, so the write lands where it was
+    /// meant to — but the circuit is running an overrun over the top of it, and the water
+    /// will follow the overrun until that finishes. Distinct from
+    /// [`NotInCurrentMode`](Self::NotInCurrentMode) because the write is not misdirected:
+    /// it takes effect, later.
+    OverriddenByOverrun,
+    /// Not enough is known to say.
+    ///
+    /// MDSF has not reported a current mode, or CDT's mode-to-setpoint relations have not
+    /// arrived. Both are read once at commissioning; until they have, a manager writing a
+    /// temperature is guessing.
+    Unknown,
+}
+
+impl SetpointEffect {
+    /// Whether the write would reach the water.
+    pub fn is_effective(self) -> bool {
+        self == Self::Effective
+    }
+}
+
 /// Why a temperature could not be written.
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 pub enum WriteRefused {
     /// The circuit published no such setpoint, or has not published its description yet.
     #[error("the circuit has published no such DHW temperature setpoint")]
     UnknownSetpoint,
+    /// The circuit is not in an operation mode that reads this setpoint.
+    ///
+    /// Raised only by [`DhwSetpoints::write_effective`]. The plain
+    /// [`write`](DhwSetpoints::write) does not check it — a manager that means to
+    /// pre-load the setpoint of a mode it is about to ask for is doing something
+    /// sensible, and this is the refusal for the manager that expects hot water now.
+    #[error("the circuit is in an operation mode that does not read this setpoint")]
+    NotInCurrentMode,
+    /// MDSF has not said which mode the circuit is in, or the relations have not arrived.
+    #[error("which operation mode the circuit is in is not known yet")]
+    ModeUnknown,
     /// The circuit published no constraints for it, so nothing can be checked.
     #[error("the circuit has not published what this setpoint accepts")]
     NoConstraints,
@@ -528,6 +582,75 @@ impl DhwSetpoints {
                 ..Default::default()
             }]),
         }))
+    }
+
+    /// What writing this setpoint would actually do, given the mode the circuit is in.
+    ///
+    /// The join CDT cannot make on its own: `state` is what
+    /// [`mdsf`](super::mdsf) learned, and Table 10's relations are what this holds. See
+    /// [`SetpointEffect`] for what each answer means.
+    pub fn effect_of(
+        &self,
+        id: SetpointId,
+        state: &super::mdsf::DhwSystemFunction,
+    ) -> SetpointEffect {
+        let Some(mode) = state.mode_id() else {
+            return SetpointEffect::Unknown;
+        };
+        let reads = self.for_mode(mode);
+        if reads.is_empty() && !self.relations.iter().any(|(known, _)| *known == mode) {
+            // The mode is known and its relations are not: a mode that relates to no
+            // setpoint and a mode nobody has described look the same from `for_mode`
+            // alone, and only one of them is an answer.
+            return SetpointEffect::Unknown;
+        }
+        if !reads.contains(&id) {
+            return SetpointEffect::NotInCurrentMode;
+        }
+        if state.overrun_active() == Some(true) {
+            return SetpointEffect::OverriddenByOverrun;
+        }
+        SetpointEffect::Effective
+    }
+
+    /// Builds the write, and refuses one the circuit would apply without heating anything.
+    ///
+    /// [`write`](Self::write) checks what the *circuit* published about the setpoint —
+    /// that it exists, and that the value is inside its constraints. This checks the one
+    /// thing neither the setpoint nor the wire can tell you: whether the circuit is in an
+    /// operation mode that reads it. A write into a mode the circuit is not in is
+    /// applied, acknowledged and changes nothing, and every consumer otherwise finds that
+    /// out the same way — a box that reports success and heats no water.
+    ///
+    /// It is the same shape as the limitation actor refusing a limit with no recent
+    /// heartbeat: the message would be accepted, and accepting it would mean nothing.
+    ///
+    /// An overrun in progress is **not** refused. The write reaches the setpoint the
+    /// current mode reads, and the one-time heating running over the top of it finishes;
+    /// use [`effect_of`](Self::effect_of) where the difference matters.
+    ///
+    /// ```
+    /// # use eebus::usecases::hvac::{cdt::{self, DhwSetpoints, SetpointEffect, WriteRefused}, mdsf::DhwSystemFunction};
+    /// # fn example(known: &DhwSetpoints, state: &DhwSystemFunction, dhw: eebus::model::SetpointId) {
+    /// match known.write_effective(dhw, 60.0, state) {
+    ///     Ok(write) => { /* send it */ }
+    ///     Err(WriteRefused::NotInCurrentMode) => { /* ask for the mode first */ }
+    ///     Err(other) => { /* the circuit would refuse it anyway */ }
+    /// }
+    /// # }
+    /// ```
+    pub fn write_effective(
+        &self,
+        id: SetpointId,
+        degrees: f64,
+        state: &super::mdsf::DhwSystemFunction,
+    ) -> Result<CmdData, WriteRefused> {
+        match self.effect_of(id, state) {
+            SetpointEffect::Effective | SetpointEffect::OverriddenByOverrun => {}
+            SetpointEffect::NotInCurrentMode => return Err(WriteRefused::NotInCurrentMode),
+            SetpointEffect::Unknown => return Err(WriteRefused::ModeUnknown),
+        }
+        self.write(id, degrees)
     }
 }
 

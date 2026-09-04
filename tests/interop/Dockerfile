@@ -50,11 +50,43 @@ FROM alpine:3.20
 COPY --from=build /out/controlbox /out/evse /usr/local/bin/
 # No ENTRYPOINT: the test names which side it wants.
 #
-# Pointing the peer the other way — their `controlbox` dialling a Controllable System that
-# listens *outside* the container, a running `hemsd` say — needs the host reachable from
-# inside it. On Docker Desktop that is the name `host.docker.internal`; on Linux add
-# `--add-host=host.docker.internal:host-gateway` to `docker run`. `eebus-go`'s examples
-# find peers over mDNS, which does not cross the container boundary, so start the peer
-# with `-remoteski <the listener's SKI>` and run the container with `--network host`
-# where the listener has to be discovered rather than dialled.
+# ---------------------------------------------------------------------------------------
+# Pointing the peer the other way: their `controlbox` dialling a Controllable System that
+# listens *outside* the container — a running `hemsd`, say, or this crate's `Hub::listen`.
+#
+# That is the direction §14a actually describes: the control box dials, the household
+# appliance listens. It needs one thing Docker does not give by default, and it is not the
+# one people reach for first.
+#
+#   1. **The peer discovers; it does not dial an address.** `eebus-go`'s examples take
+#      `-remoteski <SKI>` and then look for that SKI over mDNS. There is no `-remoteip`.
+#      So `host.docker.internal` — which resolves to the host from inside a bridge network,
+#      and which people add with `--add-host=host.docker.internal:host-gateway` on Linux —
+#      does not help: there is nowhere to put it.
+#
+#   2. **So multicast has to reach the container**, which means the container has to be on
+#      the host's own network stack:
+#
+#          docker run --rm --network host eebus-interop-controlbox:pinned \
+#              controlbox -port 4713 -remoteski <the listener's SKI>
+#
+#      `--network host` is honoured by a **native Linux daemon**. On Docker Desktop
+#      (macOS, Windows) the container runs inside a VM: the flag is accepted, the container
+#      joins the *VM's* network, and the host's mDNS never arrives. `tests/interop.rs`
+#      checks the daemon with `docker info --format {{.OSType}}/{{.OperatingSystem}}` and
+#      skips with that reason rather than reporting a pass.
+#
+#   3. **The listener has to announce itself.** `Hub::listen` opens a socket and says
+#      nothing. Announce `_ship._tcp` with `eebus::mdns::Mdns::announce`, carrying the
+#      listener's SKI in the TXT record, or the peer has nothing to resolve.
+#
+# The two SKIs still have to be exchanged first, in both directions: pass the listener's to
+# the container with `-remoteski`, and trust the container's — which it prints as
+# `Local SKI:` on start-up, since it generates a fresh certificate every run — in the
+# listener's trust store.
+#
+# `-port` above is the port the peer's *own* listener binds, not the one it dials. On the
+# host network it must not collide with the listener's, which is why the test gives it
+# 4713 and keeps 4712 for this crate.
+# ---------------------------------------------------------------------------------------
 EXPOSE 4712

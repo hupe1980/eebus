@@ -16,7 +16,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-use crate::ship::{DEFAULT_PATH, Fingerprint, HandshakeConfig, Role, SUBPROTOCOL, Ski, Trust};
+use crate::ship::{
+    COMMISSIONING_TRUST, DEFAULT_PATH, Fingerprint, HandshakeConfig, Role, SUBPROTOCOL, Ski, Trust,
+    TrustLevel,
+};
 use crate::tls::{ShipTls, peer_fingerprint, peer_ski};
 
 use super::connection::{
@@ -51,6 +54,23 @@ pub struct TrustedPeer {
     /// a pairing is owed the value that was on the sticker.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fingerprint: Option<Fingerprint>,
+    /// What this key is trusted **at** (SHIP §12.3.2, Table 10).
+    ///
+    /// Not decoration, and not a boolean by accident: §12.3.2 and §12.5 state three rules
+    /// about the numbers, and the one that bites is "the SHIP node PIN SHALL NOT be
+    /// transmitted if the public key of the corresponding communication partner has a user
+    /// trust level that is less than '32'". A store that only knows "trusted" cannot answer
+    /// that question, and answers it wrongly by default.
+    ///
+    /// [`TrustLevel::USER_VERIFIED`] is the default because it is what
+    /// [`TrustStore::trust`] means: a person compared the SKI with the label and said yes.
+    /// A store restored from JSON written before this field existed reads the same way.
+    #[serde(default = "default_trust_level")]
+    pub trust: TrustLevel,
+}
+
+fn default_trust_level() -> TrustLevel {
+    TrustLevel::USER_VERIFIED
 }
 
 impl TrustedPeer {
@@ -65,7 +85,19 @@ impl TrustedPeer {
             ship_id: None,
             trusted_at: None,
             fingerprint: None,
+            trust: TrustLevel::USER_VERIFIED,
         }
+    }
+
+    /// Records what this key is trusted at (§12.3.2, Table 10).
+    ///
+    /// Use it where the mechanism was not a person comparing forty hex digits: a device
+    /// admitted by a commissioning tool is [`TrustLevel::commissioned`], one whose key a
+    /// person typed in is [`TrustLevel::USER_INPUT`].
+    #[must_use]
+    pub fn at_level(mut self, trust: TrustLevel) -> Self {
+        self.trust = trust;
+        self
     }
 
     /// Names it, so a user can tell one line of the store from the next.
@@ -427,6 +459,45 @@ impl TrustStore {
         count
     }
 
+    /// Awards a peer the second-factor trust it earned by proving it holds this node's
+    /// PIN (§12.5), and reports how much.
+    ///
+    /// The rule is once-only and the store is the only thing that can apply it: "The first
+    /// communication partner after factory default that sends the SHIP node PIN MAY gain a
+    /// higher second factor trust level of '32' […] In SHIP, it is not possible that two
+    /// SHIP nodes may gain a second factor trust of '32' with the SHIP node PIN. Any SHIP
+    /// node that sends the PIN afterwards SHALL only get a second factor trust of '16'."
+    ///
+    /// So the first caller since the store was empty of any such award gets
+    /// [`TrustLevel::SECOND_FACTOR_PIN_FIRST`] and every later one
+    /// [`TrustLevel::SECOND_FACTOR_PIN_LATER`] — and the "after factory reset" half is
+    /// [`forget_all`](Self::forget_all), which is what an EEBUS reset calls.
+    ///
+    /// A peer that is not in the store gains nothing: a second factor is trust *added* to a
+    /// key, not a way in on its own.
+    ///
+    /// Answer [`Event::PeerPinVerified`](crate::ship::Event::PeerPinVerified) with this.
+    pub fn award_pin_trust(&self, ski: &Ski) -> Option<TrustLevel> {
+        let mut held = self.inner.lock().ok()?;
+        let taken = held
+            .peers
+            .values()
+            .any(|peer| peer.trust.second_factor >= TrustLevel::SECOND_FACTOR_PIN_FIRST);
+        let awarded = if taken {
+            TrustLevel::SECOND_FACTOR_PIN_LATER
+        } else {
+            TrustLevel::SECOND_FACTOR_PIN_FIRST
+        };
+        let peer = held.peers.get_mut(ski)?;
+        peer.trust = peer
+            .trust
+            .merged(TrustLevel::UNTRUSTED.with_second_factor(awarded));
+        let level = peer.trust;
+        drop(held);
+        self.touch();
+        Some(level)
+    }
+
     /// Whether a peer is trusted.
     pub fn is_trusted(&self, ski: &Ski) -> bool {
         self.inner
@@ -562,6 +633,52 @@ pub struct Node {
     /// was waiting. A refusal is about *this* attempt: the peer may ask again, and the
     /// user may answer differently.
     refusals: Mutex<Vec<Ski>>,
+    /// Peers whose handshake is holding, waiting on a trust decision right now.
+    ///
+    /// One entry per waiting *handshake*, so a peer that dialled twice appears twice —
+    /// which is the truth an installer's screen should show, and what makes the entry
+    /// disappear when its own handshake ends rather than when some other one does.
+    pending: Mutex<Vec<PendingPeer>>,
+    /// Bumped whenever `pending` changes, so a user interface can wait rather than poll.
+    pending_changed: watch::Sender<u64>,
+}
+
+/// A peer that has proved who it is and is waiting for somebody to approve it.
+///
+/// It has completed TLS — the SKI and the fingerprint are *proved*, not claimed — and has
+/// been told `hello: pending` (SHIP §13.4.4.1). It stays connected for as long as its own
+/// SHIP timers allow, so there is a window in which a person can be shown these forty hex
+/// digits and asked whether they match the label on the box in front of them. Field
+/// reports make that exchange the most common §14a commissioning failure, and a box that
+/// cannot *display* the SKI cannot take part in it at all.
+///
+/// Answer with [`TrustStore::trust`] or [`Node::refuse_pairing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingPeer {
+    /// The Subject Key Identifier of the peer's public key: what SHIP §12.2 trusts, and
+    /// what is printed on the box.
+    pub ski: Ski,
+    /// The SHA-256 fingerprint of the whole certificate.
+    ///
+    /// The other identity SHIP knows a node by (Pairing Service §10.2), and the one a QR
+    /// code carries as `FPH256`. A peer may be admitted on either.
+    pub fingerprint: Fingerprint,
+}
+
+/// Keeps a [`PendingPeer`] listed for as long as its handshake is waiting.
+///
+/// Dropped when the handshake ends however it ends — approved, refused, timed out, socket
+/// gone, or the caller's future cancelled — because a list of peers waiting for a decision
+/// that nobody is waiting for any more is worse than no list.
+pub(crate) struct PendingGuard<'a> {
+    node: &'a Node,
+    ski: Ski,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.node.forget_pending(&self.ski);
+    }
 }
 
 impl Node {
@@ -577,6 +694,8 @@ impl Node {
             tls,
             trust,
             refusals: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            pending_changed: watch::Sender::new(0),
         }
     }
 
@@ -641,6 +760,80 @@ impl Node {
         self.trust.touch();
     }
 
+    /// The peers whose handshake is waiting on a trust decision right now.
+    ///
+    /// **This is what a box shows an installer.** An unapproved peer completes TLS, so its
+    /// SKI is proved rather than claimed, and is then held in the SHIP pending state —
+    /// which exists precisely so that a person can compare it with the label on the
+    /// device. Without a way to read it out, the SKI has to come off the other box
+    /// instead, and that exchange is the most common §14a commissioning failure there is.
+    ///
+    /// Every peer here is also reported once through the
+    /// [`TrustReporter`](super::TrustReporter) a call to
+    /// [`accept_reporting`](Self::accept_reporting) or
+    /// [`connect_reporting`](Self::connect_reporting) passed, if it passed one. This is
+    /// the same thing for a caller that would rather ask than be told — a plain
+    /// [`accept`](Self::accept) fills it in too.
+    ///
+    /// One entry per waiting handshake. An entry disappears when its handshake ends,
+    /// whether that is an approval, a refusal, a timeout or a dropped socket.
+    ///
+    /// ```no_run
+    /// # async fn example(node: &eebus::runtime::Node) {
+    /// let mut changes = node.watch_pending();
+    /// loop {
+    ///     if changes.changed().await.is_err() {
+    ///         break;
+    ///     }
+    ///     for peer in node.pending_peers() {
+    ///         println!("approve {}? (fingerprint {})", peer.ski, peer.fingerprint);
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn pending_peers(&self) -> Vec<PendingPeer> {
+        self.pending
+            .lock()
+            .map(|pending| pending.clone())
+            .unwrap_or_default()
+    }
+
+    /// Wakes whenever [`pending_peers`](Self::pending_peers) changes.
+    ///
+    /// The receiver carries a counter that means nothing on its own; what it is for is
+    /// `changed().await`. It is marked as seen when handed out, so the first wake is a
+    /// real change rather than the state at the time of subscribing — call
+    /// [`pending_peers`](Self::pending_peers) once after subscribing if a peer may already
+    /// be waiting.
+    pub fn watch_pending(&self) -> watch::Receiver<u64> {
+        self.pending_changed.subscribe()
+    }
+
+    /// Lists a peer as waiting, and keeps it listed until the guard is dropped.
+    pub(crate) fn note_pending(&self, peer: PendingPeer) -> PendingGuard<'_> {
+        let ski = peer.ski;
+        if let Ok(mut pending) = self.pending.lock() {
+            // Bounded by the connections the caller is running: a `Hub` caps those with
+            // `MAX_PENDING_TRUST`, and a consumer driving `accept` itself decides how many
+            // handshakes it starts. Nothing a peer sends adds an entry on its own.
+            pending.push(peer);
+        }
+        self.pending_changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        PendingGuard { node: self, ski }
+    }
+
+    /// Drops one waiting entry for `ski` — the one whose handshake has ended.
+    fn forget_pending(&self, ski: &Ski) {
+        if let Ok(mut pending) = self.pending.lock()
+            && let Some(index) = pending.iter().position(|peer| &peer.ski == ski)
+        {
+            pending.remove(index);
+        }
+        self.pending_changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     /// Takes a refusal for `ski`, if one was recorded.
     pub(crate) fn take_refusal(&self, ski: &Ski) -> bool {
         let Ok(mut refusals) = self.refusals.lock() else {
@@ -692,7 +885,9 @@ impl Node {
 
     /// [`connect`](Self::connect), telling `report` when the peer turns out to be one
     /// this node has not approved.
-    pub(crate) async fn connect_reporting(
+    ///
+    /// The dialling half of [`accept_reporting`](Self::accept_reporting); see there.
+    pub async fn connect_reporting(
         &self,
         address: impl ToSocketAddrs,
         report: Option<TrustReporter>,
@@ -713,7 +908,9 @@ impl Node {
         self.connect_over_reporting(stream, None).await
     }
 
-    pub(crate) async fn connect_over_reporting(
+    /// [`connect_over`](Self::connect_over), telling `report` when the peer turns out to
+    /// be one this node has not approved.
+    pub async fn connect_over_reporting(
         &self,
         stream: TcpStream,
         report: Option<TrustReporter>,
@@ -769,7 +966,34 @@ impl Node {
 
     /// [`accept`](Self::accept), telling `report` when the peer is one this node has not
     /// approved and is now waiting on a decision.
-    pub(crate) async fn accept_reporting(
+    ///
+    /// The peer has completed TLS by then, so the [`PendingPeer`] handed to `report` is
+    /// proved rather than claimed, and the handshake goes on holding the connection while
+    /// somebody decides. This is the hook a consumer needs to **show** an installer the
+    /// SKI of the box that is asking; without it the only way to learn the number is to
+    /// read it off the other device, which is the §14a commissioning step that most often
+    /// goes wrong.
+    ///
+    /// The callback runs on this task, so it must not block — send it on a channel. A
+    /// caller that would rather poll can use [`pending_peers`](Self::pending_peers)
+    /// instead and pass [`None`] here; both are filled in either way.
+    ///
+    /// ```no_run
+    /// # async fn example(node: &eebus::runtime::Node, stream: tokio::net::TcpStream)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let connection = node
+    ///     .accept_reporting(stream, Some(Box::new(move |peer| { let _ = tx.send(peer); })))
+    ///     .await?;
+    /// # let _ = connection;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// [`Hub`](super::Hub) uses this to raise
+    /// [`HubEvent::TrustRequested`](super::HubEvent::TrustRequested); a driver that owns
+    /// its own [`Engine`](crate::spine::Engine) — because it has to be testable without a
+    /// socket — calls it directly.
+    pub async fn accept_reporting(
         &self,
         stream: TcpStream,
         report: Option<TrustReporter>,
@@ -812,7 +1036,8 @@ impl Node {
         Ok(TcpListener::bind(address).await?)
     }
 
-    /// Whether a peer that has just completed TLS is one this node will talk to.
+    /// Whether a peer that has just completed TLS is one this node will talk to, and at
+    /// what level.
     ///
     /// Two ways in, and they are equal in standing. The SKI is classic SHIP §12.2. The
     /// certificate fingerprint is the Pairing Service §10.2, which says that matching it
@@ -820,13 +1045,22 @@ impl Node {
     /// specification" — so a control unit paired that way reaches the data phase without
     /// anybody having compared forty hex digits. Matching it also records the SKI, which
     /// is what every table in this crate is keyed by.
+    ///
+    /// The **level** comes from what the store recorded (§12.3.2, Table 10). A peer added
+    /// with [`TrustStore::trust`] is `user verified`, because that is what approving a SKI
+    /// off a screen is; a control unit trusted through the Pairing Service is a
+    /// commissioning mechanism and is recorded as such. It matters at the next phase but
+    /// one: §12.5 forbids sending this node's PIN to a peer below user trust 32, and a
+    /// stack whose trust is a boolean has nothing to check that against.
     pub(crate) fn trust_for(&self, peer: &PeerIdentity) -> Trust {
-        if self.trust.is_trusted(&peer.ski) {
-            return Trust::Trusted;
+        if let Some(known) = self.trust.get(&peer.ski) {
+            return Trust::Trusted(known.trust);
         }
         if self.trust.is_certificate_trusted(&peer.fingerprint) {
             self.trust.observe_unit_ski(&peer.fingerprint, peer.ski);
-            return Trust::Trusted;
+            // Pairing Service §10.2 admits the unit on a fingerprint a user scanned off a
+            // QR code, which Table 10 calls `commissioned`.
+            return Trust::Trusted(TrustLevel::commissioned(COMMISSIONING_TRUST));
         }
         Trust::Pending
     }

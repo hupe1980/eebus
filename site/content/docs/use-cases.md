@@ -65,8 +65,7 @@ let what_is_it = keys.name_of(some_key_from_a_value_list);
 
 This is the one class of protocol error that produces no error. The write is well-formed,
 it names a real entry of the peer's, the peer applies it and acknowledges it, and the value
-has gone somewhere else. Nine such defects were fixed in 0.5.0 and every one of them was
-invisible to a test whose other end was this same crate.
+has gone somewhere else — invisible to any test whose other end is this same crate.
 
 Each use case wraps the resolver its own data needs — `limitation::PeerIds`,
 `mgcp::Curtailment`, `charging::PhaseLimits`, `evcc::EvReader` — and the actors do it for
@@ -87,6 +86,7 @@ expecting it to write anything, which is what `EnergyGuardActor::is_ready` repor
 | **OSCEV** — Optimization of Self-Consumption During EV Charging | EV, CEM | OSCEV 1.0.1b |
 | **EVCEM** — EV Charging Electricity Measurement | EV, Energy Guard | EVCEM 1.0.1 |
 | **EVSOC** — EV State of Charge | EV, Monitoring Appliance | EVSOC 1.0.0 |
+| **EVCS** — EV Charging Summary | EVSE, Energy Broker (or CEM) | EVCS 1.0.1 |
 | **MOI** — Monitoring of Inverter | Inverter, Monitoring Appliance | MOI 1.0.0 |
 | **MPS** — Monitoring of PV String | PVString, Monitoring Appliance | MPS 1.0.0 |
 | **MOB** — Monitoring of Battery | Battery, Monitoring Appliance | MOB 1.0.0 |
@@ -94,6 +94,7 @@ expecting it to write anything, which is what `EnergyGuardActor::is_ready` repor
 | **CDT** — Configuration of DHW Temperature | DHW Circuit, Configuration Appliance | CDT 1.0.0 |
 | **MDSF** — Monitoring of DHW System Function | DHW Circuit, Monitoring Appliance | MDSF 1.0.0 |
 | **MDT** — Monitoring of DHW Temperature | DHW Circuit, Monitoring Appliance | MDT 1.0.0 |
+| **OHPCF** — Optimization of Self-Consumption by Heat Pump Compressor Flexibility | Compressor, CEM | OHPCF 1.0.0 |
 
 The first four are the ones certifiable since July 2026. Every one of them is implemented
 on **both** sides — the appliance's and the manager's — which is where most of the
@@ -101,7 +102,32 @@ implementation guides' pages actually go.
 
 Not implemented: **CEVC** (Coordinated EV Charging), which is a different shape from
 everything above — three actors, power sequences, incentive tables, and a charging plan
-negotiated rather than a ceiling imposed.
+negotiated rather than a ceiling imposed. **ITPCM** (Incentive Table Based Power
+Consumption Management) is the other absence, and it is the same shape: a price signal over
+`incentiveTable` that an appliance plans against, rather than an instruction it follows.
+Nothing in the eight-device corpus announces either; the SMA Home Manager 2 announces
+[OHPCF](https://docs.rs/eebus/latest/eebus/usecases/ohpcf/index.html), which is the
+direct-control answer to the same question and is implemented.
+
+## The two levers that can ask for *more*
+
+Every other control use case here can only ask an appliance to do less, and a ceiling an
+appliance is already under changes nothing at all. Two can ask for more, and they are not
+interchangeable:
+
+* **CDT** raises a hot water **setpoint** and leaves the circuit's own controller to decide
+  what to do about it. A tank already at temperature will not run for a higher setpoint.
+* **OHPCF** **starts a process**: the compressor's optional power consumption, at a time
+  the CEM names, with stop, pause and resume afterwards. It is what makes a heat pump
+  pre-heat while the roof is exporting — the one thing a thermal model exists to do, and
+  the thing no limit can express.
+
+`ohpcf` is one function on one feature, and what a payload *means* is which of four phases
+the compressor is in: an offer (`inactive`, no schedule), a process (`scheduled`, `running`
+or `paused`), an ending (`completed` or `invalid`), or nothing (no `alternatives`). The
+compressor refuses what the specification does not allow — a pause on something not running,
+a stop it never announced as stoppable — before acknowledging it, the shape LPC's
+Controllable System established.
 
 ## Two use cases, one implementation
 
@@ -134,7 +160,10 @@ Three more pairs work the same way:
   solar only.
 * **EVCEM, EVSOC, MOI, MPS, MOB, COB and MDT** are built on the same `monitoring`
   machinery as MPC and MGCP — one implementation of "describe a measurement twice and read
-  it back", serving nine use cases. What each adds is vocabulary, not mechanism.
+  it back", serving nine use cases. What each adds is vocabulary, not mechanism. `mdt` has
+  a `locate` of its own for the one thing it does not share: a DHW circuit has no
+  `ElectricalConnection`, so searching for one would find whatever else the device happens
+  to serve.
 
 The reference implementations duplicate each pair; here a fix to one is a fix to both, and
 the only thing the direction changes is what the tests assert.

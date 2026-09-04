@@ -20,6 +20,41 @@ is not validated against a root store — there is no root — but the presented
 must carry the SKI that was approved, and the SKI must be derived from the key that
 actually completed the handshake.
 
+## …and trust is a *number*, not a yes
+
+§12.3.2 gives trust three independent categories — **user**, **PKI**, **second factor** —
+and Table 10 maps every way a key can be accepted onto values in them. Three rules read those
+numbers, each a SHALL:
+
+| | |
+|---|---|
+| user trust < 8 | "the communication SHALL be aborted" |
+| user trust < 32 | §12.5: "the SHIP node PIN SHALL NOT be transmitted" to this peer |
+| commissioning over SHIP | needs 32 in user trust **or** second factor |
+
+```rust
+TrustLevel::USER_VERIFIED.permits_pin_transmission();   // true — a person said yes
+TrustLevel::AUTO_ACCEPT.permits_pin_transmission();     // false — it is only trusted at 8
+```
+
+The middle rule is the one with teeth. The QR-code flow of §12.5 exists *because* a node that
+auto-accepts needs a second factor, so handing that secret to a peer admitted by auto-accept
+alone gives it to whoever answered the socket. `send_pin_if_permitted` refuses and raises
+`Event::PinWithheld`.
+
+Categories do not add up: a key verified by auto-accept *and* by a user is at 32, not 40 —
+"only the mechanism which offers the highest trust level in this category SHALL be accounted
+for". PKI trust alone opens nothing, being "no verification mode, as it does not offer the
+necessary user trust".
+
+Proving the PIN earns a second factor, once. §12.5 lets only the first peer since a factory
+default reach 32 — which is what permits it to act as a commissioning tool — and caps every
+later one at 16. `TrustStore::award_pin_trust` applies it, because only the store outlives
+the connection; `Node::eebus_reset` re-opens it.
+
+§12.3.2 closes by inviting a layer above SHIP to use these numbers, and a §14a box deciding
+whether the thing on the other end may set a grid limit is that layer.
+
 ## TLS 1.2, mutual, no resumption
 
 * **1.2 only**, because SHIP §9 says 1.3 "is not considered in this version".

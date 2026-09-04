@@ -93,7 +93,7 @@ impl Link {
 /// and as client, reaching data exchange with the version and format both agreed on.
 #[test]
 fn tc_ship_role_001_002_handshake_completes_in_both_roles() {
-    let mut link = Link::new(Trust::Trusted, Trust::Trusted);
+    let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
 
     assert_eq!(link.a.phase(), Phase::DataExchange);
@@ -131,8 +131,8 @@ fn version_negotiation_falls_back_to_the_older_peer() {
     let mut link = Link::with_configs(
         legacy,
         HandshakeConfig::default(),
-        Trust::Trusted,
-        Trust::Trusted,
+        Trust::VERIFIED,
+        Trust::VERIFIED,
     );
     link.pump();
 
@@ -150,7 +150,7 @@ fn version_negotiation_falls_back_to_the_older_peer() {
 fn tc_ship_cmi_003_004_cmi_timeout_aborts() {
     let config = HandshakeConfig::default();
     let cmi_timeout = config.cmi_timeout;
-    let mut hs = Handshake::new(Role::Client, config, Trust::Trusted, Duration::ZERO);
+    let mut hs = Handshake::new(Role::Client, config, Trust::VERIFIED, Duration::ZERO);
 
     assert_eq!(hs.poll_transmit(), Some(ShipMessage::Cmi));
     assert_eq!(hs.poll_timeout(), Some(cmi_timeout));
@@ -169,7 +169,7 @@ fn tc_ship_hello_001_ready_hello_enters_protocol_handshake() {
     let mut hs = Handshake::new(
         Role::Server,
         HandshakeConfig::default(),
-        Trust::Trusted,
+        Trust::VERIFIED,
         Duration::ZERO,
     );
     let _cmi = hs.poll_transmit();
@@ -239,7 +239,12 @@ fn tc_ship_hello_002_prolongation_requests_are_accepted() {
 #[test]
 fn the_prolongation_dance_survives_a_slow_user() {
     let t0 = Duration::ZERO;
-    let mut client = Handshake::new(Role::Client, HandshakeConfig::default(), Trust::Trusted, t0);
+    let mut client = Handshake::new(
+        Role::Client,
+        HandshakeConfig::default(),
+        Trust::VERIFIED,
+        t0,
+    );
     let mut server = Handshake::new(Role::Server, HandshakeConfig::default(), Trust::Pending, t0);
 
     fn exchange(a: &mut Handshake, b: &mut Handshake, now: Duration) {
@@ -275,7 +280,7 @@ fn the_prolongation_dance_survives_a_slow_user() {
 
     // The user finally approves, and the handshake runs to completion from there.
     let now = Duration::from_secs(601);
-    server.set_trust(Trust::Trusted, now).unwrap();
+    server.set_trust(Trust::VERIFIED, now).unwrap();
     exchange(&mut client, &mut server, now);
     assert!(
         client.is_ready_for_data(),
@@ -346,7 +351,7 @@ fn tc_ship_hello_003_wait_for_ready_timer_expires() {
     let mut hs = Handshake::new(
         Role::Client,
         HandshakeConfig::default(),
-        Trust::Trusted,
+        Trust::VERIFIED,
         Duration::ZERO,
     );
     let _ = hs.poll_transmit();
@@ -369,7 +374,7 @@ fn tc_ship_hello_004_pending_without_request_does_not_extend() {
     let mut hs = Handshake::new(
         Role::Client,
         HandshakeConfig::default(),
-        Trust::Trusted,
+        Trust::VERIFIED,
         Duration::ZERO,
     );
     let _ = hs.poll_transmit();
@@ -427,7 +432,7 @@ fn short_waiting_times_do_not_arm_a_prolongation_request() {
 /// The hello phase waits for a person, then completes when the answer arrives.
 #[test]
 fn a_pending_trust_decision_completes_the_handshake_when_granted() {
-    let mut link = Link::new(Trust::Trusted, Trust::Pending);
+    let mut link = Link::new(Trust::VERIFIED, Trust::Pending);
     link.pump();
 
     assert_eq!(link.b.phase(), Phase::Hello);
@@ -439,7 +444,7 @@ fn a_pending_trust_decision_completes_the_handshake_when_granted() {
     );
 
     link.advance(Duration::from_secs(30));
-    link.b.set_trust(Trust::Trusted, link.now).unwrap();
+    link.b.set_trust(Trust::VERIFIED, link.now).unwrap();
     link.pump();
 
     assert_eq!(link.a.phase(), Phase::DataExchange);
@@ -449,7 +454,7 @@ fn a_pending_trust_decision_completes_the_handshake_when_granted() {
 /// A refusal aborts both sides, and the peer is told rather than left to time out.
 #[test]
 fn a_rejected_key_aborts_both_sides() {
-    let mut link = Link::new(Trust::Trusted, Trust::Rejected);
+    let mut link = Link::new(Trust::VERIFIED, Trust::Rejected);
     link.pump();
 
     assert_eq!(link.b.phase(), Phase::Aborted);
@@ -533,7 +538,7 @@ fn a_selection_the_client_never_offered_is_rejected() {
 /// any PIN traffic. The SHIP parameter sheet fixes the device under test to this state.
 #[test]
 fn tc_ship_pin_001_pin_state_none() {
-    let mut link = Link::new(Trust::Trusted, Trust::Trusted);
+    let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
 
     assert_eq!(link.a.peer_pin_state(), Some(PinState::None));
@@ -553,7 +558,7 @@ fn a_required_pin_is_supplied_and_verified() {
         peer_pin: Some("1234ABCD".into()),
         ..HandshakeConfig::default()
     };
-    let mut link = Link::with_configs(client, server, Trust::Trusted, Trust::Trusted);
+    let mut link = Link::with_configs(client, server, Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
 
     assert_eq!(link.b.phase(), Phase::DataExchange, "the PIN was accepted");
@@ -572,7 +577,7 @@ fn a_wrong_pin_is_refused() {
         peer_pin: Some("DEADBEEF".into()),
         ..HandshakeConfig::default()
     };
-    let mut link = Link::with_configs(client, server, Trust::Trusted, Trust::Trusted);
+    let mut link = Link::with_configs(client, server, Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
 
     assert_ne!(link.b.phase(), Phase::DataExchange);
@@ -591,8 +596,8 @@ fn tc_ship_am_001_access_methods_carry_the_ship_id() {
     let mut link = Link::with_configs(
         HandshakeConfig::default(),
         config,
-        Trust::Trusted,
-        Trust::Trusted,
+        Trust::VERIFIED,
+        Trust::VERIFIED,
     );
     link.pump();
 
@@ -619,7 +624,7 @@ fn tc_ship_am_001_access_methods_carry_the_ship_id() {
 /// will time out waiting for discovery replies that never come.
 #[test]
 fn tc_ship_amdata_001_access_methods_do_not_block_data() {
-    let mut link = Link::new(Trust::Trusted, Trust::Trusted);
+    let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
 
     link.a.request_access_methods();
@@ -641,7 +646,7 @@ fn tc_ship_amdata_001_access_methods_do_not_block_data() {
 /// `TC_SHIP_TERM_001`: a termination is announced with a `maxTime` and confirmed.
 #[test]
 fn tc_ship_term_001_close_is_announced_and_confirmed() {
-    let mut link = Link::new(Trust::Trusted, Trust::Trusted);
+    let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
 
     link.a.close(
@@ -687,7 +692,7 @@ fn tc_ship_term_001_close_is_announced_and_confirmed() {
 /// Once finished, the state machine refuses further input rather than reopening.
 #[test]
 fn a_closed_handshake_stays_closed() {
-    let mut link = Link::new(Trust::Trusted, Trust::Trusted);
+    let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
     link.a.close(
         ConnectionCloseReason::RemovedConnection,
@@ -763,7 +768,7 @@ fn client_in_protocol_handshake() -> Handshake {
     let mut hs = Handshake::new(
         Role::Client,
         HandshakeConfig::default(),
-        Trust::Trusted,
+        Trust::VERIFIED,
         Duration::ZERO,
     );
     let _ = hs.poll_transmit();
@@ -816,7 +821,7 @@ fn ship_13_4_4_3_4_invalid_pins_are_penalised() {
         peer_pin: Some("00000000".into()),
         ..HandshakeConfig::default()
     };
-    let mut link = Link::with_configs(client, server, Trust::Trusted, Trust::Trusted);
+    let mut link = Link::with_configs(client, server, Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
     assert_eq!(link.b.invalid_pin_attempts(), 1);
 
@@ -865,7 +870,7 @@ fn ship_13_4_4_3_4_invalid_pins_are_penalised() {
 /// confirmation that will never come would hold the socket — and the caller — forever.
 #[test]
 fn ship_13_4_8_an_unconfirmed_close_finishes_on_its_own() {
-    let mut link = Link::new(Trust::Trusted, Trust::Trusted);
+    let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
     link.pump();
     assert!(link.a.is_ready_for_data());
 
@@ -912,8 +917,8 @@ fn ship_12_1_3_a_certificate_update_reaches_the_peer_and_is_acknowledged() {
             key_material: Some(keys.clone()),
             ..HandshakeConfig::default()
         },
-        Trust::Trusted,
-        Trust::Trusted,
+        Trust::VERIFIED,
+        Trust::VERIFIED,
     );
     link.pump();
     assert!(link.a.is_ready_for_data() && link.b.is_ready_for_data());
@@ -985,13 +990,13 @@ fn ship_12_1_3_2_an_unacknowledged_update_is_resent_then_abandoned() {
             key_material: Some(OwnKeys::new(Ski::from_bytes([0x11; 20]))),
             ..HandshakeConfig::default()
         },
-        Trust::Trusted,
+        Trust::VERIFIED,
         now,
     );
     let mut peer = Handshake::new(
         Role::Server,
         HandshakeConfig::default(),
-        Trust::Trusted,
+        Trust::VERIFIED,
         now,
     );
     run(&mut node, &mut peer, &mut now);
@@ -1033,13 +1038,13 @@ fn ship_12_1_3_4_a_request_for_stale_key_material_is_answered() {
             key_material: Some(keys),
             ..HandshakeConfig::default()
         },
-        Trust::Trusted,
+        Trust::VERIFIED,
         now,
     );
     let mut peer = Handshake::new(
         Role::Client,
         HandshakeConfig::default(),
-        Trust::Trusted,
+        Trust::VERIFIED,
         now,
     );
     run(&mut peer, &mut node, &mut now);
@@ -1125,7 +1130,12 @@ fn no_secret_reaches_a_log_through_debug() {
         peer_pin: Some(PEER_PIN.into()),
         ..HandshakeConfig::default()
     };
-    let handshake = Handshake::new(Role::Client, config.clone(), Trust::Trusted, Duration::ZERO);
+    let handshake = Handshake::new(
+        Role::Client,
+        config.clone(),
+        Trust::VERIFIED,
+        Duration::ZERO,
+    );
     let qr: ShipQr = format!(
         "SHIP;SKI:5555AAAAFFFF1111CCCC3333EEEEDDDD99992222;ID:i:1_u:x;\
          PIN:{PIN};SPSEC:{SECRET};ENDSHIP;"
@@ -1155,4 +1165,96 @@ fn no_secret_reaches_a_log_through_debug() {
     // the *printing* rather than the storage.
     assert_eq!(config.peer_pin.as_deref(), Some(PEER_PIN));
     assert_eq!(qr.pairing_secret.as_deref(), Some(SECRET));
+}
+
+// ---- §12.3.2 and §12.5: trust is a number, and the numbers are rules ---------------
+
+/// §12.5: the PIN is not sent to a peer that is not trusted enough to be told a secret.
+///
+/// "The PIN is an authentication secret that must be kept confidential and SHALL only be
+/// shared with authenticated and authorized communication partners. Therefore, the SHIP
+/// node PIN SHALL NOT be transmitted if the public key of the corresponding communication
+/// partner has a user trust level that is less than '32'."
+///
+/// A peer admitted by auto-accept alone is at 8. Handing it the PIN gives the secret to
+/// whoever answered the socket — which is exactly what the QR-code flow of §12.5 exists to
+/// avoid, so the rule is not incidental.
+#[test]
+fn the_pin_is_not_sent_to_a_peer_below_user_trust_thirty_two() {
+    use eebus::ship::TrustLevel;
+
+    let server = HandshakeConfig {
+        pin: PinRequirement::Required("1234ABCD".into()),
+        ..HandshakeConfig::default()
+    };
+    let client = HandshakeConfig {
+        peer_pin: Some("1234ABCD".into()),
+        ..HandshakeConfig::default()
+    };
+    // The client knows the PIN, and trusts the server only as far as auto-accept goes.
+    let mut link = Link::with_configs(
+        client,
+        server,
+        Trust::Trusted(TrustLevel::AUTO_ACCEPT),
+        Trust::VERIFIED,
+    );
+    link.pump();
+
+    assert_ne!(
+        link.b.phase(),
+        Phase::DataExchange,
+        "the PIN was sent to a peer §12.5 forbids sending it to"
+    );
+    assert!(
+        core::iter::from_fn(|| link.a.poll_event())
+            .any(|event| matches!(event, Event::PinWithheld { .. })),
+        "and withholding it is reported, because from the far end it looks exactly like \
+         having no PIN at all"
+    );
+}
+
+/// The same connection, with the peer verified, sends it.
+///
+/// The control for the test above: nothing else about the exchange differs.
+#[test]
+fn the_pin_is_sent_to_a_peer_a_person_verified() {
+    let server = HandshakeConfig {
+        pin: PinRequirement::Required("1234ABCD".into()),
+        ..HandshakeConfig::default()
+    };
+    let client = HandshakeConfig {
+        peer_pin: Some("1234ABCD".into()),
+        ..HandshakeConfig::default()
+    };
+    let mut link = Link::with_configs(client, server, Trust::VERIFIED, Trust::VERIFIED);
+    link.pump();
+
+    assert_eq!(link.b.phase(), Phase::DataExchange);
+    assert!(
+        core::iter::from_fn(|| link.b.poll_event())
+            .any(|event| matches!(event, Event::PeerPinVerified)),
+        "and the verifier is told, because §12.5 makes that worth a second factor"
+    );
+}
+
+/// §12.3.2: below user trust 8 the communication SHALL be aborted, whatever the caller
+/// called it.
+///
+/// "A 'user trust' of '8' is the minimal 'user trust' that is required for general SHIP
+/// communication. This means if the 'user trust' is less than '8', the communication SHALL
+/// be aborted." A caller handing back `Trusted` at level 0 has said two contradictory
+/// things; the specification settles which wins.
+#[test]
+fn a_trusted_peer_below_the_user_trust_floor_is_still_refused() {
+    use eebus::ship::TrustLevel;
+
+    let mut link = Link::new(Trust::Trusted(TrustLevel::UNTRUSTED), Trust::VERIFIED);
+    link.pump();
+
+    assert_ne!(link.a.phase(), Phase::DataExchange);
+    assert!(
+        core::iter::from_fn(|| link.a.poll_event())
+            .any(|event| matches!(event, Event::Aborted(AbortReason::TrustRejected))),
+        "the handshake aborts rather than opening on a trust of nothing"
+    );
 }

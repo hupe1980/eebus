@@ -16,7 +16,7 @@ alongside the code. [What EEBUS is](https://hupe1980.github.io/eebus/docs/introd
 > **Status: under construction.** The stack is complete from the socket to the use case,
 > and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are
 > implemented on **both** sides and measured against all 203 of their published abstract
-> test cases, as are six of the e-mobility family and four more for inverters, PV strings
+> test cases, as are seven of the e-mobility family and four more for inverters, PV strings
 > and batteries. Not published to crates.io yet; the API will change.
 
 ## What EEBUS is, and why this exists
@@ -180,9 +180,16 @@ an ordinary `cargo test` needs no Docker.
 and their siblings name the tests that cover them. For the four certifiable use cases,
 `eebus::conformance` carries all 203 abstract test cases of the High-Level Test
 Specifications as data, the suite **drives every one of them**, and `cargo test` prints
-189/203. The fourteen missing are exactly the seven device-level cases — a factory reset, a
-power cut, a start-up duration — counted for LPC and LPP, each listed with its reason, and
-held to that by a test.
+189/203. The fourteen not covered are the seven device-level cases — a factory reset, a
+power cut, a start-up duration — counted once for LPC and once for LPP, each listed with its
+reason and held to that by a test.
+
+Those need a device, so `eebus::conformance::harness` carries their steps and
+expected results for a consumer to drive **against its own running binary**, judged against
+the device's declared parameter sheet: the failsafe defaults a factory reset must restore,
+the `StartUpDur` a black start has to come back inside, the sixty seconds a rebooted Energy
+Guard has to send a heartbeat and a limit in. A persistence test that writes back the value
+the device already held is reported *inconclusive*, not passed.
 
 ## The wire format
 
@@ -218,31 +225,37 @@ in that position loses it, which is the interoperable answer.
 | | certificate updates, end to end | §12.1.3 |
 | | SKI, SHIP ID, `_ship._tcp` TXT record, installation QR code | §5.4, installation requirements 1.1.0 |
 | | the Pairing Service end to end: both roles, the TXT record, the fingerprint trust, the §4.3 policy | Pairing Service 1.0.0 |
+| | trust as a number in three categories, and the three rules that read it — including the PIN a peer below user trust 32 is never sent | §12.3.2 Table 10, §12.5 |
 | **SPINE** | device model, NodeManagement, detailed and use-case discovery | §5.1, §7.1–7.3 |
-| | Restricted Function Exchange: partial read and write, filtered delete, several filters per command — sent as well as served | §5.3.4, SPINE IG §3.3, LPC UC TS §3.4.1.4 |
+| | entities and use cases added, removed and modified at runtime — announced, subscribed to, and merged by their own rules | §7.1.5, §7.5.4 |
+| | Restricted Function Exchange: partial read and write, filtered delete, several filters per command — sent as well as served | §5.3.4, §5.3.4.5, §7.1.3, §7.5.3, SPINE IG §3.3, LPC UC TS §3.4.1.4 |
+| | what identifies a list entry taken from the specification's own identifier table, PRIMARY and SUB apart from FOREIGN | Resource Spec Annex B.7 Table 358, §3.4.2.1 |
 | | a peer's partial notifications and replies merged into the state they update | §7.4, SPINE IG §3.2.2, §3.3 |
 | | acknowledgements, error numbers, counters, `specificationVersion` | §5.2.4–5.2.5, SPINE IG §2.5 |
 | | `maxResponseDelay`: honoured on what a peer announced, announced for what a feature needs | §5.2.5.3 |
 | | unanswered requests retried at 30 s, 5 min and 15 min under fresh counters, then given up on | SPINE IG §2.6.1–2.6.4 |
 | | bindings and subscriptions, single-writer policy, group lock | §5.3.5–5.3.6, LPC IG §3.5 |
-| | the binding and subscription tables, served from the live relations | §7.3.2, §7.4.2 |
-| | heartbeat producer and monitor; deferred writes on the merged state | LPC/LPP scenario 3, LPC IG §4.1.5 |
-| **Use cases** | 17 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
+| | relations kept on both sides, and the tables tailored to their recipient rather than leaking a third peer's | §7.3.2, §7.4.1 rule 4, §7.4.3 |
+| | heartbeat producer and monitor; deferred writes on the merged state, and on a document the application owns | LPC/LPP scenario 3, LPC IG §4.1.5, §7.4.1 |
+| **Use cases** | 19 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
 | | LPC and LPP: state machine, both actors, the §14a record | UC TS §2.3, §3.3 + the 2026 IGs |
 | | every identifier a client addresses is read from the peer's own descriptions, never assumed | the `<l1#…>`, `<k1#…>`, `<p1#…>` placeholders |
 | | scenario 4 constraints: the nameplate for a device, the contract for a CEM | [LPC/LPP-041], [LPC/LPP-042], UC TS §2.6.4.1 |
 | | MPC and MGCP: both actors, incl. the PV curtailment factor as a ceiling in watts | MPC/MGCP UC TS §3.2.2, [MGCP-011] |
-| | six e-mobility use cases; OPEV and OSCEV as one machine, told apart by `limitCategory` | EVSECC/EVCC/OPEV/OSCEV/EVCEM 1.0.1, EVSOC 1.0.0 |
+| | seven e-mobility use cases; OPEV and OSCEV as one machine, told apart by `limitCategory` | EVSECC/EVCC/OPEV/OSCEV/EVCEM/EVCS 1.0.1, EVSOC 1.0.0 |
+| | EV Charging Summary: what a session cost and where its energy came from, written *into* the wallbox | EVCS 1.0.1 §3.2.1 |
 | | inverter, PV string and battery monitoring | MOI/MPS/MOB 1.0.0 |
 | | Control of Battery: six states, twenty transitions, both control modes | COB 1.0.0 §2.4 |
 | | the DHW trio: the hot water setpoint, the mode that says whether a write reaches it, and the temperature it got to | CDT/MDSF/MDT 1.0.0 |
+| | heat pump compressor flexibility: the CEM *starts* an optional consumption process, and stops, pauses and resumes it | OHPCF 1.0.0 §2.5 |
 | **Certification** | the 203 abstract test cases of the four HLTS as data, all driven: 189/203 | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
+| | the other fourteen as a harness a consumer runs against its **own binary**: seven procedures with the specification's steps, judged against its declared parameter sheet | LPC HLTS 1.0.2 tables 15–34, §6.11.8 |
 | | runtime signals for a laboratory's debug interface | the HLTS "e.g. via debug interface" footnote |
 | **Transport** | node certificates, TLS 1.2 with mutual auth | SHIP §9, §12 (`cert`, `tls`) |
 | | mDNS-SD announce and browse | SHIP §5 (`mdns`) |
 | | connection table, keep-alive, reconnection with spread backoff | SHIP §10 (`runtime`) |
 | | persistent trust store, and the "delete all foreign keys" reset | SHIP §12.2.2 (`runtime`) |
-| | interactive pairing: the pending peer reported, approved or refused in place, and bounded in number | SHIP §13.4.4.1 (`runtime`) |
+| | interactive pairing: the pending peer reported, approved or refused in place, and bounded in number — with or without a `Hub` | SHIP §13.4.4.1 (`runtime`) |
 | | automatic pairing: `_shippairing._tcp` requests evaluated, and announced, from the hub | Pairing Service §4, §9 (`runtime`, `mdns`) |
 
 Where the crate deliberately departs from the reference implementations — the §12.2.3

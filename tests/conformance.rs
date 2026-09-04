@@ -1939,6 +1939,60 @@ fn the_device_level_cases_are_the_catalogues_and_the_suites_alike() {
     }
 }
 
+/// The harness answers exactly the cases this suite cannot, and nothing else.
+///
+/// Three lists have to agree, and it is the third that is new: what this suite marks
+/// `Claim::Device`, what `conformance::DEVICE_LEVEL` publishes, and what
+/// `conformance::harness::PROCEDURES` gives a consumer a procedure for. A device-level case
+/// with no procedure is one a consumer is told it must answer and given no way to; a
+/// procedure for a case this suite already drives would be work done twice.
+#[test]
+fn every_device_level_case_has_a_procedure_a_consumer_can_run() {
+    use eebus::conformance::harness::{PROCEDURES, Procedure};
+
+    let mut covered: Vec<&str> = PROCEDURES
+        .iter()
+        .flat_map(|procedure| procedure.cases())
+        .collect();
+    covered.sort_unstable();
+
+    let mut owed: Vec<&str> = conformance::device_level()
+        .map(|(case, _)| case.id)
+        .collect();
+    owed.sort_unstable();
+
+    assert_eq!(
+        covered, owed,
+        "the harness and the catalogue name the same cases"
+    );
+
+    // And each procedure carries the reason the case is the device's, and steps to run.
+    for procedure in PROCEDURES {
+        let [lpc, lpp] = procedure.catalogue();
+        assert_eq!(
+            Some(procedure.owner()),
+            lpc.owed_by_device(),
+            "{procedure} disagrees with the catalogue about why it is the device's"
+        );
+        assert_eq!(lpp.owed_by_device(), lpc.owed_by_device());
+        assert!(!procedure.steps().is_empty(), "{procedure} has no steps");
+    }
+
+    // The two black starts are the only ones a device may decline, and only if it says so.
+    let optional: Vec<Procedure> = PROCEDURES
+        .iter()
+        .copied()
+        .filter(|p| !p.level().1.is_empty())
+        .collect();
+    assert_eq!(
+        optional,
+        [
+            Procedure::ControllableSystemBlackStart,
+            Procedure::EnergyGuardBlackStart
+        ]
+    );
+}
+
 /// Every claim names a test case that exists — a typo would otherwise inflate the number
 /// it was made to justify.
 #[test]
@@ -2087,6 +2141,10 @@ fn coverage_of_the_certifiable_use_cases() {
             report.push_str(&format!("  {name:<20} {reason}\n"));
         }
     }
+    report.push_str(
+        "\n  These are `eebus::conformance::harness`: seven procedures a consumer drives\n\
+         \x20 against its own binary, each carrying the specification's own steps.\n",
+    );
     report.push_str(
         "\nCovered here, and still owed by the device:\n\
          \x20 MPC/MGCP notification   the library notifies a change at once, as SPINE IG\n\

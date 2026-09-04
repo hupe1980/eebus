@@ -53,6 +53,7 @@
 pub mod charging;
 pub mod evcc;
 pub mod evcem;
+pub mod evcs;
 pub mod evsecc;
 pub mod evsoc;
 pub mod opev;

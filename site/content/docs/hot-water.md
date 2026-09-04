@@ -1,15 +1,15 @@
 +++
 title = "The DHW trio — hot water"
-description = "CDT, MDSF and MDT: which mode a hot water circuit is in, setting its temperature setpoint — the only lever here that can ask an appliance to use more — and what the water actually got to."
+description = "CDT, MDSF and MDT: which mode a hot water circuit is in, setting its temperature setpoint — one of the two levers here that can ask an appliance to use more — and what the water actually got to."
 weight = 105
 [extra]
 group = "Use cases"
 +++
 
-Every other control use case here can only ask an appliance to do **less**. [LPC and
+Nearly every control use case here can only ask an appliance to do **less**. [LPC and
 LPP](@/docs/limitation.md) set a ceiling; [OPEV](@/docs/e-mobility.md) sets a current a car
 may not exceed; [COB](@/docs/use-cases.md) drives a battery between limits. **Configuration
-of DHW Temperature** is the exception: it sets a target, and a target can go up.
+of DHW Temperature** is one of the two exceptions: it sets a target, and a target can go up.
 
 That is not a detail. A hot water tank is the cheapest thermal battery in most buildings,
 and raising its setpoint by ten degrees while the roof is exporting stores a few
@@ -53,6 +53,33 @@ nothing anybody can measure. Nothing on the wire says so.
 // Which setpoint would a write actually reach, right now?
 let reachable = state.current_setpoints(&known);
 ```
+
+So there is a gate on the write, the same shape as the limitation actor refusing a limit
+with no recent heartbeat: the message would be accepted and mean nothing.
+
+```rust
+use eebus::usecases::hvac::cdt::WriteRefused;
+
+match known.write_effective(dhw, 60.0, &state) {
+    Ok(write)                           => { /* send it */ }
+    Err(WriteRefused::NotInCurrentMode) => { /* ask for the mode first */ }
+    Err(WriteRefused::ModeUnknown)      => { /* MDSF has not spoken yet */ }
+    Err(other)                          => { /* the circuit would refuse it anyway */ }
+}
+```
+
+`effect_of` asks the same question without the write, and has four answers:
+
+| | |
+|---|---|
+| `Effective` | the circuit is in a mode that reads this setpoint |
+| `NotInCurrentMode` | it reads some other setpoint, or none — `off` may relate to none [CDT-003/3] |
+| `OverriddenByOverrun` | a one-time heating is running over the top of it (MDSF Table 12). The write **lands**; it takes effect when the overrun ends |
+| `Unknown` | no mode has been reported, or CDT's relations have not arrived |
+
+Only `NotInCurrentMode` and `Unknown` are refusals — an overrun is "later", not "never".
+The unconditional `write` remains, for a manager pre-loading the setpoint of a mode it is
+about to ask for.
 
 Both specifications also give an entity **one** `HVAC` feature (§3.2.2.2.1), so a circuit
 serving both puts MDSF's six functions and CDT's relations on the same one —
@@ -153,6 +180,36 @@ the three resting states and hands the announcement back separately:
 state.overrun();               // Active | Running | Inactive
 state.overrun_just_finished(); // the one-shot, not stored
 ```
+
+## The other lever: OHPCF
+
+A setpoint is a request the circuit's own controller decides what to do about, and a tank
+already at temperature will not run for a higher one. **Optimization of Self-Consumption by
+Heat Pump Compressor Flexibility** is the other half of the same idea and a different
+mechanism: the compressor announces that it *could* run and how much it would draw, and the
+CEM **starts that process** at a time it names — then stops, pauses or resumes it.
+
+```rust
+use eebus::usecases::ohpcf::{self, CompressorOffer, Flexibility, Interrupt};
+
+let read = CompressorOffer::read(&payload)?;
+if read.is_available() {
+    // The roof is exporting. Run it now.
+    engine.write(&peer.flexibility, &client, ohpcf::activate(read.sequence, "PT0S"), true, now);
+}
+```
+
+It is one function on one `SmartEnergyManagementPs` feature, and what a payload *means* is
+which of four phases the compressor is in — an offer, a process, an ending, or nothing at
+all. Two things it tells a planner that nothing else does: [OHPCF-008], the least time the
+compressor must run once started, and [OHPCF-009], the least time it must rest before
+starting again. Short-cycling a compressor is how they die, and the CEM is the only thing in
+a position to avoid it.
+
+The compressor refuses what the specification does not allow — a pause on something that is
+not running, a stop it never announced as stoppable — before acknowledging it. [OHPCF-011/7]
+guarantees it always announces at least one way out, so `Interrupt` has no empty case, and a
+peer that announces neither is reported rather than assumed.
 
 ## What is not here
 

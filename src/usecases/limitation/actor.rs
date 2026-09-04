@@ -490,6 +490,7 @@ pub fn read_heartbeat(data: &CmdData) -> Option<u64> {
 
 /// What the Controllable System actor did.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum CsEvent {
     /// A write on the Active Power Limit was decided.
     ///

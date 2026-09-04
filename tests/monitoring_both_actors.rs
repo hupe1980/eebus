@@ -101,8 +101,11 @@ impl Pair {
             actors::MONITORED_UNIT,
         )
         .expect("a Monitored Unit");
-        assert_eq!(peer.measurement, self.measurement);
-        assert_eq!(peer.electrical_connection, self.electrical_connection);
+        assert_eq!(peer.measurement.as_ref(), Some(&self.measurement));
+        assert_eq!(
+            peer.electrical_connection.as_ref(),
+            Some(&self.electrical_connection)
+        );
 
         self.appliance.attach(&mut self.manager, peer, self.now);
         self.settle();
@@ -486,5 +489,236 @@ fn another_key_is_never_mistaken_for_the_factor() {
             .any(|e| matches!(e, MonitoringEvent::CurtailmentChanged { .. })),
         "and nothing was reported: {:?}",
         pair.events
+    );
+}
+
+/// [B3] A Grid Connection Point that serves scenario 1 and nothing else is still located.
+///
+/// MGCP §3.2.2.2.1 ties each feature type to the scenarios that use it, and Table 1 marks
+/// those separately per actor: `DeviceConfiguration` belongs to scenario 1, `Measurement`
+/// and `ElectricalConnection` to scenarios 2 to 7. A Grid Connection Point that publishes
+/// only the curtailment factor is unusual — Table 1 makes scenarios 2, 3 and 4 mandatory
+/// *for that actor* — but it is describable, and an appliance that refused to locate it
+/// would read nothing from a device that is telling it something.
+#[test]
+fn a_connection_point_serving_only_scenario_one_is_still_located_and_read() {
+    use eebus::model::{
+        CmdData, DeviceConfigurationKeyId, DeviceConfigurationKeyName,
+        DeviceConfigurationKeyValueData, DeviceConfigurationKeyValueDescriptionData,
+        DeviceConfigurationKeyValueDescriptionListData, DeviceConfigurationKeyValueListData,
+        DeviceConfigurationKeyValueType, DeviceConfigurationKeyValueValue, ScaledNumber,
+        UnitOfMeasurement,
+    };
+
+    let now = Duration::ZERO;
+    let key = DeviceConfigurationKeyId(4);
+
+    let mut unit_device = LocalDevice::new("i:67890", "Inverter-1", DeviceType::SubMeter).unwrap();
+    unit_device
+        .add_entity(
+            LocalEntity::new([1], EntityType::GridConnectionPointOfPremises)
+                .with_feature(eebus::usecases::mgcp::curtailment_feature(1)),
+        )
+        .unwrap();
+    let configuration = unit_device.address_of(&[1], 1);
+    let mut unit_engine = Engine::new(unit_device);
+    unit_engine.add_use_case_scenarios([1], 1, &eebus::usecases::mgcp::GRID_CONNECTION_POINT, &[1]);
+
+    let feature = unit_engine
+        .device_mut()
+        .resolve_mut(&configuration)
+        .expect("the feature");
+    feature
+        .set_data(CmdData::DeviceConfigurationKeyValueDescriptionListData(
+            DeviceConfigurationKeyValueDescriptionListData {
+                device_configuration_key_value_description_data: Some(vec![
+                    DeviceConfigurationKeyValueDescriptionData {
+                        key_id: Some(key),
+                        key_name: Some(DeviceConfigurationKeyName::PvCurtailmentLimitFactor),
+                        value_type: Some(DeviceConfigurationKeyValueType::ScaledNumber),
+                        unit: Some(UnitOfMeasurement::Pct),
+                        ..Default::default()
+                    },
+                ]),
+            },
+        ))
+        .expect("publishable");
+    feature
+        .set_data(CmdData::DeviceConfigurationKeyValueListData(
+            DeviceConfigurationKeyValueListData {
+                device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
+                    key_id: Some(key),
+                    value: Some(DeviceConfigurationKeyValueValue {
+                        scaled_number: Some(ScaledNumber::from_f64(60.0, 2)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+            },
+        ))
+        .expect("publishable");
+
+    let mut manager_device = LocalDevice::new(
+        "i:12345",
+        "EnergyManager-1",
+        DeviceType::EnergyManagementSystem,
+    )
+    .unwrap();
+    manager_device
+        .add_entity(
+            LocalEntity::new([1], EntityType::CEM).with_feature(LocalFeature::new(
+                1,
+                FeatureType::Generic,
+                Role::Client,
+            )),
+        )
+        .unwrap();
+    let client = manager_device.address_of(&[1], 1);
+    let mut manager = Engine::new(manager_device);
+    manager.add_use_case([1], 1, &eebus::usecases::mgcp::MONITORING_APPLIANCE);
+    let mut appliance = MonitoringApplianceActor::new(client);
+
+    let manager_nm = node_management(manager.device().address());
+    let unit_nm = node_management(unit_engine.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        manager.read(&unit_nm, &manager_nm, function, now);
+    }
+
+    let device = unit_engine.device().address().clone();
+    let mut events = Vec::new();
+    let settle = |manager: &mut Engine,
+                  unit_engine: &mut Engine,
+                  appliance: &mut MonitoringApplianceActor,
+                  events: &mut Vec<MonitoringEvent>| {
+        for _ in 0..64 {
+            let mut moved = false;
+            while let Some(datagram) = manager.poll_transmit() {
+                unit_engine.handle_datagram(&datagram, now);
+                moved = true;
+            }
+            while let Some(datagram) = unit_engine.poll_transmit() {
+                manager.handle_datagram(&datagram, now);
+                moved = true;
+            }
+            while let Some(event) = manager.poll_event() {
+                moved = true;
+                events.extend(appliance.handle_event(&event));
+            }
+            while unit_engine.poll_event().is_some() {
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("the exchange did not settle");
+    };
+    settle(&mut manager, &mut unit_engine, &mut appliance, &mut events);
+
+    let remote = manager.peer(&device).expect("the connection point");
+    let peer = monitoring::locate(
+        remote,
+        "monitoringOfGridConnectionPoint",
+        actors::GRID_CONNECTION_POINT,
+    )
+    .expect("a connection point that serves scenario 1 alone is still a peer");
+    assert_eq!(peer.curtailment.as_ref(), Some(&configuration));
+    assert!(
+        peer.measurement.is_none() && peer.electrical_connection.is_none(),
+        "it publishes neither, and locating it must not require them"
+    );
+
+    appliance.attach(&mut manager, peer, now);
+    settle(&mut manager, &mut unit_engine, &mut appliance, &mut events);
+
+    assert_eq!(
+        appliance.curtailment(&device),
+        Some(60.0),
+        "the one scenario it serves came through"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, MonitoringEvent::CurtailmentChanged { .. })),
+        "and was reported: {events:?}"
+    );
+}
+
+/// A peer that announces the use case and serves none of its features is not located.
+///
+/// The other half of the leniency: `locate` stops requiring particular features, and
+/// stops short of returning a peer there is nothing to read from. Such a peer would
+/// otherwise sit in the actor's list for the life of the connection, having asked for
+/// nothing and waiting for notifications that cannot come.
+#[test]
+fn a_peer_that_serves_none_of_the_features_is_not_located() {
+    let now = Duration::ZERO;
+
+    let mut unit_device = LocalDevice::new("i:67890", "Empty-1", DeviceType::SubMeter).unwrap();
+    unit_device
+        .add_entity(LocalEntity::new(
+            [1],
+            EntityType::GridConnectionPointOfPremises,
+        ))
+        .unwrap();
+    let mut unit_engine = Engine::new(unit_device);
+    unit_engine.add_use_case_scenarios([1], 1, &eebus::usecases::mgcp::GRID_CONNECTION_POINT, &[1]);
+
+    let mut manager_device = LocalDevice::new(
+        "i:12345",
+        "EnergyManager-1",
+        DeviceType::EnergyManagementSystem,
+    )
+    .unwrap();
+    manager_device
+        .add_entity(
+            LocalEntity::new([1], EntityType::CEM).with_feature(LocalFeature::new(
+                1,
+                FeatureType::Generic,
+                Role::Client,
+            )),
+        )
+        .unwrap();
+    let mut manager = Engine::new(manager_device);
+
+    let manager_nm = node_management(manager.device().address());
+    let unit_nm = node_management(unit_engine.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        manager.read(&unit_nm, &manager_nm, function, now);
+    }
+    for _ in 0..8 {
+        while let Some(datagram) = manager.poll_transmit() {
+            unit_engine.handle_datagram(&datagram, now);
+        }
+        while let Some(datagram) = unit_engine.poll_transmit() {
+            manager.handle_datagram(&datagram, now);
+        }
+    }
+
+    let device = unit_engine.device().address().clone();
+    let remote = manager.peer(&device).expect("the peer");
+    assert!(
+        remote
+            .use_case(
+                "monitoringOfGridConnectionPoint",
+                actors::GRID_CONNECTION_POINT
+            )
+            .is_some(),
+        "it did announce the use case"
+    );
+    assert!(
+        monitoring::locate(
+            remote,
+            "monitoringOfGridConnectionPoint",
+            actors::GRID_CONNECTION_POINT,
+        )
+        .is_none(),
+        "and serves none of its features, so there is nothing to attach to"
     );
 }

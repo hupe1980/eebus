@@ -1,6 +1,6 @@
 +++
 title = "E-mobility"
-description = "The six e-mobility use cases: who is on the end of the cable, what it may take, and what it actually did — EVSECC, EVCC, OPEV, OSCEV, EVCEM and EVSOC."
+description = "The seven e-mobility use cases: who is on the end of the cable, what it may take, and what it actually did — EVSECC, EVCC, OPEV, OSCEV, EVCEM, EVSOC and EVCS."
 weight = 100
 [extra]
 group = "Use cases"
@@ -11,7 +11,7 @@ energy manager that has to keep the house fuse intact.
 
 A car is the one appliance in a building that arrives, says what it is, and leaves again.
 Half of this family is therefore about finding out what is on the end of the cable before
-anything can be asked of it, and the six use cases layer:
+anything can be asked of it, and the use cases layer:
 
 | | Use case | What it answers |
 |---|---|---|
@@ -21,6 +21,7 @@ anything can be asked of it, and the six use cases layer:
 | | OSCEV | the surplus the roof is producing — a *recommendation* |
 | **What it did** | EVCEM | the current, power and energy that really flowed |
 | | EVSOC | how full the battery is, and how big |
+| | EVCS | what the finished session cost, and where its energy came from |
 
 ## EVSECC — commissioning the wallbox
 
@@ -181,6 +182,45 @@ dashboard shows.
 
 EVCEM and EVSOC run on the [shared measurement layer](@/docs/monitoring.md); what they add
 is vocabulary, not mechanism.
+
+## EVCS — what the session cost, and where the energy came from
+
+**EV Charging Summary** goes the other way from everything above. The EVSE serves a
+**writeable** `Bill` and the energy manager writes into it: only the manager knows what the
+roof was producing at the time and what the tariff was, and the wallbox is where a driver
+looks. It is the one function in this crate a *client* actor writes for somebody else's
+screen.
+
+```rust
+use eebus::usecases::emobility::evcs::{ChargingSummary, Share};
+use eebus::model::Currency;
+
+// 18 kWh at €4.20 — a quarter of the energy off the grid, and nearly all of the bill.
+let summary = ChargingSummary::new(18_000.0, 4.20, Currency::EUR)
+    .from_grid(Share::new(25.0, 90.0))
+    .self_produced(Share::new(75.0, 10.0));
+
+summary.grid_energy_wh();       // Some(4_500.0)
+summary.self_produced_cost();   // Some(0.42)
+```
+
+The energy split and the cost split are different numbers, and keeping them apart is the
+point of the use case. Reading it back is what makes a session's accounting the **car's**,
+rather than something inferred from the wallbox's power curve.
+
+Two things matter before matching on an actor name:
+
+* **The client has two conformant names.** §3.2.2.1: `CEM` where the Energy Guard and the
+  Energy Broker are the same CEM entity, `EnergyBroker` where they are different ones.
+* **`evcs::locate` matches on the role, not the name.** §3.2.2 gives the Energy Broker "only
+  client functionality", so the peer serving a `Bill` is the EVSE whatever it calls itself —
+  which is how the Porsche Mobile Charger Connect is found, announcing this use case under
+  actor `EV`.
+
+The wallbox asks for a summary by setting `updateRequired` [EVCS-009], and clears it once the
+write arrives. Tables 6 and 8 both warn the result "SHOULD NOT be used for actual billing as
+it may also contain approximated values" — it is what a driver is shown, not what anybody is
+invoiced.
 
 ## Not here: CEVC
 

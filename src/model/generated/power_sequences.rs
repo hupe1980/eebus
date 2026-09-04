@@ -575,7 +575,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(PowerTimeSlotScheduleConstraintsData { sequence_id });
+crate::eebus_identity!(PowerTimeSlotScheduleConstraintsData {
+    sequence_id,
+    slot_number
+});
 
 crate::eebus_struct! {
     /// `PowerTimeSlotScheduleConstraintsListDataSelectorsType`.
@@ -641,7 +644,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(PowerTimeSlotScheduleData { sequence_id });
+crate::eebus_identity!(PowerTimeSlotScheduleData {
+    sequence_id,
+    slot_number
+});
 
 crate::eebus_struct! {
     /// `PowerTimeSlotScheduleListDataSelectorsType`.
@@ -695,7 +701,10 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(PowerTimeSlotValueData { sequence_id });
+crate::eebus_identity!(PowerTimeSlotValueData {
+    sequence_id,
+    slot_number
+});
 
 crate::eebus_struct! {
     /// `PowerTimeSlotValueListDataSelectorsType`.

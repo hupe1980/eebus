@@ -158,11 +158,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(SetpointDescriptionData {
-    setpoint_id,
-    measurement_id,
-    time_table_id
-});
+crate::eebus_identity!(SetpointDescriptionData { setpoint_id });
 
 crate::eebus_struct! {
     /// `SetpointDescriptionListDataSelectorsType`.

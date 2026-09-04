@@ -114,6 +114,26 @@
 //! household appliance that find each other over mDNS, remember whom they trust, and print
 //! the runtime signals of [`usecases::signals`] as they go.
 //!
+//! # Matching on an event
+//!
+//! Every enum this crate *reports* things through is `#[non_exhaustive]`, so a `match` on
+//! one needs a `_` arm. That is deliberate and it is the reverse of an inconvenience: the
+//! crate keeps finding things worth reporting — a peer withholding a PIN, a use case
+//! appearing at runtime, a request that walked the whole retry ladder — and without the
+//! attribute every one of those is a breaking change for every consumer that matches
+//! exhaustively.
+//!
+//! The line is drawn by *who closes the set*:
+//!
+//! | | |
+//! |---|---|
+//! | `#[non_exhaustive]` | anything this crate closes: [`HubEvent`](runtime::HubEvent), [`SpineEvent`](spine::SpineEvent), [`ship::Event`], every actor's event and error type |
+//! | exhaustive | anything the **specification** closes: [`LimitationState`](usecases::limitation::LimitationState)'s five states, [`Trust`](ship::Trust), `PinState`, every generated enumeration |
+//!
+//! So a `match` on a state machine's states is still checked for completeness — which is
+//! the case where you want to be told about a new one — and a `match` on a stream of events
+//! is not.
+//!
 //! # Certification
 //!
 //! [`conformance`] carries the 203 abstract test cases of the LPC, LPP, MPC and MGCP

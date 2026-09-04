@@ -126,3 +126,34 @@ asymmetry is the specification's: LPC IG §3.3 asks each actor to hold **one** c
 with featureType `Generic` for all of its client functionality. A Monitoring Appliance reads
 a `Measurement` server for scenarios 2 to 7 and a `DeviceConfiguration` server for scenario 1
 from the same one — `limitation::client_feature`, the same constructor an Energy Guard uses.
+
+## Every feature a peer might not have
+
+MGCP §3.2.2.2.1 ties each feature type to the scenarios that use it, and then says the
+presence indications are "meant relative to the ones of the according Scenario stated in
+Table 1". `DeviceConfiguration` belongs to scenario 1; `Measurement` and
+`ElectricalConnection` belong to scenarios 2 to 7. So which features a peer serves depends
+on which scenarios it implements, and `MonitoredUnitPeer` carries all three as `Option`:
+
+```rust
+let peer = monitoring::locate(remote, mgcp::NAME, actors::GRID_CONNECTION_POINT)?;
+peer.measurement;            // Option: absent on a scenario-1-only connection point
+peer.electrical_connection;  // Option: absent wherever there are no phases to describe
+peer.curtailment;            // Option: MGCP scenario 1, and absent from MPC entirely
+```
+
+`attach` reads only what is there. What `locate` *does* require is that the peer serve at
+least one of them: a peer announcing the use case and none of its features would otherwise
+sit in the actor's list for the life of the connection, waiting for notifications that
+cannot come.
+
+That is also what lets a hot water tank in through the same door. A DHW circuit has no
+`ElectricalConnection` at all — MDT Table 6 gives the use case one feature — so it has a
+`locate` of its own, and what it returns goes into the same actor:
+
+```rust
+use eebus::usecases::hvac::mdt;
+
+let tank = mdt::locate(remote)?;          // measurement only; no phases to describe
+appliance.attach(&mut engine, tank, now); // the same actor as a grid connection point
+```

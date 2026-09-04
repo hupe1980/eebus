@@ -159,12 +159,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         match event {
-            HubEvent::TrustRequested { ski, origin } => {
+            HubEvent::TrustRequested { peer, origin } => {
                 println!(
                     "[pump] {} wants to pair, {origin}\n       trust it? [y/N] ",
-                    ski.to_display_string()
+                    peer.ski.to_display_string()
                 );
-                answers.ask(ski);
+                answers.ask(peer.ski);
             }
             HubEvent::Connected { ski, version } => {
                 println!("[pump] {ski} completed the handshake (SHIP {version:?})");
@@ -259,6 +259,8 @@ fn announce_decision(decision: &CsEvent) {
         }
         CsEvent::GuardIdentified { .. } => println!("[pump] the Energy Guard has both bindings"),
         CsEvent::StateChanged { from, to } => println!("[pump] {from} → {to}"),
+        // The crate keeps adding events; a consumer that does not need them says so.
+        _ => {}
     }
 }
 

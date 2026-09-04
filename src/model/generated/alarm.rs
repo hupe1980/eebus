@@ -58,10 +58,7 @@ crate::eebus_struct! {
     }
 }
 
-crate::eebus_identity!(AlarmData {
-    alarm_id,
-    threshold_id
-});
+crate::eebus_identity!(AlarmData { alarm_id });
 
 crate::eebus_id! {
     /// `AlarmIdType`.
