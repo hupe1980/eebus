@@ -10,6 +10,13 @@
 //! never sends, and a counter may reset or wrap when a peer restarts
 //! (`TC_SPINE_DATA_003`). A receiver that insists on `+1` will drop traffic from
 //! perfectly compliant peers.
+//!
+//! They are also not a *sequence*. §5.2.4 makes the counter a sender-unique identifier
+//! for `msgCounterReference` to point at; nothing makes arrival order counter order. A
+//! peer that allocates a counter in one task and writes the datagram from another sends
+//! them interleaved, which `eebus-go` does — so a receiver that keeps only the highest
+//! counter it has seen reads the overtaken message as a duplicate and drops it. That is
+//! why [`MsgCounterTracker`] remembers a window rather than a maximum.
 
 use crate::model::MsgCounter;
 
@@ -52,6 +59,7 @@ impl MsgCounterSource {
 
 /// What a receiver made of an incoming counter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CounterCheck {
     /// The expected case: the counter advanced.
     Ascending,
@@ -64,8 +72,11 @@ pub enum CounterCheck {
     /// The counter went backwards far enough to be a restart or a wrap
     /// (`TC_SPINE_DATA_003`), so the sequence starts again from here.
     Restarted,
-    /// The counter repeated or went slightly backwards, which is a duplicate rather than
-    /// a restart.
+    /// A counter below the highest one seen, and not seen before: a message overtaken in
+    /// flight by one its sender numbered later. Processed like any other.
+    Reordered,
+    /// The counter repeated, or is too far back to tell a late message from one already
+    /// processed.
     Duplicate,
 }
 
@@ -82,7 +93,11 @@ impl CounterCheck {
 /// Follows the counters a peer sends.
 #[derive(Clone, Debug, Default)]
 pub struct MsgCounterTracker {
+    /// The highest counter accepted so far.
     last: Option<u64>,
+    /// Which of the [`WINDOW`] counters below `last` have already been seen: bit `i` is
+    /// the counter `last - 1 - i`. `last` itself is seen by definition.
+    seen: u64,
 }
 
 /// How far a counter may go backwards before it reads as a restart rather than a
@@ -91,6 +106,14 @@ pub struct MsgCounterTracker {
 /// A peer that reboots begins again from a low number, while a genuine duplicate repeats
 /// a counter close to the last one. The threshold separates the two without a handshake.
 const RESTART_THRESHOLD: u64 = 1_000;
+
+/// How many counters below the highest one are remembered individually.
+///
+/// Only inside this window can a message overtaken in flight be told from one already
+/// processed. SHIP runs over a WebSocket, so the stream itself is ordered and lossless
+/// and the reordering to absorb is only what a sender's own concurrency produces —
+/// sixty-four is far past any of it, and costs one word per peer.
+const WINDOW: u64 = u64::BITS as u64;
 
 impl MsgCounterTracker {
     /// A tracker that has seen nothing yet.
@@ -115,29 +138,56 @@ impl MsgCounterTracker {
     /// assert_eq!(tracker.observe(MsgCounter(9)), CounterCheck::Skipped { by: 6 });
     /// assert_eq!(tracker.observe(MsgCounter(9)), CounterCheck::Duplicate);
     ///
+    /// // One its sender numbered earlier but wrote later is still news.
+    /// assert_eq!(tracker.observe(MsgCounter(8)), CounterCheck::Reordered);
+    /// assert_eq!(tracker.observe(MsgCounter(8)), CounterCheck::Duplicate);
+    ///
     /// // A peer that reboots starts over from a low number.
     /// tracker.observe(MsgCounter(40_000));
     /// assert_eq!(tracker.observe(MsgCounter(1)), CounterCheck::Restarted);
     /// ```
     pub fn observe(&mut self, counter: MsgCounter) -> CounterCheck {
         let value = counter.get();
-        let outcome = match self.last {
-            None => CounterCheck::Ascending,
-            Some(last) if value == last.wrapping_add(1) => CounterCheck::Ascending,
-            Some(last) if value > last => CounterCheck::Skipped {
-                by: value - last - 1,
-            },
-            // Far enough back to be a reboot or a wrap of the counter space.
-            Some(last) if last.saturating_sub(value) >= RESTART_THRESHOLD => {
-                CounterCheck::Restarted
-            }
-            Some(_) => CounterCheck::Duplicate,
+        let Some(last) = self.last else {
+            self.last = Some(value);
+            return CounterCheck::Ascending;
         };
 
-        if outcome.is_acceptable() {
+        if value > last {
+            let ahead = value - last;
+            // `last` becomes a member of the window, at bit `ahead - 1`; everything the
+            // window already held moves down by the same amount, and what falls off the
+            // end is older than this receiver can reason about.
+            self.seen = match ahead < WINDOW {
+                true => (self.seen << ahead) | (1 << (ahead - 1)),
+                false => 0,
+            };
             self.last = Some(value);
+            return match ahead {
+                1 => CounterCheck::Ascending,
+                _ => CounterCheck::Skipped { by: ahead - 1 },
+            };
         }
-        outcome
+
+        let behind = last - value;
+        // Far enough back to be a reboot or a wrap of the counter space.
+        if behind >= RESTART_THRESHOLD {
+            self.last = Some(value);
+            self.seen = 0;
+            return CounterCheck::Restarted;
+        }
+        // Inside the window and not yet seen: a message its sender numbered before one
+        // that overtook it. Outside the window there is nothing left to tell it from a
+        // counter already processed, so it is refused.
+        if behind == 0 || behind > WINDOW {
+            return CounterCheck::Duplicate;
+        }
+        let bit = 1u64 << (behind - 1);
+        if self.seen & bit != 0 {
+            return CounterCheck::Duplicate;
+        }
+        self.seen |= bit;
+        CounterCheck::Reordered
     }
 }
 
@@ -185,12 +235,65 @@ mod tests {
         let mut tracker = MsgCounterTracker::new();
         tracker.observe(MsgCounter(10));
         assert_eq!(tracker.observe(MsgCounter(10)), CounterCheck::Duplicate);
+        assert_eq!(tracker.observe(MsgCounter(9)), CounterCheck::Reordered);
         assert_eq!(tracker.observe(MsgCounter(9)), CounterCheck::Duplicate);
         assert_eq!(
             tracker.last(),
             Some(MsgCounter(10)),
-            "a duplicate does not move the sequence"
+            "neither a duplicate nor a late arrival moves the sequence on"
         );
+    }
+
+    /// The exchange that found this: `eebus-go` numbers a binding request 10, then sends
+    /// a result numbered 11 from another goroutine first.
+    ///
+    /// A tracker that keeps only the highest counter reads 10 as a duplicate and drops
+    /// it — and because the dropped message was a `call` with `ackRequest`, the peer gets
+    /// no result either, so nothing at either end reports that a binding was never made.
+    #[test]
+    fn a_message_overtaken_by_a_later_one_is_still_processed() {
+        let mut tracker = MsgCounterTracker::new();
+        for counter in 1..=9 {
+            assert!(tracker.observe(MsgCounter(counter)).is_acceptable());
+        }
+        assert_eq!(
+            tracker.observe(MsgCounter(11)),
+            CounterCheck::Skipped { by: 1 }
+        );
+        assert_eq!(tracker.observe(MsgCounter(10)), CounterCheck::Reordered);
+        assert_eq!(tracker.observe(MsgCounter(12)), CounterCheck::Ascending);
+    }
+
+    /// The window is what makes the distinction possible, so it has an edge.
+    #[test]
+    fn beyond_the_window_a_late_message_cannot_be_told_from_a_duplicate() {
+        let mut tracker = MsgCounterTracker::new();
+        tracker.observe(MsgCounter(100));
+        assert_eq!(
+            tracker.observe(MsgCounter(100 - WINDOW)),
+            CounterCheck::Reordered
+        );
+        assert_eq!(
+            tracker.observe(MsgCounter(100 - WINDOW - 1)),
+            CounterCheck::Duplicate,
+            "one past the window, and it is refused rather than guessed at"
+        );
+    }
+
+    /// A jump clears what the window held, because none of it is inside any more.
+    #[test]
+    fn a_large_jump_forward_empties_the_window() {
+        let mut tracker = MsgCounterTracker::new();
+        tracker.observe(MsgCounter(1));
+        tracker.observe(MsgCounter(2));
+        assert_eq!(
+            tracker.observe(MsgCounter(500)),
+            CounterCheck::Skipped { by: 497 }
+        );
+        // 499 was never sent, and is close enough behind to be a plausible late arrival.
+        assert_eq!(tracker.observe(MsgCounter(499)), CounterCheck::Reordered);
+        // 2 was seen, but the window no longer reaches it.
+        assert_eq!(tracker.observe(MsgCounter(2)), CounterCheck::Duplicate);
     }
 
     #[test]

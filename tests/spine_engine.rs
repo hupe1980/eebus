@@ -271,6 +271,53 @@ fn a_bound_write_is_applied_and_acknowledged() {
     assert_eq!(result, ErrorNumber::None);
 }
 
+/// A message overtaken in flight by one its sender numbered later is still processed.
+///
+/// `msgCounter` is a sender-unique identifier for `msgCounterReference` to point at
+/// (§5.2.4), not a sequence number, and nothing makes arrival order counter order: a peer
+/// that allocates the counter in one task and writes the datagram from another interleaves
+/// them. `eebus-go` does exactly this, and a receiver keeping only the highest counter it
+/// has seen reads the overtaken message as a duplicate and drops it — silently, and without
+/// the result its `ackRequest` asked for, so neither end learns the binding was never made.
+#[test]
+fn a_datagram_overtaken_by_a_later_numbered_one_is_still_processed() {
+    let now = Duration::ZERO;
+    let mut guard = control_box();
+    let mut pump_device = heat_pump();
+
+    let target = pump_device.device().address_of(&[1], 1);
+    let source = guard.device().address_of(&[1], 1);
+
+    guard.request_binding(&source, &target, now);
+    guard.request_subscription(&source, &target, now);
+
+    let mut sent: Vec<Datagram> = core::iter::from_fn(|| guard.poll_transmit()).collect();
+    assert_eq!(
+        sent.len(),
+        2,
+        "a binding request and a subscription request"
+    );
+    sent.swap(0, 1);
+
+    for datagram in &sent {
+        assert!(
+            pump_device.handle_datagram(&round_trip(datagram), now),
+            "neither is a duplicate, so neither is dropped"
+        );
+    }
+
+    assert!(
+        pump_device.relations().is_bound(&source, &target),
+        "the binding request arrived second and was granted all the same"
+    );
+    assert!(pump_device.relations().is_subscribed(&source, &target));
+    assert_eq!(
+        core::iter::from_fn(|| pump_device.poll_transmit()).count(),
+        2,
+        "both calls asked for an acknowledgement, and both were answered"
+    );
+}
+
 /// A partial write merges into what is stored rather than replacing it — the rule the
 /// SPINE implementation guide §3.3 devotes a table to, here over the wire.
 #[test]

@@ -112,6 +112,17 @@ API stopped it looking.
 
 ### Fixed
 
+- **A datagram overtaken in flight was dropped as a duplicate.** The receiver kept only the
+  highest `msgCounter` a peer had sent, so anything numbered below it was refused. But
+  §5.2.4 makes the counter a sender-unique name for `msgCounterReference` to point at, not a
+  sequence number, and a peer that allocates it in one task and writes the datagram from
+  another sends them interleaved — `eebus-go` numbers a binding request 10, then writes a
+  result numbered 11 from another goroutine first. The binding call was discarded without
+  even the `result` its `ackRequest` asked for, so the Energy Guard was never identified,
+  its heartbeat never subscribed to, and every limit it wrote refused with `errorNumber` 7.
+  `MsgCounterTracker` now keeps a sixty-four-counter window, and reports the new
+  `CounterCheck::Reordered` for a message that arrives late but has not been seen.
+
 - **`Mdns::announce` refuses an announcement with no address.** DNS-SD resolves an instance
   to a host name and the host name to an address, so a service registered with none is one a
   peer finds, reads the SKI from, and cannot dial. `mdns-sd` accepts the registration and

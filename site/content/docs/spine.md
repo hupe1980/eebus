@@ -212,8 +212,12 @@ owes_ack(CmdClassifier::Write, true,  ErrorNumber::None);                 // tru
 owes_ack(CmdClassifier::Write, false, ErrorNumber::None);                 // false
 ```
 
-Message counters are per-source and monotonic; a datagram addressed to a device that is not
-this one is answered `DestinationUnreachable` rather than ignored.
+Message counters are per-source, and tracked over a window rather than as a high-water
+mark: §5.2.4 makes `msgCounter` a sender-unique name for `msgCounterReference` to point at,
+and a peer that allocates it in one task and writes the datagram from another sends them
+interleaved. A receiver that kept only the highest would read the overtaken message as a
+duplicate and drop it, unanswered. A datagram addressed to a device that is not this one is
+answered `DestinationUnreachable` rather than ignored.
 
 **A payload carries exactly one command** (§5.3.2), and one that carries none or two is
 answered `errorNumber` 1. The schema permits several, so a peer can send them, but a
