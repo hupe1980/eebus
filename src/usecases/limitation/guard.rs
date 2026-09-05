@@ -427,10 +427,10 @@ impl EnergyGuardActor {
     /// Starts controlling a Controllable System.
     ///
     /// Sends the binding requests the use case needs — `LoadControl` for the limit,
-    /// `DeviceConfiguration` for the failsafe values — reads the two description
-    /// functions that say how this peer numbers its data, and subscribes to the peer's
-    /// heartbeat where it serves one. Calling it again for a peer already tracked
-    /// restarts the pre-scenario communication, which is what a reconnection needs.
+    /// `DeviceConfiguration` for the failsafe values — subscribes to every server feature
+    /// the four scenarios touch, and reads the two description functions that say how this
+    /// peer numbers its data. Calling it again for a peer already tracked restarts the
+    /// pre-scenario communication, which is what a reconnection needs.
     ///
     /// The description reads are not optional and not an optimisation. `limitId` and the
     /// failsafe `keyId`s are the peer's own (LPC/LPP Tables 22 and 24 spell them
@@ -470,15 +470,38 @@ impl EnergyGuardActor {
             let counter = engine.read(&feature, &self.client, function, now);
             tracked.pending_reads.push((counter, feature));
         }
-        // The limit itself is worth watching: a Controllable System that leaves the
-        // limited state on its own notifies the change.
-        engine.request_subscription(&self.client, &tracked.peer.load_control.clone(), now);
-        if let Some(diagnosis) = tracked.peer.device_diagnosis.clone() {
-            engine.request_subscription(&self.client, &diagnosis, now);
+        // Every server feature this guard reads, which is what §3.4.n.1 asks for in each
+        // of the four scenarios: "Actors SHALL create a subscription for each server
+        // Feature that is relevant for the corresponding Actor within this Scenario".
+        // The list is `lpc::ENERGY_GUARD.features_needing_subscription()` resolved
+        // against the addresses this peer announced, and `tests/use_case_delivery.rs`
+        // holds the two together.
+        //
+        // None of the four is a formality:
+        //
+        // * `LoadControl` — a Controllable System that leaves the limited state on its
+        //   own notifies the change, and a guard that missed it thinks it is still
+        //   limiting something.
+        // * `DeviceConfiguration` — the failsafe values are writable at the appliance
+        //   too ([LPC-024]), so the pair this guard wrote is not necessarily the pair in
+        //   force an hour later.
+        // * `DeviceDiagnosis` — scenario 3, the peer's own heartbeat.
+        // * `ElectricalConnection` — the nameplate does not change, but the *contractual*
+        //   maximum in the same list does: it is what a §14a agreement sets, and it is
+        //   changed by the grid operator rather than by this guard.
+        for feature in [
+            Some(tracked.peer.load_control.clone()),
+            Some(tracked.peer.device_configuration.clone()),
+            tracked.peer.device_diagnosis.clone(),
+            tracked.peer.electrical_connection.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            engine.request_subscription(&self.client, &feature, now);
         }
-        // Scenario 4 is a one-off read, not a subscription: a nameplate does not change
-        // while the device runs, and a contract does not change without someone writing
-        // it. The reply is what [`GuardEvent::ConstraintsLearned`] reports.
+        // Scenario 4's initial read. The reply is what [`GuardEvent::ConstraintsLearned`]
+        // reports; the subscription above is what keeps it true afterwards.
         if let Some(electrical) = tracked.peer.electrical_connection.clone() {
             engine.read(
                 &electrical,

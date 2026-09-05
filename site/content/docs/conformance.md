@@ -206,6 +206,33 @@ something it did not write. `eebus-go` discovers its peer over mDNS rather than 
 address, so it needs the host's own network stack; the test skips with the reason where the
 Docker daemon cannot give it that, and `tests/interop/Dockerfile` carries the recipe.
 
+**Pointing the peer at a daemon of your own.** The same image runs against a listener
+*outside* the container — a household daemon under development, rather than this test's
+`Hub::listen`. The comment block at the foot of `tests/interop/Dockerfile` is the recipe,
+and the three things that trip people up are there:
+
+```sh
+docker run --rm --network host eebus-interop-controlbox:pinned \
+    controlbox -port 4713 -remoteski <the listener's SKI>
+```
+
+1. **The peer discovers; it does not dial an address.** `eebus-go`'s examples take
+   `-remoteski` and then look for that SKI over mDNS. There is no `-remoteip`, so
+   `--add-host=host.docker.internal:host-gateway` does not help — there is nowhere to put
+   the name. The container has to be on the host's own network stack instead, which
+   `--network host` gives on a native Linux daemon and does not give on Docker Desktop.
+2. **The listener has to announce itself, with an address.** Opening a socket is not
+   enough: announce `_ship._tcp` with `eebus::mdns::Mdns::announce`, carrying the SKI in
+   the TXT record, and name the addresses it accepts connections on. DNS-SD resolves an
+   instance to a host name and the host name to an address, so an announcement with none is
+   one the peer finds and cannot dial.
+3. **Both SKIs have to be exchanged first.** Pass the listener's with `-remoteski`, and
+   trust the container's — it prints `Local SKI:` on start-up, since it generates a fresh
+   certificate every run — in the listener's trust store.
+
+Testing a household daemon against this crate's own Energy Guard proves the two ends agree;
+it does not prove either agrees with anyone else. This is what closes that.
+
 ```sh
 cargo test --features interop,full --test interop -- --nocapture
 ```
@@ -226,6 +253,7 @@ failure legible: it means *this crate* changed, not that the other one did.
 | A live peer, both ways | `eebus-go`'s own control box and EVSE in a container, at a pinned revision, doing the §14a exchange in each direction, and once with the peer dialling *in* to this crate's listener — opt-in, `--features interop` |
 | Device-level conformance | `eebus::conformance::harness` — the fourteen cases a library cannot answer, as procedures a consumer runs against its own binary |
 | What identifies a list entry | `tests/list_identifiers.rs` — derived from the Resource Spec's Annex B.7 and pinned per entry type |
+| Actors against their own descriptors | `tests/use_case_delivery.rs` — every actor's subscriptions are what its scenario tables name, and the sweep is held to the source so a new use case cannot skip it |
 | Fuzzing | five `cargo fuzz` targets, run nightly, seeded from the specification's examples **and** the device captures; their compilation checked on every push |
 | Lints | `cargo clippy --workspace --all-targets --features eebus/full` with `-D warnings` |
 | Documentation | `cargo doc` with `RUSTDOCFLAGS=-D warnings` |

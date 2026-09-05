@@ -237,19 +237,16 @@ fn the_manager_takes_up_the_offer_and_drives_it_to_the_end() {
     let sequence = offer.sequence;
 
     // Phase B. The roof is exporting; run it now.
-    link.write(ohpcf::activate(sequence, "2026-09-04T13:00:00Z"));
+    link.write(ohpcf::activate(sequence, Duration::from_secs(2 * 3_600)));
     assert_eq!(link.decided.len(), 1);
     assert_eq!(
         link.decided[0],
         Ok(Request::Schedule {
-            start_time: "2026-09-04T13:00:00Z".into()
+            start_time: Duration::from_secs(7_200)
         })
     );
     assert_eq!(link.offer().state, PowerSequenceState::Scheduled);
-    assert_eq!(
-        link.offer().start_time.as_deref(),
-        Some("2026-09-04T13:00:00Z")
-    );
+    assert_eq!(link.offer().start_time, Some(Duration::from_secs(7_200)));
     // And the feature holds the compressor's whole document, not the fragment written
     // into it: the power value and the interrupt flags are still there.
     let published = link.published();
@@ -297,7 +294,7 @@ fn a_subscriber_never_sees_the_fragment_it_wrote() {
     let sequence = link.offer().sequence;
 
     let mut seen: Vec<Option<f64>> = Vec::new();
-    let write = ohpcf::activate(sequence, "PT0S");
+    let write = ohpcf::activate(sequence, Duration::ZERO);
     link.manager.write(
         &link.flexibility.clone(),
         &link.client.clone(),
@@ -360,7 +357,7 @@ fn a_pause_on_a_process_that_is_not_running_is_rejected_on_the_wire() {
     link.commission();
     let sequence = link.offer().sequence;
 
-    link.write(ohpcf::activate(sequence, "PT0S"));
+    link.write(ohpcf::activate(sequence, Duration::ZERO));
     assert_eq!(link.offer().state, PowerSequenceState::Scheduled);
 
     link.write(ohpcf::pause(sequence));
@@ -393,7 +390,7 @@ fn an_interrupt_that_was_never_offered_is_refused_over_the_wire() {
     assert!(offer.is_pausable && !offer.is_stoppable);
     let sequence = offer.sequence;
 
-    link.write(ohpcf::activate(sequence, "PT0S"));
+    link.write(ohpcf::activate(sequence, Duration::ZERO));
     link.compressor.start();
     let now = link.now;
     link.compressor.notify(&mut link.pump, &feature, now);
@@ -448,7 +445,7 @@ fn a_withdrawn_offer_is_reported_as_an_absence() {
 
     // And a write into the absence is refused rather than quietly starting something.
     let sequence = link.offer().sequence;
-    link.write(ohpcf::activate(sequence, "PT0S"));
+    link.write(ohpcf::activate(sequence, Duration::ZERO));
     assert_eq!(link.decided.last(), Some(&Err(Refused::NothingOffered)));
 }
 
@@ -498,7 +495,7 @@ fn a_write_without_a_binding_is_refused_and_follow_is_what_grants_it() {
     assert!(offer.is_available(), "and it is on the table");
 
     link.answers.clear();
-    link.write(ohpcf::activate(offer.sequence, "PT0S"));
+    link.write(ohpcf::activate(offer.sequence, Duration::ZERO));
     assert_eq!(
         link.answers,
         [ErrorNumber::BindingRequired],
@@ -521,7 +518,7 @@ fn a_write_without_a_binding_is_refused_and_follow_is_what_grants_it() {
     link.settle();
 
     link.answers.clear();
-    link.write(ohpcf::activate(offer.sequence, "PT0S"));
+    link.write(ohpcf::activate(offer.sequence, Duration::ZERO));
     assert_eq!(
         link.answers,
         [ErrorNumber::None],

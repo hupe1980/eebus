@@ -15,6 +15,11 @@
 //! `src/model/values.rs` is the one exception, because it *is* the audited conversion.
 //! Everything else in those two directories should be reaching for it rather than
 //! reimplementing it.
+//!
+//! The other exemptions are exempt for the opposite reason: they contain no floating-point
+//! type at all, so an `as i64` in them is integer arithmetic and not a saturating cast off
+//! a quantity. That is *checked* rather than asserted — a float appearing in one of them
+//! fails this command, so the exemption cannot quietly become a hole.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -22,8 +27,21 @@ use std::path::Path;
 /// Directories where the wire meets arithmetic.
 const GUARDED: &[&str] = &["src/model", "src/codec"];
 
-/// The audited conversion itself, and the generated model, which contains no arithmetic.
-const EXEMPT: &[&str] = &["src/model/values.rs", "src/model/generated"];
+/// The audited conversion itself, the generated model, and the calendar arithmetic.
+///
+/// Every one but [`AUDITED`] has to keep containing no float; [`run`] checks it.
+const EXEMPT: &[&str] = &[
+    AUDITED,
+    // No arithmetic at all: field declarations and codec glue.
+    "src/model/generated",
+    // Days, months and offsets. `xs:dateTime` is integers end to end — `days_from_civil`
+    // is exact for every year an `i32` holds — so the `as i64` this guard looks for is a
+    // widening of a `u8` and never a quantity coming off the wire.
+    "src/model/time.rs",
+];
+
+/// The one exemption that may contain floats, because it *is* the conversion.
+const AUDITED: &str = "src/model/values.rs";
 
 /// What a hand-rolled conversion looks like.
 const BANNED: &[(&str, &str)] = &[
@@ -59,12 +77,26 @@ pub fn run(root: &Path) -> Result<String, String> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            let source = std::fs::read_to_string(&path)
+                .map_err(|e| format!("reading {}: {e}", path.display()))?;
             if EXEMPT.iter().any(|e| relative.starts_with(e)) {
+                // An exemption that is not the audited conversion earns it by holding no
+                // float at all. The moment one appears, the reason for the exemption is
+                // gone and this says so rather than waving the file through.
+                if !relative.starts_with(AUDITED)
+                    && let Some(number) = source.lines().position(|line| {
+                        let code = line.split("//").next().unwrap_or(line);
+                        code.contains("f64") || code.contains("f32")
+                    })
+                {
+                    findings.push(format!(
+                        "{relative}:{}: a float in a file exempted for having none —                          either use `ScaledNumber::to_f64` or take it off EXEMPT",
+                        number + 1
+                    ));
+                }
                 continue;
             }
             scanned += 1;
-            let source = std::fs::read_to_string(&path)
-                .map_err(|e| format!("reading {}: {e}", path.display()))?;
             for (number, line) in source.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or(line);
                 for (needle, why) in BANNED {

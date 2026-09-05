@@ -4,7 +4,166 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.8.0] — unreleased
+## [0.9.0] — unreleased
+
+Times off the wire, read in both the forms SPINE permits; a descriptor that says what
+the *absence* of the next message means; and the bugs that asking those two questions
+turned up — three actors subscribing to less than their own use case requires, and two
+places where an unreadable duration was read as no duration at all.
+
+### Added
+
+- **The absolute half of `AbsoluteOrRelativeTime` is readable.** `as_duration` read the
+  relative form and `is_absolute` said which form arrived; nothing read the absolute one, so
+  a consumer that had just been told "this is a timestamp" reached for its own parser — and
+  SPINE's absolute form is `xs:dateTime`, which is not RFC 3339. The offset is *optional*,
+  so `2026-09-05T08:15:00` is a valid timestamp that fixes no instant; `24:00:00` is
+  midnight ending the day; the year may be negative and may exceed four digits. An RFC 3339
+  parser rejects a conformant peer, and from the outside that looks exactly like a peer that
+  sent nothing.
+
+  `as_timestamp()` returns a `DateTime` that keeps the distinction the schema makes:
+  `unix_seconds()` is `None` for a timezone-less value — a wall-clock reading is not an
+  instant — and `unix_seconds_at(offset)` makes a caller name the zone it means to assume
+  rather than defaulting to UTC and landing hours out of place. `to_system_time()` under
+  `std`, `from_unix_seconds` and `AbsoluteOrRelativeTime::from_timestamp` for the sending
+  side, and `parse()` returning a `TimeValue` for a consumer that has to handle both halves
+  without guessing which arrived. Everything that carries meaning is refused rather than
+  repaired: a thirteenth month, a 29 February in a common year, a sixtieth second, an offset
+  past ±14:00, a `+0200` missing its colon.
+
+  What stays the consumer's is the **policy**. How far a peer's clock may be wrong before
+  its timestamps are worth less than the arrival time is not a decision a protocol crate can
+  make for a product.
+
+  Note for anyone reading the schema alongside this: `AbsoluteOrRelativeTimeType` is
+  `xs:union memberTypes="xs:duration xs:dateTime"` and admits **no** bare `xs:time`. That
+  belongs to `AbsoluteOrRecurringTimeType`, whose `time` element is a different field of a
+  different type.
+
+- **`Reading::taken_at_relative_to(arrived)`** — the relative form resolved. On a
+  measurement it is an *age*, so the instant is `arrived − duration`, and every consumer
+  keeping a monotonic clock was writing that subtraction. It saturates at zero rather than
+  wrapping, and is `None` for the absolute form, which has no relation to a monotonic clock
+  at all.
+
+- **`descriptor::Delivery` — what silence means, as data.** A value that has not arrived for
+  ten minutes is either a peer that stopped answering or a peer with nothing to say, and the
+  two call for opposite responses. Nothing in the message says which, and until now nothing
+  in the descriptors did either, so a consumer kept a hand-written list of which of its own
+  drivers subscribe.
+
+  The specification's answer turns out not to be the expected one. *Every* scenario of
+  *every* use case here is subscription-driven — each UC TS §3.4.n.1 says "Actors SHALL
+  create a subscription for each server Feature that is relevant for the corresponding Actor
+  within this Scenario", and §3.3.4 names polling only as the fallback for a subscription
+  that was **refused**. So notification-versus-poll is not a distinction these
+  specifications draw. What they do draw is whether the notification comes on a **clock**:
+
+  - `Delivery::OnChange` — sent when the value changes and at no other time. The age of the
+    last value is not a health signal, and a driver that times out on it drops the units that
+    are behaving.
+  - `Delivery::Periodic(period)` — sent at least that often whether it changed or not.
+    Silence past it *is* a fault. The heartbeats and nothing else: 60 s for LPC, LPP
+    ([LPC-005], [LPC-006]) and COB ([COB-008]), 4 s for OPEV and OSCEV ([OPEV-005],
+    [OSCEV-005]), because a car follows a current at once. The period is the specification's
+    "at least every", not a tolerance — LPC allows two missed beats, OPEV none.
+
+  Asked through `UseCaseDescriptor::delivery_of`, `periodic_functions`, and
+  `Scenario::delivery`. `tests/use_case_delivery.rs` sweeps all fifty-seven descriptors — held to the
+  source, so a new one cannot be added without a line in it — and
+  holds the heartbeat to being the only function any of these specifications puts a clock
+  on.
+
+- **`UseCaseDescriptor::features_needing_subscription()`** — the peer features an actor has
+  to subscribe to, the counterpart of `features_needing_binding`. Also
+  `UseCaseDescriptor::scenario(number)`, which every caller was writing as a `find` over
+  `scenarios`.
+
+- **`limitation::HEARTBEAT_PERIOD` and `cob::HEARTBEAT_PERIOD`** — the 60 s cadence, beside
+  the 120 s tolerance that was already there. Two missed beats is a decision; the cadence is
+  the specification's.
+
+### Fixed
+
+- **A limit whose duration could not be read was applied as a limit with no duration.**
+  LPC §3.1.8.2 — and LPP's and COB's, in the same words — says "Durations used within this
+  Use Case SHALL be presented as relative times. The same holds for the `endTime` Element
+  used for the duration of validity ([LPC-004])". The *schema* is looser: `timePeriod.endTime`
+  is the `AbsoluteOrRelativeTimeType` union, so `2026-09-05T10:00:00Z` is schema-valid and
+  use-case-invalid, and an Energy Guard written against the schema rather than the use case
+  sends one in good faith.
+
+  `read_limit_write` and `cob::read_setpoint_write` read that through `as_duration()` and
+  fell back to [`None`] — and [`None`] there does not mean "unknown", it means **no expiry**.
+  A limit the guard meant to lift after two hours was held until something else replaced it.
+  Both now refuse the write, which produces a NACK the guard can act on, exactly as they
+  already did for a `scaledNumber` whose scale overflows `f64`.
+
+- **`ohpcf::activate` documented and accepted an absolute start time the feature forbids.**
+  `SmartEnergyManagementPs` restricts `schedule.startTime` to `xs:duration` by
+  `xs:restriction` on the `PowerSequences` type that uses the union
+  (`EEBus_SPINE_TS_SmartEnergyManagementPs.xsd`), so a wall-clock instant is not expressible
+  there at all. The doc said the opposite — "an absolute `2026-09-04T13:00:00Z` or a
+  relative `PT0S`" — and the crate's own tests scheduled compressors with timestamps, which
+  is a schema-invalid message a strict peer refuses.
+
+  `activate` now takes a [`Duration`], so the wider spelling cannot be built, and the
+  compressor side refuses one rather than storing it: a `Flexibility` that accepted a
+  timestamp would announce itself `scheduled` for a time neither side could act on. The new
+  `Refused::UnreadableStartTime` says which.
+
+- **Three actors read a feature once and believed it afterwards.** Every UC TS §3.4.n.1 asks
+  for "a subscription for each server Feature that is relevant for the corresponding Actor
+  within this Scenario", and three of this crate's actors subscribed to some of theirs and
+  read the rest. Found by holding each actor's subscriptions against its own descriptor,
+  which `tests/use_case_delivery.rs` now does for all of them.
+
+  - **`MonitoringApplianceActor::attach` did not subscribe to `ElectricalConnection`.** That
+    feature is the only place `acMeasuredPhases` lives, so it does not merely *report* a
+    per-phase value — it says what one **means**. A unit that re-describes its phases, an
+    inverter that gains a string, a meter reconfigured from one phase to three, silently
+    changed the meaning of every value the appliance kept resolving against the description
+    it read at commissioning.
+  - **`limitation::EnergyGuardActor::attach` did not subscribe to `DeviceConfiguration` or
+    `ElectricalConnection`.** Neither value has this guard as its only author: the failsafe
+    pair is writable at the appliance too ([LPC-024]), and the *contractual* maximum beside
+    the nameplate in the characteristics is what a §14a agreement sets — changed by the grid
+    operator, not by the guard reading it. A one-off read left the guard computing limits
+    from values that had stopped being true.
+  - **`emobility::charging::OverloadGuardActor::attach` did not subscribe to
+    `ElectricalConnection`.** `permittedValueSet` is what says how far a car may be
+    curtailed, and it changes *during* a session. A car that raises its minimum current has
+    just made the guard's last write unacceptable, and the refusal would have been the first
+    the guard heard of it.
+
+### Changed
+
+- **`FunctionUse` gained a `delivery` field**, so a struct literal of it no longer compiles.
+  The six constructors set `Delivery::OnChange`; `.periodic(every)` is the const builder the
+  heartbeats use.
+
+- **The time helpers moved to `model::time`.** `parse_iso8601_duration`,
+  `format_iso8601_duration` and the `AbsoluteOrRelativeTime` methods are re-exported from
+  `eebus::model`, so every existing path still resolves; `model::values` is now about
+  numbers alone.
+
+- **The LPC golden vector records four subscription requests rather than one**, and the
+  notifications that follow from them. That is the guard fix above, visible on the wire.
+
+- **`ohpcf::activate` takes a `Duration`**, and `Flexibility::start_time`,
+  `CompressorOffer::start_time` and `Request::Schedule::start_time` are `Duration` rather
+  than `String`. The `ohpcf:startTime` signal is a number of seconds, like the two duration
+  signals beside it. See the fix above for why the wider type was wrong.
+
+- **`limitation::heartbeat` takes `Option<DateTime>` rather than a `&str` timestamp.** The
+  element is the `AbsoluteOrRelativeTimeType` union, but the relative half says nothing on a
+  heartbeat — "produced zero seconds ago" is not a fact about anything — so this takes the
+  absolute one and writes it in canonical form. [`None`] is a device with no clock, which is
+  what `HeartbeatProducer::beat` still sends; its documentation now shows how a device with a
+  real-time clock fills the field in.
+
+## [0.8.0] — 2026-09-05
 
 The client side of the HVAC family: `locate`, `follow` and an actor for the nine `HVAC` use
 cases, so a Configuration Appliance no longer assembles the exchange by hand. And a
@@ -1386,7 +1545,9 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
-[0.7.0]: https://github.com/hupe1980/eebus/compare/v0.6.0...HEAD
+[0.9.0]: https://github.com/hupe1980/eebus/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/hupe1980/eebus/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/hupe1980/eebus/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hupe1980/eebus/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hupe1980/eebus/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hupe1980/eebus/compare/v0.3.0...v0.4.0

@@ -131,7 +131,10 @@ have been closed accepts a write from anybody. See
 [Who may write, and who may not](@/docs/use-cases.md) for the split by use case.
 
 Unchanged data is not notified (SPINE IG §2.4). That is what makes a dozen subscriptions
-affordable on a small controller.
+affordable on a small controller, and it is also why the age of a subscribed value says
+nothing about the peer: a room holding its temperature sends nothing at all. What silence
+*does* mean is a property of the use case, and the descriptors carry it — see
+[Who has to subscribe, and what silence means](@/docs/use-cases.md).
 
 Both tables are readable — `nodeManagementBindingData` and `nodeManagementSubscriptionData`
 (§7.3.2, §7.4.2) — and both are answered from the relations actually held.

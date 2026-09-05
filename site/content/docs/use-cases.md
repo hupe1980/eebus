@@ -59,6 +59,47 @@ What replaces it on an HVAC feature is the application's own decision: those wri
 deferred, so a product that wants "only the manager I was commissioned with" enforces it
 where it can see who is asking. See [Bindings and subscriptions](@/docs/spine.md).
 
+## Who has to subscribe, and what silence means
+
+Subscription, unlike binding, the use cases *do* agree about. Every scenario of every one
+of them says the same sentence — "Actors SHALL create a subscription for each server
+Feature that is relevant for the corresponding Actor within this Scenario" (§3.4.n.1) — and
+§3.3.4 names polling only as the fallback for a subscription that was refused. So the
+descriptor derives the list rather than each actor keeping its own:
+
+```rust
+mpc::MONITORING_APPLIANCE.features_needing_subscription();
+// [ElectricalConnection, Measurement] — five scenarios, two features, each named once
+```
+
+`tests/use_case_delivery.rs` holds every actor to it: what an actor's `attach` or `follow`
+asks to subscribe to is exactly what its descriptor names. The features easiest to leave out
+are the ones that check catches, and none of them is a formality — the Monitoring Appliance's
+`ElectricalConnection`, where `acMeasuredPhases` says what a per-phase value *means*; the
+Energy Guard's `DeviceConfiguration` and `ElectricalConnection`, where the failsafe pair is
+writable at the appliance too and the contractual maximum is what a §14a agreement sets; and
+the EV guard's `permittedValueSet`, which changes mid-session when a car raises its minimum
+current.
+
+That leaves the question a consumer actually has to answer, which is what to make of a
+value that has not arrived for ten minutes. Since everything is subscribed, the distinction
+is not notification-versus-poll but whether the notification comes on a **clock**:
+
+```rust
+use eebus::usecases::descriptor::Delivery;
+
+mpc::MONITORING_APPLIANCE.delivery_of(&FeatureType::Measurement, &Function::MeasurementListData);
+// Some(Delivery::OnChange) — a room holding its temperature sends nothing, and is fine
+
+lpc::CONTROLLABLE_SYSTEM.delivery_of(&FeatureType::DeviceDiagnosis, &Function::DeviceDiagnosisHeartbeatData);
+// Some(Delivery::Periodic(60 s)) — [LPC-005]; silence past this arms the failsafe
+```
+
+The heartbeats are the only functions any of these specifications puts a clock on: 60 s for
+LPC, LPP and COB, and 4 s for OPEV and OSCEV, because a car follows a current at once. The
+period is the specification's "at least every", not a tolerance — how many missed beats to
+allow stays the consumer's, and LPC allows two where OPEV allows none.
+
 ## Addressing a peer's data
 
 Knowing which feature to talk to is only half of it. Almost every list in SPINE is keyed by

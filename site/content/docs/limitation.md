@@ -39,7 +39,7 @@ sequenceDiagram
     CS-->>EG: limitId 7 · obligation · consume
     EG->>CS: read deviceConfigurationKeyValueDescriptionListData
     CS-->>EG: failsafe keys 5 and 6
-    EG->>CS: subscriptionRequest DeviceDiagnosis
+    EG->>CS: subscriptionRequest ×4 · LoadControl · DeviceConfiguration<br>DeviceDiagnosis · ElectricalConnection
     CS-->>EG: granted
     CS->>EG: subscriptionRequest DeviceDiagnosis
     EG-->>CS: granted
@@ -173,6 +173,22 @@ Behind that line:
 * a refusal retried a minute later, and a minute later again, with the device kept (§2.5);
 * and no more than one write every five minutes otherwise (§2.10) — the opening write
   excepted, since a limit that follows it must not wait five minutes behind a deactivation.
+
+### The duration is a relative time, and an unreadable one is refused
+
+§3.1.8.2: "Durations used within this Use Case SHALL be presented as relative times. The
+same holds for the `endTime` Element used for the duration of validity ([LPC-004])." The
+*schema* is looser than that — `timePeriod.endTime` is the `AbsoluteOrRelativeTimeType`
+union, so `2026-09-05T10:00:00Z` is schema-valid and use-case-invalid, and a guard written
+against the one rather than the other sends it in good faith.
+
+`read_limit_write` refuses such a write rather than reading past it, and the reason is which
+way the mistake falls. An absent `endTime` means *no expiry*: read the unreadable one as
+absent and a limit the guard meant to lift after two hours is held until something else
+replaces it. Refusing produces a NACK, which is a fact the guard can act on. It is the same
+rule the crate applies to a `scaledNumber` whose scale overflows — a present-but-unreadable
+value is not a value — and [COB](https://docs.rs/eebus/latest/eebus/usecases/cob/index.html)
+applies it to its own setpoint duration, whose §3.1.8.2 says the same thing.
 
 A peer whose `LoadControl` feature describes no limit for this guard's direction reports
 `GuardEvent::NoLimitPublished` and is then left alone. That installation looks commissioned

@@ -117,9 +117,24 @@ impl HeartbeatProducer {
 
     /// Takes the next heartbeat, advancing the counter and the schedule.
     ///
-    /// `timestamp` is absent because nothing in this crate reads a clock. A device with
-    /// a real-time clock sets the field itself; the implementation guide §3.7 asks a
-    /// server to, and equally says a client need not check it.
+    /// `timestamp` is absent because nothing in this crate reads a clock. A device with a
+    /// real-time clock fills it in — the field is public, and
+    /// [`AbsoluteOrRelativeTime::from_timestamp`](crate::model::AbsoluteOrRelativeTime::from_timestamp)
+    /// writes a [`DateTime`](crate::model::DateTime) in the canonical form:
+    ///
+    /// ```
+    /// # use core::time::Duration;
+    /// # use eebus::model::{AbsoluteOrRelativeTime, DateTime};
+    /// # use eebus::spine::HeartbeatProducer;
+    /// # let mut producer = HeartbeatProducer::new(Duration::ZERO);
+    /// let mut beat = producer.beat(Duration::from_secs(60));
+    /// beat.timestamp = Some(AbsoluteOrRelativeTime::from_timestamp(
+    ///     DateTime::from_unix_seconds(1_788_596_100),
+    /// ));
+    /// ```
+    ///
+    /// The implementation guide §3.7 asks a server to set it, and equally says a client
+    /// need not check it — so a monotonic uptime must not be passed off as one.
     pub fn beat(&mut self, now: Duration) -> DeviceDiagnosisHeartbeatData {
         self.counter = self.counter.wrapping_add(1);
         self.next = now + self.period;

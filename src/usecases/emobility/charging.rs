@@ -428,10 +428,14 @@ pub(super) const EV_FUNCTIONS: &[FunctionUse] = &[
 ];
 
 pub(super) const EV_WATCHES: &[FunctionUse] = &[
+    // [OPEV-005], [OSCEV-005]: "SHALL be sent at least each heartbeatTimeout period",
+    // and that period is at most four seconds — so here the cadence and the tolerance
+    // are the same number, which is not true of LPC.
     FunctionUse::client(
         FeatureType::DeviceDiagnosis,
         Function::DeviceDiagnosisHeartbeatData,
-    ),
+    )
+    .periodic(HEARTBEAT_TIMEOUT),
     FunctionUse::client(
         FeatureType::DeviceDiagnosis,
         Function::DeviceDiagnosisStateData,
@@ -458,7 +462,8 @@ pub(super) const GUARD_SERVES: &[FunctionUse] = &[
     FunctionUse::server(
         FeatureType::DeviceDiagnosis,
         Function::DeviceDiagnosisHeartbeatData,
-    ),
+    )
+    .periodic(HEARTBEAT_TIMEOUT),
     FunctionUse::server(
         FeatureType::DeviceDiagnosis,
         Function::DeviceDiagnosisStateData,
@@ -1856,8 +1861,8 @@ impl OverloadGuardActor {
         }
     }
 
-    /// Starts curtailing a car: binds to its `LoadControl`, reads what it can take, and
-    /// reads how it numbers its per-phase limits.
+    /// Starts curtailing a car: binds to its `LoadControl`, subscribes to both features
+    /// the use case touches, and reads how it numbers its per-phase limits.
     ///
     /// The limit description read is what makes the write addressable at all — see
     /// [`PhaseLimits`]. Until it and the parameter descriptions have both come back there
@@ -1867,7 +1872,14 @@ impl OverloadGuardActor {
         self.peers.retain(|t| t.peer.device != device);
 
         let binding_request = engine.request_binding(&self.client, &peer.load_control, now);
-        engine.request_subscription(&self.client, &peer.load_control, now);
+        // Both features the scenario touches, as §3.4.1.1/3 asks. The
+        // `ElectricalConnection` one is not decoration: `permittedValueSet` is what says
+        // how low this car may be curtailed, and it changes *during* a session — a car
+        // that raises its minimum current has just made the guard's last write
+        // unacceptable, and a guard that only read the set once would never hear.
+        for feature in [&peer.load_control, &peer.electrical_connection] {
+            engine.request_subscription(&self.client, feature, now);
+        }
         engine.read(
             &peer.load_control,
             &self.client,

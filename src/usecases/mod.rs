@@ -90,6 +90,24 @@
 //! between actors; within one, the engine is the only shared state and each actor touches
 //! only its own features.
 //!
+//! # What silence means
+//!
+//! Every scenario of every use case here is subscription-driven: each UC TS §3.4.n.1 says
+//! "Actors SHALL create a subscription for each server Feature that is relevant for the
+//! corresponding Actor within this Scenario", and §3.3.4 names polling only as the
+//! fallback for a subscription that was *refused*. So an actor never learns that a peer is
+//! healthy by hearing from it on schedule — with one exception, and the descriptors carry
+//! which:
+//!
+//! | | |
+//! |---|---|
+//! | [`Delivery::OnChange`] | sent when the value changes and at no other time. A room holding its temperature, a heat pump staying in `auto`, a tank at its setpoint — each sends nothing for hours and each is working. **The age of the last value is not a health signal**, and a driver that times out on it drops the units that are behaving |
+//! | [`Delivery::Periodic`] | sent at least this often whether it changed or not. The heartbeats, and only the heartbeats: 60 s for LPC, LPP and COB, 4 s for OPEV and OSCEV. Silence past it **is** a fault, which is what arms the failsafe |
+//!
+//! Ask [`UseCaseDescriptor::delivery_of`](descriptor::UseCaseDescriptor::delivery_of)
+//! rather than keeping a list of which of your own drivers subscribe — the answer is the
+//! specification's, and `tests/use_case_delivery.rs` holds every actor here to it.
+//!
 //! [`emobility::charging`]: crate::usecases::emobility::charging
 
 pub mod addressing;
@@ -110,5 +128,5 @@ pub mod ohpcf;
 pub mod signals;
 mod unit;
 
-pub use descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
+pub use descriptor::{ActorRole, Delivery, FunctionUse, Scenario, Support, UseCaseDescriptor};
 pub use unit::UnitId;

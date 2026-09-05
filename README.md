@@ -17,8 +17,9 @@ alongside the code. [What EEBUS is](https://hupe1980.github.io/eebus/docs/introd
 > **Status: under construction.** The stack is complete from the socket to the use case,
 > and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are
 > implemented on **both** sides and measured against all 203 of their published abstract
-> test cases — as are seven of the e-mobility family, four for inverters, PV strings and
-> batteries, and all twelve HVAC use cases. Published, but pre-1.0: the API will change.
+> test cases. So are twenty-four more: seven of the e-mobility family, four for inverters,
+> PV strings and batteries, all twelve HVAC ones, and the heat-pump compressor flexibility
+> a CEM uses to start a process. Published, but pre-1.0: the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -139,7 +140,12 @@ SHIP's escalating penalty, and a PIN in a support bundle has none.
 **Every number off the wire is treated as hostile.** `scale` is signed 16-bit, so a `number`
 near `i64::MAX` reaches infinity in one well-formed message; `to_f64` answers `None`, and a
 use case handed a present-but-unreadable value NACKs the write rather than substituting one.
-A duration pointing backwards reads as zero, not as its magnitude.
+A duration pointing backwards reads as zero, not as its magnitude. The same rule covers the
+*times*, where reading past a bad value is the dangerous direction rather than the sloppy
+one: an absent `endTime` on an LPC limit means "no expiry", so a limit whose duration cannot
+be read is refused rather than applied for ever — and where a use case narrows the schema,
+the narrower rule wins, so a heat-pump compressor refuses a `startTime` its own feature
+restricts to a span.
 
 **And converted exactly.** A scale is applied in steps of at most `10^22`, the largest power
 of ten an `f64` holds exactly, so a negative scale *divides* by an exact constant rather
@@ -147,6 +153,26 @@ than multiplying by an inexact one, and a scale past the table is still that sca
 too large for an `i64` raises the scale instead of saturating. `cargo xtask check-floats`
 keeps hand-rolled powers of ten and float casts out of the two modules where the wire meets
 a number.
+
+**A time on the wire is two things, and both are readable.** `AbsoluteOrRelativeTimeType`
+is an `xs:union` of `xs:duration` and `xs:dateTime`, so one element arrives as an instant
+or as a span and nothing in it says which. `parse()` returns whichever came. The relative
+form on a measurement is an **age** — the instant is `arrived − duration`, which
+`Reading::taken_at_relative_to` is. The absolute form is *not* RFC 3339: `xs:dateTime`
+makes the offset optional, so `2026-09-05T08:15:00` is a valid timestamp that fixes no
+instant, and a consumer reaching for an RFC 3339 parser rejects a conformant peer in a way
+that looks exactly like a peer that sent nothing. `as_timestamp()` reads all of it, and
+`unix_seconds()` is `None` for precisely the case with no answer.
+
+**What silence means is a fact about the use case, not a guess.** Every scenario of every
+use case says "Actors SHALL create a subscription for each server Feature that is relevant
+for the corresponding Actor within this Scenario"; polling is what §3.3.4 falls back to
+when a subscription is *refused*. So the question is not notification-versus-poll but
+whether the notification comes on a clock, and the descriptors answer it:
+`Delivery::OnChange` for everything a peer sends when it changes — age it by arrival and a
+room holding its temperature vanishes from the site — and `Delivery::Periodic` for the
+heartbeats alone, at the 60 s of LPC, LPP and COB or the 4 s of OPEV and OSCEV. A test
+holds every actor's subscriptions to what its own descriptor names.
 
 **Nothing a peer sends can grow without bound.** SHIP and SPINE cap neither connections nor
 stored state. A hub holds sixteen connections and two per peer, handshakes in progress
@@ -174,9 +200,10 @@ are parsed, **driven through an engine**, resolved into a device model, and used
 fuzzers — as are all twenty-nine Restricted Function Exchange examples from the
 specification's own annex, which are served rather than only decoded. And
 `cargo test --features interop` runs `eebus-go`'s own examples in a container at a pinned
-revision — their control box against this crate's Controllable System, their EVSE against
-its Energy Guard — driving the whole §14a exchange each way. Opt-in and its own CI job, so
-an ordinary `cargo test` needs no Docker.
+revision, driving the whole §14a exchange three ways: their control box against this crate's
+Controllable System, their EVSE against its Energy Guard, and — the direction §14a actually
+describes — their control box **dialling in** to a listener of ours. Opt-in and its own CI
+job, so an ordinary `cargo test` needs no Docker.
 
 **Tests carry the certification's identifiers.** `TC_SHIP_HELLO_002`, `TC_SPINE_COMP_006`
 and their siblings name the tests that cover them. For the four certifiable use cases,
@@ -219,7 +246,7 @@ in that position loses it, which is the interoperable answer.
 
 | Layer | | Specification |
 |---|---|---|
-| **Wire format** | EEBUS JSON codec; `ScaledNumber`, ISO 8601 durations | SHIP §11.4, SPINE IG §3.2 |
+| **Wire format** | EEBUS JSON codec; `ScaledNumber`, ISO 8601 durations, `xs:dateTime` | SHIP §11.4, SPINE IG §3.2 |
 | **Model** | 830 SPINE types, 47 SHIP messages, generated | SPINE 1.3.0, SHIP 1.1.0 |
 | **SHIP** | framing; the five-phase handshake with PIN penalties and the close handshake | §10.3, §13.4.3–13.4.8 |
 | | the hello prolongation dance, driven by the side that is `pending` | §13.4.4.1.3 |
@@ -253,7 +280,9 @@ in that position loses it, which is the interoperable answer.
 | | a room's heating and cooling setpoints share `roomAirTemperature`; only the relation's `systemFunctionId` tells them apart | CRHT/CRCT §3.2.1.2.3.1 |
 | | each of the nine `HVAC` use cases locates the feature on the entity that *announced* it, and `follow` subscribes and reads its scenario tables in one call | use-case IG §3.3, HVAC §3.2.2.2.1 |
 | | one actor for the whole family: "heat the water to 60" resolves the system function, the mode it is in, the relation keyed by both, and the constraints — or refuses | CDT §3.2.1.2.3.1, [CDT-003] |
-| | a measurement carries the time the peer says it took it, not the time it arrived | [MPC-002], [MDT-002], [MRT-002], [MOT-002] |
+| | a measurement carries the time the peer says it took it, not the time it arrived — in both the forms the union permits, and an age is resolved against the reader's own clock | [MPC-002], [MDT-002], [MRT-002], [MOT-002] |
+| | what silence means, as data: every scenario is subscription-driven, and the descriptor says which functions arrive on a clock and which only when they change | UC TS §3.3.4, §3.4.n.1, [LPC-005], [OPEV-005] |
+| | where a use case narrows the schema the narrower rule is enforced: a limit duration and a compressor's start time are spans, and one that cannot be read is refused rather than treated as absent | LPC/LPP/COB §3.1.8.2, SEMPS XSD |
 | | heat pump compressor flexibility: the CEM *starts* an optional consumption process, and stops, pauses and resumes it — with the binding scenario 2 needs | OHPCF 1.0.0 §2.5, §3.4.2 |
 | **Certification** | the 203 abstract test cases of the four HLTS as data, all driven: 189/203 | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
 | | the other fourteen as a harness a consumer runs against its **own binary**: seven procedures with the specification's steps, judged against its declared parameter sheet | LPC HLTS 1.0.2 tables 15–34, §6.11.8 |

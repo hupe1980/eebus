@@ -39,7 +39,7 @@ use crate::model::{EntityType, FeatureType, Function};
 use crate::usecases::descriptor::{
     ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor, actors, names,
 };
-use crate::usecases::limitation::Direction;
+use crate::usecases::limitation::{Direction, HEARTBEAT_PERIOD};
 
 /// The direction a Controllable System actor is built with for this use case.
 pub const DIRECTION: Direction = Direction::Consumption;
@@ -107,15 +107,20 @@ pub static ENERGY_GUARD: UseCaseDescriptor = UseCaseDescriptor {
             // The Energy Guard both serves its own heartbeat and reads the Controllable
             // System's. Implementation guide §2.1.3: that reversal does not make it a
             // server actor.
+            // [LPC-005] and [LPC-006]: "SHALL be sent at least every 60 seconds", in
+            // both directions. It is the one function of the use case whose *silence*
+            // means something — see `Delivery::Periodic`.
             functions: &[
                 FunctionUse::server(
                     FeatureType::DeviceDiagnosis,
                     Function::DeviceDiagnosisHeartbeatData,
-                ),
+                )
+                .periodic(HEARTBEAT_PERIOD),
                 FunctionUse::client(
                     FeatureType::DeviceDiagnosis,
                     Function::DeviceDiagnosisHeartbeatData,
-                ),
+                )
+                .periodic(HEARTBEAT_PERIOD),
             ],
         },
         Scenario {
@@ -174,15 +179,20 @@ pub static CONTROLLABLE_SYSTEM: UseCaseDescriptor = UseCaseDescriptor {
             number: 3,
             name: "Heartbeat",
             support: Support::Mandatory,
+            // [LPC-005] and [LPC-006]: "SHALL be sent at least every 60 seconds", in
+            // both directions. It is the one function of the use case whose *silence*
+            // means something — see `Delivery::Periodic`.
             functions: &[
                 FunctionUse::server(
                     FeatureType::DeviceDiagnosis,
                     Function::DeviceDiagnosisHeartbeatData,
-                ),
+                )
+                .periodic(HEARTBEAT_PERIOD),
                 FunctionUse::client(
                     FeatureType::DeviceDiagnosis,
                     Function::DeviceDiagnosisHeartbeatData,
-                ),
+                )
+                .periodic(HEARTBEAT_PERIOD),
             ],
         },
         Scenario {

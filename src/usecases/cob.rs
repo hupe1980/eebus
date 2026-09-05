@@ -101,6 +101,14 @@ pub const INVERTER_ACTOR: &str = "Inverter";
 /// The actor an energy manager announces itself as.
 pub const CEM_ACTOR: &str = "CEM";
 
+/// How often the energy manager sends its heartbeat: "at least every 60 seconds"
+/// ([COB-008]).
+///
+/// The cadence, not the tolerance — [`HEARTBEAT_TIMEOUT`] is twice it. Reported by the
+/// descriptors as
+/// [`Delivery::Periodic`](crate::usecases::descriptor::Delivery::Periodic).
+pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(60);
+
 /// No heartbeat for this long moves the inverter into the failsafe state ([COB-913]).
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -871,14 +879,20 @@ pub fn read_setpoint_write(data: &CmdData) -> Option<SetpointWrite> {
         Some(value) => value.to_f64()?,
         None => 0.0,
     };
+    // §3.1.8.2, in the same words LPC uses: "Durations used within this Use Case SHALL be
+    // presented as relative times. The same holds for the `endTime` Element used for the
+    // validity duration ([COB-005/1])". A present `endTime` that is not a duration is a
+    // broken write, and reading it as [`None`] would mean "no duration" — a setpoint meant
+    // to expire applied until something else replaced it. Refusing produces a NACK.
+    let duration = match entry.time_period.as_ref().and_then(|p| p.end_time.as_ref()) {
+        Some(end_time) => Some(end_time.as_duration()?),
+        None => None,
+    };
+
     Some(SetpointWrite {
         is_active: entry.is_setpoint_active.unwrap_or(false),
         watts,
-        duration: entry
-            .time_period
-            .as_ref()
-            .and_then(|p| p.end_time.as_ref())
-            .and_then(|t| t.as_duration()),
+        duration,
     })
 }
 
@@ -1019,15 +1033,19 @@ const CLIENT_SETPOINTS: &[FunctionUse] = &[
     FunctionUse::client_writes(FeatureType::Setpoint, Function::SetpointListData),
 ];
 
+// [COB-008]: the heartbeat is the one function here that arrives on a clock, so it is
+// the one whose silence is a fact rather than a value that has not changed.
 const SERVER_HEARTBEAT: &[FunctionUse] = &[FunctionUse::client(
     FeatureType::DeviceDiagnosis,
     Function::DeviceDiagnosisHeartbeatData,
-)];
+)
+.periodic(HEARTBEAT_PERIOD)];
 
 const CLIENT_HEARTBEAT: &[FunctionUse] = &[FunctionUse::server(
     FeatureType::DeviceDiagnosis,
     Function::DeviceDiagnosisHeartbeatData,
-)];
+)
+.periodic(HEARTBEAT_PERIOD)];
 
 const NAMES: [&str; 5] = [
     "Control mode \"Power\"",
@@ -1139,6 +1157,44 @@ mod tests {
                 .with_default(-500.0),
             Duration::ZERO,
         )
+    }
+
+    /// §3.1.8.2: a validity duration that is not a relative time makes the write unusable.
+    ///
+    /// Reading it as absent would be the dangerous half of the mistake — absent means "no
+    /// expiry", so a setpoint meant to lapse would be held until something else replaced
+    /// it. The schema's `AbsoluteOrRelativeTimeType` union permits the timestamp this
+    /// refuses, which is exactly why a CEM sends one in good faith.
+    #[test]
+    fn cob_005_a_validity_duration_that_is_not_a_relative_time_is_refused() {
+        let with_end_time = |end_time: &str| {
+            CmdData::SetpointListData(SetpointListData {
+                setpoint_data: Some(alloc::vec![SetpointData {
+                    setpoint_id: Some(SETPOINT_ID),
+                    is_setpoint_active: Some(true),
+                    value: Some(ScaledNumber::from_f64(-2_000.0, 0)),
+                    time_period: Some(crate::model::TimePeriod {
+                        end_time: Some(end_time.into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+            })
+        };
+
+        for unreadable in ["2026-09-05T10:00:00Z", "", "P1M"] {
+            assert_eq!(
+                read_setpoint_write(&with_end_time(unreadable)),
+                None,
+                "{unreadable:?} is not a relative time"
+            );
+        }
+        assert_eq!(
+            read_setpoint_write(&with_end_time("PT2H"))
+                .expect("a well-formed write")
+                .duration,
+            Some(secs(7_200)),
+        );
     }
 
     /// Transition 0 and [COB-901]: a restart is driven by the failsafe setpoints, not by

@@ -335,9 +335,34 @@ pub fn failsafe_values(system: &ControllableSystem) -> CmdData {
 /// `heartbeatCounter` increases with every notification but not with a reply, and
 /// `heartbeatTimeout` is at most sixty seconds — LPC uses sixty, and a shorter value is
 /// permitted where another use case on the same connection needs one.
-pub fn heartbeat(counter: u64, timeout: Duration, timestamp: &str) -> CmdData {
+///
+/// `timestamp` is an *instant*, and [`None`] for a device that has no clock to read one
+/// from. The schema's element is the `AbsoluteOrRelativeTimeType` union, but the relative
+/// half says nothing here — "this heartbeat was produced zero seconds ago" is not a fact
+/// about anything — so this takes the absolute one and writes it in canonical form. The
+/// implementation guide §3.7 asks a server to set it and equally says a client need not
+/// check it, which is why an appliance with no real-time clock sends [`None`] rather than
+/// a number off the engine's monotonic uptime.
+///
+/// ```
+/// use core::time::Duration;
+/// use eebus::model::DateTime;
+/// use eebus::usecases::limitation;
+///
+/// let beat = limitation::heartbeat(
+///     7,
+///     Duration::from_secs(60),
+///     Some(DateTime::from_unix_seconds(1_788_596_100)),
+/// );
+/// assert!(serde_json::to_string(&beat).unwrap().contains("2026-09-05T08:15:00Z"));
+/// ```
+pub fn heartbeat(
+    counter: u64,
+    timeout: Duration,
+    timestamp: Option<crate::model::DateTime>,
+) -> CmdData {
     CmdData::DeviceDiagnosisHeartbeatData(DeviceDiagnosisHeartbeatData {
-        timestamp: Some(timestamp.into()),
+        timestamp: timestamp.map(crate::model::AbsoluteOrRelativeTime::from_timestamp),
         heartbeat_counter: Some(counter),
         heartbeat_timeout: Some(crate::model::format_iso8601_duration(timeout)),
     })
@@ -469,14 +494,25 @@ pub fn read_limit_write(data: &CmdData, limit_id: LoadControlLimitId) -> Option<
         None => 0.0,
     };
 
+    // The same rule for the duration, and here it matters more. §3.1.8.2: "Durations used
+    // within this Use Case SHALL be presented as relative times. The same holds for the
+    // `endTime` Element used for the duration of validity ([LPC-004])." So an `endTime`
+    // that is present and is not a duration — an absolute `2026-09-05T10:00:00Z`, which
+    // the *schema's* union permits and this use case forbids — is a broken write.
+    //
+    // Reading it as [`None`] would be the dangerous half of the mistake: `None` here means
+    // "no duration", so a limit the guard meant to expire in two hours would be applied
+    // until something else replaced it. Refusing produces a NACK, and a NACK is a fact the
+    // Energy Guard can act on.
+    let duration = match entry.time_period.as_ref().and_then(|p| p.end_time.as_ref()) {
+        Some(end_time) => Some(end_time.as_duration()?),
+        None => None,
+    };
+
     Some(LimitWrite {
         is_active: entry.is_limit_active.unwrap_or(false),
         watts,
-        duration: entry
-            .time_period
-            .as_ref()
-            .and_then(|p| p.end_time.as_ref())
-            .and_then(|t| t.as_duration()),
+        duration,
     })
 }
 
@@ -1165,6 +1201,13 @@ impl ControllableSystemActor {
                 .flatten()
                 .find(|entry| entry.key_id == Some(key))
                 .and_then(|entry| entry.value.as_ref());
+            // **Both fallbacks are chosen to fail the validator that follows**, and that
+            // is what makes an absent or unreadable value a NACK rather than a silent
+            // acceptance. `-1.0` is refused by [LPC/LPP-021] — "a power below zero is not
+            // one" — and `Duration::ZERO` sits outside the two-to-twenty-four hours
+            // [LPC/LPP-022] permits. Replacing either with the "obvious" neutral default
+            // would turn a broken write into an applied one, which is the failsafe pair
+            // this system falls back on when the grid operator goes quiet.
             let result = match key {
                 FAILSAFE_LIMIT_KEY => {
                     let watts = value

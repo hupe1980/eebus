@@ -63,8 +63,9 @@
 //! assert_eq!(read.power_watts, Some(2_400.0));
 //! assert!(read.is_stoppable);
 //!
-//! // The roof is exporting. Run it now.
-//! let write = ohpcf::activate(read.sequence, "2026-09-04T13:00:00Z");
+//! // The roof is exporting. Run it now — `startTime` here is a span, not an instant:
+//! // this feature restricts the element to `xs:duration`.
+//! let write = ohpcf::activate(read.sequence, Duration::ZERO);
 //! # let _ = write;
 //! ```
 //!
@@ -109,7 +110,7 @@
 //! [`cob`]: crate::usecases::cob
 //! [`hvac::cdt`]: crate::usecases::hvac::cdt
 
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -323,7 +324,7 @@ pub struct Flexibility {
     interrupt: Interrupt,
     durations: Durations,
     state: PowerSequenceState,
-    start_time: Option<String>,
+    start_time: Option<Duration>,
     /// Whether there is a process at all. `false` is phase D, [OHPCF-003].
     offered: bool,
 }
@@ -389,9 +390,17 @@ impl Flexibility {
         self.state.clone()
     }
 
-    /// When the process is due to start, once the CEM has said.
-    pub fn start_time(&self) -> Option<&str> {
-        self.start_time.as_deref()
+    /// How long from now the process is due to start, once the CEM has said.
+    ///
+    /// A **span**, not an instant, and that is the schema's doing rather than a
+    /// simplification: `SmartEnergyManagementPs` restricts `schedule.startTime` to
+    /// `xs:duration` (SPINE 1.3.0 `EEBus_SPINE_TS_SmartEnergyManagementPs.xsd`), where the
+    /// generic `PowerSequences` feature it derives from allows the
+    /// `AbsoluteOrRelativeTimeType` union. So `PT0S` is "now" and `PT2H` is "in two hours",
+    /// and a wall-clock instant is not expressible here at all — which is the right answer
+    /// for a compressor that may have no clock to read one against.
+    pub fn start_time(&self) -> Option<Duration> {
+        self.start_time
     }
 
     /// How the CEM may interrupt it.
@@ -538,9 +547,9 @@ impl Flexibility {
                     ..Default::default()
                 }),
                 // An absent `schedule` is [OHPCF-011/3]: not started autonomously.
-                schedule: self.start_time.as_ref().map(|start| {
+                schedule: self.start_time.map(|start| {
                     SmartEnergyManagementPsPowerSequenceSchedule {
-                        start_time: Some(start.clone()),
+                        start_time: Some(crate::model::format_iso8601_duration(start)),
                         ..Default::default()
                     }
                 }),
@@ -643,14 +652,19 @@ impl Flexibility {
     }
 
     fn schedule(&mut self, start: &str) -> Result<Request, Refused> {
+        // The schema restricts this element to `xs:duration`, so a value that is not one
+        // is refused rather than stored and echoed back. A compressor that accepted
+        // `2026-09-04T13:00:00Z` here — the shape the *generic* PowerSequences feature
+        // allows, and the one a CEM written against it would send — would report itself
+        // `scheduled` and start at a time neither side agrees on.
+        let start =
+            crate::model::parse_iso8601_duration(start).ok_or(Refused::UnreadableStartTime)?;
         match self.state {
             // §2.5.2 A: a re-schedule is the same command, and only before it starts.
             PowerSequenceState::Inactive | PowerSequenceState::Scheduled => {
-                self.start_time = Some(start.to_string());
+                self.start_time = Some(start);
                 self.state = PowerSequenceState::Scheduled;
-                Ok(Request::Schedule {
-                    start_time: start.to_string(),
-                })
+                Ok(Request::Schedule { start_time: start })
             }
             PowerSequenceState::Completed | PowerSequenceState::Invalid => {
                 Err(Refused::AlreadyEnded)
@@ -708,8 +722,8 @@ impl Flexibility {
 pub enum Request {
     /// [OHPCF-021]: run the announced process, starting then.
     Schedule {
-        /// The `startTime` the CEM named, as it wrote it.
-        start_time: String,
+        /// How long from now the CEM asked it to start — `PT0S` for immediately.
+        start_time: Duration,
     },
     /// [OHPCF-022/1]: abort it.
     Stop,
@@ -734,6 +748,15 @@ pub enum Refused {
     /// The write named neither a start time nor a state.
     #[error("the write asked for nothing this use case defines")]
     NothingAsked,
+    /// The `startTime` is not an `xs:duration`, which is what this feature restricts it to.
+    ///
+    /// The likely cause is a CEM written against the generic `PowerSequences` feature,
+    /// whose `startTime` is the `AbsoluteOrRelativeTimeType` union and so accepts a
+    /// timestamp. `SmartEnergyManagementPs` narrows it to a span, and storing a value this
+    /// side cannot read would leave the compressor `scheduled` for a time it could not act
+    /// on.
+    #[error("`startTime` here is an ISO 8601 duration, such as `PT0S` or `PT2H`")]
+    UnreadableStartTime,
     /// A schedule arrived for a process that has already started (§2.5.2).
     #[error("the process has already started; only stop, pause and resume apply now")]
     AlreadyStarted,
@@ -819,8 +842,10 @@ impl crate::usecases::signals::Signals for Flexibility {
             ))
             .with(Signal::new(
                 "ohpcf:startTime",
-                match self.start_time.as_deref() {
-                    Some(start) => text(start),
+                match self.start_time {
+                    // Seconds from now, as the element itself is a span. The other two
+                    // durations in this set are reported the same way.
+                    Some(start) => SignalValue::Number(start.as_secs_f64()),
                     None => SignalValue::Absent,
                 },
             ))
@@ -868,9 +893,14 @@ pub struct CompressorOffer {
     pub kind: Option<PowerKind>,
     /// The state of the process ([OHPCF-012/2]).
     pub state: PowerSequenceState,
-    /// When it starts, once it is scheduled. Absent means it will not start on its own
-    /// ([OHPCF-011/3]).
-    pub start_time: Option<String>,
+    /// How long from now it starts, once it is scheduled. Absent means it will not start
+    /// on its own ([OHPCF-011/3]).
+    ///
+    /// A span rather than an instant, because this feature restricts the element to
+    /// `xs:duration` — see [`Flexibility::start_time`]. A compressor that put a timestamp
+    /// here has broken the schema, and this reads [`None`] for it rather than a number
+    /// nobody sent.
+    pub start_time: Option<Duration>,
     /// Whether the CEM may abort it.
     pub is_stoppable: bool,
     /// Whether the CEM may pause and resume it.
@@ -932,7 +962,8 @@ impl CompressorOffer {
             start_time: sequence
                 .schedule
                 .as_ref()
-                .and_then(|schedule| schedule.start_time.clone()),
+                .and_then(|schedule| schedule.start_time.as_deref())
+                .and_then(crate::model::parse_iso8601_duration),
             is_stoppable: interrupt.and_then(|i| i.is_stoppable) == Some(true),
             is_pausable: interrupt.and_then(|i| i.is_pausable) == Some(true),
             active_duration_min: durations
@@ -1007,24 +1038,26 @@ pub fn is_absent(data: &CmdData) -> bool {
 /// arrives. Send it with
 /// [`Engine::write`](crate::spine::Engine::write) and `partial: true`.
 ///
-/// `start_time` is `AbsoluteOrRelativeTime`: an absolute `2026-09-04T13:00:00Z` or a
-/// relative `PT0S` for "now". Which one to use is the compressor's business as much as the
-/// CEM's — a device with no clock cannot act on an absolute time — and nothing in the
-/// payload says which the peer prefers.
+/// `start_time` is how long from now, not a wall-clock instant. That is the schema's
+/// restriction rather than a simplification: `SmartEnergyManagementPs` narrows
+/// `schedule.startTime` to `xs:duration`, where the generic `PowerSequences` feature it
+/// derives from allows the `AbsoluteOrRelativeTimeType` union. So [`Duration::ZERO`] is
+/// "now" and two hours is "in two hours" — and a compressor with no clock can act on
+/// either, which is presumably why the specification narrowed it.
 ///
 /// Re-scheduling is the same write again, and §2.5.2 allows it up until the process
 /// starts.
 ///
 /// **Needs a binding.** §3.4.2/1, and it is the one step a CEM built out of this crate's
 /// monitoring use cases has never had to take — see [`CompressorPeer::follow`].
-pub fn activate(sequence: PowerSequenceId, start_time: &str) -> CmdData {
+pub fn activate(sequence: PowerSequenceId, start_time: Duration) -> CmdData {
     write_sequence(SmartEnergyManagementPsPowerSequence {
         description: Some(SmartEnergyManagementPsPowerSequenceDescription {
             sequence_id: Some(sequence),
             ..Default::default()
         }),
         schedule: Some(SmartEnergyManagementPsPowerSequenceSchedule {
-            start_time: Some(start_time.to_string()),
+            start_time: Some(crate::model::format_iso8601_duration(start_time)),
             ..Default::default()
         }),
         ..Default::default()
@@ -1332,19 +1365,19 @@ mod tests {
     #[test]
     fn the_cem_schedules_the_process_and_the_compressor_starts_it() {
         let mut compressor = an_offer();
-        let write = activate(SEQUENCE_ID, "2026-09-04T13:00:00Z");
+        let write = activate(SEQUENCE_ID, Duration::from_secs(2 * 3_600));
 
         assert_eq!(
             compressor.apply(&write),
             Ok(Request::Schedule {
-                start_time: "2026-09-04T13:00:00Z".to_string()
+                start_time: Duration::from_secs(7_200)
             })
         );
         assert_eq!(compressor.state(), PowerSequenceState::Scheduled);
 
         let read = CompressorOffer::read(&compressor.data()).expect("a process");
         assert!(read.is_active() && !read.is_available());
-        assert_eq!(read.start_time.as_deref(), Some("2026-09-04T13:00:00Z"));
+        assert_eq!(read.start_time, Some(Duration::from_secs(7_200)));
 
         // [OHPCF-012/4]: the compressor begins on its own, and the CEM hears about it.
         compressor.start();
@@ -1357,19 +1390,65 @@ mod tests {
     fn a_reschedule_is_refused_once_the_process_has_started() {
         let mut compressor = an_offer();
         compressor
-            .apply(&activate(SEQUENCE_ID, "2026-09-04T13:00:00Z"))
+            .apply(&activate(SEQUENCE_ID, Duration::from_secs(3_600)))
             .expect("scheduled");
         assert!(
             compressor
-                .apply(&activate(SEQUENCE_ID, "2026-09-04T14:00:00Z"))
+                .apply(&activate(SEQUENCE_ID, Duration::from_secs(7_200)))
                 .is_ok(),
             "a re-schedule before it starts is the same command again"
         );
 
         compressor.start();
         assert_eq!(
-            compressor.apply(&activate(SEQUENCE_ID, "2026-09-04T15:00:00Z")),
+            compressor.apply(&activate(SEQUENCE_ID, Duration::from_secs(10_800))),
             Err(Refused::AlreadyStarted)
+        );
+    }
+
+    /// The element is `xs:duration` here, so a timestamp is refused rather than stored.
+    ///
+    /// `SmartEnergyManagementPs` restricts `schedule.startTime` where the generic
+    /// `PowerSequences` feature allows the `AbsoluteOrRelativeTimeType` union, so a CEM
+    /// written against the wrong one of the two sends `2026-09-04T13:00:00Z` in perfectly
+    /// good faith. Storing it would leave the compressor announcing itself `scheduled` for
+    /// a time neither side could act on.
+    #[test]
+    fn a_start_time_that_is_not_a_duration_is_refused() {
+        let mut compressor = an_offer();
+        let timestamp = write_sequence(SmartEnergyManagementPsPowerSequence {
+            description: Some(SmartEnergyManagementPsPowerSequenceDescription {
+                sequence_id: Some(SEQUENCE_ID),
+                ..Default::default()
+            }),
+            schedule: Some(SmartEnergyManagementPsPowerSequenceSchedule {
+                start_time: Some("2026-09-04T13:00:00Z".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            compressor.apply(&timestamp),
+            Err(Refused::UnreadableStartTime)
+        );
+        assert_eq!(
+            compressor.state(),
+            PowerSequenceState::Inactive,
+            "and the offer is left as it was, rather than scheduled for nothing"
+        );
+        assert_eq!(compressor.start_time(), None);
+
+        // The same value read off a compressor that did store it: `None`, not a guess.
+        let offer = CompressorOffer::read(&compressor.data()).expect("an offer");
+        assert_eq!(offer.start_time, None);
+
+        // `PT0S` — start now — is a duration and is accepted.
+        assert_eq!(
+            compressor.apply(&activate(SEQUENCE_ID, Duration::ZERO)),
+            Ok(Request::Schedule {
+                start_time: Duration::ZERO
+            })
         );
     }
 
@@ -1378,7 +1457,7 @@ mod tests {
     fn the_state_commands_apply_only_in_the_states_they_are_defined_for() {
         let mut compressor = an_offer();
         compressor
-            .apply(&activate(SEQUENCE_ID, "PT0S"))
+            .apply(&activate(SEQUENCE_ID, Duration::ZERO))
             .expect("scheduled");
 
         assert_eq!(
@@ -1412,7 +1491,9 @@ mod tests {
             Flexibility::abort as fn(&mut Flexibility),
         ] {
             let mut compressor = an_offer();
-            compressor.apply(&activate(SEQUENCE_ID, "PT0S")).unwrap();
+            compressor
+                .apply(&activate(SEQUENCE_ID, Duration::ZERO))
+                .unwrap();
             compressor.start();
             ending(&mut compressor);
 
@@ -1426,7 +1507,7 @@ mod tests {
                 Err(Refused::AlreadyEnded)
             );
             assert_eq!(
-                compressor.apply(&activate(SEQUENCE_ID, "PT1H")),
+                compressor.apply(&activate(SEQUENCE_ID, Duration::from_secs(3_600))),
                 Err(Refused::AlreadyEnded),
                 "and a new run starts from a new offer, not from the old one"
             );
@@ -1438,7 +1519,11 @@ mod tests {
                     .expect("an offer")
                     .is_available()
             );
-            assert!(compressor.apply(&activate(SEQUENCE_ID, "PT1H")).is_ok());
+            assert!(
+                compressor
+                    .apply(&activate(SEQUENCE_ID, Duration::from_secs(3_600)))
+                    .is_ok()
+            );
         }
     }
 
@@ -1447,7 +1532,7 @@ mod tests {
     fn an_interrupt_the_compressor_never_offered_is_refused() {
         let mut only_stoppable = Flexibility::offered(2_400.0).interruptible(Interrupt::Stoppable);
         only_stoppable
-            .apply(&activate(SEQUENCE_ID, "PT0S"))
+            .apply(&activate(SEQUENCE_ID, Duration::ZERO))
             .unwrap();
         only_stoppable.start();
         assert_eq!(
@@ -1457,7 +1542,9 @@ mod tests {
         assert_eq!(only_stoppable.apply(&stop(SEQUENCE_ID)), Ok(Request::Stop));
 
         let mut only_pausable = Flexibility::offered(2_400.0).interruptible(Interrupt::Pausable);
-        only_pausable.apply(&activate(SEQUENCE_ID, "PT0S")).unwrap();
+        only_pausable
+            .apply(&activate(SEQUENCE_ID, Duration::ZERO))
+            .unwrap();
         only_pausable.start();
         assert_eq!(
             only_pausable.apply(&stop(SEQUENCE_ID)),
@@ -1493,7 +1580,7 @@ mod tests {
         assert!(is_absent(&data), "[OHPCF-003]");
         assert_eq!(CompressorOffer::read(&data), None);
         assert_eq!(
-            compressor.apply(&activate(SEQUENCE_ID, "PT0S")),
+            compressor.apply(&activate(SEQUENCE_ID, Duration::ZERO)),
             Err(Refused::NothingOffered),
             "there is nothing to schedule"
         );
@@ -1578,7 +1665,9 @@ mod tests {
 
         let mut compressor = an_offer();
         assert_eq!(slot(&compressor), None, "inactive");
-        compressor.apply(&activate(SEQUENCE_ID, "PT0S")).unwrap();
+        compressor
+            .apply(&activate(SEQUENCE_ID, Duration::ZERO))
+            .unwrap();
         assert_eq!(slot(&compressor), None, "scheduled but not started");
         compressor.start();
         assert_eq!(slot(&compressor), Some(SLOT_NUMBER));

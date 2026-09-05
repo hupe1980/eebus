@@ -422,6 +422,59 @@ fn an_unrepresentable_limit_value_is_refused() {
     );
 }
 
+/// And a duration that is present but not a relative time is refused for the same reason,
+/// where reading it as "no duration" would be the *dangerous* half of the mistake.
+///
+/// LPC §3.1.8.2: "Durations used within this Use Case SHALL be presented as relative
+/// times. The same holds for the `endTime` Element used for the duration of validity
+/// ([LPC-004])." The schema's own union permits `xs:dateTime` there, so a guard written
+/// against the schema rather than the use case sends one in good faith — and an
+/// `endTime` read as absent means *no expiry*, so a limit meant to lift after two hours
+/// would stay until something else replaced it.
+#[test]
+fn a_limit_duration_that_is_not_a_relative_time_is_refused() {
+    let with_end_time = |end_time: &str| {
+        CmdData::LoadControlLimitListData(LoadControlLimitListData {
+            load_control_limit_data: Some(vec![LoadControlLimitData {
+                limit_id: Some(LoadControlLimitId(1)),
+                is_limit_active: Some(true),
+                value: Some(ScaledNumber::from_f64(4_200.0, 0)),
+                time_period: Some(eebus::model::TimePeriod {
+                    end_time: Some(end_time.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+        })
+    };
+
+    for unreadable in ["2026-09-05T10:00:00Z", "", "P1M", "two hours"] {
+        assert_eq!(
+            eebus::usecases::limitation::read_limit_write(
+                &with_end_time(unreadable),
+                LoadControlLimitId(1)
+            ),
+            None,
+            "{unreadable:?} is not a relative time, so the write is unusable"
+        );
+    }
+
+    // A relative one is read, and `PT0S` — the expired duration [LPC-004] permits a peer
+    // to leave in place — is a duration and not an absence.
+    let read = eebus::usecases::limitation::read_limit_write(
+        &with_end_time("PT2H"),
+        LoadControlLimitId(1),
+    )
+    .expect("a well-formed write");
+    assert_eq!(read.duration, Some(Duration::from_secs(7_200)));
+    let expired = eebus::usecases::limitation::read_limit_write(
+        &with_end_time("PT0S"),
+        LoadControlLimitId(1),
+    )
+    .expect("a well-formed write");
+    assert_eq!(expired.duration, Some(Duration::ZERO));
+}
+
 // ---- the limitation state machine, driven at random ---------------------------
 
 /// One thing that can happen to a Controllable System.

@@ -28,9 +28,6 @@ add_color_scheme = true
 
 [link_checker]
 skip_prefixes = [
-    # The crate is not published yet, so docs.rs has nothing to serve.
-    "https://docs.rs/eebus",
-    "https://crates.io/crates/eebus",
     # eebus.org answers a browser but refuses the CI runner's egress, so checking it
     # from a workflow fails on every link regardless of whether the page exists.
     "https://www.eebus.org",

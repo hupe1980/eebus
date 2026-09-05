@@ -45,8 +45,20 @@ use core::time::Duration;
 
 use crate::model::ErrorNumber;
 
+/// How often each side sends its heartbeat: "at least every 60 seconds"
+/// ([LPC/LPP-005], [LPC/LPP-006]).
+///
+/// The cadence, not the tolerance. It is what the descriptors report as
+/// [`Delivery::Periodic`](crate::usecases::descriptor::Delivery::Periodic), and what
+/// makes the heartbeat the one function of the use case whose *silence* is a fact:
+/// everything else arrives when it changes, so its age says nothing.
+pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(60);
+
 /// No heartbeat for this long moves the system into the failsafe state
 /// ([LPC/LPP-911], [LPC/LPP-912]).
+///
+/// Two missed beats of [`HEARTBEAT_PERIOD`], which is the tolerance the specification
+/// picks rather than one this crate chose.
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A limit write counts only if a heartbeat arrived within this window before it

@@ -71,6 +71,71 @@ call. A Monitored Unit on this side stamps with `MonitoredUnit::set_at`, or
 `hvac::mrt::temperature_at` and its two siblings. `set` sends no timestamp: the engine's
 clock is monotonic uptime, not a time of day.
 
+### One element, two things
+
+`timestamp` is `AbsoluteOrRelativeTimeType`, which the schema defines as
+`xs:union memberTypes="xs:duration xs:dateTime"`. So it is either an instant or a **span**,
+nothing in the element says which, and the two mean opposite things. `parse()` reads
+whichever arrived:
+
+```rust
+use eebus::model::TimeValue;
+
+let taken_at = match reading.taken_at()?.parse()? {
+    // An instant on the peer's own calendar.
+    TimeValue::Absolute(stamp) => stamp.unix_seconds(),
+    // An age: the unit measured this long before it sent the message.
+    TimeValue::Relative(_) => reading.taken_at_relative_to(arrived).map(|d| d.as_secs() as i64),
+};
+```
+
+The relative form is the sharper half and it is unambiguous: on a measurement it is an age,
+so the instant is `arrived − duration`. `Reading::taken_at_relative_to` is that subtraction
+against the same monotonic clock the engine is already given, saturating at zero rather than
+wrapping.
+
+The absolute form is **not RFC 3339**, and reaching for a parser that assumes it is will
+silently reject conformant peers. `xs:dateTime` makes the offset *optional*, so
+`2026-09-05T08:15:00` names a wall-clock reading and fixes no instant at all; it permits
+`24:00:00` as midnight ending the day; and it permits years outside four digits.
+`AbsoluteOrRelativeTime::as_timestamp` reads all of it into a `DateTime`, whose
+`unix_seconds()` is `None` for exactly the case that has no answer — the timezone-less one —
+and whose `unix_seconds_at()` makes the caller name the zone it means to assume.
+
+What stays yours is the **policy**. A household device sets its clock from NTP or from
+nothing, and how far a peer's clock may be wrong before its timestamps are worth less than
+the arrival time is not a decision a protocol crate can make. `is_absolute()` says which
+form the peer meant; `as_timestamp()` says whether it could be read. The two disagreeing is
+how you learn a peer sent something it believed was a timestamp.
+
+### What silence means
+
+A value that has not arrived for ten minutes is either a peer that stopped answering or a
+peer with nothing to say. Nothing in the message says which, and the answer decides whether
+to drop the unit from the site or leave it exactly where it is.
+
+The use case answers it, and the descriptors carry the answer as data:
+
+```rust
+use eebus::model::{FeatureType, Function};
+use eebus::usecases::descriptor::Delivery;
+use eebus::usecases::{lpc, mpc};
+
+mpc::MONITORING_APPLIANCE.delivery_of(&FeatureType::Measurement, &Function::MeasurementListData);
+// Some(Delivery::OnChange) — silence is the protocol working.
+
+lpc::CONTROLLABLE_SYSTEM.delivery_of(&FeatureType::DeviceDiagnosis, &Function::DeviceDiagnosisHeartbeatData);
+// Some(Delivery::Periodic(60 s)) — silence past this is a fault.
+```
+
+Every scenario of every use case here is subscription-driven — each UC TS §3.4.n.1 says
+"Actors SHALL create a subscription for each server Feature that is relevant for the
+corresponding Actor within this Scenario", and §3.3.4 names polling only as what to do when
+a subscription request is *refused*. So the distinction that matters is not
+notification-versus-poll: it is whether the notification comes on a **clock**. Exactly one
+family of functions does, the heartbeats, and `periodic_functions()` lists them. Everything
+else is `OnChange`, and its age is a fact about the world rather than about the peer.
+
 ## Curtailment
 
 MGCP scenario 1 carries the photovoltaic curtailment factor: how much of what the plant

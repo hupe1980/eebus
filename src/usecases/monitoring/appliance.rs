@@ -64,9 +64,53 @@ impl Reading {
     /// When the unit says it took the reading, where it said.
     ///
     /// See [`timestamp`](Self::timestamp) for why an absent one is not an error and not a
-    /// reason to substitute the arrival time.
+    /// reason to substitute the arrival time. It is
+    /// [`AbsoluteOrRelativeTime`](crate::model::AbsoluteOrRelativeTime), so it is one of
+    /// two things and [`parse`](crate::model::AbsoluteOrRelativeTime::parse) says which:
+    /// a calendar instant on the peer's clock, or an age counted back from this message.
     pub fn taken_at(&self) -> Option<&AbsoluteOrRelativeTime> {
         self.timestamp.as_ref()
+    }
+
+    /// When the reading was taken, on the clock `arrived` is counted on.
+    ///
+    /// The relative form of a `timestamp` is an **age**: the unit measured this long
+    /// before it sent the message, so the instant is `arrived − age` and every consumer
+    /// that keeps a monotonic clock writes that subtraction. This is it, once.
+    ///
+    /// `arrived` is whatever "now" the caller passes the engine — the same
+    /// [`Duration`](core::time::Duration) since some fixed start that
+    /// [`Engine::read`](crate::spine::Engine::read) and the actors take. A reading older
+    /// than the clock itself saturates at zero rather than wrapping.
+    ///
+    /// [`None`] where the unit sent no timestamp, and [`None`] for the **absolute** form:
+    /// a calendar instant has no relation to a monotonic clock, and turning one into the
+    /// other needs a wall-clock reading and a judgement about the peer's clock that
+    /// belongs to the consumer. Read that form with
+    /// [`taken_at`](Self::taken_at) and [`AbsoluteOrRelativeTime::as_timestamp`](crate::model::AbsoluteOrRelativeTime::as_timestamp).
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::usecases::hvac::mrt;
+    /// use eebus::usecases::monitoring::Readings;
+    ///
+    /// let mut readings = Readings::new();
+    /// readings.describe(&mrt::temperature_description());
+    /// // "measured thirty seconds ago", which is what the relative form means.
+    /// readings.apply(&mrt::temperature_at(21.5, "PT30S".into()));
+    ///
+    /// let arrived = Duration::from_secs(3_600);
+    /// let reading = readings.latest(&mrt::MEASURAND).expect("a reading");
+    /// assert_eq!(
+    ///     reading.taken_at_relative_to(arrived),
+    ///     Some(Duration::from_secs(3_570)),
+    /// );
+    /// ```
+    pub fn taken_at_relative_to(
+        &self,
+        arrived: core::time::Duration,
+    ) -> Option<core::time::Duration> {
+        Some(arrived.saturating_sub(self.timestamp.as_ref()?.as_duration()?))
     }
 
     /// The value, if the unit did not flag it.
@@ -277,6 +321,13 @@ impl Readings {
     /// What a consumer that ages its inputs needs — see [`Reading::timestamp`] for why the
     /// arrival time will not do. [`None`] whenever the peer sent none, which is the common
     /// case, and what that means is the caller's decision.
+    ///
+    /// The timestamp is a union of two forms and is returned as the peer wrote it. The
+    /// **relative** one is an age, and resolving it is
+    /// [`Reading::taken_at_relative_to`]; the **absolute** one is an `xs:dateTime`, which
+    /// [`AbsoluteOrRelativeTime::as_timestamp`] reads — and which is not RFC 3339, so a
+    /// consumer that reaches for its own parser rejects peers that sent a perfectly good
+    /// timestamp with no offset.
     ///
     /// ```
     /// use eebus::model::UnitOfMeasurement;
@@ -596,6 +647,16 @@ impl MonitoringApplianceActor {
             ] {
                 engine.read(&electrical, &self.client, function, now);
             }
+            // Subscribed, not just read once. The parameter descriptions are the only
+            // place `acMeasuredPhases` lives, so a unit that re-describes its phases —
+            // an inverter that gains a string, a meter reconfigured from one phase to
+            // three — silently changes what every per-phase measurement *means*. MPC
+            // §3.1.6 is explicit that "a client always needs to be subscribed on the
+            // corresponding dataset to stay updated", and §3.4.n.1 asks for a
+            // subscription to every server feature the scenario touches. Without this,
+            // the appliance would keep resolving new values against a description that
+            // stopped being true, which is worse than dropping them.
+            engine.request_subscription(&self.client, &electrical, now);
         }
         if let Some(measurement) = peer.measurement.clone() {
             for function in [

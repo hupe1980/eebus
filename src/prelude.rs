@@ -29,7 +29,7 @@ pub use crate::spine::{
     Engine, HeartbeatMonitor, HeartbeatProducer, LocalDevice, LocalEntity, LocalFeature,
     Operations, SpineEvent, device_address, feature_address, node_management,
 };
-pub use crate::usecases::{ActorRole, UseCaseDescriptor};
+pub use crate::usecases::{ActorRole, Delivery, UseCaseDescriptor};
 
 pub use crate::usecases::{emobility, limitation, lpc, lpp, mgcp, monitoring, mpc};
 

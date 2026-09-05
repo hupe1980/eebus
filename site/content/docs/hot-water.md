@@ -304,6 +304,7 @@ subscribed gets every notification and can act on none of them — `activate` co
 requests in the order the two scenarios put them:
 
 ```rust
+use core::time::Duration;
 use eebus::usecases::ohpcf::{self, CompressorOffer};
 
 let compressor = ohpcf::locate(remote)?;
@@ -312,9 +313,22 @@ let pending = compressor.follow(&mut engine, &client, now);   // bind, subscribe
 let read = CompressorOffer::read(&payload)?;
 if read.is_available() {
     // The roof is exporting. Run it now.
-    engine.write(&compressor.flexibility, &client, ohpcf::activate(read.sequence, "PT0S"), true, now);
+    let write = ohpcf::activate(read.sequence, Duration::ZERO);
+    engine.write(&compressor.flexibility, &client, write, true, now);
 }
 ```
+
+**The start time is a span, not an instant**, and that is the schema's doing rather than a
+simplification. `SmartEnergyManagementPs` *restricts* `schedule.startTime` to `xs:duration`
+where the generic `PowerSequences` feature it derives from allows the
+`AbsoluteOrRelativeTimeType` union — so `Duration::ZERO` is "now" and two hours is "in two
+hours", and a wall-clock instant cannot be expressed here at all. Which is the right answer
+for a compressor that may have no clock to read one against.
+
+It is an easy thing to get wrong from the outside, so the compressor side refuses rather
+than stores: a `startTime` that is not a duration comes back `UnreadableStartTime`, because
+a compressor that accepted `2026-09-04T13:00:00Z` would announce itself `scheduled` for a
+time neither side could act on.
 
 One function on one `SmartEnergyManagementPs` feature, and what a payload *means* is which
 of four phases the compressor is in: an offer, a process, an ending, or nothing at all. Two

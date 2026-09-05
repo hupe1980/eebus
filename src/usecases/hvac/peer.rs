@@ -520,6 +520,62 @@ mod tests {
         );
     }
 
+    /// `follow` subscribes to exactly the features the use case's own tables name.
+    ///
+    /// §3.4.n.1, in all nine: "Actors SHALL create a subscription for each server Feature
+    /// that is relevant for the corresponding Actor within this Scenario". The descriptor
+    /// carries that table as data, and nothing but this test forces the code that acts on
+    /// it to agree — the same check `tests/use_case_delivery.rs` runs for the actors whose
+    /// peers can be built without a discovery fixture.
+    #[test]
+    fn follow_subscribes_to_exactly_what_the_descriptor_names() {
+        let device = gateway();
+        let remote = discovered(&device);
+
+        let mut manager =
+            LocalDevice::new("i:12345", "CEM-1", DeviceType::EnergyManagementSystem).unwrap();
+        manager
+            .add_entity(
+                LocalEntity::new([1], EntityType::CEM)
+                    .with_feature(crate::usecases::limitation::client_feature(1)),
+            )
+            .unwrap();
+        let client = manager.address_of(&[1], 1);
+
+        for (peer, descriptor) in [
+            (cdsf::locate(&remote), &cdsf::CONFIGURATION_APPLIANCE),
+            (mdsf::locate(&remote), &mdsf::MONITORING_APPLIANCE),
+            (cdt::locate(&remote), &cdt::CONFIGURATION_APPLIANCE),
+            (crhsf::locate(&remote), &crhsf::CONFIGURATION_APPLIANCE),
+        ] {
+            let peer = peer.expect("the gateway announced it");
+            let mut engine = crate::spine::Engine::new(manager.clone());
+            let pending = peer.follow(&mut engine, &client, Duration::ZERO);
+
+            let mut subscribed = alloc::vec![FeatureType::HVAC];
+            if pending.setpoint_subscription.is_some() {
+                subscribed.push(FeatureType::Setpoint);
+            }
+            let mut expected: Vec<FeatureType> = descriptor
+                .features_needing_subscription()
+                .cloned()
+                .collect();
+
+            subscribed.sort_by_key(|f| alloc::format!("{f:?}"));
+            expected.sort_by_key(|f| alloc::format!("{f:?}"));
+            assert_eq!(
+                subscribed, expected,
+                "{} subscribes to something other than its scenario tables name",
+                descriptor.actor
+            );
+            assert_eq!(
+                peer.setpoint.is_some(),
+                expected.contains(&FeatureType::Setpoint),
+                "a use case whose tables name `Setpoint` has to have located one"
+            );
+        }
+    }
+
     /// The six reads CDSF needs, in the order its scenario tables put them, plus the
     /// subscription — one call.
     #[test]
