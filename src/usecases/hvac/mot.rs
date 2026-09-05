@@ -37,8 +37,8 @@
 //! ```
 
 use crate::model::{
-    CmdData, EntityType, FeatureType, Function, MeasurementId, MeasurementValueSource,
-    MeasurementValueState, UnitOfMeasurement,
+    AbsoluteOrRelativeTime, CmdData, EntityType, FeatureType, Function, MeasurementId,
+    MeasurementValueSource, MeasurementValueState, UnitOfMeasurement,
 };
 use crate::spine::LocalFeature;
 use crate::usecases::descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
@@ -99,7 +99,7 @@ pub fn temperature_constraints(min: f64, max: f64, step: Option<f64>) -> CmdData
 
 /// The current outdoor temperature (Table 9), measured.
 pub fn temperature(degrees: f64) -> CmdData {
-    temperature_from(degrees, MeasurementValueSource::MeasuredValue, None)
+    temperature_from(degrees, MeasurementValueSource::MeasuredValue, None, None)
 }
 
 /// The same, saying where the number came from and whether it can be trusted.
@@ -111,9 +111,26 @@ pub fn temperature_from(
     degrees: f64,
     source: MeasurementValueSource,
     state: Option<MeasurementValueState>,
+    taken_at: Option<AbsoluteOrRelativeTime>,
 ) -> CmdData {
-    // [MOT-002]: only the newest value, and no history.
-    temperature::reported(MEASUREMENT_ID, degrees, source, state)
+    // [MOT-002]: only the newest value, and no history. The timestamp is the element
+    // that rule permits; the second entry is the one it forbids.
+    temperature::reported(MEASUREMENT_ID, degrees, source, state, taken_at)
+}
+
+/// The current outdoor temperature, measured, and stamped with when.
+///
+/// [MOT-002] permits the `timestamp` element, and this is what it is for. An outdoor sensor that reports every few minutes and a forecast fitted against it
+/// need the same clock, and the sensor's is the one that matters. A client
+/// that has only the arrival time cannot tell the two apart; one that has this can. See
+/// [`Reading::timestamp`](crate::usecases::monitoring::Reading::timestamp).
+pub fn temperature_at(degrees: f64, taken_at: AbsoluteOrRelativeTime) -> CmdData {
+    temperature_from(
+        degrees,
+        MeasurementValueSource::MeasuredValue,
+        None,
+        Some(taken_at),
+    )
 }
 
 // ---- what a Monitoring Appliance finds -------------------------------------------------
@@ -257,6 +274,7 @@ mod tests {
             12.0,
             MeasurementValueSource::MeasuredValue,
             Some(MeasurementValueState::Error),
+            None,
         ));
         assert_eq!(
             readings.get(&MEASURAND).map(|r| r.state),

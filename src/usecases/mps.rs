@@ -20,7 +20,7 @@
 //!
 //! // Two strings on one inverter, each its own electrical connection.
 //! let mut south = mps::monitored_unit(1).with(Measurand::unphased(Quantity::DcPower));
-//! south.set(&Measurand::unphased(Quantity::DcPower), 3_900.0, Duration::ZERO);
+//! south.set(&Measurand::unphased(Quantity::DcPower), 3_900.0);
 //!
 //! let mut readings = Readings::new();
 //! readings.describe(&south.measurement_descriptions());

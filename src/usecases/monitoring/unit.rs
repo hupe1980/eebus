@@ -5,11 +5,11 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use crate::model::{
-    CmdData, ElectricalConnectionDescriptionData, ElectricalConnectionDescriptionListData,
-    ElectricalConnectionId, ElectricalConnectionParameterDescriptionData,
-    ElectricalConnectionParameterDescriptionListData, ElectricalConnectionParameterId,
-    ElectricalConnectionVoltageType, EnergyDirection, FeatureType, Function,
-    MeasurementConstraintsData, MeasurementConstraintsListData, MeasurementData,
+    AbsoluteOrRelativeTime, CmdData, ElectricalConnectionDescriptionData,
+    ElectricalConnectionDescriptionListData, ElectricalConnectionId,
+    ElectricalConnectionParameterDescriptionData, ElectricalConnectionParameterDescriptionListData,
+    ElectricalConnectionParameterId, ElectricalConnectionVoltageType, EnergyDirection, FeatureType,
+    Function, MeasurementConstraintsData, MeasurementConstraintsListData, MeasurementData,
     MeasurementDescriptionData, MeasurementDescriptionListData, MeasurementId, MeasurementListData,
     MeasurementValueState, MeasurementValueType, Role, ScaledNumber,
 };
@@ -65,6 +65,10 @@ struct Slot {
     value: Option<f64>,
     state: MeasurementValueState,
     range: Option<(f64, f64)>,
+    /// When the sensor took the reading, where the application said. Sent as the
+    /// `timestamp` element, which every measurement use case here permits and none
+    /// requires.
+    taken_at: Option<AbsoluteOrRelativeTime>,
 }
 
 /// A Monitored Unit: what it measures, and the last value of each measurement.
@@ -74,7 +78,6 @@ struct Slot {
 /// notification against it.
 ///
 /// ```
-/// use core::time::Duration;
 /// use eebus::model::ElectricalConnectionPhaseName as Phase;
 /// use eebus::usecases::monitoring::{Measurand, MonitoredUnit, Quantity};
 ///
@@ -82,7 +85,7 @@ struct Slot {
 ///     .with(Measurand::total_power())
 ///     .with(Measurand::on(Quantity::Current, Phase::A));
 ///
-/// unit.set(&Measurand::total_power(), 2_300.0, Duration::ZERO);
+/// unit.set(&Measurand::total_power(), 2_300.0);
 /// assert_eq!(unit.value(&Measurand::total_power()), Some(2_300.0));
 /// ```
 #[derive(Clone, Debug)]
@@ -131,6 +134,7 @@ impl MonitoredUnit {
             value: None,
             state: MeasurementValueState::Normal,
             range: None,
+            taken_at: None,
         });
         measurement_id
     }
@@ -168,10 +172,39 @@ impl MonitoredUnit {
     /// A value outside the declared range is marked `outOfRange` ([MPC-003]) rather than
     /// silently clamped or passed off as normal — the reading is what it is, and it is
     /// the client's business what to do about it. Otherwise recording a value clears any
-    /// earlier state: a measurement that reads again is working again.
-    pub fn set(&mut self, measurand: &Measurand, value: f64, _now: Duration) {
+    /// earlier state: a measurement that reads again is working again — and clears any
+    /// timestamp, because a new reading taken at an unstated time is not the old one's
+    /// time.
+    pub fn set(&mut self, measurand: &Measurand, value: f64) {
+        self.record(measurand, value, None);
+    }
+
+    /// The same, saying when the sensor took the reading.
+    ///
+    /// The `timestamp` element, which every measurement use case in this crate permits and
+    /// none requires. Worth sending, and the reason is on the *reader's* side: a client
+    /// subscribed to this unit hears from it when something changes, so the arrival time
+    /// of a notification is the age of the change and not the age of the measurement. A
+    /// quantity that is steady sends nothing at all, and to a client that ages its inputs
+    /// by arrival that steadiness is indistinguishable from a sensor that stopped. See
+    /// [`Reading::timestamp`](super::Reading::timestamp).
+    ///
+    /// The value is passed through verbatim: SPINE's element is an absolute time *or* an
+    /// ISO 8601 duration, and which one this unit sends is the application's decision —
+    /// this crate has no clock of its own.
+    pub fn set_at(&mut self, measurand: &Measurand, value: f64, taken_at: AbsoluteOrRelativeTime) {
+        self.record(measurand, value, Some(taken_at));
+    }
+
+    fn record(
+        &mut self,
+        measurand: &Measurand,
+        value: f64,
+        taken_at: Option<AbsoluteOrRelativeTime>,
+    ) {
         if let Some(slot) = self.slot_mut(measurand) {
             slot.value = Some(value);
+            slot.taken_at = taken_at;
             slot.state = match slot.range {
                 Some((min, max)) if value < min || value > max => MeasurementValueState::OutOfRange,
                 _ => MeasurementValueState::Normal,
@@ -328,6 +361,7 @@ impl MonitoredUnit {
                         value: slot.value.map(|v| ScaledNumber::from_f64(v, DECIMALS)),
                         value_state: (slot.state != MeasurementValueState::Normal)
                             .then(|| slot.state.clone()),
+                        timestamp: slot.taken_at.clone(),
                         ..Default::default()
                     })
                     .collect(),

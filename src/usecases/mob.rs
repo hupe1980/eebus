@@ -37,8 +37,8 @@
 //!     .with(Measurand::unphased(Quantity::DcPower))
 //!     .with(Measurand::unphased(Quantity::StateOfCharge));
 //! // Discharging: the sign says which way it is going.
-//! battery.set(&Measurand::unphased(Quantity::DcPower), -3_200.0, Duration::ZERO);
-//! battery.set(&Measurand::unphased(Quantity::StateOfCharge), 61.0, Duration::ZERO);
+//! battery.set(&Measurand::unphased(Quantity::DcPower), -3_200.0);
+//! battery.set(&Measurand::unphased(Quantity::StateOfCharge), 61.0);
 //!
 //! let mut readings = Readings::new();
 //! readings.describe(&battery.measurement_descriptions());

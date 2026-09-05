@@ -74,6 +74,7 @@ use crate::model::{
 use crate::spine::LocalFeature;
 use crate::usecases::descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
 
+use super::peer::{self, HvacPeer, Subject};
 use super::setpoint::{self, Setpoints};
 use super::{DHW, system_function_id};
 
@@ -143,6 +144,10 @@ pub fn setpoint_feature(address: u32) -> LocalFeature {
 pub fn hvac_feature(address: u32) -> LocalFeature {
     setpoint::hvac_feature(address)
 }
+
+/// What this use case is about, for [`HvacApplianceActor`](super::HvacApplianceActor):
+/// which system function, which overrun where there is one, and which setpoint scope.
+pub const SUBJECT: Subject = Subject::temperature(DHW, TEMPERATURE_SCOPE);
 
 // ---- what a DHW Circuit publishes ---------------------------------------------------
 
@@ -219,6 +224,44 @@ pub fn read_setpoint_write(data: &CmdData, id: SetpointId) -> Option<f64> {
 /// A reader collecting this circuit's hot water setpoints.
 pub fn reader() -> Setpoints {
     Setpoints::dhw()
+}
+
+// ---- what a Configuration Appliance finds ----------------------------------
+
+/// Finds a DHW circuit's features from its detailed discovery and use-case data.
+///
+/// The guide's §3.3 rule doing its work: the `HVAC` feature is the one on the entity that
+/// **announced this use case**, not whichever the appliance happens to carry. A device
+/// that heats water and two rooms has one `HVAC` feature per entity and every one of them
+/// answers to the same lookup by type.
+///
+/// Two features, not one: the three setpoint functions live on `Setpoint` and the relation
+/// that says which mode uses which setpoint lives on `HVAC`, so both are located and both
+/// are subscribed to. A circuit serving one and not the other is not located at all —
+/// there is no scenario it could run.
+///
+/// **Follow the mode as well.** These four reads are this use case's whole scenario table
+/// and they are not enough on their own: the relation says which setpoint each *mode* uses,
+/// and which mode the circuit is in is [`mdsf`](super::mdsf)'s or
+/// [`cdsf`](super::cdsf)'s to say. That is why [CDT-005] makes one of those two mandatory
+/// for a circuit serving this — locate and follow it too, and join the two readers with
+/// [`SystemFunction::current_setpoints`](super::system_function::SystemFunction::current_setpoints)
+/// or [`Setpoints::write_effective`](super::setpoint::Setpoints::write_effective).
+///
+/// Returns [`None`] until the peer has announced both the use case and the features its
+/// scenarios are served from. What comes next is [`HvacPeer::follow`], and it is not
+/// optional: a located peer is an address, not a conversation.
+pub fn locate(remote: &crate::spine::RemoteDevice) -> Option<HvacPeer> {
+    peer::locate(remote, &DHW_CIRCUIT, &SUBJECT)
+}
+
+/// Every DHW circuit on one device that serves it.
+///
+/// A device may hold more than one — a heat-pump gateway announces the use case once per
+/// entity — and each is its own `HVAC` feature with its own state. See
+/// [`peer::locate_all`].
+pub fn locate_all(remote: &crate::spine::RemoteDevice) -> alloc::vec::Vec<HvacPeer> {
+    peer::locate_all(remote, &DHW_CIRCUIT, &SUBJECT)
 }
 
 // ---- descriptors ---------------------------------------------------------------------

@@ -9,7 +9,8 @@
 use alloc::vec::Vec;
 
 use crate::model::{
-    CmdData, ElectricalConnectionPhaseName, MeasurementId, MeasurementValueState, ScopeType,
+    AbsoluteOrRelativeTime, CmdData, ElectricalConnectionPhaseName, MeasurementId,
+    MeasurementValueState, ScopeType,
 };
 
 use super::measurand::{Measurand, Quantity};
@@ -23,6 +24,22 @@ pub struct Reading {
     pub value: Option<f64>,
     /// Whether the value can be trusted ([MPC-003]).
     pub state: ReadingState,
+    /// When the unit says it took the reading, exactly as it sent it.
+    ///
+    /// Permitted by every measurement use case here and required by none ([MPC-002],
+    /// [MDT-002], [MRT-002], [MOT-002]), so [`None`] far more often than not — and what a
+    /// missing one means is the reader's decision.
+    ///
+    /// The obvious substitute is wrong: an appliance subscribes rather than polls, so the
+    /// arrival time of a notification is the age of the *change*, and a room holding its
+    /// temperature sends nothing at all. Ageing readings by arrival discards the ones most
+    /// likely to still be true, and cannot tell that room from a sensor that died an hour
+    /// ago. Only the peer knows when it measured.
+    ///
+    /// Kept as [`AbsoluteOrRelativeTime`] rather than a parsed instant because the element
+    /// is exactly that — a time *or* an ISO 8601 duration — and which one arrived is part
+    /// of what the peer said.
+    pub timestamp: Option<AbsoluteOrRelativeTime>,
 }
 
 /// What a measurement's `valueState` says about its value.
@@ -44,6 +61,14 @@ pub enum ReadingState {
 }
 
 impl Reading {
+    /// When the unit says it took the reading, where it said.
+    ///
+    /// See [`timestamp`](Self::timestamp) for why an absent one is not an error and not a
+    /// reason to substitute the arrival time.
+    pub fn taken_at(&self) -> Option<&AbsoluteOrRelativeTime> {
+        self.timestamp.as_ref()
+    }
+
     /// The value, if the unit did not flag it.
     ///
     /// [MPC-003], [MDT-005]: where `valueState` is `error` **or** `outOfRange` the content
@@ -161,6 +186,12 @@ impl Readings {
     /// Values whose `measurementId` has no description, or whose phases are not yet
     /// known, are dropped: a number without a meaning is worse than no number, because it
     /// invites a guess.
+    ///
+    /// **Give it the resolved state, not a fragment.** A notification may be partial, and
+    /// an omitted element then means *unchanged* (SPINE IG §3.3) — a measurement whose
+    /// `scale` is left out keeps the one already sent, so reading the fragment alone is off
+    /// by a power of ten. The same rule is what makes an absent `timestamp` here mean "this
+    /// peer sends none" rather than "this update left it out".
     pub fn apply(&mut self, data: &CmdData) -> Vec<Reading> {
         let CmdData::MeasurementListData(list) = data else {
             return Vec::new();
@@ -182,6 +213,11 @@ impl Readings {
                 measurand,
                 value: entry.value.as_ref().and_then(|v| v.to_f64()),
                 state,
+                // Only what the peer sent. Give this the *resolved* state and an absent
+                // element is a peer that sent no timestamp: a partial update that omits it
+                // leaves the stored one in place, which is §7.1.5's rule and not this
+                // reader's to second-guess.
+                timestamp: entry.timestamp.clone(),
             };
             match self.values.iter_mut().find(|(known, _)| *known == id) {
                 Some((_, stored)) => *stored = reading.clone(),
@@ -220,15 +256,45 @@ impl Readings {
 
     /// The latest reading of a measurand.
     pub fn get(&self, measurand: &Measurand) -> Option<Reading> {
+        self.latest(measurand).cloned()
+    }
+
+    /// The same, without copying it.
+    pub fn latest(&self, measurand: &Measurand) -> Option<&Reading> {
         self.values
             .iter()
             .find(|(_, reading)| reading.measurand == *measurand)
-            .map(|(_, reading)| reading.clone())
+            .map(|(_, reading)| reading)
     }
 
     /// The latest usable value of a measurand, in its unit.
     pub fn value(&self, measurand: &Measurand) -> Option<f64> {
-        self.get(measurand).and_then(|r| r.usable())
+        self.latest(measurand).and_then(Reading::usable)
+    }
+
+    /// The same value, with when the unit says it was taken.
+    ///
+    /// What a consumer that ages its inputs needs — see [`Reading::timestamp`] for why the
+    /// arrival time will not do. [`None`] whenever the peer sent none, which is the common
+    /// case, and what that means is the caller's decision.
+    ///
+    /// ```
+    /// use eebus::model::UnitOfMeasurement;
+    /// use eebus::usecases::hvac::mrt;
+    /// use eebus::usecases::monitoring::Readings;
+    ///
+    /// let mut readings = Readings::new();
+    /// readings.describe(&mrt::temperature_description());
+    /// readings.apply(&mrt::temperature_at(21.5, "2026-09-05T08:15:00Z".into()));
+    ///
+    /// let (degrees, taken_at) = readings.read_at(&mrt::MEASURAND).expect("a reading");
+    /// assert_eq!(degrees, 21.5);
+    /// assert_eq!(taken_at.map(|t| t.as_str()), Some("2026-09-05T08:15:00Z"));
+    /// # let _ = UnitOfMeasurement::DegC;
+    /// ```
+    pub fn read_at(&self, measurand: &Measurand) -> Option<(f64, Option<&AbsoluteOrRelativeTime>)> {
+        let reading = self.latest(measurand)?;
+        Some((reading.usable()?, reading.taken_at()))
     }
 
     /// The latest total active power, in watts — scenario 1 of MPC, scenario 2 of MGCP.
@@ -287,28 +353,7 @@ pub struct MonitoredUnitPeer {
     pub curtailment: Option<crate::model::FeatureAddress>,
 }
 
-/// Which monitored unit a reading came from: an **entity**, not a device.
-///
-/// One device is regularly several units. The use-case implementation guide §3.3 puts an
-/// actor's features on the entity that announced it, and nothing stops a device announcing
-/// the same actor on several entities — a heat-pump gateway publishes one `HVACRoom` per
-/// room ([`hvac::mrt`](crate::usecases::hvac::mrt)), and each room is its own
-/// `Measurement` feature with its own temperature. Keying a Monitoring Appliance by device
-/// would have the second room evict the first, and every notification after that resolve
-/// against the wrong one.
-///
-/// Obtained from [`MonitoredUnitPeer::id`], carried by every [`MonitoringEvent`], and what
-/// [`MonitoringApplianceActor::readings`] takes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct UnitId {
-    /// The device the unit is on.
-    pub device: crate::model::AddressDevice,
-    /// The entity path within it, as detailed discovery gave it: `[1]`, `[1, 2]`.
-    ///
-    /// Empty only for a peer whose features carried no entity address at all, which no
-    /// conformant discovery reply does.
-    pub entity: Vec<u32>,
-}
+pub use crate::usecases::UnitId;
 
 impl MonitoredUnitPeer {
     /// Which unit this is: its device and the entity its features live on.

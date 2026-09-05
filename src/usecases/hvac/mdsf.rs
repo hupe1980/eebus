@@ -57,6 +57,7 @@ use crate::model::{
 use crate::spine::LocalFeature;
 use crate::usecases::descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
 
+use super::peer::{self, HvacPeer, Subject};
 use super::system_function::{self, SystemFunction};
 use super::{DHW, system_function_id};
 
@@ -114,6 +115,10 @@ pub fn with_cdt(address: u32) -> LocalFeature {
     system_function::with_setpoint_relations(hvac_feature(address))
 }
 
+/// What this use case is about, for [`HvacApplianceActor`](super::HvacApplianceActor):
+/// which system function, which overrun where there is one, and which setpoint scope.
+pub const SUBJECT: Subject = Subject::mode_with_overrun(DHW, ONE_TIME_DHW);
+
 // ---- what a DHW Circuit publishes ---------------------------------------------------
 
 /// The system function description this use case publishes (Table 9).
@@ -163,6 +168,36 @@ pub fn overrun_state(status: HvacOverrunStatus) -> CmdData {
 /// A reader following this circuit's hot water.
 pub fn reader() -> SystemFunction {
     SystemFunction::dhw()
+}
+
+// ---- what a Monitoring Appliance finds ----------------------------------
+
+/// Finds a DHW circuit's features from its detailed discovery and use-case data.
+///
+/// The guide's §3.3 rule doing its work: the `HVAC` feature is the one on the entity that
+/// **announced this use case**, not whichever the appliance happens to carry. A device
+/// that heats water and two rooms has one `HVAC` feature per entity and every one of them
+/// answers to the same lookup by type.
+///
+/// Six reads and one subscription — the same six [`cdsf`](super::cdsf) needs, because the
+/// two use cases are the same data read and written. The subscription is what makes this
+/// use case worth having at all: a circuit whose mode is changed at the wall panel changes
+/// it without telling anybody otherwise.
+///
+/// Returns [`None`] until the peer has announced both the use case and the features its
+/// scenarios are served from. What comes next is [`HvacPeer::follow`], and it is not
+/// optional: a located peer is an address, not a conversation.
+pub fn locate(remote: &crate::spine::RemoteDevice) -> Option<HvacPeer> {
+    peer::locate(remote, &DHW_CIRCUIT, &SUBJECT)
+}
+
+/// Every DHW circuit on one device that serves it.
+///
+/// A device may hold more than one — a heat-pump gateway announces the use case once per
+/// entity — and each is its own `HVAC` feature with its own state. See
+/// [`peer::locate_all`].
+pub fn locate_all(remote: &crate::spine::RemoteDevice) -> alloc::vec::Vec<HvacPeer> {
+    peer::locate_all(remote, &DHW_CIRCUIT, &SUBJECT)
 }
 
 // ---- descriptors ---------------------------------------------------------------------

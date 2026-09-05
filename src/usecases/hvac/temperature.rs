@@ -24,10 +24,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::model::{
-    CmdData, FeatureType, MeasurementConstraintsData, MeasurementConstraintsListData,
-    MeasurementData, MeasurementDescriptionData, MeasurementDescriptionListData, MeasurementId,
-    MeasurementListData, MeasurementValueSource, MeasurementValueState, MeasurementValueType, Role,
-    ScaledNumber, UnitOfMeasurement,
+    AbsoluteOrRelativeTime, CmdData, FeatureType, MeasurementConstraintsData,
+    MeasurementConstraintsListData, MeasurementData, MeasurementDescriptionData,
+    MeasurementDescriptionListData, MeasurementId, MeasurementListData, MeasurementValueSource,
+    MeasurementValueState, MeasurementValueType, Role, ScaledNumber, UnitOfMeasurement,
 };
 use crate::spine::{LocalFeature, Operations};
 use crate::usecases::monitoring::{Measurand, MonitoredUnitPeer};
@@ -94,11 +94,23 @@ pub fn constraints(id: MeasurementId, min: f64, max: f64, step: Option<f64>) -> 
 /// `calculatedValue` from a model and a `measuredValue` from a sensor are different claims.
 /// `state` follows [MDT-005] / [MRT-005] / [MOT-005] — omit it for a good value, and set
 /// `outOfRange` or `error` for one the appliance **SHALL ignore**.
+///
+/// `taken_at` is the `timestamp` element, which [MDT-002], [MRT-002] and [MOT-002] all
+/// permit. It is worth sending, and the reason is on the *reader's* side: a subscribed
+/// value arrives when it changes, so a client that stamps it with the arrival time has the
+/// age of the notification and not the age of the measurement. A room holding its
+/// temperature sends nothing at all, and without this element that room is
+/// indistinguishable from a sensor that stopped. See
+/// [`Reading::timestamp`](crate::usecases::monitoring::Reading::timestamp).
+///
+/// What it must **not** become is a history: the same rules say "additional historical
+/// values are forbidden", and this sends one entry whatever else it carries.
 pub fn reported(
     id: MeasurementId,
     degrees: f64,
     source: MeasurementValueSource,
     state: Option<MeasurementValueState>,
+    taken_at: Option<AbsoluteOrRelativeTime>,
 ) -> CmdData {
     CmdData::MeasurementListData(MeasurementListData {
         measurement_data: Some(vec![MeasurementData {
@@ -107,8 +119,9 @@ pub fn reported(
             value: Some(ScaledNumber::from_f64(degrees, 1)),
             value_source: Some(source),
             value_state: state,
-            // Only the newest value, and no history. A timestamp is permitted and adds
-            // nothing here — a second entry would be the forbidden thing.
+            timestamp: taken_at,
+            // Only the newest value, and no history: one entry, always. A second one is
+            // the forbidden thing, not the timestamp above it.
             ..Default::default()
         }]),
     })

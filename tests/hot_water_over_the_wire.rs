@@ -25,7 +25,7 @@ use eebus::usecases::hvac::cdt;
 use eebus::usecases::hvac::mdt;
 use eebus::usecases::hvac::setpoint::{SetpointEffect, Setpoints, WriteRefused};
 use eebus::usecases::hvac::system_function::{ModeRefused, OverrunReport, Request, SystemFunction};
-use eebus::usecases::hvac::{cdsf, mdsf};
+use eebus::usecases::hvac::{HvacApplianceActor, HvacEvent, cdsf, mdsf};
 use eebus::usecases::monitoring::Readings;
 
 /// The circuit's own identifier for the hot water. Not 1, which is its room air setpoint.
@@ -53,6 +53,9 @@ struct Pair {
     requested: Vec<Result<Request, ModeRefused>>,
     /// Every acknowledgement the manager got back, by the counter it asked under.
     answers: Vec<(eebus::model::MsgCounter, eebus::spine::ErrorNumber)>,
+    /// The actor, where a test drives one, and everything it reported.
+    actor: Option<HvacApplianceActor>,
+    seen: Vec<HvacEvent>,
 }
 
 impl Pair {
@@ -171,11 +174,13 @@ impl Pair {
             own,
             requested: Vec::new(),
             answers: Vec::new(),
+            actor: None,
+            seen: Vec::new(),
         }
     }
 
-    /// Discovery, then the three reads a Configuration Appliance owes before it writes.
-    fn commission(&mut self) {
+    /// Both discovery reads, in both directions, and nothing else.
+    fn discover(&mut self) {
         let ours = node_management(self.manager.device().address());
         let theirs = node_management(self.circuit.device().address());
         for function in [
@@ -187,6 +192,17 @@ impl Pair {
             self.circuit.read(&ours, &theirs, function, self.now);
         }
         self.settle();
+    }
+
+    /// The peer as the manager knows it once discovery has settled.
+    fn peer(&self) -> &eebus::spine::RemoteDevice {
+        let device = self.circuit.device().address().clone();
+        self.manager.peer(&device).expect("the circuit")
+    }
+
+    /// Discovery, then the three reads a Configuration Appliance owes before it writes.
+    fn commission(&mut self) {
+        self.discover();
 
         // §3.4.1.1: **no binding**, and that is the specification's own instruction —
         // "Binding SHOULD NOT be used for this Scenario". Subscribe, to hear the circuit
@@ -296,6 +312,9 @@ impl Pair {
             for event in &events {
                 if let SpineEvent::ResultReceived { request, error } = event {
                     self.answers.push((*request, *error));
+                }
+                if let Some(actor) = self.actor.as_mut() {
+                    self.seen.extend(actor.handle_event(event));
                 }
                 if let SpineEvent::ReplyReceived { resolved, .. }
                 | SpineEvent::DataNotified { resolved, .. } = event
@@ -615,17 +634,95 @@ fn a_write_into_a_mode_the_circuit_is_not_in_is_refused() {
 /// Before MDSF has spoken, the gate says so rather than guessing.
 #[test]
 fn the_gate_refuses_while_the_mode_is_unknown() {
-    let known = cdt::reader();
+    use eebus::usecases::hvac::setpoint;
+
     let state = mdsf::reader();
+
+    // A reader that has read nothing at all cannot even say the setpoint exists, and says
+    // *that* rather than reasoning about modes it also knows nothing about.
+    assert_eq!(
+        cdt::reader().write_effective(THEIR_DHW, 60.0, &state),
+        Err(WriteRefused::UnknownSetpoint),
+    );
+
+    // The case that matters: CDT has been read and MDSF has not, which is the state a
+    // Configuration Appliance is in when it follows only the temperature half.
+    let mut known = cdt::reader();
+    known.learn(&setpoint::descriptions(&[(
+        THEIR_DHW,
+        cdt::TEMPERATURE_SCOPE,
+        UnitOfMeasurement::DegC,
+        None,
+    )]));
+    known.learn(&setpoint::constraints_of(&[(
+        THEIR_DHW,
+        40.0,
+        65.0,
+        Some(0.5),
+    )]));
+
     assert_eq!(
         known.effect_of(THEIR_DHW, &state),
         SetpointEffect::Unknown,
-        "nothing has been read yet"
+        "which mode the circuit is in has not been read"
     );
     assert_eq!(
         known.write_effective(THEIR_DHW, 60.0, &state),
         Err(WriteRefused::ModeUnknown),
         "and a manager writing a temperature into that is guessing"
+    );
+    assert_eq!(
+        known.current_setpoint(&state),
+        Err(WriteRefused::ModeUnknown),
+        "so there is no 'the' temperature to set either"
+    );
+}
+
+/// "Heat the water to 60" resolves to the setpoint the circuit is actually reading.
+///
+/// The chain a manager would otherwise walk by hand: the system function's identifier from
+/// the descriptions, the mode it is in from the state, the relation keyed by both, and only
+/// then a setpoint to write. Every number in it is the circuit's own — this one keeps its
+/// hot water on `3` and a room air temperature on `1`.
+#[test]
+fn the_temperature_to_set_is_the_one_the_current_mode_reads() {
+    let mut pair = Pair::new();
+    pair.commission();
+
+    assert_eq!(
+        pair.known.current_setpoint(&pair.state),
+        Ok(THEIR_DHW),
+        "not this crate's numbering, and not the first one described"
+    );
+    let write = pair
+        .known
+        .write_current(60.0, &pair.state)
+        .expect("the circuit is in a mode that reads it");
+    assert_eq!(
+        cdt::read_setpoint_write(&write, THEIR_DHW),
+        Some(60.0),
+        "and the write names it"
+    );
+
+    // Into `off`, which this circuit relates to no setpoint at all [CDT-003/3].
+    let feature = pair.hvac_feature.clone();
+    set(
+        &mut pair.circuit,
+        &feature,
+        mdsf::system_function_state(off(), false, Some(true)),
+    );
+    pair.circuit
+        .notify(&feature, &Function::HvacSystemFunctionListData, pair.now);
+    pair.settle();
+
+    assert_eq!(
+        pair.known.current_setpoint(&pair.state),
+        Err(WriteRefused::NotInCurrentMode),
+        "there is nothing an `off` circuit is working to"
+    );
+    assert_eq!(
+        pair.known.write_current(60.0, &pair.state),
+        Err(WriteRefused::NotInCurrentMode)
     );
 }
 
@@ -735,6 +832,7 @@ fn a_flagged_reading_is_not_acted_on() {
             120.0,
             MeasurementValueSource::MeasuredValue,
             Some(MeasurementValueState::OutOfRange),
+            None,
         ),
     );
     pair.circuit
@@ -994,4 +1092,363 @@ fn cdsf_a_mode_the_circuit_does_not_have_is_rejected_on_the_wire() {
         Some(&HvacOperationModeType::Auto),
         "and the circuit stayed where it was"
     );
+}
+
+/// [B1] Two calls instead of a hand-written commissioning, and the same state at the end.
+///
+/// `commission` above is what a Configuration Appliance had to write by hand: resolve the
+/// use case, resolve the feature on the entity that announced it, then name six functions
+/// for the mode and four for the temperature and hope none was forgotten. Every one of
+/// those is a chance to name the wrong actor, reach for the appliance's own entity instead
+/// of the one that announced the use case — §3.3's rule — or stop after the descriptions
+/// and be left with a reader that refuses every write with `FunctionUnknown`.
+///
+/// `locate` and `follow` are the same exchange with none of those choices left open. This
+/// asserts they arrive at the state the hand-written version does, because a convenience
+/// that reads *nearly* everything is worse than none.
+#[test]
+fn the_circuit_is_located_and_followed_in_two_calls() {
+    let mut pair = Pair::new();
+    pair.discover();
+
+    let (mode, temperature, tank) = {
+        let remote = pair.peer();
+        (
+            cdsf::locate(remote).expect("a circuit that announced CDSF"),
+            cdt::locate(remote).expect("and CDT"),
+            mdt::locate(remote).expect("and MDT"),
+        )
+    };
+
+    // §3.3: one `HVAC` feature carries both use cases, and both found the same one.
+    assert_eq!(mode.hvac, pair.hvac_feature);
+    assert_eq!(temperature.hvac, pair.hvac_feature);
+    assert_eq!(mode.setpoint, None, "a mode has no setpoint in scope");
+    assert_eq!(temperature.setpoint, Some(pair.setpoint_feature.clone()));
+    assert_eq!(tank.measurement, Some(pair.measurement_feature.clone()));
+
+    let client = pair.client.clone();
+    let now = pair.now;
+    let following = mode.follow(&mut pair.manager, &client, now);
+    temperature.follow(&mut pair.manager, &client, now);
+    pair.settle();
+
+    // Nothing was asked for that the circuit does not serve. A read of an undeclared
+    // function comes back `CommandNotSupported`, and `follow` reads discovery rather than
+    // guessing.
+    for (counter, error) in &pair.answers {
+        assert_eq!(
+            *error,
+            eebus::spine::ErrorNumber::None,
+            "{:?} was refused",
+            following.function_of(*counter)
+        );
+    }
+
+    // MDSF's whole scenario 1, from the six reads `follow` issued.
+    assert!(pair.state.is_complete(), "the mode reader answers");
+    assert_eq!(pair.state.mode(), Some(&HvacOperationModeType::Auto));
+    assert_eq!(pair.state.overrun(), Some(OverrunReport::Inactive));
+    assert_eq!(pair.state.mode_changeable(), Some(true));
+    assert!(
+        pair.state
+            .set_mode_named(&HvacOperationModeType::On)
+            .is_ok(),
+        "a reader that stopped after the descriptions would refuse this"
+    );
+    assert!(
+        pair.state.start_overrun().is_ok(),
+        "and one that skipped the overrun descriptions could not address it"
+    );
+
+    // CDT's, from the four the other call issued.
+    assert_eq!(pair.known.temperature(THEIR_DHW), Some(52.0));
+    assert_eq!(
+        pair.state.current_setpoints(&pair.known),
+        [THEIR_DHW],
+        "the join between the two halves, which needs both features read"
+    );
+    assert!(
+        pair.known
+            .write_effective(THEIR_DHW, 60.0, &pair.state)
+            .is_ok()
+    );
+}
+
+/// [B1] The whole hot water circuit through one actor: locate, follow, read, write.
+///
+/// What a Configuration Appliance had to assemble by hand — a reader per system function, a
+/// reader per setpoint scope, a routing table from feature address to unit, change
+/// detection so a re-notified mode is not reported as a change, and the join that makes
+/// "heat the water to 60" resolve to the setpoint the circuit's *current mode* actually
+/// reads. All of it is bookkeeping, none of it is the application's subject, and every one
+/// of them is a place to get the circuit's own numbering wrong.
+#[test]
+fn the_actor_commissions_a_circuit_and_writes_through_it() {
+    use eebus::usecases::hvac::DHW;
+
+    let mut pair = Pair::new();
+    pair.actor = Some(HvacApplianceActor::new(pair.client.clone()));
+    pair.discover();
+
+    let (mode, temperature) = {
+        let remote = pair.peer();
+        (
+            cdsf::locate(remote).expect("a circuit that announced CDSF"),
+            cdt::locate(remote).expect("and CDT"),
+        )
+    };
+    assert_eq!(mode.id(), temperature.id(), "one entity, two use cases");
+    let unit = mode.id();
+
+    let now = pair.now;
+    let mut actor = pair.actor.take().expect("the actor");
+    actor.attach(&mut pair.manager, mode, now);
+    actor.attach(&mut pair.manager, temperature, now);
+    pair.actor = Some(actor);
+    pair.settle();
+
+    let actor = pair.actor.as_ref().expect("the actor");
+    assert_eq!(
+        actor.units().collect::<Vec<_>>(),
+        [&unit],
+        "one unit, not two"
+    );
+    assert!(
+        pair.seen.contains(&HvacEvent::FunctionDescribed {
+            unit: unit.clone(),
+            function: DHW,
+        }),
+        "scenario 1 can be reported: {:?}",
+        pair.seen
+    );
+    assert!(
+        pair.seen.iter().any(|e| matches!(
+            e,
+            HvacEvent::ModeChanged { mode, .. } if *mode == HvacOperationModeType::Auto
+        )),
+        "and the mode it is in arrived"
+    );
+    assert_eq!(actor.mode(&unit, &DHW), Some(&HvacOperationModeType::Auto));
+    assert_eq!(
+        actor.system_function(&unit, &DHW).and_then(|f| f.overrun()),
+        Some(OverrunReport::Inactive)
+    );
+
+    // The join: not "setpoint 3 is 52" but "what this circuit is working to right now".
+    assert_eq!(
+        actor.temperature(&unit, &DHW),
+        Some((THEIR_DHW, 52.0)),
+        "resolved through the function's id, the mode it is in, and the relation"
+    );
+    assert_eq!(
+        actor.temperature(&unit, &eebus::usecases::hvac::HEATING),
+        None,
+        "this circuit heats no room, and nothing was attached for one"
+    );
+
+    // Write it, without naming the circuit's own setpoint identifier.
+    pair.seen.clear();
+    let actor = pair.actor.take().expect("the actor");
+    actor
+        .set_temperature(&mut pair.manager, &unit, &DHW, 60.0, now)
+        .expect("the circuit is in a mode that reads it");
+    pair.actor = Some(actor);
+    pair.settle();
+    assert_eq!(
+        pair.applied,
+        [(THEIR_DHW, 60.0)],
+        "the circuit applied it to the setpoint its current mode reads"
+    );
+    assert!(
+        pair.seen.contains(&HvacEvent::SetpointChanged {
+            unit: unit.clone(),
+            setpoint: THEIR_DHW,
+            degrees: 60.0,
+        }),
+        "and the subscription reported it back: {:?}",
+        pair.seen
+    );
+
+    // The mode, by name, and the one-time loading.
+    pair.seen.clear();
+    let actor = pair.actor.take().expect("the actor");
+    actor
+        .set_mode(
+            &mut pair.manager,
+            &unit,
+            &DHW,
+            &HvacOperationModeType::On,
+            now,
+        )
+        .expect("a mode this circuit relates to");
+    actor
+        .start_overrun(&mut pair.manager, &unit, &DHW, now)
+        .expect("a circuit that described its one-time loading");
+    pair.actor = Some(actor);
+    pair.settle();
+
+    assert_eq!(
+        pair.requested,
+        [
+            Ok(Request::SetMode(on())),
+            Ok(Request::StartOverrun(mdsf::OVERRUN_ID)),
+        ],
+        "both reached the circuit as the requests they were"
+    );
+    assert!(
+        pair.seen.iter().any(|e| matches!(
+            e,
+            HvacEvent::ModeChanged { mode, .. } if *mode == HvacOperationModeType::On
+        )),
+        "and the change came back over the subscription: {:?}",
+        pair.seen
+    );
+    assert_eq!(
+        pair.actor.as_ref().and_then(|a| a.mode(&unit, &DHW)),
+        Some(&HvacOperationModeType::On)
+    );
+
+    // A mode the circuit never described is refused here rather than on the wire.
+    let actor = pair.actor.as_ref().expect("the actor");
+    assert_eq!(
+        actor
+            .set_mode(
+                &mut pair.manager,
+                &unit,
+                &DHW,
+                &HvacOperationModeType::Eco,
+                now
+            )
+            .unwrap_err(),
+        ModeRefused::NotRelated,
+        "this circuit relates auto, on and off — not eco"
+    );
+}
+
+/// [MDSF-002] `finished` is announced once, and the next payload does not announce it again.
+///
+/// The flag lives in the reader until another overrun payload replaces it, which is right
+/// for a caller asking "did one just finish?" and wrong for an actor that consults it on
+/// every payload. A circuit notifies its whole `HVAC` feature, so the mode change that
+/// follows a completed heating would otherwise re-announce it — and an application acting on
+/// that would think two heatings had run.
+#[test]
+fn a_completed_heating_is_announced_once() {
+    use eebus::usecases::hvac::DHW;
+
+    let mut pair = Pair::new();
+    pair.actor = Some(HvacApplianceActor::new(pair.client.clone()));
+    pair.discover();
+
+    let circuit = cdsf::locate(pair.peer()).expect("a circuit that announced CDSF");
+    let unit = circuit.id();
+    let now = pair.now;
+    let mut actor = pair.actor.take().expect("the actor");
+    actor.attach(&mut pair.manager, circuit, now);
+    pair.actor = Some(actor);
+    pair.settle();
+
+    let feature = pair.hvac_feature.clone();
+    pair.seen.clear();
+    set(
+        &mut pair.circuit,
+        &feature,
+        mdsf::overrun_state(HvacOverrunStatus::Finished),
+    );
+    pair.circuit
+        .notify(&feature, &Function::HvacOverrunListData, pair.now);
+    pair.settle();
+    assert_eq!(
+        pair.seen
+            .iter()
+            .filter(|e| matches!(e, HvacEvent::OverrunFinished { .. }))
+            .count(),
+        1,
+        "once: {:?}",
+        pair.seen
+    );
+
+    // Anything else on the same feature afterwards, which is the ordinary case.
+    pair.seen.clear();
+    set(
+        &mut pair.circuit,
+        &feature,
+        mdsf::system_function_state(on(), false, Some(true)),
+    );
+    pair.circuit
+        .notify(&feature, &Function::HvacSystemFunctionListData, pair.now);
+    pair.settle();
+
+    assert!(
+        pair.seen.iter().any(|e| matches!(
+            e,
+            HvacEvent::ModeChanged { mode, .. } if *mode == HvacOperationModeType::On
+        )),
+        "the mode change was reported"
+    );
+    assert!(
+        !pair
+            .seen
+            .iter()
+            .any(|e| matches!(e, HvacEvent::OverrunFinished { .. })),
+        "and the heating that finished before it was not announced a second time: {:?}",
+        pair.seen
+    );
+    assert_eq!(
+        pair.actor
+            .as_ref()
+            .and_then(|a| a.system_function(&unit, &DHW))
+            .and_then(|f| f.overrun()),
+        Some(OverrunReport::Inactive),
+        "`finished` is not a state to rest in (Table 14)"
+    );
+}
+
+/// A temperature write with no system-function use case attached is refused, not guessed.
+///
+/// [CDT-005] makes MDSF or CDSF mandatory for a circuit that serves CDT, and this is the
+/// reason: without one, "which mode is it in" has no answer, and a setpoint written into a
+/// mode the circuit is not in is applied, acknowledged and heats nothing.
+#[test]
+fn the_temperature_half_alone_cannot_say_what_a_write_would_do() {
+    use eebus::usecases::hvac::DHW;
+
+    let mut pair = Pair::new();
+    pair.actor = Some(HvacApplianceActor::new(pair.client.clone()));
+    pair.discover();
+
+    let temperature = cdt::locate(pair.peer()).expect("a circuit that announced CDT");
+    let unit = temperature.id();
+    let now = pair.now;
+    let mut actor = pair.actor.take().expect("the actor");
+    actor.attach(&mut pair.manager, temperature, now);
+    pair.actor = Some(actor);
+    pair.settle();
+
+    let actor = pair.actor.as_ref().expect("the actor");
+    assert!(
+        actor.setpoints(&unit, &DHW).is_some(),
+        "the setpoints themselves arrived"
+    );
+    assert_eq!(
+        actor.set_temperature(&mut pair.manager, &unit, &DHW, 60.0, now),
+        Err(WriteRefused::ModeUnknown),
+        "nothing said which mode the circuit is in"
+    );
+    assert_eq!(
+        actor.effect(&unit, &DHW, THEIR_DHW),
+        SetpointEffect::Unknown
+    );
+
+    // Pre-loading is the one write that does not need it, and it still checks the range.
+    assert!(
+        actor
+            .preload_setpoint(&mut pair.manager, &unit, &DHW, THEIR_DHW, 60.0, now)
+            .is_ok()
+    );
+    assert!(matches!(
+        actor.preload_setpoint(&mut pair.manager, &unit, &DHW, THEIR_DHW, 99.0, now),
+        Err(WriteRefused::OutOfRange { .. })
+    ));
 }

@@ -72,12 +72,18 @@
 //! |---|---|
 //! | `Duration` | a deadline is always pending, because this actor produces a heartbeat. `ControllableSystemActor`, `EnergyGuardActor`, the guard side of [`emobility::charging`] |
 //! | `Option<Duration>` | there may be nothing to wait for. Every state machine — [`limitation::ControllableSystem`], [`cob::BatteryControl`] — and the actors that produce no heartbeat of their own |
-//! | *absent* | this actor has no timers at all. [`monitoring::MonitoringApplianceActor`] reads descriptions and subscribes; the engine owns the retry ladder for both |
+//! | *absent* | this actor has no timers at all. [`monitoring::MonitoringApplianceActor`] and [`hvac::HvacApplianceActor`] read descriptions and subscribe; the engine owns the retry ladder for all three |
 //!
 //! That is a rule rather than an inconsistency, and it is the reason the types differ: an
 //! actor that must beat has a deadline it cannot be without, and saying so in the type is
 //! worth more than a uniform signature that would make every caller unwrap a `Some` that
 //! is always there.
+//!
+//! `handle_event` returns what the actor made of one engine event: an `Option` almost
+//! everywhere, and a `Vec` from [`hvac::HvacApplianceActor`] alone. That is the payloads
+//! rather than a taste: one `hvacSystemFunctionListData` carries every system function the
+//! appliance has, so a single notification legitimately moves a room's heating *and* its
+//! cooling, and there is no one event to return.
 //!
 //! A driver with several actors on one engine folds what they report and sleeps until the
 //! earliest, then hands the same `now` to each `handle_timeout`. Order does not matter
@@ -102,5 +108,7 @@ pub mod mpc;
 pub mod mps;
 pub mod ohpcf;
 pub mod signals;
+mod unit;
 
 pub use descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
+pub use unit::UnitId;

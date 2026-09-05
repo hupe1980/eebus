@@ -204,12 +204,8 @@ fn a_monitored_unit_reports_its_measurands_and_their_value_states() {
         .with(Measurand::total_power())
         .with(Measurand::on(Quantity::Current, Phase::A))
         .with_range(Measurand::on(Quantity::Current, Phase::A), 0.0, 32.0);
-    unit.set(&Measurand::total_power(), -2_300.0, Duration::ZERO);
-    unit.set(
-        &Measurand::on(Quantity::Current, Phase::A),
-        40.0,
-        Duration::ZERO,
-    );
+    unit.set(&Measurand::total_power(), -2_300.0);
+    unit.set(&Measurand::on(Quantity::Current, Phase::A), 40.0);
 
     let signals = unit.signals(());
     assert_eq!(

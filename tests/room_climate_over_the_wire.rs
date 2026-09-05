@@ -28,7 +28,9 @@ use eebus::model::{
 use eebus::spine::{Engine, LocalDevice, LocalEntity, SpineEvent, node_management};
 use eebus::usecases::hvac::setpoint::{SetpointEffect, Setpoints, WriteRefused};
 use eebus::usecases::hvac::system_function::{ModeRefused, Request, SystemFunction};
-use eebus::usecases::hvac::{self, crcsf, crct, crhsf, crht, mrcsf, mrhsf, mrt};
+use eebus::usecases::hvac::{
+    self, HvacApplianceActor, HvacEvent, crcsf, crct, crhsf, crht, mrcsf, mrhsf, mrt,
+};
 use eebus::usecases::limitation;
 use eebus::usecases::monitoring::Readings;
 
@@ -56,6 +58,11 @@ struct Room {
     /// write against. One reader each: they are two functions on one feature.
     own_heating: SystemFunction,
     own_cooling: SystemFunction,
+    /// Every acknowledgement the manager got back, by the counter it asked under.
+    answers: Vec<(eebus::model::MsgCounter, eebus::spine::ErrorNumber)>,
+    /// The actor, where a test drives one, and everything it reported.
+    actor: Option<HvacApplianceActor>,
+    seen: Vec<HvacEvent>,
     now: Duration,
 }
 
@@ -216,12 +223,15 @@ impl Room {
             applied: Vec::new(),
             own_heating: own(mrhsf::reader(), heating_id, hvac::HEATING, &modes),
             own_cooling: own(mrcsf::reader(), cooling_id, hvac::COOLING, &modes),
+            answers: Vec::new(),
+            actor: None,
+            seen: Vec::new(),
             now,
         }
     }
 
-    /// Discovery, then every function of the three features — and **no binding request**.
-    fn commission(&mut self) {
+    /// Both discovery reads, and nothing else.
+    fn discover(&mut self) {
         let ours = node_management(self.manager.device().address());
         let theirs = node_management(self.room.device().address());
         for function in [
@@ -231,6 +241,17 @@ impl Room {
             self.manager.read(&theirs, &ours, function, self.now);
         }
         self.settle();
+    }
+
+    /// The room as the manager knows it once discovery has settled.
+    fn peer(&self) -> &eebus::spine::RemoteDevice {
+        let device = self.room.device().address().clone();
+        self.manager.peer(&device).expect("the room")
+    }
+
+    /// Discovery, then every function of the three features — and **no binding request**.
+    fn commission(&mut self) {
+        self.discover();
 
         for function in [
             Function::HvacSystemFunctionDescriptionListData,
@@ -359,6 +380,12 @@ impl Room {
                 core::iter::from_fn(|| self.manager.poll_event()).collect();
             for event in &events {
                 moved = true;
+                if let Some(actor) = self.actor.as_mut() {
+                    self.seen.extend(actor.handle_event(event));
+                }
+                if let SpineEvent::ResultReceived { request, error } = event {
+                    self.answers.push((*request, *error));
+                }
                 if let SpineEvent::ReplyReceived { resolved, .. }
                 | SpineEvent::DataNotified { resolved, .. } = event
                 {
@@ -702,5 +729,241 @@ fn a_write_for_one_system_function_is_not_claimed_by_the_other() {
         room.heating.mode(),
         Some(&HvacOperationModeType::Auto),
         "and the heating did not"
+    );
+}
+
+/// [B1] Four use cases on one `HVAC` feature, each located and followed on its own.
+///
+/// The hard case for a lookup by feature type: this room serves heating, cooling and both
+/// temperatures from the *same* `HVAC` feature, so every one of the four `locate` calls
+/// returns the same address — and that is right, because §3.2.2.2.1 gives an entity one
+/// feature of a type. What tells the use cases apart is not the address but the
+/// `systemFunctionType` each reader is told to follow, which is why locating cannot be the
+/// end of it.
+#[test]
+fn every_use_case_on_one_feature_is_located_and_followed_separately() {
+    let mut room = Room::new();
+    room.discover();
+
+    let (heating, cooling, warm, cool, thermometer) = {
+        let remote = room.peer();
+        (
+            crhsf::locate(remote).expect("room heating"),
+            crcsf::locate(remote).expect("room cooling"),
+            crht::locate(remote).expect("the heating setpoint"),
+            crct::locate(remote).expect("the cooling setpoint"),
+            mrt::locate(remote).expect("the thermometer"),
+        )
+    };
+    for peer in [&heating, &cooling, &warm, &cool] {
+        assert_eq!(
+            peer.hvac, room.hvac_feature,
+            "one entity, one `HVAC` feature, four use cases"
+        );
+    }
+    assert_eq!(heating.setpoint, None);
+    assert_eq!(warm.setpoint, Some(room.setpoint_feature.clone()));
+    assert_eq!(cool.setpoint, Some(room.setpoint_feature.clone()));
+    assert_eq!(
+        thermometer.measurement,
+        Some(room.measurement_feature.clone())
+    );
+
+    let client = room.client.clone();
+    let now = room.now;
+    let following = heating.follow(&mut room.manager, &client, now);
+    cooling.follow(&mut room.manager, &client, now);
+    warm.follow(&mut room.manager, &client, now);
+    room.settle();
+
+    for (counter, error) in &room.answers {
+        assert_eq!(
+            *error,
+            eebus::spine::ErrorNumber::None,
+            "{:?} was refused",
+            following.function_of(*counter)
+        );
+    }
+
+    // Both readers were fed from the same four payloads and disagree about the mode,
+    // because they follow different system functions.
+    assert!(room.heating.is_complete() && room.cooling.is_complete());
+    assert_eq!(room.heating.mode(), Some(&HvacOperationModeType::Auto));
+    assert_eq!(
+        room.heating.system_function(),
+        Some(hvac::system_function_id(&hvac::HEATING))
+    );
+    assert_eq!(
+        room.cooling.system_function(),
+        Some(hvac::system_function_id(&hvac::COOLING))
+    );
+    assert_eq!(
+        room.heating.overrun(),
+        None,
+        "no overrun is in scope outside the hot water"
+    );
+
+    // The join, for the heating: the setpoint `auto` actually uses.
+    assert_eq!(
+        room.heating.current_setpoints(&room.setpoints),
+        [THEIR_HEATING]
+    );
+    assert_eq!(
+        room.cooling.current_setpoints(&room.setpoints),
+        [THEIR_COOLING],
+        "the same mode identifier, a different function, a different setpoint"
+    );
+}
+
+/// [B1] One room, four use cases, one actor — and the heating and the cooling do not mix.
+///
+/// The hardest case the family has, and the one every part of this design exists for. This
+/// room serves `crhsf`, `crcsf`, `crht` and `crct` from **one** `HVAC` feature and **one**
+/// `Setpoint` feature: both system functions arrive in the same lists under the same
+/// `operationModeId`s, and both setpoints are `roomAirTemperature` in `degC`. Nothing about
+/// a payload says which is which. What separates them is the `systemFunctionId` the
+/// relations are keyed by, and a manager that got it wrong would ask for 21 °C of heating
+/// and write the cooling setpoint — the room applies it, acknowledges it, and gets colder.
+#[test]
+fn the_actor_keeps_a_rooms_heating_and_cooling_apart() {
+    let mut room = Room::new();
+    room.actor = Some(HvacApplianceActor::new(room.client.clone()));
+    room.discover();
+
+    let peers = {
+        let remote = room.peer();
+        [
+            crhsf::locate(remote).expect("room heating"),
+            crcsf::locate(remote).expect("room cooling"),
+            crht::locate(remote).expect("the heating setpoint"),
+            crct::locate(remote).expect("the cooling setpoint"),
+        ]
+    };
+    let unit = peers[0].id();
+    assert!(
+        peers.iter().all(|peer| peer.id() == unit),
+        "four use cases, one entity, one unit"
+    );
+
+    let now = room.now;
+    let mut actor = room.actor.take().expect("the actor");
+    for peer in peers {
+        actor.attach(&mut room.manager, peer, now);
+    }
+    room.actor = Some(actor);
+    room.settle();
+
+    let actor = room.actor.as_ref().expect("the actor");
+    assert_eq!(actor.units().count(), 1);
+    for function in [hvac::HEATING, hvac::COOLING] {
+        assert!(
+            room.seen.contains(&HvacEvent::FunctionDescribed {
+                unit: unit.clone(),
+                function: function.clone(),
+            }),
+            "{function:?} was described: {:?}",
+            room.seen
+        );
+        assert_eq!(
+            actor.mode(&unit, &function),
+            Some(&HvacOperationModeType::Auto)
+        );
+    }
+
+    // The whole point: the same mode, the same reader, two different setpoints.
+    assert_eq!(
+        actor.temperature(&unit, &hvac::HEATING),
+        Some((THEIR_HEATING, 20.0))
+    );
+    assert_eq!(
+        actor.temperature(&unit, &hvac::COOLING),
+        Some((THEIR_COOLING, 26.0))
+    );
+    assert!(
+        core::ptr::eq(
+            actor.setpoints(&unit, &hvac::HEATING).expect("a reader"),
+            actor.setpoints(&unit, &hvac::COOLING).expect("a reader"),
+        ),
+        "and it really is one reader: they share `roomAirTemperature`"
+    );
+
+    // Ask for warmth, and only the heating setpoint moves.
+    room.seen.clear();
+    let actor = room.actor.take().expect("the actor");
+    actor
+        .set_temperature(&mut room.manager, &unit, &hvac::HEATING, 21.5, now)
+        .expect("the room is in a mode that reads it");
+    room.actor = Some(actor);
+    room.settle();
+
+    assert_eq!(room.applied, [Ok(Applied::Setpoint(THEIR_HEATING, 21.5))]);
+    assert!(
+        room.seen.contains(&HvacEvent::SetpointChanged {
+            unit: unit.clone(),
+            setpoint: THEIR_HEATING,
+            degrees: 21.5,
+        }),
+        "reported back under the identifier the room published: {:?}",
+        room.seen
+    );
+    let actor = room.actor.as_ref().expect("the actor");
+    assert_eq!(
+        actor.temperature(&unit, &hvac::HEATING),
+        Some((THEIR_HEATING, 21.5))
+    );
+    assert_eq!(
+        actor.temperature(&unit, &hvac::COOLING),
+        Some((THEIR_COOLING, 26.0)),
+        "and the cooling setpoint was not touched"
+    );
+
+    // `off` relates to no setpoint at all [CRHT-003/3], so there is nothing to set.
+    room.seen.clear();
+    let actor = room.actor.take().expect("the actor");
+    actor
+        .set_mode(
+            &mut room.manager,
+            &unit,
+            &hvac::HEATING,
+            &HvacOperationModeType::Off,
+            now,
+        )
+        .expect("a mode this room relates to");
+    room.actor = Some(actor);
+    room.settle();
+
+    let actor = room.actor.as_ref().expect("the actor");
+    assert_eq!(
+        actor.mode(&unit, &hvac::HEATING),
+        Some(&HvacOperationModeType::Off)
+    );
+    assert_eq!(
+        actor.mode(&unit, &hvac::COOLING),
+        Some(&HvacOperationModeType::Auto),
+        "the write named one system function and moved only that one"
+    );
+    assert_eq!(
+        actor.set_temperature(&mut room.manager, &unit, &hvac::HEATING, 22.0, now),
+        Err(WriteRefused::NotInCurrentMode),
+        "an `off` heating reads no setpoint; a write would be applied and heat nothing"
+    );
+    assert_eq!(
+        actor.temperature(&unit, &hvac::HEATING),
+        None,
+        "and there is no temperature it is working to"
+    );
+    assert!(
+        actor
+            .set_temperature(&mut room.manager, &unit, &hvac::COOLING, 25.0, now)
+            .is_ok(),
+        "the cooling is still in `auto`, and its setpoint is still live"
+    );
+
+    // No overrun outside the hot water, and the actor says so rather than inventing one.
+    assert_eq!(
+        actor
+            .start_overrun(&mut room.manager, &unit, &hvac::HEATING, now)
+            .unwrap_err(),
+        ModeRefused::NoOverrun
     );
 }

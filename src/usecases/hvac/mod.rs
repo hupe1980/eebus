@@ -22,7 +22,38 @@
 //!   system function their relations name.
 //! * [`temperature`] — the thermometer. Three, told apart by `scopeType`.
 //!
+//! [`HvacApplianceActor`] is the client side of all nine `HVAC` use cases with the
+//! bookkeeping done. The rest of this page is what its calls have to get right.
+//!
+//! ```no_run
+//! # use core::time::Duration;
+//! use eebus::usecases::hvac::{self, HvacApplianceActor, cdsf, cdt};
+//! # fn example(
+//! #     engine: &mut eebus::spine::Engine,
+//! #     remote: &eebus::spine::RemoteDevice,
+//! #     client: &eebus::model::FeatureAddress,
+//! #     now: Duration,
+//! # ) -> Option<()> {
+//! let mut appliance = HvacApplianceActor::new(client.clone());
+//! appliance.attach(engine, cdsf::locate(remote)?, now);
+//! appliance.attach(engine, cdt::locate(remote)?, now);
+//!
+//! let unit = appliance.units().next()?.clone();
+//! appliance.set_temperature(engine, &unit, &hvac::DHW, 60.0, now).ok()?;
+//! # Some(())
+//! # }
+//! ```
+//!
 //! # How a manager uses them
+//!
+//! 0. **Find it, and start talking.** Each use case has a `locate` and a `locate_all`: the
+//!    feature is the one on the entity that *announced the actor* (use-case implementation
+//!    guide §3.3), and a gateway with four rooms has four `HVAC` features a lookup by type
+//!    cannot choose between. Then [`peer::HvacPeer::follow`], which subscribes and reads
+//!    the whole scenario table at once. [`mdt`], [`mrt`] and [`mot`] have their own
+//!    `locate`, returning a
+//!    [`MonitoredUnitPeer`](crate::usecases::monitoring::MonitoredUnitPeer) for the
+//!    measurement layer instead.
 //!
 //! 1. **Will the write reach anything?** A setpoint is addressed *through* an operation
 //!    mode, so one written into a mode the appliance is not in is applied, acknowledged and
@@ -32,7 +63,11 @@
 //!    [`cdsf`], [`crhsf`] and [`crcsf`] change the mode; [`cdsf`] scenario 2 starts a
 //!    one-time hot water loading outright.
 //! 3. **Did it work?** [`mdt`] and [`mrt`] are thermometers. A setpoint is a request, and
-//!    what the water and the room got to is a different number.
+//!    what the water and the room got to is a different number. They go through the
+//!    measurement layer, whose
+//!    [`MonitoringApplianceActor`](crate::usecases::monitoring::MonitoringApplianceActor)
+//!    keys them by the same [`UnitId`](crate::usecases::UnitId) — so a room's temperature
+//!    and its setpoint answer to one key.
 //!
 //! [`mrt`], [`mot`] and the heat delivered between them are also the three signals a
 //! building's thermal model is fitted from — which is what turns a forecast into a
@@ -79,6 +114,9 @@ use crate::model::{
     HvacSystemFunctionType,
 };
 
+mod appliance;
+pub use appliance::*;
+
 pub mod cdsf;
 pub mod cdt;
 pub mod crcsf;
@@ -91,6 +129,7 @@ pub mod mot;
 pub mod mrcsf;
 pub mod mrhsf;
 pub mod mrt;
+pub mod peer;
 pub mod setpoint;
 pub mod system_function;
 pub mod temperature;

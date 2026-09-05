@@ -12,6 +12,19 @@
 //! authentication, the five-phase SHIP handshake, SPINE discovery, the binding and the
 //! subscription, and a consumption limit that `eebus-go` writes and this crate accepts.
 //!
+//! Three tests, and the third is the one a household device needs. Two of them have this
+//! crate **dialling** a container that listens — as an Energy Guard against their `evse`,
+//! and as a Controllable System against their `controlbox`. That is the wrong way round for
+//! the installation §14a describes: the control box goes to the appliance, and the appliance
+//! holds the listener open. So `eebus_go_dials_this_crate_listening` turns it around —
+//! `Hub::listen` plus an `_ship._tcp` announcement on this side, and their control box
+//! discovering it from inside the container. It needs the host's own network stack, because
+//! `eebus-go`'s examples take `-remoteski` and then *find* that SKI over mDNS: there is no
+//! address to hand them, and multicast does not cross Docker's bridge. `--network host` is
+//! honoured only by a native Linux daemon, so elsewhere the test says which case it skipped
+//! for rather than reporting a pass. `tests/interop/Dockerfile` carries the recipe for
+//! pointing the peer at a listener of your own — a `hemsd`, say — rather than at this test's.
+//!
 //! # Why not `testcontainers`
 //!
 //! It is the obvious tool and it was the wrong one here. This crate's dependency set is

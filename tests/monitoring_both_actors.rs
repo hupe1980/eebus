@@ -160,9 +160,9 @@ fn the_appliance_commissions_a_unit_and_then_reads_it() {
 
     let unit = pair.unit();
     // The unit measures something new and notifies its subscriber.
-    pair.unit.set(&Measurand::total_power(), 2_300.0, pair.now);
+    pair.unit.set(&Measurand::total_power(), 2_300.0);
     pair.unit
-        .set(&Measurand::on(Quantity::Current, Phase::A), 3.5, pair.now);
+        .set(&Measurand::on(Quantity::Current, Phase::A), 3.5);
     let measurement = pair.measurement.clone();
     pair.unit
         .notify(&mut pair.unit_engine, &measurement, pair.now);
@@ -723,5 +723,48 @@ fn a_peer_that_serves_none_of_the_features_is_not_located() {
         )
         .is_none(),
         "and serves none of its features, so there is nothing to attach to"
+    );
+}
+
+/// [F1] A Monitored Unit stamps a reading, and the appliance reads the stamp back.
+///
+/// The two halves of the same element. `set_at` is the only way this crate sends a
+/// `timestamp`, because a timestamp is a wall-clock fact and this crate has no clock —
+/// the engine's `now` is monotonic uptime, which is not a time of day and must never be
+/// passed off as one.
+#[test]
+fn a_stamped_measurement_survives_the_round_trip() {
+    let mut pair = Pair::new();
+    pair.commission();
+    let unit = pair.unit();
+
+    pair.unit.set_at(
+        &Measurand::total_power(),
+        2_300.0,
+        "2026-09-05T08:15:00Z".into(),
+    );
+    let measurement = pair.measurement.clone();
+    pair.unit
+        .notify(&mut pair.unit_engine, &measurement, pair.now);
+    pair.settle();
+
+    let readings = pair.appliance.readings(&unit).expect("the unit");
+    let (watts, taken_at) = readings
+        .read_at(&Measurand::total_power())
+        .expect("a stamped reading");
+    assert_eq!(watts, 2_300.0);
+    assert_eq!(taken_at.map(|t| t.as_str()), Some("2026-09-05T08:15:00Z"));
+
+    // An unstamped reading afterwards does not keep the old time.
+    pair.unit.set(&Measurand::total_power(), 2_400.0);
+    pair.unit
+        .notify(&mut pair.unit_engine, &measurement, pair.now);
+    pair.settle();
+    assert_eq!(
+        pair.appliance
+            .readings(&unit)
+            .and_then(|r| r.read_at(&Measurand::total_power())),
+        Some((2_400.0, None)),
+        "a new reading taken at an unstated time is not the old one's time"
     );
 }

@@ -146,7 +146,7 @@ fn the_grid_connection_point_names_its_energies_from_the_grids_side() {
 fn a_measurement_without_a_description_is_not_reported() {
     let mut link = Link::consuming();
     // No commissioning: the manager has read no descriptions.
-    link.unit.set(&Measurand::total_power(), 2_300.0, link.now);
+    link.unit.set(&Measurand::total_power(), 2_300.0);
 
     let mut readings = Readings::new();
     assert!(readings.apply(&link.unit.measurements()).is_empty());

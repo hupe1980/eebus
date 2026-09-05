@@ -30,8 +30,8 @@
 //! let mut car = evcem::monitored_unit(1)
 //!     .with(Measurand::on(Quantity::Current, Phase::A))
 //!     .with(Measurand::unphased(Quantity::EnergyCharged));
-//! car.set(&Measurand::on(Quantity::Current, Phase::A), 15.8, Duration::ZERO);
-//! car.set(&Measurand::unphased(Quantity::EnergyCharged), 8_400.0, Duration::ZERO);
+//! car.set(&Measurand::on(Quantity::Current, Phase::A), 15.8);
+//! car.set(&Measurand::unphased(Quantity::EnergyCharged), 8_400.0);
 //!
 //! // What the energy manager makes of it, having read the descriptions first.
 //! let mut readings = Readings::new();
@@ -191,7 +191,6 @@ mod tests {
     };
     use crate::usecases::monitoring::{Measurand, Quantity};
     use alloc::vec::Vec;
-    use core::time::Duration;
 
     /// Table 6: the three descriptions, each with the scope its scenario fixes.
     #[test]
@@ -257,16 +256,8 @@ mod tests {
         let mut car = monitored_unit(1)
             .with(Measurand::on(Quantity::Current, Phase::A))
             .with(Measurand::on(Quantity::Current, Phase::B));
-        car.set(
-            &Measurand::on(Quantity::Current, Phase::A),
-            16.0,
-            Duration::ZERO,
-        );
-        car.set(
-            &Measurand::on(Quantity::Current, Phase::B),
-            6.0,
-            Duration::ZERO,
-        );
+        car.set(&Measurand::on(Quantity::Current, Phase::A), 16.0);
+        car.set(&Measurand::on(Quantity::Current, Phase::B), 6.0);
 
         let mut readings = Readings::new();
         readings.describe(&car.measurement_descriptions());

@@ -162,21 +162,9 @@ fn a_batterys_measurements_arrive_without_phases() {
         .with(Measurand::unphased(Quantity::DcPower))
         .with(Measurand::unphased(Quantity::StateOfCharge))
         .with(Measurand::unphased(Quantity::StateOfEnergy));
-    battery.set(
-        &Measurand::unphased(Quantity::DcPower),
-        -3_200.0,
-        Duration::ZERO,
-    );
-    battery.set(
-        &Measurand::unphased(Quantity::StateOfCharge),
-        61.0,
-        Duration::ZERO,
-    );
-    battery.set(
-        &Measurand::unphased(Quantity::StateOfEnergy),
-        12_200.0,
-        Duration::ZERO,
-    );
+    battery.set(&Measurand::unphased(Quantity::DcPower), -3_200.0);
+    battery.set(&Measurand::unphased(Quantity::StateOfCharge), 61.0);
+    battery.set(&Measurand::unphased(Quantity::StateOfEnergy), 12_200.0);
 
     // The manager reads the descriptions and then the values, in that order.
     let mut readings = Readings::new();

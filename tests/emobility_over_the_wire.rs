@@ -253,21 +253,9 @@ fn evcem_makes_a_curtailment_checkable_rather_than_asserted() {
         .with(Measurand::unphased(Quantity::EnergyCharged));
 
     // The manager wrote 16 A on A and 6 A on B; this is what the car actually drew.
-    car.set(
-        &Measurand::on(Quantity::Current, Phase::A),
-        15.9,
-        Duration::ZERO,
-    );
-    car.set(
-        &Measurand::on(Quantity::Current, Phase::B),
-        6.0,
-        Duration::ZERO,
-    );
-    car.set(
-        &Measurand::unphased(Quantity::EnergyCharged),
-        8_400.0,
-        Duration::ZERO,
-    );
+    car.set(&Measurand::on(Quantity::Current, Phase::A), 15.9);
+    car.set(&Measurand::on(Quantity::Current, Phase::B), 6.0);
+    car.set(&Measurand::unphased(Quantity::EnergyCharged), 8_400.0);
 
     let mut readings = Readings::new();
     readings.describe(&car.measurement_descriptions());
@@ -309,11 +297,7 @@ fn a_car_without_a_data_link_is_not_asked_about_its_battery() {
     // And what it would be asked, once it can be.
     let mut battery = evsoc::Battery::new();
     let mut car = evsoc::monitored_unit(1).with(Measurand::unphased(Quantity::StateOfCharge));
-    car.set(
-        &Measurand::unphased(Quantity::StateOfCharge),
-        40.0,
-        Duration::ZERO,
-    );
+    car.set(&Measurand::unphased(Quantity::StateOfCharge), 40.0);
     let mut readings = Readings::new();
     readings.describe(&car.measurement_descriptions());
     readings.describe(&car.parameter_descriptions());

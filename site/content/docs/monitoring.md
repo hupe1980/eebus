@@ -51,6 +51,26 @@ Two rules the crate enforces rather than leaving to the caller:
   both; the raw `value` field is still there for a display, which is a different thing from
   acting on it.
 
+### When the reading was taken, not when it arrived
+
+[MPC-002], [MDT-002], [MRT-002] and [MOT-002] all permit a `timestamp` on the value and
+forbid the history that would otherwise justify one. `Reading::timestamp` carries it
+verbatim, and `Readings::read_at` hands it back beside the value:
+
+```rust
+let (degrees, taken_at) = readings.read_at(&mrt::MEASURAND)?;
+```
+
+The obvious substitute is wrong. An appliance subscribes rather than polls, so a
+notification arrives when something **changes** — and a room holding its temperature sends
+nothing at all. Age the readings by arrival and you discard the ones most likely to still be
+true, and cannot tell that room from a sensor that died an hour ago.
+
+Most peers send none, so `taken_at` is usually `None`; what that means is the application's
+call. A Monitored Unit on this side stamps with `MonitoredUnit::set_at`, or
+`hvac::mrt::temperature_at` and its two siblings. `set` sends no timestamp: the engine's
+clock is monotonic uptime, not a time of day.
+
 ## Curtailment
 
 MGCP scenario 1 carries the photovoltaic curtailment factor: how much of what the plant

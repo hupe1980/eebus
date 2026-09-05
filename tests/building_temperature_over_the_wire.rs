@@ -418,6 +418,7 @@ fn mot_005_a_flagged_outdoor_value_is_not_a_temperature() {
             12.0,
             eebus::model::MeasurementValueSource::MeasuredValue,
             Some(eebus::model::MeasurementValueState::OutOfRange),
+            None,
         ),
     );
     building
@@ -454,4 +455,97 @@ fn no_actor_here_needs_a_binding() {
             descriptor.actor
         );
     }
+}
+
+/// [F1][MRT-002] A room says *when* it took the reading, and the appliance keeps it.
+///
+/// The element is permitted and rarely sent, and the case that needs it is the ordinary
+/// one. A thermostat notifies when the temperature changes, so a room holding steady sends
+/// nothing at all — and to an appliance that ages its inputs by *arrival*, a steady room
+/// and a dead sensor look identical. The peer's own timestamp is what separates them, and
+/// only the peer can send it.
+#[test]
+fn mrt_002_a_stamped_reading_keeps_the_time_the_room_took_it() {
+    use eebus::usecases::monitoring::Readings;
+
+    let mut building = Building::new();
+    building.discover();
+    let room = mrt::locate(building.peer()).expect("a room");
+    building
+        .appliance
+        .attach(&mut building.manager, room, building.now);
+    building.settle();
+    let unit = building.appliance.units().next().expect("the room").id();
+
+    // Nothing was stamped at commissioning, and an absent timestamp is not an error.
+    assert_eq!(
+        building
+            .appliance
+            .readings(&unit)
+            .and_then(|r| r.read_at(&mrt::MEASURAND)),
+        Some((21.5, None)),
+        "a peer that sent no timestamp said nothing, which is not the same as stale"
+    );
+
+    let feature = building.rooms[0].clone();
+    set(
+        &mut building.pump,
+        &feature,
+        mrt::temperature_at(21.5, "2026-09-05T08:15:00Z".into()),
+    );
+    building
+        .pump
+        .notify(&feature, &Function::MeasurementListData, building.now);
+    building.settle();
+
+    let (degrees, taken_at) = building
+        .appliance
+        .readings(&unit)
+        .and_then(|r| r.read_at(&mrt::MEASURAND))
+        .expect("a stamped reading");
+    assert_eq!(degrees, 21.5, "the same temperature it already had");
+    let taken_at = taken_at.expect("and now a time it was taken");
+    assert_eq!(taken_at.as_str(), "2026-09-05T08:15:00Z");
+    assert!(
+        taken_at.is_absolute(),
+        "SPINE's element is a time or a duration, and this one is a time"
+    );
+
+    // The next unstamped reading does not inherit it: a value taken at an unstated time is
+    // not the old one's time.
+    set(&mut building.pump, &feature, mrt::temperature(22.0));
+    building
+        .pump
+        .notify(&feature, &Function::MeasurementListData, building.now);
+    building.settle();
+    assert_eq!(
+        building
+            .appliance
+            .readings(&unit)
+            .and_then(|r| r.read_at(&mrt::MEASURAND)),
+        Some((22.0, None))
+    );
+
+    // And a flagged value is still no value, timestamp or not.
+    let mut readings = Readings::new();
+    readings.describe(&mrt::temperature_description());
+    readings.apply(&mrt::temperature_from(
+        -40.0,
+        eebus::model::MeasurementValueSource::MeasuredValue,
+        Some(eebus::model::MeasurementValueState::OutOfRange),
+        Some("2026-09-05T08:20:00Z".into()),
+    ));
+    assert_eq!(
+        readings.read_at(&mrt::MEASURAND),
+        None,
+        "[MRT-005]: a flagged value is ignored, and a timestamp does not rescue it"
+    );
+    assert_eq!(
+        readings
+            .latest(&mrt::MEASURAND)
+            .and_then(|r| r.taken_at())
+            .map(|t| t.as_str()),
+        Some("2026-09-05T08:20:00Z"),
+        "the reading is still there for a person to look at"
+    );
 }

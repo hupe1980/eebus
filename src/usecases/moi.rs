@@ -28,8 +28,8 @@
 //! let mut inverter = moi::monitored_unit(1)
 //!     .with(Measurand::total(Quantity::ApparentPower))
 //!     .with(Measurand::unphased(Quantity::YieldDay));
-//! inverter.set(&Measurand::total(Quantity::ApparentPower), 4_100.0, Duration::ZERO);
-//! inverter.set(&Measurand::unphased(Quantity::YieldDay), 18_400.0, Duration::ZERO);
+//! inverter.set(&Measurand::total(Quantity::ApparentPower), 4_100.0);
+//! inverter.set(&Measurand::unphased(Quantity::YieldDay), 18_400.0);
 //!
 //! let mut readings = Readings::new();
 //! readings.describe(&inverter.measurement_descriptions());

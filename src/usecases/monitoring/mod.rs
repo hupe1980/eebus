@@ -25,7 +25,7 @@
 //! let mut unit = MonitoredUnit::new(1)
 //!     .with(Measurand::total_power())
 //!     .with(Measurand::on(Quantity::Current, Phase::A));
-//! unit.set(&Measurand::total_power(), 2_300.0, Duration::ZERO);
+//! unit.set(&Measurand::total_power(), 2_300.0);
 //!
 //! // What an energy manager makes of it, having read the descriptions first.
 //! let mut readings = Readings::new();

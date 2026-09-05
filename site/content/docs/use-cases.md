@@ -213,6 +213,14 @@ Three more pairs work the same way:
 * **MDT, MRT and MOT** share a `locate` of their own for the one thing they do not share
   with MPC: a tank, a room and the outdoors have no `ElectricalConnection`, so searching for
   one would find whatever else the device happens to serve.
+* **The other nine share `hvac::peer`.** One `locate`, one `locate_all` and one `follow`,
+  told apart by the use-case descriptor each passes in — so what `follow` reads is the
+  specification's own scenario tables rather than a second list kept beside them. See
+  [Heat pumps](@/docs/hot-water.md).
+* **And one actor for all nine.** `HvacApplianceActor` serves both client actors of the
+  family — the Monitoring Appliance reads, the Configuration Appliance also writes — keyed
+  by `UnitId`, device **and** entity. That is the same key `MonitoringApplianceActor` uses,
+  because a room's thermometer and its setpoint are the same entity.
 
 The reference implementations duplicate each pair; here a fix to one is a fix to both, and
 the only thing the direction changes is what the tests assert.

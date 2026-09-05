@@ -564,7 +564,7 @@ impl MonitoringPair {
 
     /// The unit takes a reading and notifies its subscribers.
     pub fn report(&mut self, measurand: &Measurand, value: f64) {
-        self.unit.set(measurand, value, self.now);
+        self.unit.set(measurand, value);
         let measurement = self.unit_feature(2);
         self.unit
             .notify(&mut self.unit_engine, &measurement, self.now);

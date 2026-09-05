@@ -30,7 +30,7 @@
 //!
 //! // A car that is 40 % full, on a 77 kWh battery.
 //! let mut car = evsoc::monitored_unit(1).with(Measurand::unphased(Quantity::StateOfCharge));
-//! car.set(&Measurand::unphased(Quantity::StateOfCharge), 40.0, Duration::ZERO);
+//! car.set(&Measurand::unphased(Quantity::StateOfCharge), 40.0);
 //!
 //! let mut readings = Readings::new();
 //! readings.describe(&car.measurement_descriptions());
@@ -385,28 +385,15 @@ mod tests {
     use super::*;
     use crate::model::ScopeType;
     use alloc::vec::Vec;
-    use core::time::Duration;
 
     fn a_car() -> (MonitoredUnit, Readings) {
         let mut unit = monitored_unit(1)
             .with(Measurand::unphased(Quantity::StateOfCharge))
             .with(Measurand::unphased(Quantity::StateOfHealth))
             .with(Measurand::unphased(Quantity::TravelRange));
-        unit.set(
-            &Measurand::unphased(Quantity::StateOfCharge),
-            40.0,
-            Duration::ZERO,
-        );
-        unit.set(
-            &Measurand::unphased(Quantity::StateOfHealth),
-            92.0,
-            Duration::ZERO,
-        );
-        unit.set(
-            &Measurand::unphased(Quantity::TravelRange),
-            180_000.0,
-            Duration::ZERO,
-        );
+        unit.set(&Measurand::unphased(Quantity::StateOfCharge), 40.0);
+        unit.set(&Measurand::unphased(Quantity::StateOfHealth), 92.0);
+        unit.set(&Measurand::unphased(Quantity::TravelRange), 180_000.0);
 
         let mut readings = Readings::new();
         readings.describe(&unit.measurement_descriptions());
@@ -502,11 +489,7 @@ mod tests {
 
         // A notification carrying only the state of charge.
         let mut only_charge = monitored_unit(1).with(Measurand::unphased(Quantity::StateOfCharge));
-        only_charge.set(
-            &Measurand::unphased(Quantity::StateOfCharge),
-            55.0,
-            Duration::ZERO,
-        );
+        only_charge.set(&Measurand::unphased(Quantity::StateOfCharge), 55.0);
         battery.apply(&only_charge.measurements(), &readings);
 
         assert_eq!(battery.state_of_charge, Some(55.0));

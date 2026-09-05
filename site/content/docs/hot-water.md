@@ -214,6 +214,72 @@ on:
 
 See [Addressing a peer's data](@/docs/use-cases.md) for why none of this may be shortcut.
 
+## Finding one, and driving it
+
+Nine of the twelve are served from an `HVAC` feature, and finding it is the lookup the
+use-case implementation guide §3.3 makes easiest to get wrong: the feature is on the entity
+that **announced the actor**, not whichever entity happens to carry an `HVAC` server. A heat
+pump that heats water and two rooms has three of them.
+
+Each use case has a `locate`, and — where a device can hold several — a `locate_all`:
+
+```rust
+let circuit = cdsf::locate(remote)?;          // the DHW circuit's `HVAC` feature
+let warm    = crht::locate(remote)?;          // `HVAC` *and* `Setpoint`, on one entity
+for room in crhsf::locate_all(remote) { … }   // one per `HVACRoom`
+```
+
+A located peer is an address, not a conversation: a `SystemFunction` answers nothing until
+six payloads have arrived, and a client that read the descriptions and stopped holds a
+reader that refuses every write it is asked to build. `HvacPeer::follow` subscribes and
+reads the use case's whole scenario table in one call. The subscription goes first, so a
+mode that changes between the reply and a later request is not missed; the reads are
+filtered by what discovery said the peer serves, so a circuit without the one-time loading
+is asked for four functions rather than six. `Following::function_of` names the
+function behind a refusal.
+
+### Or let the actor do it
+
+`HvacApplianceActor` is `follow` plus the bookkeeping — a reader per system function, a
+reader per setpoint scope, routing by feature address, and change detection:
+
+```rust
+use eebus::usecases::hvac::{self, HvacApplianceActor, cdsf, cdt};
+
+let mut appliance = HvacApplianceActor::new(client.clone());
+appliance.attach(&mut engine, cdsf::locate(remote)?, now);   // the mode and the overrun
+appliance.attach(&mut engine, cdt::locate(remote)?, now);    // the temperature
+
+// …once the replies have gone through `appliance.handle_event(&event)`:
+appliance.set_temperature(&mut engine, &unit, &hvac::DHW, 60.0, now)?;
+```
+
+That last call is four joins deep: the circuit's own `systemFunctionId`, the mode it is
+*currently* in, the relation keyed by both, and the constraints for the setpoint that names.
+Two of its answers are refusals rather than guesses — `NotInCurrentMode` where the mode reads
+no setpoint, and `SeveralSetpoints` where it reads more than one and which applies is the
+circuit's own business. With no system-function use case attached it is `ModeUnknown`, which
+is [CDT-005] as an API; `preload_setpoint` is the exception, for loading the setpoint of a
+mode you are about to ask for.
+
+Use cases attached against one entity gather on one **unit**, keyed by `UnitId` — device and
+entity, the same key a `MonitoringApplianceActor` gives that room's thermometer. A room that
+heats and cools is one unit with two system functions and one setpoint reader, and
+`set_temperature(&unit, &hvac::HEATING, …)` and the same call with `&hvac::COOLING` reach
+different setpoints out of the same `roomAirTemperature` list.
+
+`handle_event` returns a **list**: one `hvacSystemFunctionListData` carries every system
+function the appliance has, so one notification can move the heating and the cooling at
+once. Only changes are reported.
+
+| | |
+|---|---|
+| `FunctionDescribed` | an identifier, its modes and a current one: scenario 1 can be reported |
+| `ModeChanged` | including when the *appliance* changed it — the wall panel, or its own scheduler |
+| `OverrunChanged` | somebody pressed the one-time loading button |
+| `OverrunFinished` | the one-shot [MDSF-002] announcement, which is not a state |
+| `SetpointChanged` | a setpoint moved, whoever moved it |
+
 ## Nothing here binds
 
 All twelve say the same sentence, including the six that write: **"Binding SHOULD NOT be

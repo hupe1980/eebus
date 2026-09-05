@@ -4,7 +4,140 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.7.0] — unreleased
+## [0.8.0] — unreleased
+
+The client side of the HVAC family: `locate`, `follow` and an actor for the nine `HVAC` use
+cases, so a Configuration Appliance no longer assembles the exchange by hand. And a
+measurement that carries the time the peer took it.
+
+### Added
+
+- **`hvac::peer` — `locate` and `follow` for the nine `HVAC` use cases.** `mdt`, `mrt` and
+  `mot` each had a `locate`; the six system-function use cases and the three setpoint ones
+  had none, so a Configuration Appliance resolved the feature by hand — `use_case(name,
+  actor)`, then `address_of(found, &FeatureType::HVAC, Role::Server)` — with two chances to
+  name the wrong actor and one to reach for the appliance's own entity instead of the one
+  that announced the use case. That last is the use-case implementation guide's §3.3 rule,
+  and it is not academic: §3.2.2.2.1 gives an entity **one** `HVAC` feature, so a heat pump
+  that heats water and two rooms has three of them and a lookup by feature type reports a
+  living room's operation mode from the tank's.
+
+  `cdsf::locate` and its eight siblings return an `HvacPeer` — the `HVAC` feature, and the
+  `Setpoint` beside it for `cdt`, `crht` and `crct`. `locate_all` returns one per entity,
+  which every room use case needs for the same reason `mrt::locate_all` does.
+
+  Locating was never the whole of it, which is why this is `follow` and not only `locate`.
+  A `SystemFunction` answers nothing until six payloads have arrived — the system function
+  descriptions, the operation modes, the relations between them, the state, and, for the hot
+  water, the two overrun functions — and a client that read the descriptions and stopped
+  holds a reader that refuses every write it is asked to build. `HvacPeer::follow` subscribes
+  to both features and issues every read in one call, in the order the specification's own
+  scenario tables put them, and returns a `Following` whose counters say which read a
+  `ResultReceived` refused. The subscription goes out **before** the reads: a mode changed
+  between the reply and a later subscription request is a change nothing ever hears about.
+  There is no binding, as all nine use cases instruct.
+
+  The read list is not a second list kept beside the specification — it is
+  `UseCaseDescriptor::server_functions()`, the scenario tables this crate already carries as
+  data, intersected with what the peer declared in discovery. So a circuit serving CDSF
+  scenario 1 and not the one-time loading — which is conformant, scenario 3 being
+  recommended — is asked for four functions rather than six, instead of earning two
+  `errorNumber` 7 replies to questions discovery had already answered.
+
+- **`hvac::HvacApplianceActor` — the family had readers and no actor.** Every other family
+  here has one. The HVAC client side had a `SystemFunction`, a `Setpoints` and no way to
+  hold them, so a Configuration Appliance wrote the same bookkeeping every time: a reader
+  per system function, a reader per setpoint scope, routing from feature address to unit,
+  change detection so a re-notified mode is not reported as a change, and the join between
+  the two halves that makes a temperature write mean anything.
+
+  It serves **both** client actors, which read the same data and differ only in whether
+  they also write. `attach` takes a located peer — the `Subject` stamped on it says which
+  readers to build — and use cases attached against one entity gather on one unit, because
+  §3.2.2.2.1 gives an entity one `HVAC` feature and one `Setpoint` feature.
+
+  The write side is where it earns its place. `set_temperature(&unit, &hvac::DHW, 60.0)` is
+  four joins deep: the appliance's own `systemFunctionId`, the mode it is *currently* in,
+  the relation keyed by both, and the constraints for the setpoint that names. A room's
+  heating and its cooling resolve to different setpoints out of the same
+  `roomAirTemperature` list, told apart by nothing but the relation's `systemFunctionId`.
+  Two answers are refusals rather than guesses: `SeveralSetpoints` where the current mode
+  reads more than one, which [CDT-003/1] permits `auto` to do, and `ModeUnknown` where no
+  system function has been attached — [CDT-005] as an API.
+
+  `handle_event` returns a **`Vec`** where every other actor returns an `Option`, because
+  one `hvacSystemFunctionListData` carries every system function the appliance has and one
+  notification can move a room's heating *and* its cooling. Only changes are reported, and
+  `OverrunFinished` stays separate from `OverrunChanged`: [MDSF-002]'s `finished` is a
+  one-shot announcement, not a state to rest in.
+
+- **`usecases::UnitId` — one key for a room's thermometer and its setpoint.** It was
+  `monitoring::UnitId`, which was the right shape in the wrong place: an
+  `hvac::mrt` room and an `hvac::crht` room are the *same entity*, and an application
+  joining "it is 19.5 °C in here" to "the target is 21.5" had no reason to be given two
+  types to do it with. It is now one type both actors hand back, with `UnitId::of` and
+  `UnitId::holds` as the primitives; `monitoring::UnitId` still resolves, as a re-export.
+
+- **`Setpoints::current_setpoint` and `Setpoints::write_current`** — "the temperature this
+  server is working to", without an application having to know which of the appliance's one
+  to four setpoint identifiers the mode it happens to be in is reading. The three ways it
+  can have no answer are three refusals rather than a `None`: no mode reported, a mode that
+  relates to no setpoint at all (which [xDT-003/3] lets `off` be), and a mode that relates
+  to several.
+
+- **`Reading::timestamp` and `Readings::read_at` — when the peer says it measured.**
+  [MPC-002], [MDT-002], [MRT-002] and [MOT-002] all permit a `timestamp` on a measurement
+  and forbid the history that would otherwise justify one. The crate dropped it, leaving a
+  consumer only the moment the value *arrived* — a different number for a subscribed value,
+  which comes when something **changes**, so a room holding its temperature sends nothing at
+  all. Ageing readings by arrival discards the ones most likely to still be true, and cannot
+  tell that room from a sensor that died an hour ago.
+
+  Carried verbatim as an `AbsoluteOrRelativeTime`, since SPINE permits a time *or* an ISO
+  8601 duration and which one arrived is part of what the peer said. Most peers send none,
+  and what that means stays the consumer's decision. The server half goes with it:
+  `MonitoredUnit::set_at`, and `mdt`/`mrt`/`mot`'s `temperature_at` — neither invents a
+  timestamp from the engine's clock, which is monotonic uptime and not a time of day.
+
+- **`UseCaseDescriptor::server_functions()`** — every `(feature, function)` an actor serves,
+  deduplicated, in scenario order. The scenario tables read back as a list of reads, which
+  `HvacPeer::follow` is built on.
+
+### Fixed
+
+- **`Setpoints::write_effective` blamed the mode for a setpoint the server never
+  published.** An identifier no description had mentioned went to `effect_of`, which
+  answered `NotInCurrentMode` — true, and useless: "the server is in a mode that reads some
+  other setpoint" sends a caller looking at the modes when what is wrong is the number it
+  passed in. Whether the setpoint exists is now asked first, and answered
+  `UnknownSetpoint`.
+
+### Changed
+
+- **`hvac::{cdsf, mdsf, …}::locate` take no arguments and return an `HvacPeer`**, and the
+  generic `hvac::peer::locate` takes the use case's `Subject` beside its descriptor. Each
+  module's wrapper pairs the two, so a caller cannot pass a descriptor and a subject that
+  disagree.
+
+- **`monitoring::MonitoringApplianceActor::readings` and friends still take a `&UnitId`**,
+  but the type is now `usecases::UnitId`. Nothing on either actor changed shape; the path
+  did, and `monitoring::UnitId` re-exports it.
+
+- **`MonitoredUnit::set` no longer takes a `now`.** It never used it — the parameter was
+  `_now` — and keeping it invited exactly the mistake the timestamp work is about: a
+  monotonic uptime is not a time of day, and passing it off as one would put a meaningless
+  `timestamp` on the wire. `set_at` takes the real thing, from the application that has a
+  clock.
+
+- **`Reading` gained a `timestamp` field**, so a struct literal or an exhaustive destructure
+  of it no longer compiles. `Readings::latest` is a borrowing `get` for callers that only
+  want to look.
+
+- **`hvac::{mdt, mrt, mot}::temperature_from` and `hvac::temperature::reported` take the
+  timestamp.** `temperature(degrees)` is unchanged and sends none; `temperature_at` is the
+  short form for a stamped measured value.
+
+## [0.7.0] — 2026-09-05
 
 Twelve HVAC use cases, which is both specification bundles complete, and the interoperability
 bug that made the previous five unusable: an unbound write was refused whatever it addressed,

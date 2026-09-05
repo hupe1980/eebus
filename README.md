@@ -251,6 +251,9 @@ in that position loses it, which is the interoperable answer.
 | | Control of Battery: six states, twenty transitions, both control modes | COB 1.0.0 §2.4 |
 | | the complete HVAC family — all twelve use cases of both bundles, as three exchanges: the operation mode, the temperature setpoint, the thermometer | CDT/CDSF/MDSF/MDT, CRHT/CRHSF/MRHSF/MRT, CRCT/CRCSF/MRCSF, MOT 1.0.0 |
 | | a room's heating and cooling setpoints share `roomAirTemperature`; only the relation's `systemFunctionId` tells them apart | CRHT/CRCT §3.2.1.2.3.1 |
+| | each of the nine `HVAC` use cases locates the feature on the entity that *announced* it, and `follow` subscribes and reads its scenario tables in one call | use-case IG §3.3, HVAC §3.2.2.2.1 |
+| | one actor for the whole family: "heat the water to 60" resolves the system function, the mode it is in, the relation keyed by both, and the constraints — or refuses | CDT §3.2.1.2.3.1, [CDT-003] |
+| | a measurement carries the time the peer says it took it, not the time it arrived | [MPC-002], [MDT-002], [MRT-002], [MOT-002] |
 | | heat pump compressor flexibility: the CEM *starts* an optional consumption process, and stops, pauses and resumes it — with the binding scenario 2 needs | OHPCF 1.0.0 §2.5, §3.4.2 |
 | **Certification** | the 203 abstract test cases of the four HLTS as data, all driven: 189/203 | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
 | | the other fourteen as a harness a consumer runs against its **own binary**: seven procedures with the specification's steps, judged against its declared parameter sheet | LPC HLTS 1.0.2 tables 15–34, §6.11.8 |

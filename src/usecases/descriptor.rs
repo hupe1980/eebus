@@ -229,6 +229,49 @@ impl UseCaseDescriptor {
             })
     }
 
+    /// Every `(feature, function)` this actor serves, deduplicated, in scenario order.
+    ///
+    /// The specification's own table read back as a list of reads, so a client knows what
+    /// to ask a located peer for — descriptions before state, as the scenario tables are
+    /// written — without a second list to drift from the first.
+    /// [`hvac::peer::HvacPeer::follow`](crate::usecases::hvac::peer::HvacPeer::follow)
+    /// reads it.
+    ///
+    /// Take it from the **server** actor's descriptor: the client-side one lists the same
+    /// functions under [`Role::Client`] and yields nothing here.
+    ///
+    /// ```
+    /// use eebus::model::{FeatureType, Function};
+    /// use eebus::usecases::hvac::cdt;
+    ///
+    /// let reads: Vec<_> = cdt::DHW_CIRCUIT.server_functions().collect();
+    /// assert_eq!(
+    ///     reads.first(),
+    ///     Some(&(&FeatureType::Setpoint, &Function::SetpointDescriptionListData)),
+    /// );
+    /// // The relation lives on the `HVAC` feature, not on the `Setpoint` one.
+    /// assert!(reads.contains(&(
+    ///     &FeatureType::HVAC,
+    ///     &Function::HvacSystemFunctionSetpointRelationListData,
+    /// )));
+    /// ```
+    pub fn server_functions(&self) -> impl Iterator<Item = (&FeatureType, &Function)> + '_ {
+        let mut seen: alloc::vec::Vec<(&FeatureType, &Function)> = alloc::vec::Vec::new();
+        self.scenarios
+            .iter()
+            .flat_map(|s| s.functions.iter())
+            .filter(|f| f.role == Role::Server)
+            .filter_map(move |f| {
+                let pair = (&f.feature, &f.function);
+                if seen.contains(&pair) {
+                    None
+                } else {
+                    seen.push(pair);
+                    Some(pair)
+                }
+            })
+    }
+
     /// The features on the *peer* this actor has to bind to before it can write.
     pub fn features_needing_binding(&self) -> impl Iterator<Item = &FeatureType> + '_ {
         let mut seen: alloc::vec::Vec<&FeatureType> = alloc::vec::Vec::new();

@@ -412,6 +412,19 @@ pub enum WriteRefused {
     /// The server published no constraints for it, so nothing can be checked.
     #[error("the server has not published what this setpoint accepts")]
     NoConstraints,
+    /// The current operation mode reads **more than one** setpoint.
+    ///
+    /// [xDT-003/1] lets `auto` relate to one to four of them and leaves "which applies, and
+    /// when" to the server. So "set the temperature" has no single answer here, and picking
+    /// the first would be a guess of exactly the kind this crate refuses to make on a
+    /// caller's behalf. Ask [`Setpoints::for_mode`] which they are and name one.
+    ///
+    /// Raised only by [`Setpoints::current_setpoint`] and [`Setpoints::write_current`].
+    #[error("the current operation mode reads {count} setpoints; name the one to write")]
+    SeveralSetpoints {
+        /// How many the current mode relates to.
+        count: usize,
+    },
     /// Outside [`Constraints::min`]..=[`Constraints::max`].
     #[error("{degrees} is outside the {min}..={max} the server accepts")]
     OutOfRange {
@@ -671,6 +684,11 @@ impl Setpoints {
     /// The join this use case cannot make on its own: `state` is what the matching
     /// system-function use case learned, and the relations are what this holds. See
     /// [`SetpointEffect`] for what each answer means.
+    ///
+    /// An identifier the server never described reads as
+    /// [`NotInCurrentMode`](SetpointEffect::NotInCurrentMode), which is true and unhelpful;
+    /// [`write_effective`](Self::write_effective) tells that case apart and reports
+    /// [`WriteRefused::UnknownSetpoint`].
     pub fn effect_of(
         &self,
         id: SetpointId,
@@ -691,6 +709,55 @@ impl Setpoints {
         SetpointEffect::Effective
     }
 
+    /// The one setpoint the server's current operation mode reads.
+    ///
+    /// The lookup a manager that wants "the" temperature needs, and it is three joins deep:
+    /// the system function's identifier, the mode it is currently in, and the relation
+    /// keyed by both. Every step is the server's own numbering.
+    ///
+    /// * [`WriteRefused::ModeUnknown`] — the system-function use case has not reported a
+    ///   mode, or the relations have not arrived.
+    /// * [`WriteRefused::NotInCurrentMode`] — the mode reads no setpoint at all, which
+    ///   [xDT-003/3] allows `off` to be. There is nothing to set.
+    /// * [`WriteRefused::SeveralSetpoints`] — the mode reads more than one, and which
+    ///   applies is the server's business.
+    pub fn current_setpoint(
+        &self,
+        state: &super::system_function::SystemFunction,
+    ) -> Result<SetpointId, WriteRefused> {
+        let (Some(function), Some(mode)) = (state.system_function(), state.mode_id()) else {
+            return Err(WriteRefused::ModeUnknown);
+        };
+        if !self.describes(function, mode) {
+            return Err(WriteRefused::ModeUnknown);
+        }
+        match self.for_mode(function, mode) {
+            [] => Err(WriteRefused::NotInCurrentMode),
+            [only] => Ok(*only),
+            several => Err(WriteRefused::SeveralSetpoints {
+                count: several.len(),
+            }),
+        }
+    }
+
+    /// Builds the write that sets the temperature the server is **currently reading**.
+    ///
+    /// [`current_setpoint`](Self::current_setpoint) and then
+    /// [`write_effective`](Self::write_effective): what an application means by "heat the
+    /// water to 60", without it having to know which of the circuit's one to four setpoint
+    /// identifiers the mode it happens to be in is looking at.
+    ///
+    /// An overrun in progress is not refused, for the same reason
+    /// [`write_effective`](Self::write_effective) does not refuse it: the write lands where
+    /// it was meant to and takes effect when the overrun ends.
+    pub fn write_current(
+        &self,
+        degrees: f64,
+        state: &super::system_function::SystemFunction,
+    ) -> Result<CmdData, WriteRefused> {
+        self.write_effective(self.current_setpoint(state)?, degrees, state)
+    }
+
     /// Builds the write, and refuses one the server would apply without changing anything.
     ///
     /// [`write`](Self::write) checks what the *server* published about the setpoint — that
@@ -709,6 +776,13 @@ impl Setpoints {
         degrees: f64,
         state: &super::system_function::SystemFunction,
     ) -> Result<CmdData, WriteRefused> {
+        // Whether the server published this setpoint at all is asked first, and separately.
+        // [`effect_of`] answers `NotInCurrentMode` for an identifier the server never
+        // described — true, and useless: "the mode reads some other setpoint" sends a
+        // caller looking at the modes, when what is wrong is the number it passed in.
+        if !self.temperatures.iter().any(|(known, _)| *known == id) {
+            return Err(WriteRefused::UnknownSetpoint);
+        }
         match self.effect_of(id, state) {
             SetpointEffect::Effective | SetpointEffect::OverriddenByOverrun => {}
             SetpointEffect::NotInCurrentMode => return Err(WriteRefused::NotInCurrentMode),
