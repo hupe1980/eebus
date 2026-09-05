@@ -760,10 +760,28 @@ impl RemoteDevice {
     }
 
     /// Finds the use case a peer plays as `actor`, if any.
+    ///
+    /// The **first** one. A device may play the same use case as the same actor on several
+    /// entities — a heat-pump gateway announcing one `HVACRoom` per room does exactly
+    /// that — and [`use_cases_played`](Self::use_cases_played) is how to see all of them.
     pub fn use_case(&self, name: &str, actor: &str) -> Option<&RemoteUseCase> {
+        self.use_cases_played(name, actor).next()
+    }
+
+    /// Every entity of this peer that plays `name` as `actor`.
+    ///
+    /// Usually one, and §7.5 does not say it has to be: the use-case information is a list
+    /// keyed by address, so a device with four rooms announces "Monitoring of Room
+    /// Temperature" four times, once per `HVACRoom` entity, and a client that took the
+    /// first would monitor one room and never learn of the others.
+    pub fn use_cases_played(
+        &self,
+        name: &str,
+        actor: &str,
+    ) -> impl Iterator<Item = &RemoteUseCase> {
         self.use_cases
             .iter()
-            .find(|u| u.name.as_str() == name && u.actor.as_str() == actor)
+            .filter(move |u| u.name.as_str() == name && u.actor.as_str() == actor)
     }
 
     /// Finds the feature a use case needs on the entity that plays it.

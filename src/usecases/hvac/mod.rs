@@ -1,102 +1,156 @@
-//! Heating, ventilation, air conditioning — and, mostly, hot water.
+//! Heating, ventilation, air conditioning — the hot water, and the building around it.
 //!
-//! The grid use cases in this crate all point the same way: [`limitation`] sets a ceiling,
-//! [`emobility::opev`] sets a current not to exceed, [`cob`] drives a battery between
-//! limits. Every one of them can only ask an appliance to do **less**, and a ceiling an
-//! appliance is already under changes nothing at all.
+//! Every grid use case in this crate points the same way: [`limitation`] sets a ceiling,
+//! [`emobility::opev`] a current not to exceed, [`cob`] a battery between limits. A ceiling
+//! an appliance is already under changes nothing, so a manager holding only those can never
+//! spend a surplus. This family sets *targets*, and a target can go up.
 //!
-//! This family is where that stops being true. A hot water tank is the cheapest thermal
-//! battery most buildings have, and asking a heat pump for a higher tank temperature while
-//! the roof is exporting stores kilowatt-hours that would otherwise be sold at the
-//! feed-in tariff and bought back at the retail one. No limit can express that.
+//! # All twelve of them, as three exchanges
 //!
-//! Three use cases, and they are three parts of one thing:
+//! | | monitor | configure |
+//! |---|---|---|
+//! | **hot water** — mode & overrun | [`mdsf`] | [`cdsf`] |
+//! | **hot water** — temperature | [`mdt`] | [`cdt`] |
+//! | **room heating** — mode | [`mrhsf`] | [`crhsf`] |
+//! | **room cooling** — mode | [`mrcsf`] | [`crcsf`] |
+//! | **room** — temperature | [`mrt`] | [`crht`], [`crct`] |
+//! | **outdoors** — temperature | [`mot`] | — |
 //!
-//! * [`mdsf`] — **Monitoring of DHW System Function**: which operation mode the hot water
-//!   is in (`auto`, `on`, `off`, `eco`), and whether a one-time heating is running.
-//! * [`cdt`] — **Configuration of DHW Temperature**: the temperature setpoint itself.
-//! * [`mdt`] — **Monitoring of DHW Temperature**: what the water actually got to.
+//! * [`system_function`] — the operation mode. Six use cases, told apart by
+//!   `systemFunctionType` and by whether the actor may write.
+//! * [`setpoint`] — the temperature setpoint. Three, told apart by `scopeType` and by the
+//!   system function their relations name.
+//! * [`temperature`] — the thermometer. Three, told apart by `scopeType`.
 //!
-//! Written as an energy manager uses them: `mdsf` says whether a write will reach
-//! anything, `cdt` writes it, `mdt` says whether it worked.
+//! # How a manager uses them
 //!
-//! # Why both
+//! 1. **Will the write reach anything?** A setpoint is addressed *through* an operation
+//!    mode, so one written into a mode the appliance is not in is applied, acknowledged and
+//!    changes nothing. [`system_function::SystemFunction::current_setpoints`] is the join;
+//!    [`setpoint::Setpoints::write_effective`] is the gate.
+//! 2. **Ask.** [`cdt`], [`crht`] and [`crct`] write the temperature;
+//!    [`cdsf`], [`crhsf`] and [`crcsf`] change the mode; [`cdsf`] scenario 2 starts a
+//!    one-time hot water loading outright.
+//! 3. **Did it work?** [`mdt`] and [`mrt`] are thermometers. A setpoint is a request, and
+//!    what the water and the room got to is a different number.
 //!
-//! CDT §2.4.2 and §2.4.3 are unusually firm about it: a DHW Circuit that does not serve
-//! "Monitoring of DHW System Function" **SHALL** serve "Configuration of DHW System
-//! Function" [CDT-005]. One of the two is mandatory, and it is not decoration — CDT's
-//! setpoints are addressed *through* the operation modes. Table 10 relates each mode to
-//! the setpoints it uses, so "write 60 °C" is only a complete instruction once you know
-//! which mode the circuit is in and which setpoint that mode reads. A Configuration
-//! Appliance holding only CDT can write a temperature and have it apply to a mode the
-//! circuit is not in.
+//! [`mrt`], [`mot`] and the heat delivered between them are also the three signals a
+//! building's thermal model is fitted from — which is what turns a forecast into a
+//! compressor schedule for [`ohpcf`](crate::usecases::ohpcf).
 //!
-//! They also share their identifiers, and the specification says so rather than leaving it
-//! to taste. `systemFunctionId` is the same number in CDT and MDSF ([`SYSTEM_FUNCTION_ID`]
-//! here); CDT's `operationModeId`s are the ones MDSF describes (CDT Table 10's two
-//! footnotes); and CDT's setpoint `measurementId` SHALL be the one MDT publishes
-//! (§3.2.1.2.2.1), which is what
-//! [`cdt::setpoint_description_measuring`] takes.
+//! # Two rules that hold across the whole family
 //!
-//! # What is not here
+//! **Nothing here binds.** All twelve say "Binding SHOULD NOT be used for this Scenario",
+//! including the six that write — the opposite of every grid use case, where an unbound
+//! write is refused with `errorNumber` 9. The writeable features here are built with
+//! [`with_unbound_writes`](crate::spine::LocalFeature::with_unbound_writes) and
+//! [`with_deferred_writes`](crate::spine::LocalFeature::with_deferred_writes): a server that
+//! insisted on a binding would refuse every conformant Configuration Appliance, and what
+//! replaces it is the application's own decision. See
+//! [`WriteBinding`](crate::spine::WriteBinding).
 //!
-//! Nine further HVAC use cases are specified in the same two documents: the room heating
-//! and cooling temperatures, their system functions, the outdoor temperature, and
-//! "Configuration of DHW System Function" — the writeable counterpart of [`mdsf`], which a
-//! circuit may serve *instead* of it to satisfy [CDT-005].
+//! **One entity holds one feature of a type** (§3.2.2.2.1). So a heat pump that heats water,
+//! heats a room and cools it publishes all three system functions in the *same* lists on the
+//! *same* `HVAC` feature, and both room setpoints on the same `Setpoint` feature under the
+//! same `scopeType: roomAirTemperature`. Every reader is therefore told which system
+//! function it follows, and the setpoint relations are keyed by `systemFunctionId` **and**
+//! `operationModeId`. [`system_function`] and [`setpoint`] set out what follows from that.
+//!
+//! # Why the pairs go together
+//!
+//! [CDT-005], [CRHT-005] and [CRCT-005]: a server that does not serve the monitoring
+//! system-function use case **SHALL** serve the configuration one. One of the two is
+//! mandatory because the setpoints are addressed through the modes, so a Configuration
+//! Appliance holding only the temperature half can write a value that applies to a mode the
+//! appliance is not in.
+//!
+//! They share their identifiers, and the specifications say so rather than leaving it to
+//! taste: [`system_function_id`] is the same number in all three DHW use cases, the
+//! `operationModeId`s are the ones the system-function use case describes, and the
+//! setpoint's `measurementId` SHALL be the one the matching thermometer publishes
+//! (§3.2.1.2.2.1) — which is what [`cdt::setpoint_description_measuring`] takes.
 //!
 //! [`limitation`]: crate::usecases::limitation
 //! [`emobility::opev`]: crate::usecases::emobility::opev
 //! [`cob`]: crate::usecases::cob
 
 use crate::model::{
-    CmdData, HvacOperationModeId, HvacOperationModeType, HvacSystemFunctionDescriptionData,
-    HvacSystemFunctionDescriptionListData, HvacSystemFunctionId, HvacSystemFunctionType,
+    CmdData, HvacOperationModeId, HvacOperationModeType, HvacSystemFunctionId,
+    HvacSystemFunctionType,
 };
 
+pub mod cdsf;
 pub mod cdt;
+pub mod crcsf;
+pub mod crct;
+pub mod crhsf;
+pub mod crht;
 pub mod mdsf;
 pub mod mdt;
+pub mod mot;
+pub mod mrcsf;
+pub mod mrhsf;
+pub mod mrt;
+pub mod setpoint;
+pub mod system_function;
+pub mod temperature;
 
-/// The `systemFunctionId` **this** implementation publishes the DHW system function under.
+/// The `systemFunctionId` **this** implementation publishes each system function under.
 ///
-/// A local choice, `<sf1#(1..1)>` — but one with a cross-use-case obligation attached: CDT
-/// Table 10 and MDSF Table 9 both address the *same* system function, and the number has
-/// to agree between them on one device. Everything in this family uses this constant for
-/// that reason, and a peer's is found with [`find_dhw_system_function`].
-pub const SYSTEM_FUNCTION_ID: HvacSystemFunctionId = HvacSystemFunctionId(1);
+/// Local choices, `<sf1#(1..1)>` — but with a cross-use-case obligation attached, and one
+/// the specifications spell out: the monitoring and the configuration use case of a
+/// function address the *same* number, and so does the temperature use case that writes
+/// setpoints into it. Everything in this family goes through this function for that reason.
+///
+/// **Three different numbers**, because one `HVAC` feature carries every function the
+/// appliance has (§3.2.2.2.1 gives an entity at most one feature of a type). An appliance
+/// that heated water and a room under the same identifier would be publishing one system
+/// function that claims to be both, and a client would read whichever description arrived
+/// last.
+///
+/// A peer's is never assumed: it is found by `systemFunctionType`, which is what
+/// [`find_system_function`] and
+/// [`SystemFunction`](system_function::SystemFunction) do.
+pub const fn system_function_id(kind: &HvacSystemFunctionType) -> HvacSystemFunctionId {
+    HvacSystemFunctionId(match kind {
+        HvacSystemFunctionType::Dhw => 1,
+        HvacSystemFunctionType::Heating => 2,
+        HvacSystemFunctionType::Cooling => 3,
+        HvacSystemFunctionType::Ventilation => 4,
+        // The enumeration is extensible. A vendor-specific function this crate does not
+        // name is published under the same number as ventilation only if a caller asks for
+        // it by hand, which nothing here does.
+        _ => 5,
+    })
+}
 
 /// The `systemFunctionType` that marks the hot water (MDSF Table 9, CDT §3.2.1.2.3.1).
 pub const DHW: HvacSystemFunctionType = HvacSystemFunctionType::Dhw;
 
-/// The system function description both use cases publish (MDSF Table 9).
-pub fn system_function_description() -> CmdData {
-    CmdData::HvacSystemFunctionDescriptionListData(HvacSystemFunctionDescriptionListData {
-        hvac_system_function_description_data: Some(alloc::vec![
-            HvacSystemFunctionDescriptionData {
-                system_function_id: Some(SYSTEM_FUNCTION_ID),
-                system_function_type: Some(DHW),
-                ..Default::default()
-            }
-        ]),
-    })
-}
+/// The `systemFunctionType` that marks room heating (MRHSF, CRHT).
+pub const HEATING: HvacSystemFunctionType = HvacSystemFunctionType::Heating;
 
-/// Finds the `systemFunctionId` a peer publishes its **hot water** under.
+/// The `systemFunctionType` that marks room cooling (MRCSF, CRCT).
+pub const COOLING: HvacSystemFunctionType = HvacSystemFunctionType::Cooling;
+
+/// Finds the `systemFunctionId` a peer publishes one kind of system function under.
 ///
-/// An HVAC feature carries every system function the appliance has — a heat pump serves
+/// An `HVAC` feature carries every system function the appliance has — a heat pump serves
 /// heating and hot water from the same one, and `<sf1#(1..1)>` is the appliance's own
 /// numbering. `systemFunctionType` is the element the specification fixes, so that is what
 /// this matches on: a client that assumed `1` would read the *heating* circuit's operation
 /// mode and write the hot water setpoint against it.
-pub fn find_dhw_system_function(data: &CmdData) -> Option<HvacSystemFunctionId> {
+pub fn find_system_function(
+    data: &CmdData,
+    kind: &HvacSystemFunctionType,
+) -> Option<HvacSystemFunctionId> {
     let CmdData::HvacSystemFunctionDescriptionListData(list) = data else {
         return None;
     };
     list.hvac_system_function_description_data
         .iter()
         .flatten()
-        .find(|entry| entry.system_function_type.as_ref() == Some(&DHW))
+        .find(|entry| entry.system_function_type.as_ref() == Some(kind))
         .and_then(|entry| entry.system_function_id)
 }
 
@@ -107,8 +161,8 @@ pub fn find_dhw_system_function(data: &CmdData) -> Option<HvacSystemFunctionId> 
 /// moment [MDSF-001]. `operationModeType` is what the specification fixes.
 ///
 /// This is what both use cases in the family read the modes through, which is what keeps
-/// [`cdt::DhwSetpoints::for_mode`] and [`mdsf::DhwSystemFunction::mode`] talking about the
-/// same numbers.
+/// [`setpoint::Setpoints::for_mode`] and [`system_function::SystemFunction::mode`] talking
+/// about the same numbers.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OperationModes {
     known: alloc::vec::Vec<(HvacOperationModeId, HvacOperationModeType)>,

@@ -144,12 +144,12 @@
 //!
 //! # Status
 //!
-//! Under construction, and not yet published. The model, codec, SHIP handshake and
+//! Under construction, and pre-1.0. The model, codec, SHIP handshake and
 //! transport including certificate updates, the SPINE engine, the runtime, and all four
 //! use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are implemented and
-//! tested on both sides of each, as are six of the e-mobility family
-//! ([`usecases::emobility`]) and four more for inverters, PV strings and batteries. The
-//! API will change.
+//! tested on both sides of each — as are seven of the e-mobility family
+//! ([`usecases::emobility`]), four for inverters, PV strings and batteries, and all twelve
+//! HVAC use cases ([`usecases::hvac`]). The API will change.
 //!
 //! EEBUS® is a trademark of EEBus Initiative e.V. This project is not affiliated with or
 //! endorsed by the EEBus Initiative.

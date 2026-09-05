@@ -146,7 +146,7 @@ fn every_exchanged_entry_type_is_identified_as_the_specification_says() {
 /// DHW circuit reports which operation mode it is in through `currentOperationModeId`, and
 /// notifies a change partially. Counted as identity, the change matches nothing stored and
 /// is appended — leaving two `hvacSystemFunctionData` entries for one system function, and
-/// `mdsf::DhwSystemFunction` reading whichever it finds first, for ever.
+/// `hvac::system_function::SystemFunction` reading whichever it finds first, for ever.
 #[test]
 fn a_mode_change_updates_the_system_function_rather_than_adding_a_second() {
     use eebus::model::{

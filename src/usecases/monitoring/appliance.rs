@@ -287,7 +287,94 @@ pub struct MonitoredUnitPeer {
     pub curtailment: Option<crate::model::FeatureAddress>,
 }
 
+/// Which monitored unit a reading came from: an **entity**, not a device.
+///
+/// One device is regularly several units. The use-case implementation guide §3.3 puts an
+/// actor's features on the entity that announced it, and nothing stops a device announcing
+/// the same actor on several entities — a heat-pump gateway publishes one `HVACRoom` per
+/// room ([`hvac::mrt`](crate::usecases::hvac::mrt)), and each room is its own
+/// `Measurement` feature with its own temperature. Keying a Monitoring Appliance by device
+/// would have the second room evict the first, and every notification after that resolve
+/// against the wrong one.
+///
+/// Obtained from [`MonitoredUnitPeer::id`], carried by every [`MonitoringEvent`], and what
+/// [`MonitoringApplianceActor::readings`] takes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UnitId {
+    /// The device the unit is on.
+    pub device: crate::model::AddressDevice,
+    /// The entity path within it, as detailed discovery gave it: `[1]`, `[1, 2]`.
+    ///
+    /// Empty only for a peer whose features carried no entity address at all, which no
+    /// conformant discovery reply does.
+    pub entity: Vec<u32>,
+}
+
 impl MonitoredUnitPeer {
+    /// Which unit this is: its device and the entity its features live on.
+    pub fn id(&self) -> UnitId {
+        UnitId {
+            device: self.device.clone(),
+            entity: self.entity_path(),
+        }
+    }
+
+    /// Whether this is the unit `id` names, without building one to compare against.
+    ///
+    /// The lookup every accessor runs, and it is on the hot path of `handle_event`.
+    pub fn is_unit(&self, id: &UnitId) -> bool {
+        if self.device != id.device {
+            return false;
+        }
+        match self.entity_feature() {
+            Some(feature) => feature
+                .entity
+                .iter()
+                .flatten()
+                .map(|e| e.get())
+                .eq(id.entity.iter().copied()),
+            // A peer with no features at all has no entity, which `id` reports as empty.
+            None => id.entity.is_empty(),
+        }
+    }
+
+    /// Whichever feature says which entity this unit is.
+    ///
+    /// The three are on one entity — implementation guide §3.3 — so whichever is present
+    /// answers for all of them.
+    fn entity_feature(&self) -> Option<&crate::model::FeatureAddress> {
+        self.measurement
+            .as_ref()
+            .or(self.curtailment.as_ref())
+            .or(self.electrical_connection.as_ref())
+    }
+
+    fn entity_path(&self) -> Vec<u32> {
+        self.entity_feature()
+            .map(crate::spine::entity_path)
+            .unwrap_or_default()
+    }
+
+    /// Whether `feature` is one of the three this peer serves.
+    ///
+    /// The device is checked first and separately: [`same_feature`](crate::spine::same_feature)
+    /// compares device addresses only where both carry one, which is right for matching a
+    /// discovery read against the instance it was aimed at and wrong here — two devices may
+    /// well number an entity and a feature the same way.
+    fn serves(&self, feature: &crate::model::FeatureAddress) -> bool {
+        if feature.device.as_ref().is_none_or(|d| d != &self.device) {
+            return false;
+        }
+        [
+            self.measurement.as_ref(),
+            self.curtailment.as_ref(),
+            self.electrical_connection.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|known| crate::spine::same_feature(known, feature))
+    }
+
     /// A peer whose only feature is a `Measurement` server.
     ///
     /// What a use case with no electrical connection to describe locates: MDT's DHW
@@ -381,12 +468,12 @@ pub enum MonitoringEvent {
     /// A unit's descriptions arrived, so its values can now be read.
     UnitDescribed {
         /// The unit.
-        device: crate::model::AddressDevice,
+        unit: UnitId,
     },
     /// New values arrived from a unit.
     Measured {
         /// The unit.
-        device: crate::model::AddressDevice,
+        unit: UnitId,
         /// What changed.
         readings: Vec<Reading>,
     },
@@ -402,7 +489,7 @@ pub enum MonitoringEvent {
     /// measurement.
     CurtailmentChanged {
         /// The connection point.
-        device: crate::model::AddressDevice,
+        unit: UnitId,
         /// The factor, as a percentage in `0..=100`.
         factor_percent: f64,
     },
@@ -438,6 +525,10 @@ impl MonitoringApplianceActor {
     /// Calling it again for a unit already tracked restarts the exchange, which is what
     /// a reconnection needs — the subscription did not survive it, and the descriptions
     /// may have changed while the connection was down.
+    ///
+    /// "Already tracked" is by [`UnitId`] — device *and* entity — so several units of one
+    /// device sit here side by side. A heat-pump gateway announcing one `HVACRoom` per room
+    /// is attached once per room, and each keeps its own [`Readings`].
     pub fn attach(
         &mut self,
         engine: &mut crate::spine::Engine,
@@ -446,8 +537,8 @@ impl MonitoringApplianceActor {
     ) {
         use crate::model::Function;
 
-        let device = peer.device.clone();
-        self.peers.retain(|t| t.peer.device != device);
+        let id = peer.id();
+        self.peers.retain(|t| !t.peer.is_unit(&id));
 
         // Each of the three features is read only where the peer serves it. A read
         // addressed to a feature that is not there is answered with `errorNumber` 7 at
@@ -494,7 +585,16 @@ impl MonitoringApplianceActor {
     }
 
     /// Stops monitoring a unit.
-    pub fn detach(&mut self, device: &crate::model::AddressDevice) {
+    pub fn detach(&mut self, unit: &UnitId) {
+        self.peers.retain(|t| !t.peer.is_unit(unit));
+    }
+
+    /// Stops monitoring every unit on a device — what a lost connection removes.
+    ///
+    /// A device that goes away takes all of its entities with it, and a Monitoring
+    /// Appliance holding one room of a gateway and not the other three is worse than one
+    /// holding none.
+    pub fn detach_device(&mut self, device: &crate::model::AddressDevice) {
         self.peers.retain(|t| &t.peer.device != device);
     }
 
@@ -504,10 +604,10 @@ impl MonitoringApplianceActor {
     }
 
     /// What is known about one unit's measurements.
-    pub fn readings(&self, device: &crate::model::AddressDevice) -> Option<&Readings> {
+    pub fn readings(&self, unit: &UnitId) -> Option<&Readings> {
         self.peers
             .iter()
-            .find(|t| &t.peer.device == device)
+            .find(|t| t.peer.is_unit(unit))
             .map(|t| &t.readings)
     }
 
@@ -516,10 +616,10 @@ impl MonitoringApplianceActor {
     /// [`None`] for a peer that does not serve MGCP scenario 1, and for one whose
     /// description and value have not both arrived. Not zero, ever: a factor that has not
     /// been read is not a curtailment, and treating it as one stops a roof exporting.
-    pub fn curtailment(&self, device: &crate::model::AddressDevice) -> Option<f64> {
+    pub fn curtailment(&self, unit: &UnitId) -> Option<f64> {
         self.peers
             .iter()
-            .find(|t| &t.peer.device == device)?
+            .find(|t| t.peer.is_unit(unit))?
             .curtailment
             .factor_percent()
     }
@@ -531,12 +631,12 @@ impl MonitoringApplianceActor {
     /// the caller's to supply.
     pub fn feed_in_limit(
         &self,
-        device: &crate::model::AddressDevice,
+        unit: &UnitId,
         nominal_peak_watts: f64,
     ) -> Option<crate::usecases::mgcp::FeedInLimit> {
         self.peers
             .iter()
-            .find(|t| &t.peer.device == device)?
+            .find(|t| t.peer.is_unit(unit))?
             .curtailment
             .limit(nominal_peak_watts)
     }
@@ -558,27 +658,35 @@ impl MonitoringApplianceActor {
             } => (feature, resolved),
             _ => return None,
         };
-        let device = feature.device.as_ref()?;
-        let index = self.peers.iter().position(|t| &t.peer.device == device)?;
+        // By feature, not by device. Two `HVACRoom` entities of one gateway are two units
+        // with two `Measurement` features, and a device-wide lookup would resolve both
+        // rooms' notifications against whichever was attached first.
+        let index = self.peers.iter().position(|t| t.peer.serves(feature))?;
         let tracked = &mut self.peers[index];
+        let unit = tracked.peer.id();
 
         // MGCP scenario 1: a `DeviceConfiguration` payload from the feature this peer
         // serves it from. Neither half is a measurement, so it is settled before the
         // measurement layer sees it.
-        if tracked.peer.curtailment.as_ref() == Some(feature) {
+        if tracked
+            .peer
+            .curtailment
+            .as_ref()
+            .is_some_and(|known| crate::spine::same_feature(known, feature))
+        {
             let before = tracked.curtailment.factor_percent();
             if tracked.curtailment.describe(data) {
                 // A description can complete a value that arrived before it.
                 return changed(before, tracked.curtailment.factor_percent()).map(|factor| {
                     MonitoringEvent::CurtailmentChanged {
-                        device: device.clone(),
+                        unit,
                         factor_percent: factor,
                     }
                 });
             }
             let after = tracked.curtailment.apply(data);
             return changed(before, after).map(|factor| MonitoringEvent::CurtailmentChanged {
-                device: device.clone(),
+                unit,
                 factor_percent: factor,
             });
         }
@@ -588,9 +696,7 @@ impl MonitoringApplianceActor {
             // at least one measurement has both a meaning and its phases.
             if !tracked.described && tracked.readings.described().next().is_some() {
                 tracked.described = true;
-                return Some(MonitoringEvent::UnitDescribed {
-                    device: device.clone(),
-                });
+                return Some(MonitoringEvent::UnitDescribed { unit });
             }
             return None;
         }
@@ -599,10 +705,7 @@ impl MonitoringApplianceActor {
         if readings.is_empty() {
             return None;
         }
-        Some(MonitoringEvent::Measured {
-            device: device.clone(),
-            readings,
-        })
+        Some(MonitoringEvent::Measured { unit, readings })
     }
 }
 
@@ -645,6 +748,8 @@ fn phasing_of(scope: &ScopeType) -> Option<Option<ElectricalConnectionPhaseName>
         | ScopeType::InsulationResistance
         | ScopeType::ComponentTemperature
         | ScopeType::DhwTemperature
+        | ScopeType::RoomAirTemperature
+        | ScopeType::OutsideAirTemperature
         | ScopeType::TravelRange => Some(None),
         // Apparent and reactive power split into a total and a per-phase scope, like
         // active power: the phase-specific ones wait for the parameter description.
@@ -676,9 +781,12 @@ fn quantity_of(scope: &ScopeType) -> Option<Quantity> {
         ScopeType::AcYieldYear => Quantity::YieldYear,
         ScopeType::AcYieldTotal => Quantity::YieldTotal,
         ScopeType::ComponentTemperature => Quantity::Temperature,
-        // The one measurement here that is not electricity, and has no phases: a tank is
-        // a tank (MDT Table 7).
+        // The three measurements here that are not electricity, and have no phases: a
+        // tank is a tank (MDT Table 7), a room is a room (MRT Table 7), and outdoors is
+        // outdoors (MOT Table 7).
         ScopeType::DhwTemperature => Quantity::DhwTemperature,
+        ScopeType::RoomAirTemperature => Quantity::RoomTemperature,
+        ScopeType::OutsideAirTemperature => Quantity::OutdoorTemperature,
         ScopeType::DcPower => Quantity::DcPower,
         ScopeType::DcCurrent => Quantity::DcCurrent,
         ScopeType::DcVoltage => Quantity::DcVoltage,

@@ -152,6 +152,41 @@ pub enum WriteApproval {
     Deferred,
 }
 
+/// Whether a peer must hold a binding before it may write to a feature.
+///
+/// **A property of the feature, not of the protocol.** §7.3: "please note that some feature
+/// types define requirements for binding!" — and `TC_SPINE_BIND_002` tests that consequence
+/// rather than a blanket rule, rejecting an unbound write "if the target feature **requires**
+/// a binding (e.g. LoadControl)". Which features those are is the use case's business, and
+/// the specifications say so in both directions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WriteBinding {
+    /// A write from a peer holding no binding is refused with
+    /// [`ErrorNumber::BindingRequired`](crate::model::ErrorNumber::BindingRequired).
+    ///
+    /// The default, and what every *grid* use case here asks for — LPC/LPP, OPEV/OSCEV,
+    /// COB, EVCS, OHPCF scenario 2: "Actors that write parts of a Feature within this
+    /// Scenario need to create a binding". A limit or a current ceiling is an instruction
+    /// with consequences, and the binding is what makes "who may give it" answerable — with
+    /// [`BindingPolicy::SinglePerFeature`](crate::spine::BindingPolicy), with one name.
+    ///
+    /// It is also the safe default: a feature that should have been open refuses a write a
+    /// conformant peer will retry and complain about, where one that should have been closed
+    /// accepts a write from anybody.
+    #[default]
+    Required,
+    /// Any peer that can reach the feature may write it.
+    ///
+    /// What every use case in [`hvac`](crate::usecases::hvac) asks for by name: "Binding
+    /// SHOULD NOT be used for this Scenario". A server that insisted on one would refuse
+    /// every conformant Configuration Appliance.
+    ///
+    /// Not the same as unchecked: the write still has to pass [`Operations`], and a feature
+    /// with [`WriteApproval::Deferred`] still puts every one to the application — which is
+    /// where a policy of "only this manager" belongs if a product wants one.
+    NotRequired,
+}
+
 /// A feature of a local entity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalFeature {
@@ -159,6 +194,7 @@ pub struct LocalFeature {
     feature_type: FeatureType,
     role: Role,
     approval: WriteApproval,
+    binding: WriteBinding,
     functions: Vec<FunctionEntry>,
     max_response_delay: Option<core::time::Duration>,
 }
@@ -171,6 +207,7 @@ impl LocalFeature {
             feature_type,
             role,
             approval: WriteApproval::Automatic,
+            binding: WriteBinding::Required,
             functions: Vec::new(),
             max_response_delay: None,
         }
@@ -181,6 +218,26 @@ impl LocalFeature {
     pub fn with_deferred_writes(mut self) -> Self {
         self.approval = WriteApproval::Deferred;
         self
+    }
+
+    /// Accepts writes from peers that hold no binding.
+    ///
+    /// For a feature whose use case says a binding is not to be used — which is every one
+    /// in [`hvac`](crate::usecases::hvac), by name: "Binding SHOULD NOT be used for this
+    /// Scenario". Without it a conformant Configuration Appliance's setpoint write is
+    /// answered `errorNumber` 9 and the use case cannot run at all.
+    ///
+    /// See [`WriteBinding`] for which use cases say which, and why the default is the
+    /// other way round.
+    #[must_use]
+    pub fn with_unbound_writes(mut self) -> Self {
+        self.binding = WriteBinding::NotRequired;
+        self
+    }
+
+    /// Whether a peer must be bound before it may write to this feature.
+    pub fn write_binding(&self) -> WriteBinding {
+        self.binding
     }
 
     /// Announces that this feature may take longer than the ten-second default to answer.
@@ -225,11 +282,24 @@ impl LocalFeature {
                 && CmdData::supports_restriction(function.as_str()),
             ..operations
         };
-        self.functions.push(FunctionEntry {
-            function,
-            operations,
-            data: None,
-        });
+        // Replace rather than append. §7.1.2's `supportedFunction` list names each
+        // function once, so a duplicate entry would announce the same function twice in
+        // detailed discovery — and the *first* of the two would decide what a peer is
+        // allowed to do with it, which is how a feature built up in layers ends up refusing
+        // a write it declared. Declaring a function twice now means the later declaration
+        // wins, which is what a builder that adds writes on top of reads intends.
+        match self
+            .functions
+            .iter_mut()
+            .find(|entry| entry.function == function)
+        {
+            Some(entry) => entry.operations = operations,
+            None => self.functions.push(FunctionEntry {
+                function,
+                operations,
+                data: None,
+            }),
+        }
         self
     }
 
@@ -834,6 +904,49 @@ pub(crate) fn entity_addresses(path: &[u32]) -> Vec<AddressEntity> {
 mod tests {
     use super::*;
     use crate::model::{LoadControlLimitData, LoadControlLimitId, LoadControlLimitListData};
+
+    /// §7.1.2's `supportedFunction` list names each function once, and the later
+    /// declaration wins.
+    ///
+    /// A builder that adds writes on top of reads — which is how every configuration use
+    /// case in [`hvac`](crate::usecases::hvac) is built, the writeable feature being the
+    /// read-only one plus two writes — would otherwise leave two entries for the same
+    /// function, announce the function twice in detailed discovery, and have the *first*
+    /// one decide what a peer may do. Which is a feature that declares a write and refuses
+    /// it, and nothing in either end's logs says why.
+    #[test]
+    fn declaring_a_function_twice_replaces_it_rather_than_appending() {
+        let feature = LocalFeature::new(1, FeatureType::HVAC, Role::Server)
+            .with_function(Function::HvacSystemFunctionListData, Operations::read())
+            .with_function(
+                Function::HvacSystemFunctionListData,
+                Operations::read_write(),
+            );
+
+        let declared: Vec<_> = feature
+            .functions()
+            .iter()
+            .filter(|entry| entry.function == Function::HvacSystemFunctionListData)
+            .collect();
+        assert_eq!(declared.len(), 1, "one entry, not two");
+        assert!(declared[0].operations.write, "and it is the writeable one");
+    }
+
+    /// Writes require a binding by default, and a feature may say otherwise.
+    #[test]
+    fn a_feature_says_for_itself_whether_a_write_needs_a_binding() {
+        let limit = LocalFeature::new(1, FeatureType::LoadControl, Role::Server);
+        assert_eq!(
+            limit.write_binding(),
+            WriteBinding::Required,
+            "the safe way round, and what every grid use case asks for"
+        );
+        assert_eq!(
+            crate::usecases::hvac::cdt::setpoint_feature(1).write_binding(),
+            WriteBinding::NotRequired,
+            "CDT §3.4.1.1: \"Binding SHOULD NOT be used for this Scenario\""
+        );
+    }
 
     fn heat_pump() -> LocalDevice {
         let mut device =

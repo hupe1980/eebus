@@ -77,10 +77,10 @@ would be making that choice for every consumer downstream of it, including one w
 `deny.toml` bans it — and the result is not a compile error but a household box that panics
 the first time a control box connects.
 
-```toml
-eebus = { version = "0.4", features = ["runtime", "ring"] }
+```sh
+cargo add eebus --features runtime,ring
 # or, for a build that must not contain `ring`:
-eebus = { version = "0.4", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+cargo add eebus --no-default-features --features std,runtime,aws-lc-rs
 ```
 
 Nothing here ever reads the process default. The provider is built explicitly, with exactly

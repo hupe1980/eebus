@@ -101,13 +101,34 @@ quietly loses it:
 
 Two distinct grants, easily confused:
 
-* A **binding** grants the right to *write* to a feature. Without one, a write is refused.
+* A **binding** grants the right to *write* to a feature that requires one.
 * A **subscription** asks to be *notified* when data changes.
 
 LPC requires both, in that order, and requires the Energy Guard to have subscribed to the
 heartbeat *before* it writes a limit. A single-writer policy applies: a feature accepts a
 binding from one client, and the group lock the LPC implementation guide §3.5 describes is
 enforced here rather than left to the application.
+
+### "…that requires one"
+
+§7.3 puts the requirement on the **feature**: "please note that some feature types define
+requirements for binding!" — and the SPINE test specification follows it rather than
+stating a blanket rule. `TC_SPINE_BIND_002` has the device under test reject an unbound
+write "if the target feature **requires** a binding (e.g. LoadControl)".
+
+The use cases say which features those are, and they do not agree — LPC/LPP and their
+relatives require one, every HVAC use case says "Binding SHOULD NOT be used for this
+Scenario". So `WriteBinding` is per feature:
+
+```rust
+limitation::load_control_feature(1);   // WriteBinding::Required — the default
+cdt::setpoint_feature(1);              // WriteBinding::NotRequired — CDT §3.4.1.1
+```
+
+The default is `Required`, which is the safe way round: a feature that should have been
+open refuses a write a conformant peer will retry and complain about, where one that should
+have been closed accepts a write from anybody. See
+[Who may write, and who may not](@/docs/use-cases.md) for the split by use case.
 
 Unchanged data is not notified (SPINE IG §2.4). That is what makes a dozen subscriptions
 affordable on a small controller.

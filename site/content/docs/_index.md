@@ -23,7 +23,8 @@ If you know the standard and want the code, go straight to
 [MPC and MGCP](@/docs/monitoring.md) for measuring it,
 [E-mobility](@/docs/e-mobility.md) for wallboxes and cars,
 [inverters, PV and batteries](@/docs/storage.md) for the generation side, and
-[hot water](@/docs/hot-water.md) for the one setpoint a limit cannot express.
+[heat pumps](@/docs/hot-water.md) for the hot water, the building's temperature and
+the compressor that heats it.
 
 If you are evaluating the crate, [Architecture](@/docs/architecture.md),
 [Conformance](@/docs/conformance.md) and [Certification](@/docs/certification.md) are the

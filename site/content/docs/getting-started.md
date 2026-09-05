@@ -8,11 +8,8 @@ group = "Start"
 
 ## Install
 
-The crate is not on crates.io yet. Take it from git:
-
-```toml
-[dependencies]
-eebus = { git = "https://github.com/hupe1980/eebus" }
+```sh
+cargo add eebus
 ```
 
 Default features are `std`, `pairing` and `conformance`. Sockets, TLS and certificates are
@@ -25,8 +22,8 @@ one for you: add `ring` or `aws-lc-rs`, exactly one, or the build stops with an 
 The choice is process-global in `rustls`, so it belongs to whoever builds the binary — see
 [the security model](@/docs/security.md#the-cryptography-provider-is-the-consumer-s-choice).
 
-```toml
-eebus = { git = "https://github.com/hupe1980/eebus", features = ["runtime", "ring"] }
+```sh
+cargo add eebus --features runtime,ring
 ```
 
 ## Run the exchange

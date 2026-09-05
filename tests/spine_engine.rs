@@ -207,6 +207,118 @@ fn tc_spine_bind_002_an_unbound_write_is_refused() {
     );
 }
 
+/// The other half of `TC_SPINE_BIND_002`, and the half a blanket rule gets wrong: a
+/// feature whose use case says **not** to bind accepts the write.
+///
+/// §7.3 puts the requirement on the feature — "please note that some feature types define
+/// requirements for binding!" — and the test case follows it: reject an unbound write "if
+/// the target feature **requires** a binding (e.g. LoadControl)". Every use case in
+/// `usecases::hvac` says the opposite, in the same words each time: "Binding SHOULD NOT be
+/// used for this Scenario". A device that refused those would refuse every conformant
+/// Configuration Appliance, and the hot water setpoint no other vendor's manager could set
+/// would look, from both ends, like a device that simply does not work.
+#[test]
+fn a_feature_that_does_not_require_a_binding_takes_the_write() {
+    use eebus::model::{
+        ScaledNumber, SetpointData, SetpointDescriptionData, SetpointDescriptionListData,
+        SetpointId, SetpointListData, SetpointType, UnitOfMeasurement,
+    };
+    use eebus::spine::WriteBinding;
+    use eebus::usecases::hvac::cdt;
+
+    let now = Duration::ZERO;
+    let mut manager = control_box();
+
+    let mut device =
+        LocalDevice::new("i:67890", "HeatPump-2", DeviceType::HeatGenerationSystem).unwrap();
+    device
+        .add_entity(
+            LocalEntity::new([1], EntityType::DHWCircuit).with_feature(cdt::setpoint_feature(1)),
+        )
+        .unwrap();
+    let target = device.address_of(&[1], 1);
+    device
+        .resolve_mut(&target)
+        .unwrap()
+        .set_data(CmdData::SetpointDescriptionListData(
+            SetpointDescriptionListData {
+                setpoint_description_data: Some(vec![SetpointDescriptionData {
+                    setpoint_id: Some(SetpointId(1)),
+                    setpoint_type: Some(SetpointType::ValueAbsolute),
+                    unit: Some(UnitOfMeasurement::DegC),
+                    scope_type: Some(eebus::model::ScopeType::DhwTemperature),
+                    ..Default::default()
+                }]),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        device.resolve(&target).unwrap().write_binding(),
+        WriteBinding::NotRequired,
+        "CDT §3.4.1.1 says so, and the constructor is where that has to live"
+    );
+    let mut circuit = Engine::new(device);
+    circuit.add_use_case([1], 1, &cdt::DHW_CIRCUIT);
+
+    let source = manager.device().address_of(&[1], 1);
+    // No binding request anywhere above this line.
+    manager.write(
+        &target,
+        &source,
+        CmdData::SetpointListData(SetpointListData {
+            setpoint_data: Some(vec![SetpointData {
+                setpoint_id: Some(SetpointId(1)),
+                value: Some(ScaledNumber::from_f64(60.0, 1)),
+                ..Default::default()
+            }]),
+        }),
+        true,
+        now,
+    );
+    pump(&mut manager, &mut circuit, now);
+
+    // The circuit defers its setpoint writes, so the application answers.
+    let write = events(&mut circuit)
+        .into_iter()
+        .find_map(|e| match e {
+            SpineEvent::WriteRequested(write) => Some(write),
+            _ => None,
+        })
+        .expect("the write reached the application rather than being refused at the door");
+    circuit.accept_write(write.token, now).expect("stored");
+    pump(&mut manager, &mut circuit, now);
+
+    let result = events(&mut manager)
+        .into_iter()
+        .find_map(|e| match e {
+            SpineEvent::ResultReceived { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("a result came back");
+    assert_eq!(
+        result,
+        ErrorNumber::None,
+        "an unbound write to a feature that requires no binding is applied"
+    );
+    assert!(
+        circuit
+            .device()
+            .resolve(&target)
+            .unwrap()
+            .data(&Function::SetpointListData)
+            .is_some(),
+        "and the temperature landed"
+    );
+
+    // The rule is per feature, not per device: the grid features on the same node still
+    // refuse. `heat_pump()`'s `LoadControl` is the default and is checked above.
+    assert_eq!(
+        eebus::usecases::limitation::load_control_feature(1).write_binding(),
+        WriteBinding::Required,
+        "a limit is an instruction with consequences; §7.3's binding is who may give it"
+    );
+}
+
 /// The full sequence: bind, subscribe, then write. This is the pre-scenario
 /// communication of LPC §3.3 followed by scenario 1.
 #[test]

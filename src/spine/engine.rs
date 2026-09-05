@@ -1686,8 +1686,16 @@ impl Engine {
         let Some(feature) = self.device.resolve(destination) else {
             return CmdOutcome::Answer(ErrorNumber::DestinationUnknown);
         };
-        // `TC_SPINE_BIND_002`: a write without a binding is refused.
-        if !self.relations.is_bound(source, destination) {
+        // `TC_SPINE_BIND_002`: a write without a binding is refused — **where the feature
+        // requires one**. The test case says so ("if the target feature requires a binding
+        // (e.g. LoadControl)") and §7.3 says why: "some feature types define requirements
+        // for binding". Refusing every unbound write instead would make the whole HVAC
+        // family unusable, since CDT, CDSF, CRHT, CRCT, CRHSF and CRCSF each say "Binding
+        // SHOULD NOT be used for this Scenario" — the setpoint write a conformant
+        // Configuration Appliance sends carries no binding and never will.
+        if feature.write_binding() == crate::spine::WriteBinding::Required
+            && !self.relations.is_bound(source, destination)
+        {
             return CmdOutcome::Answer(ErrorNumber::BindingRequired);
         }
 

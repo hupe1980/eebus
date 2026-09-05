@@ -68,6 +68,42 @@
 //! # let _ = write;
 //! ```
 //!
+//! # Subscribe to be told, bind to write
+//!
+//! Both scenarios are served from the one `SmartEnergyManagementPs` feature, and they ask
+//! for different pre-scenario communication. §3.4.1.1 says of scenario 1 that "Binding
+//! SHOULD NOT be used for this Scenario", and §3.4.2 adds for scenario 2: "Actors that
+//! write parts of a Feature within this Scenario need to create a binding […] Only one
+//! binding partner is allowed to write the data specified in this Scenario."
+//!
+//! So a CEM needs both, and the one that is easy to leave out is the binding — every
+//! monitoring use case in this crate needs none, this is the first here that *writes*, and
+//! nothing in the payload of an offer mentions it. What a CEM without one gets is an offer
+//! it can see, report, and never take up: [`activate`] is answered with `errorNumber` 9,
+//! `bindingRequired`, before the payload is looked at. The SPINE test specification makes
+//! that a conformance requirement of the *server* — [SPINE-TS-BIND-02], `TC_SPINE_BIND_002`
+//! "Reject unbound write" — so a compressor that let the write through would be the one at
+//! fault.
+//!
+//! [`CompressorPeer::follow`] sends the binding, the subscription and the initial read in
+//! the order the two scenarios want them, and is what a CEM should call the moment
+//! [`locate`] returns a peer.
+//!
+//! ```no_run
+//! # use core::time::Duration;
+//! use eebus::usecases::ohpcf;
+//! # fn example(
+//! #     engine: &mut eebus::spine::Engine,
+//! #     remote: &eebus::spine::RemoteDevice,
+//! #     client: &eebus::model::FeatureAddress,
+//! #     now: Duration,
+//! # ) -> Option<()> {
+//! let compressor = ohpcf::locate(remote)?;
+//! compressor.follow(engine, client, now);
+//! # Some(())
+//! # }
+//! ```
+//!
 //! [`limitation`]: crate::usecases::limitation
 //! [`emobility::opev`]: crate::usecases::emobility::opev
 //! [`cob`]: crate::usecases::cob
@@ -978,6 +1014,9 @@ pub fn is_absent(data: &CmdData) -> bool {
 ///
 /// Re-scheduling is the same write again, and §2.5.2 allows it up until the process
 /// starts.
+///
+/// **Needs a binding.** §3.4.2/1, and it is the one step a CEM built out of this crate's
+/// monitoring use cases has never had to take — see [`CompressorPeer::follow`].
 pub fn activate(sequence: PowerSequenceId, start_time: &str) -> CmdData {
     write_sequence(SmartEnergyManagementPsPowerSequence {
         description: Some(SmartEnergyManagementPsPowerSequenceDescription {
@@ -993,16 +1032,22 @@ pub fn activate(sequence: PowerSequenceId, start_time: &str) -> CmdData {
 }
 
 /// [OHPCF-022/1]: aborts the process. The specification spells it `invalid`.
+///
+/// A write, so it needs the binding [`CompressorPeer::follow`] asks for.
 pub fn stop(sequence: PowerSequenceId) -> CmdData {
     state_write(sequence, PowerSequenceState::Invalid)
 }
 
 /// [OHPCF-022/2]: pauses a running process.
+///
+/// A write, so it needs the binding [`CompressorPeer::follow`] asks for.
 pub fn pause(sequence: PowerSequenceId) -> CmdData {
     state_write(sequence, PowerSequenceState::Paused)
 }
 
 /// [OHPCF-022/3]: resumes a paused one.
+///
+/// A write, so it needs the binding [`CompressorPeer::follow`] asks for.
 pub fn resume(sequence: PowerSequenceId) -> CmdData {
     state_write(sequence, PowerSequenceState::Running)
 }
@@ -1034,12 +1079,123 @@ fn write_sequence(sequence: SmartEnergyManagementPsPowerSequence) -> CmdData {
 // ---- what a CEM finds ----------------------------------------------------------------
 
 /// Where one compressor's flexibility lives.
+///
+/// **Subscribe to be told; bind to write.** Both scenarios are served from the one feature
+/// and they ask for different pre-scenario communication (§3.4.1.1, §3.4.2):
+///
+/// | | |
+/// |---|---|
+/// | scenario 1, *monitor* | "Binding SHOULD NOT be used for this Scenario"; a **subscription** is what carries the compressor's own state changes |
+/// | scenario 2, *control* | "Actors that write parts of a Feature within this Scenario need to create a binding" |
+///
+/// So a CEM that only subscribes gets every notification and cannot act on any of them:
+/// [`activate`], [`stop`], [`pause`] and [`resume`] are writes, and a compressor answers a
+/// write from a peer holding no binding with
+/// [`ErrorNumber::BindingRequired`](crate::model::ErrorNumber::BindingRequired) — 9 — before
+/// the payload is looked at (`TC_SPINE_BIND_002`). Nothing in the offer says so; it is an
+/// acknowledgement that never comes back positive.
+///
+/// [`follow`](Self::follow) sends all three requests in the order the two scenarios want.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompressorPeer {
     /// The peer's device address.
     pub device: crate::model::AddressDevice,
     /// Its `SmartEnergyManagementPs` feature: read for the offer, written to take it up.
+    ///
+    /// One feature, two privileges. A subscription on it is what scenario 1 needs and a
+    /// binding is what scenario 2 needs, and holding one is no evidence of the other.
     pub flexibility: crate::model::FeatureAddress,
+}
+
+/// The three requests [`CompressorPeer::follow`] sent, in the order they went out.
+///
+/// Worth keeping. The two calls are answered under their own counters as
+/// [`SpineEvent::ResultReceived`](crate::spine::SpineEvent::ResultReceived), and that is
+/// the **only** place a refused binding is visible — nothing else on the wire says a CEM
+/// may not write. Told apart by counter, "the compressor will not let me write" and "the
+/// compressor will not tell me anything" are two different commissioning faults with two
+/// different fixes; told apart by nothing, they are one silence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Following {
+    /// The binding request scenario 2 needs before any write ([OHPCF-021], [OHPCF-022]).
+    ///
+    /// `ErrorNumber::None` under this counter is what says [`activate`] will be looked at
+    /// rather than answered `BindingRequired`.
+    pub binding: crate::model::MsgCounter,
+    /// The subscription request scenario 1 runs on.
+    ///
+    /// Refused, a CEM should poll instead: §3.3.4 permits exactly that, and a compressor
+    /// with no subscriptions left is a compressor whose own state changes reach nobody.
+    pub subscription: crate::model::MsgCounter,
+    /// The initial read of `smartEnergyManagementPsData` (§3.4.1.2).
+    ///
+    /// A *successful* read arrives as
+    /// [`ReplyReceived`](crate::spine::SpineEvent::ReplyReceived), which carries the
+    /// feature rather than this counter; a failed one is a `ResultReceived` under it. So
+    /// this is the counter that says the read went wrong, not the one that says it went
+    /// right.
+    pub read: crate::model::MsgCounter,
+}
+
+impl CompressorPeer {
+    /// Starts following a compressor: binds, subscribes, and reads what it is offering.
+    ///
+    /// The pre-scenario communication both scenarios ask for, in one call and in the order
+    /// the specification puts it:
+    ///
+    /// 1. **Bind** (§3.3.3, §3.4.2/1). A write needs it, and "only one binding partner is
+    ///    allowed to write the data specified in this Scenario" — so a second CEM asking is
+    ///    refused, and finding that out at commissioning is better than finding it out at
+    ///    the moment the roof starts exporting.
+    /// 2. **Subscribe** (§3.3.4, §3.4.1.1/3). Scenario 1's "Actors SHALL create a
+    ///    subscription". Without it a compressor that starts at its scheduled time, or
+    ///    completes, or withdraws the offer, changes state and tells nobody.
+    /// 3. **Read** (§3.4.1.2). The initial scenario communication, which "SHALL be
+    ///    exchanged each time a (re-)connection is established, even if the Pre-Scenario
+    ///    communication phase is skipped" — the offer may have changed while the connection
+    ///    was down.
+    ///
+    /// Calling it again restarts all three, which is what a reconnection needs: neither the
+    /// binding nor the subscription survived it.
+    ///
+    /// `client` is the CEM's own client feature — the `Generic` one the use-case
+    /// implementation guide §3.3 asks for, which
+    /// [`limitation::client_feature`](crate::usecases::limitation::client_feature) builds.
+    ///
+    /// ```no_run
+    /// # use core::time::Duration;
+    /// use eebus::usecases::ohpcf;
+    /// # fn example(
+    /// #     engine: &mut eebus::spine::Engine,
+    /// #     remote: &eebus::spine::RemoteDevice,
+    /// #     client: &eebus::model::FeatureAddress,
+    /// #     now: Duration,
+    /// # ) -> Option<()> {
+    /// let compressor = ohpcf::locate(remote)?;
+    /// let pending = compressor.follow(engine, client, now);
+    /// // `pending.binding` is the counter to watch: until it is acknowledged, every
+    /// // `activate`/`stop`/`pause`/`resume` this CEM sends comes back refused.
+    /// # let _ = pending;
+    /// # Some(())
+    /// # }
+    /// ```
+    pub fn follow(
+        &self,
+        engine: &mut crate::spine::Engine,
+        client: &crate::model::FeatureAddress,
+        now: Duration,
+    ) -> Following {
+        Following {
+            binding: engine.request_binding(client, &self.flexibility, now),
+            subscription: engine.request_subscription(client, &self.flexibility, now),
+            read: engine.read(
+                &self.flexibility,
+                client,
+                Function::SmartEnergyManagementPsData,
+                now,
+            ),
+        }
+    }
 }
 
 /// Finds a compressor's feature from its detailed discovery and use-case data.
@@ -1050,6 +1206,11 @@ pub struct CompressorPeer {
 /// work: the feature is on the entity that announced the actor.
 ///
 /// Returns [`None`] until the peer has announced both the use case and the feature.
+///
+/// What comes next is [`CompressorPeer::follow`], and it is not optional: a located
+/// compressor is an address, not a conversation. Scenario 1 needs a subscription and
+/// scenario 2 needs a **binding**, and a CEM that took only the subscription can watch an
+/// offer it will never be allowed to take up.
 pub fn locate(remote: &crate::spine::RemoteDevice) -> Option<CompressorPeer> {
     let found = remote.use_case(NAME, COMPRESSOR_ACTOR)?;
     Some(CompressorPeer {

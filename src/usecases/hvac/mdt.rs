@@ -47,16 +47,13 @@
 //! assert_eq!(readings.value(&tank), Some(58.5));
 //! ```
 
-use alloc::vec;
-
 use crate::model::{
-    CmdData, EntityType, FeatureType, Function, MeasurementConstraintsData,
-    MeasurementConstraintsListData, MeasurementData, MeasurementDescriptionData,
-    MeasurementDescriptionListData, MeasurementId, MeasurementListData, MeasurementValueSource,
-    MeasurementValueState, MeasurementValueType, Role, ScaledNumber, UnitOfMeasurement,
+    CmdData, EntityType, FeatureType, Function, MeasurementId, MeasurementValueSource,
+    MeasurementValueState, UnitOfMeasurement,
 };
-use crate::spine::{LocalFeature, Operations};
+use crate::spine::LocalFeature;
 use crate::usecases::descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
+use crate::usecases::hvac::temperature;
 use crate::usecases::monitoring::{Measurand, Quantity};
 
 /// The version this implementation speaks.
@@ -95,21 +92,20 @@ pub const MEASURAND: Measurand = Measurand::unphased(Quantity::DhwTemperature);
 /// case unlike MPC and MGCP: a tank has no phases and no connection to describe, so the
 /// measurement description stands alone.
 pub fn measurement_feature(address: u32) -> LocalFeature {
-    LocalFeature::new(address, FeatureType::Measurement, Role::Server)
-        .with_function(Function::MeasurementDescriptionListData, Operations::read())
-        .with_function(Function::MeasurementConstraintsListData, Operations::read())
-        .with_function(Function::MeasurementListData, Operations::read())
+    temperature::measurement_feature(address)
 }
 
 // ---- what a DHW Circuit publishes ---------------------------------------------------
 
 /// The measurement's description (Table 7).
 ///
-/// `commodityType: domesticHotWater` is `M` and is the only place in this crate where a
-/// measurement is not electricity. A client that filters on the commodity — which is what
-/// the element is for — would not find a tank published as electricity.
+/// `commodityType: domesticHotWater` is `M`, and is one of the three places in this crate
+/// where a measurement is not electricity — the other two being a room and the outdoors,
+/// both `air` ([`mrt`](super::mrt), [`mot`](super::mot)). A client that filters on the
+/// commodity — which is what the element is for — would not find a tank published as
+/// electricity.
 pub fn temperature_description() -> CmdData {
-    described(UnitOfMeasurement::DegC)
+    temperature_description_in(UnitOfMeasurement::DegC)
 }
 
 /// The same, in the unit the circuit actually works in.
@@ -118,20 +114,7 @@ pub fn temperature_description() -> CmdData {
 /// appliance that assumes Celsius disagree by forty degrees at the temperatures that
 /// matter, and nothing on the wire objects.
 pub fn temperature_description_in(unit: UnitOfMeasurement) -> CmdData {
-    described(unit)
-}
-
-fn described(unit: UnitOfMeasurement) -> CmdData {
-    CmdData::MeasurementDescriptionListData(MeasurementDescriptionListData {
-        measurement_description_data: Some(vec![MeasurementDescriptionData {
-            measurement_id: Some(MEASUREMENT_ID),
-            measurement_type: Some(MEASURAND.measurement_type()),
-            commodity_type: Some(MEASURAND.commodity_type()),
-            unit: Some(unit),
-            scope_type: Some(MEASURAND.scope_type()),
-            ..Default::default()
-        }]),
-    })
+    temperature::description(&MEASURAND, MEASUREMENT_ID, unit)
 }
 
 /// The range and granularity the circuit can report (Table 8).
@@ -140,19 +123,12 @@ fn described(unit: UnitOfMeasurement) -> CmdData {
 /// `outOfRange` to these bounds, so without them an appliance told a value is out of range
 /// cannot say which way.
 pub fn temperature_constraints(min: f64, max: f64, step: Option<f64>) -> CmdData {
-    CmdData::MeasurementConstraintsListData(MeasurementConstraintsListData {
-        measurement_constraints_data: Some(vec![MeasurementConstraintsData {
-            measurement_id: Some(MEASUREMENT_ID),
-            value_range_min: Some(ScaledNumber::from_f64(min, 1)),
-            value_range_max: Some(ScaledNumber::from_f64(max, 1)),
-            value_step_size: step.map(|step| ScaledNumber::from_f64(step, 1)),
-        }]),
-    })
+    temperature::constraints(MEASUREMENT_ID, min, max, step)
 }
 
 /// The current temperature (Table 9), measured.
 pub fn temperature(degrees: f64) -> CmdData {
-    reported(degrees, MeasurementValueSource::MeasuredValue, None)
+    temperature_from(degrees, MeasurementValueSource::MeasuredValue, None)
 }
 
 /// The same, saying where the number came from and whether it can be trusted.
@@ -168,26 +144,8 @@ pub fn temperature_from(
     source: MeasurementValueSource,
     state: Option<MeasurementValueState>,
 ) -> CmdData {
-    reported(degrees, source, state)
-}
-
-fn reported(
-    degrees: f64,
-    source: MeasurementValueSource,
-    state: Option<MeasurementValueState>,
-) -> CmdData {
-    CmdData::MeasurementListData(MeasurementListData {
-        measurement_data: Some(vec![MeasurementData {
-            measurement_id: Some(MEASUREMENT_ID),
-            value_type: Some(MeasurementValueType::Value),
-            value: Some(ScaledNumber::from_f64(degrees, 1)),
-            value_source: Some(source),
-            value_state: state,
-            // [MDT-002]: only the newest value, and no history. A timestamp is permitted
-            // and adds nothing here — a second entry would be the forbidden thing.
-            ..Default::default()
-        }]),
-    })
+    // [MDT-002]: only the newest value, and no history.
+    temperature::reported(MEASUREMENT_ID, degrees, source, state)
 }
 
 // ---- what a Monitoring Appliance finds ----------------------------------------------
@@ -217,11 +175,18 @@ fn reported(
 pub fn locate(
     remote: &crate::spine::RemoteDevice,
 ) -> Option<crate::usecases::monitoring::MonitoredUnitPeer> {
-    let found = remote.use_case(NAME, DHW_CIRCUIT_ACTOR)?;
-    Some(crate::usecases::monitoring::MonitoredUnitPeer::measuring(
-        remote.address.clone()?,
-        remote.address_of(found, &FeatureType::Measurement, Role::Server)?,
-    ))
+    temperature::locate(remote, NAME, DHW_CIRCUIT_ACTOR)
+}
+
+/// Every DHW circuit on one device.
+///
+/// A device may hold more than one — a heat pump with two tanks announces the use case
+/// once per `DHWCircuit` entity — and each is its own unit with its own temperature. See
+/// [`temperature::locate_all`].
+pub fn locate_all(
+    remote: &crate::spine::RemoteDevice,
+) -> alloc::vec::Vec<crate::usecases::monitoring::MonitoredUnitPeer> {
+    temperature::locate_all(remote, NAME, DHW_CIRCUIT_ACTOR)
 }
 
 // ---- descriptors ---------------------------------------------------------------------

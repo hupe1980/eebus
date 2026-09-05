@@ -114,17 +114,16 @@ impl Link {
             "the feature is on the compressor, not on the appliance around it"
         );
 
-        self.manager
-            .request_binding(&self.client, &self.flexibility.clone(), self.now);
-        self.manager
-            .request_subscription(&self.client, &self.flexibility.clone(), self.now);
-        self.manager.read(
-            &self.flexibility.clone(),
-            &self.client,
-            Function::SmartEnergyManagementPsData,
-            self.now,
-        );
+        // The binding scenario 2 needs, the subscription scenario 1 runs on, and the
+        // initial read — one call, in the order §3.4.1.1 and §3.4.2 put them.
+        let pending = peer.follow(&mut self.manager, &self.client.clone(), self.now);
         self.settle();
+        assert!(
+            self.answers.contains(&ErrorNumber::None),
+            "the binding and the subscription were granted: {:?}",
+            self.answers
+        );
+        let _ = pending;
     }
 
     /// The manager writes, partially, as Table 10 requires.
@@ -451,4 +450,82 @@ fn a_withdrawn_offer_is_reported_as_an_absence() {
     let sequence = link.offer().sequence;
     link.write(ohpcf::activate(sequence, "PT0S"));
     assert_eq!(link.decided.last(), Some(&Err(Refused::NothingOffered)));
+}
+
+/// [TC_SPINE_BIND_002]: a CEM that subscribed and did not bind can watch the offer and
+/// cannot take it up.
+///
+/// The failure a controller hits first, and the one nothing on the wire warns about: the
+/// offer arrives, `CompressorOffer::read` says it is available, the write goes out
+/// well-formed against the sequence the compressor itself named — and comes back
+/// `BindingRequired`, before the compressor's own state machine has seen it. Every other
+/// EEBUS use case a monitoring-shaped controller has met needs no binding, so it is the one
+/// step that gets left out.
+///
+/// `CompressorPeer::follow` is the fix, and this test is both halves: without it, refused;
+/// with it, the same write is accepted.
+#[test]
+fn a_write_without_a_binding_is_refused_and_follow_is_what_grants_it() {
+    let mut link = Link::new();
+
+    // Discovery and a subscription — scenario 1, and nothing more. §3.4.1.1 even says
+    // binding "SHOULD NOT be used for this Scenario", which is exactly how a CEM ends up
+    // here.
+    let theirs = node_management(link.pump.device().address());
+    let ours = node_management(link.manager.device().address());
+    for function in [
+        Function::NodeManagementDetailedDiscoveryData,
+        Function::NodeManagementUseCaseData,
+    ] {
+        link.manager.read(&theirs, &ours, function, link.now);
+    }
+    link.settle();
+
+    let device = link.pump.device().address().clone();
+    let peer =
+        ohpcf::locate(link.manager.peer(&device).expect("the heat pump")).expect("a compressor");
+    link.manager
+        .request_subscription(&link.client, &peer.flexibility.clone(), link.now);
+    link.manager.read(
+        &peer.flexibility.clone(),
+        &link.client,
+        Function::SmartEnergyManagementPsData,
+        link.now,
+    );
+    link.settle();
+
+    let offer = link.offer.clone().expect("the offer arrived");
+    assert!(offer.is_available(), "and it is on the table");
+
+    link.answers.clear();
+    link.write(ohpcf::activate(offer.sequence, "PT0S"));
+    assert_eq!(
+        link.answers,
+        [ErrorNumber::BindingRequired],
+        "the offer was readable and the write was not"
+    );
+    assert!(
+        link.decided.is_empty(),
+        "and the compressor's own state machine never saw it: the binding check is \
+         before the payload"
+    );
+    assert_eq!(
+        link.compressor.state(),
+        PowerSequenceState::Inactive,
+        "so nothing was scheduled"
+    );
+
+    // The one call that was missing.
+    link.answers.clear();
+    peer.follow(&mut link.manager, &link.client.clone(), link.now);
+    link.settle();
+
+    link.answers.clear();
+    link.write(ohpcf::activate(offer.sequence, "PT0S"));
+    assert_eq!(
+        link.answers,
+        [ErrorNumber::None],
+        "the same write, now that the compressor has a binding partner"
+    );
+    assert_eq!(link.compressor.state(), PowerSequenceState::Scheduled);
 }

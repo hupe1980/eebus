@@ -82,6 +82,22 @@ impl FunctionUse {
         }
     }
 
+    /// A function this actor serves and **any** peer may write.
+    ///
+    /// For a use case that says so, which in this crate is every one in
+    /// [`hvac`](crate::usecases::hvac): "Binding SHOULD NOT be used for this Scenario". See
+    /// [`WriteBinding`](crate::spine::WriteBinding) for the reasoning and for the local
+    /// feature that has to agree with this.
+    pub const fn server_writeable_unbound(feature: FeatureType, function: Function) -> Self {
+        Self {
+            feature,
+            role: Role::Server,
+            function,
+            writeable: true,
+            needs_binding: false,
+        }
+    }
+
     /// A function this actor reads from a peer.
     pub const fn client(feature: FeatureType, function: Function) -> Self {
         Self {
@@ -101,6 +117,23 @@ impl FunctionUse {
             function,
             writeable: true,
             needs_binding: true,
+        }
+    }
+
+    /// A function this actor writes on a peer **without** binding to it first.
+    ///
+    /// The HVAC counterpart of [`client_writes`](Self::client_writes). A Configuration
+    /// Appliance that bound anyway would not be refused — a server may grant a binding it
+    /// does not require — but it would be doing something its use case tells it not to,
+    /// and on a server that limits its bindings it would be taking a slot from an actor
+    /// that needs one.
+    pub const fn client_writes_unbound(feature: FeatureType, function: Function) -> Self {
+        Self {
+            feature,
+            role: Role::Client,
+            function,
+            writeable: true,
+            needs_binding: false,
         }
     }
 }

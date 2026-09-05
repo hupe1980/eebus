@@ -72,12 +72,26 @@ pub enum Quantity {
     Temperature,
     /// The temperature of the domestic hot water, in degrees Celsius ([MDT-001]).
     ///
-    /// `dhwTemperature` on `commodityType: domesticHotWater`, which is the one measurement
-    /// in this crate that is not electricity. Comparing it against the setpoint
-    /// [`cdt`](crate::usecases::hvac::cdt) wrote is how the energy demand for hot water is
-    /// estimated, and how a manager finds out whether a temperature it asked for was
-    /// actually reached.
+    /// `dhwTemperature` on `commodityType: domesticHotWater`, which is one of the three
+    /// measurements in this crate that are not electricity. Comparing it against the
+    /// setpoint [`cdt`](crate::usecases::hvac::cdt) wrote is how the energy demand for hot
+    /// water is estimated, and how a manager finds out whether a temperature it asked for
+    /// was actually reached.
     DhwTemperature,
+    /// The air temperature of an indoor space, in degrees Celsius ([MRT-001]).
+    ///
+    /// `roomAirTemperature` on `commodityType: air`. The measurement a building's thermal
+    /// model is fitted against: indoor temperature, outdoor temperature and delivered heat
+    /// are what an `RC` model of a house is identified from, and this is the first of the
+    /// three. See [`hvac::mrt`](crate::usecases::hvac::mrt).
+    RoomTemperature,
+    /// The outdoor air temperature, in degrees Celsius ([MOT-001]).
+    ///
+    /// `outsideAirTemperature` on `commodityType: air`, and the second input of that same
+    /// model. A heat pump measures it anyway — it is what its own defrost and heating
+    /// curve run on — so a building rarely needs a sensor of its own for it. See
+    /// [`hvac::mot`](crate::usecases::hvac::mot).
+    OutdoorTemperature,
 
     // ---- the direct-current side (MOB, MPS, MOI) --------------------------------
     /// Direct-current power, in watts.
@@ -128,7 +142,10 @@ impl Quantity {
             | Self::DcChargeEnergy
             | Self::DcDischargeEnergy
             | Self::StateOfEnergy => MeasurementType::Energy,
-            Self::Temperature | Self::DhwTemperature => MeasurementType::Temperature,
+            Self::Temperature
+            | Self::DhwTemperature
+            | Self::RoomTemperature
+            | Self::OutdoorTemperature => MeasurementType::Temperature,
             Self::DcCurrent => MeasurementType::Current,
             Self::DcVoltage => MeasurementType::Voltage,
             Self::UsableCapacity => MeasurementType::Capacity,
@@ -162,7 +179,10 @@ impl Quantity {
             | Self::DcDischargeEnergy
             | Self::StateOfEnergy
             | Self::UsableCapacity => UnitOfMeasurement::Wh,
-            Self::Temperature | Self::DhwTemperature => UnitOfMeasurement::DegC,
+            Self::Temperature
+            | Self::DhwTemperature
+            | Self::RoomTemperature
+            | Self::OutdoorTemperature => UnitOfMeasurement::DegC,
             Self::DcPower => UnitOfMeasurement::W,
             Self::DcCurrent => UnitOfMeasurement::A,
             Self::DcVoltage => UnitOfMeasurement::V,
@@ -251,16 +271,21 @@ impl Measurand {
         self.phases.is_none()
     }
 
-    /// The `commodityType` of the description, which is `electricity` throughout.
     /// The `commodityType` of the `Measurement` description.
     ///
-    /// Electricity for everything this crate measures but one: MDT Table 7 fixes
-    /// `domesticHotWater` for the hot water temperature, and it is `M`. A client filtering
-    /// on the commodity — which is the point of the element — would not see a tank
-    /// published as electricity.
+    /// Electricity for everything this crate measures but three, and all three are
+    /// temperatures somebody heats or lives in: MDT Table 7 fixes `domesticHotWater` for
+    /// the hot water, MRT Table 7 and MOT Table 7 fix `air` for a room and for outdoors.
+    /// Each is `M`. A client filtering on the commodity — which is the point of the
+    /// element — would not see a tank published as electricity.
+    ///
+    /// An inverter's heatsink is *not* one of them:
+    /// [`Temperature`](Quantity::Temperature) is `componentTemperature` on a piece of
+    /// electrical equipment, and stays `electricity`.
     pub const fn commodity_type(&self) -> CommodityType {
         match self.quantity {
             Quantity::DhwTemperature => CommodityType::DomesticHotWater,
+            Quantity::RoomTemperature | Quantity::OutdoorTemperature => CommodityType::Air,
             _ => CommodityType::Electricity,
         }
     }
@@ -296,6 +321,8 @@ impl Measurand {
             Quantity::YieldTotal => ScopeType::AcYieldTotal,
             Quantity::Temperature => ScopeType::ComponentTemperature,
             Quantity::DhwTemperature => ScopeType::DhwTemperature,
+            Quantity::RoomTemperature => ScopeType::RoomAirTemperature,
+            Quantity::OutdoorTemperature => ScopeType::OutsideAirTemperature,
             Quantity::DcPower => ScopeType::DcPower,
             Quantity::DcCurrent => ScopeType::DcCurrent,
             Quantity::DcVoltage => ScopeType::DcVoltage,
@@ -362,6 +389,8 @@ impl Measurand {
             Quantity::YieldTotal => "yieldTotal",
             Quantity::Temperature => "temperature",
             Quantity::DhwTemperature => "dhwTemperature",
+            Quantity::RoomTemperature => "roomTemperature",
+            Quantity::OutdoorTemperature => "outdoorTemperature",
             Quantity::DcPower => "dcPower",
             Quantity::DcCurrent => "dcCurrent",
             Quantity::DcVoltage => "dcVoltage",

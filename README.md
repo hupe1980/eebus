@@ -4,6 +4,7 @@ An unofficial [EEBUS](https://www.eebus.org) implementation in Rust: the SHIP tr
 the SPINE information model, and the grid use cases that German §14a EnWG installations
 are built on.
 
+[![crates.io](https://img.shields.io/crates/v/eebus.svg)](https://crates.io/crates/eebus)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Docs](https://img.shields.io/badge/docs-hupe1980.github.io%2Feebus-0b8f63.svg)](https://hupe1980.github.io/eebus/)
 
@@ -16,8 +17,8 @@ alongside the code. [What EEBUS is](https://hupe1980.github.io/eebus/docs/introd
 > **Status: under construction.** The stack is complete from the socket to the use case,
 > and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are
 > implemented on **both** sides and measured against all 203 of their published abstract
-> test cases, as are seven of the e-mobility family and four more for inverters, PV strings
-> and batteries. Not published to crates.io yet; the API will change.
+> test cases — as are seven of the e-mobility family, four for inverters, PV strings and
+> batteries, and all twelve HVAC use cases. Published, but pre-1.0: the API will change.
 
 ## What EEBUS is, and why this exists
 
@@ -119,9 +120,10 @@ minutes otherwise (§2.10).
 **Two use cases, one implementation.** LPC and LPP are the same use case pointed in opposite
 directions — the same four scenarios, table numbers and thirteen transitions — so the state
 machine and both actors are written once and pointed by a `Direction`. OPEV and OSCEV are
-the same pair on the e-mobility side, pointed by a `Purpose`; nine use cases share one
-measurement layer. The reference implementations duplicate each; here a fix to one is a fix
-to all.
+the same pair on the e-mobility side, pointed by a `Purpose`; eleven use cases share one
+measurement layer; and the twelve HVAC use cases are three exchanges — the operation mode,
+the setpoint, the thermometer — with twelve modules of constants on top. The reference
+implementations duplicate each; here a fix to one is a fix to all.
 
 **Illegal states are unrepresentable.** A SPINE command carries a payload *choice*, so "two
 payloads in one command" cannot be built. Identifiers are distinct types, so a
@@ -235,9 +237,10 @@ in that position loses it, which is the interoperable answer.
 | | `maxResponseDelay`: honoured on what a peer announced, announced for what a feature needs | §5.2.5.3 |
 | | unanswered requests retried at 30 s, 5 min and 15 min under fresh counters, then given up on | SPINE IG §2.6.1–2.6.4 |
 | | bindings and subscriptions, single-writer policy, group lock | §5.3.5–5.3.6, LPC IG §3.5 |
+| | whether a write needs a binding is a property of the feature, not of the protocol: the grid features refuse an unbound write, the HVAC ones must not | §7.3, `TC_SPINE_BIND_002`, HVAC §3.4.x |
 | | relations kept on both sides, and the tables tailored to their recipient rather than leaking a third peer's | §7.3.2, §7.4.1 rule 4, §7.4.3 |
 | | heartbeat producer and monitor; deferred writes on the merged state, and on a document the application owns | LPC/LPP scenario 3, LPC IG §4.1.5, §7.4.1 |
-| **Use cases** | 19 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
+| **Use cases** | 28 use cases, both actors of each | see [Use cases](https://hupe1980.github.io/eebus/docs/use-cases/) |
 | | LPC and LPP: state machine, both actors, the §14a record | UC TS §2.3, §3.3 + the 2026 IGs |
 | | every identifier a client addresses is read from the peer's own descriptions, never assumed | the `<l1#…>`, `<k1#…>`, `<p1#…>` placeholders |
 | | scenario 4 constraints: the nameplate for a device, the contract for a CEM | [LPC/LPP-041], [LPC/LPP-042], UC TS §2.6.4.1 |
@@ -246,8 +249,9 @@ in that position loses it, which is the interoperable answer.
 | | EV Charging Summary: what a session cost and where its energy came from, written *into* the wallbox | EVCS 1.0.1 §3.2.1 |
 | | inverter, PV string and battery monitoring | MOI/MPS/MOB 1.0.0 |
 | | Control of Battery: six states, twenty transitions, both control modes | COB 1.0.0 §2.4 |
-| | the DHW trio: the hot water setpoint, the mode that says whether a write reaches it, and the temperature it got to | CDT/MDSF/MDT 1.0.0 |
-| | heat pump compressor flexibility: the CEM *starts* an optional consumption process, and stops, pauses and resumes it | OHPCF 1.0.0 §2.5 |
+| | the complete HVAC family — all twelve use cases of both bundles, as three exchanges: the operation mode, the temperature setpoint, the thermometer | CDT/CDSF/MDSF/MDT, CRHT/CRHSF/MRHSF/MRT, CRCT/CRCSF/MRCSF, MOT 1.0.0 |
+| | a room's heating and cooling setpoints share `roomAirTemperature`; only the relation's `systemFunctionId` tells them apart | CRHT/CRCT §3.2.1.2.3.1 |
+| | heat pump compressor flexibility: the CEM *starts* an optional consumption process, and stops, pauses and resumes it — with the binding scenario 2 needs | OHPCF 1.0.0 §2.5, §3.4.2 |
 | **Certification** | the 203 abstract test cases of the four HLTS as data, all driven: 189/203 | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
 | | the other fourteen as a harness a consumer runs against its **own binary**: seven procedures with the specification's steps, judged against its declared parameter sheet | LPC HLTS 1.0.2 tables 15–34, §6.11.8 |
 | | runtime signals for a laboratory's debug interface | the HLTS "e.g. via debug interface" footnote |
@@ -394,10 +398,10 @@ so re-running it when nothing has changed produces no diff.
 by default: `rustls`' provider is process-global, so a library that pulled one in would
 choose for every consumer downstream of it.
 
-```toml
-eebus = { version = "0.4", features = ["runtime", "ring"] }
+```sh
+cargo add eebus --features runtime,ring
 # or, for a build that must not contain `ring`:
-eebus = { version = "0.4", default-features = false, features = ["std", "runtime", "aws-lc-rs"] }
+cargo add eebus --no-default-features --features std,runtime,aws-lc-rs
 ```
 
 Naming both, or neither, is a `compile_error!` rather than a device that panics on its first

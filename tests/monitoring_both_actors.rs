@@ -13,7 +13,7 @@ use eebus::model::{
 use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management};
 use eebus::usecases::descriptor::actors;
 use eebus::usecases::monitoring::{
-    self, Measurand, MonitoredUnit, MonitoringApplianceActor, MonitoringEvent, Quantity,
+    self, Measurand, MonitoredUnit, MonitoringApplianceActor, MonitoringEvent, Quantity, UnitId,
 };
 use eebus::usecases::mpc;
 
@@ -139,8 +139,9 @@ impl Pair {
         panic!("the exchange did not settle");
     }
 
-    fn device(&self) -> eebus::model::AddressDevice {
-        self.unit_engine.device().address().clone()
+    /// Which unit the appliance is holding — device *and* entity.
+    fn unit(&self) -> UnitId {
+        self.appliance.units().next().expect("a unit").id()
     }
 }
 
@@ -157,7 +158,7 @@ fn the_appliance_commissions_a_unit_and_then_reads_it() {
         "the descriptions arrived"
     );
 
-    let device = pair.device();
+    let unit = pair.unit();
     // The unit measures something new and notifies its subscriber.
     pair.unit.set(&Measurand::total_power(), 2_300.0, pair.now);
     pair.unit
@@ -167,7 +168,7 @@ fn the_appliance_commissions_a_unit_and_then_reads_it() {
         .notify(&mut pair.unit_engine, &measurement, pair.now);
     pair.settle();
 
-    let readings = pair.appliance.readings(&device).expect("the unit");
+    let readings = pair.appliance.readings(&unit).expect("the unit");
     assert_eq!(readings.total_power(), Some(2_300.0));
     assert_eq!(
         readings.value(&Measurand::on(Quantity::Current, Phase::A)),
@@ -188,9 +189,9 @@ fn the_appliance_commissions_a_unit_and_then_reads_it() {
 fn a_value_without_a_description_is_not_invented() {
     let mut pair = Pair::new();
     pair.commission();
-    let device = pair.device();
+    let unit = pair.unit();
 
-    let readings = pair.appliance.readings(&device).expect("the unit");
+    let readings = pair.appliance.readings(&unit).expect("the unit");
     assert!(
         readings
             .value(&Measurand::on(Quantity::Voltage, Phase::A))
@@ -426,8 +427,9 @@ impl GridPair {
         panic!("the exchange did not settle");
     }
 
-    fn device(&self) -> eebus::model::AddressDevice {
-        self.unit_engine.device().address().clone()
+    /// Which unit the appliance is holding — device *and* entity.
+    fn unit(&self) -> UnitId {
+        self.appliance.units().next().expect("a unit").id()
     }
 }
 
@@ -437,10 +439,10 @@ impl GridPair {
 fn the_curtailment_factor_reaches_the_appliance_under_the_peers_own_key() {
     let mut pair = GridPair::new();
     pair.commission();
-    let device = pair.device();
+    let unit = pair.unit();
 
     assert_eq!(
-        pair.appliance.curtailment(&device),
+        pair.appliance.curtailment(&unit),
         None,
         "no factor has been published yet, and an unread factor is not zero"
     );
@@ -456,10 +458,10 @@ fn the_curtailment_factor_reaches_the_appliance_under_the_peers_own_key() {
         "the change is reported: {:?}",
         pair.events
     );
-    assert_eq!(pair.appliance.curtailment(&device), Some(70.0));
+    assert_eq!(pair.appliance.curtailment(&unit), Some(70.0));
     assert_eq!(
         pair.appliance
-            .feed_in_limit(&device, 12_000.0)
+            .feed_in_limit(&unit, 12_000.0)
             .map(|limit| limit.watts()),
         Some(8_400.0),
         "70 % of a 12 kWp array"
@@ -474,11 +476,11 @@ fn the_curtailment_factor_reaches_the_appliance_under_the_peers_own_key() {
 fn another_key_is_never_mistaken_for_the_factor() {
     let mut pair = GridPair::new();
     pair.commission();
-    let device = pair.device();
+    let unit = pair.unit();
 
     // Key 1 was published and notified during commissioning; the factor was not.
     assert_eq!(
-        pair.appliance.curtailment(&device),
+        pair.appliance.curtailment(&unit),
         None,
         "key 1 holds 12 kW of peak power, not a percentage"
     );
@@ -634,8 +636,9 @@ fn a_connection_point_serving_only_scenario_one_is_still_located_and_read() {
     appliance.attach(&mut manager, peer, now);
     settle(&mut manager, &mut unit_engine, &mut appliance, &mut events);
 
+    let unit = appliance.units().next().expect("a unit").id();
     assert_eq!(
-        appliance.curtailment(&device),
+        appliance.curtailment(&unit),
         Some(60.0),
         "the one scenario it serves came through"
     );

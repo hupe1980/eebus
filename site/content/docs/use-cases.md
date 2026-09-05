@@ -38,6 +38,27 @@ The answer says which use cases the peer plays, in which actor role, and which s
 each. Only then does an application know whether the peer is a heat pump it may limit or a
 display that merely watches.
 
+## Who may write, and who may not
+
+Whether a write needs a binding is a property of the **feature**, not a rule of the protocol
+(SPINE §7.3), and the use cases do not agree about their own:
+
+| | |
+|---|---|
+| **binds** | LPC/LPP, OPEV/OSCEV, COB, EVCS, OHPCF scenario 2 — "Actors that write parts of a Feature within this Scenario need to create a binding [...] Only one binding partner is allowed" |
+| **does not** | every HVAC use case, including all six that write — "Binding SHOULD NOT be used for this Scenario" |
+
+So the feature constructors carry it, and the default is `Required`:
+
+```rust
+limitation::load_control_feature(1);   // WriteBinding::Required
+cdt::setpoint_feature(1);              // WriteBinding::NotRequired — CDT §3.4.1.1
+```
+
+What replaces it on an HVAC feature is the application's own decision: those writes are
+deferred, so a product that wants "only the manager I was commissioned with" enforces it
+where it can see who is asking. See [Bindings and subscriptions](@/docs/spine.md).
+
 ## Addressing a peer's data
 
 Knowing which feature to talk to is only half of it. Almost every list in SPINE is keyed by
@@ -91,14 +112,27 @@ expecting it to write anything, which is what `EnergyGuardActor::is_ready` repor
 | **MPS** — Monitoring of PV String | PVString, Monitoring Appliance | MPS 1.0.0 |
 | **MOB** — Monitoring of Battery | Battery, Monitoring Appliance | MOB 1.0.0 |
 | **COB** — Control of Battery | Inverter, CEM | COB 1.0.0 |
-| **CDT** — Configuration of DHW Temperature | DHW Circuit, Configuration Appliance | CDT 1.0.0 |
 | **MDSF** — Monitoring of DHW System Function | DHW Circuit, Monitoring Appliance | MDSF 1.0.0 |
+| **CDSF** — Configuration of DHW System Function | DHW Circuit, Configuration Appliance | CDSF 1.0.0 |
 | **MDT** — Monitoring of DHW Temperature | DHW Circuit, Monitoring Appliance | MDT 1.0.0 |
+| **CDT** — Configuration of DHW Temperature | DHW Circuit, Configuration Appliance | CDT 1.0.0 |
+| **MRHSF** — Monitoring of Room Heating System Function | HVAC Room, Monitoring Appliance | MRHSF 1.0.0 |
+| **CRHSF** — Configuration of Room Heating System Function | HVAC Room, Configuration Appliance | CRHSF 1.0.0 |
+| **MRCSF** — Monitoring of Room Cooling System Function | HVAC Room, Monitoring Appliance | MRCSF 1.0.0 |
+| **CRCSF** — Configuration of Room Cooling System Function | HVAC Room, Configuration Appliance | CRCSF 1.0.0 |
+| **MRT** — Monitoring of Room Temperature | HVAC Room, Monitoring Appliance | MRT 1.0.0 |
+| **CRHT** — Configuration of Room Heating Temperature | HVAC Room, Configuration Appliance | CRHT 1.0.0 |
+| **CRCT** — Configuration of Room Cooling Temperature | HVAC Room, Configuration Appliance | CRCT 1.0.0 |
+| **MOT** — Monitoring of Outdoor Temperature | Outdoor Temperature Sensor, Monitoring Appliance | MOT 1.0.0 |
 | **OHPCF** — Optimization of Self-Consumption by Heat Pump Compressor Flexibility | Compressor, CEM | OHPCF 1.0.0 |
 
 The first four are the ones certifiable since July 2026. Every one of them is implemented
 on **both** sides — the appliance's and the manager's — which is where most of the
 implementation guides' pages actually go.
+
+The twelve HVAC rows are the **complete** contents of the two HVAC specification bundles —
+`EEBUS_HVAC_SystemFunction_UseCases_V1.0.0` and `EEBUS_HVAC_Temperature_UseCases_V1.0.0`.
+Nothing in either is left out.
 
 Not implemented: **CEVC** (Coordinated EV Charging), which is a different shape from
 everything above — three actors, power sequences, incentive tables, and a charging plan
@@ -109,14 +143,22 @@ Nothing in the eight-device corpus announces either; the SMA Home Manager 2 anno
 [OHPCF](https://docs.rs/eebus/latest/eebus/usecases/ohpcf/index.html), which is the
 direct-control answer to the same question and is implemented.
 
-## The two levers that can ask for *more*
+## The four levers that can ask for *more*
 
-Every other control use case here can only ask an appliance to do less, and a ceiling an
-appliance is already under changes nothing at all. Two can ask for more, and they are not
+Every use case in the grid, e-mobility and storage rows can only ask an appliance to do
+less, and a ceiling an appliance is already under changes nothing at all — so a manager
+holding only those can never spend a surplus. Four can ask for more, and they are not
 interchangeable:
 
-* **CDT** raises a hot water **setpoint** and leaves the circuit's own controller to decide
-  what to do about it. A tank already at temperature will not run for a higher setpoint.
+* **CDT / CRHT / CRCT** raise a **setpoint** and leave the appliance's own controller to
+  decide what to do about it. A tank already at temperature will not run for a higher
+  setpoint.
+* **CDSF / CRHSF / CRCSF** change the **operation mode** — `eco` while the grid is
+  expensive, `on` while it is not. Slower, and available only where the appliance says
+  `isOperationModeIdChangeable`.
+* **CDSF scenario 2** starts a **one-time hot water loading** outright: the button in the
+  bathroom, pressed over the wire. The shortest path there is from "the roof is exporting"
+  to "the tank is absorbing it", and scenario 3 gives it back when a cloud arrives.
 * **OHPCF** **starts a process**: the compressor's optional power consumption, at a time
   the CEM names, with stop, pause and resume afterwards. It is what makes a heat pump
   pre-heat while the roof is exporting — the one thing a thermal model exists to do, and
@@ -158,12 +200,19 @@ Three more pairs work the same way:
   by a `Purpose`: `obligation`/`overloadProtection` against
   `recommendation`/`selfConsumption`. Two words, and a car that confuses them charges on
   solar only.
-* **EVCEM, EVSOC, MOI, MPS, MOB, COB and MDT** are built on the same `monitoring`
-  machinery as MPC and MGCP — one implementation of "describe a measurement twice and read
-  it back", serving nine use cases. What each adds is vocabulary, not mechanism. `mdt` has
-  a `locate` of its own for the one thing it does not share: a DHW circuit has no
-  `ElectricalConnection`, so searching for one would find whatever else the device happens
-  to serve.
+* **EVCEM, EVSOC, MOI, MPS, MOB, COB, MDT, MRT and MOT** are built on the same
+  `monitoring` machinery as MPC and MGCP — one implementation of "describe a measurement
+  twice and read it back", serving eleven use cases. What each adds is vocabulary, not
+  mechanism.
+* **The twelve HVAC use cases are three exchanges.** `hvac::system_function` is the
+  operation-mode one and serves six — MDSF/CDSF, MRHSF/CRHSF, MRCSF/CRCSF — told apart by
+  `systemFunctionType` (`dhw`, `heating`, `cooling`) and by whether the actor may write.
+  `hvac::setpoint` is the temperature-setting one and serves three — CDT, CRHT, CRCT.
+  `hvac::temperature` is the measurement one and serves three — MDT, MRT, MOT. Twelve
+  modules of constants and descriptors sit on top; the behaviour is written once.
+* **MDT, MRT and MOT** share a `locate` of their own for the one thing they do not share
+  with MPC: a tank, a room and the outdoors have no `ElectricalConnection`, so searching for
+  one would find whatever else the device happens to serve.
 
 The reference implementations duplicate each pair; here a fix to one is a fix to both, and
 the only thing the direction changes is what the tests assert.

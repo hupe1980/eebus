@@ -4,7 +4,185 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.6.0] — unreleased
+## [0.7.0] — unreleased
+
+Twelve HVAC use cases, which is both specification bundles complete, and the interoperability
+bug that made the previous five unusable: an unbound write was refused whatever it addressed,
+where SPINE §7.3 makes the binding a property of the feature and every HVAC use case says not
+to use one.
+
+### Added
+
+- **`usecases::hvac::mrt` and `usecases::hvac::mot` — the building the heat pump heats**,
+  both actors of each. Monitoring of Room Temperature and Monitoring of Outdoor Temperature:
+  the air temperature of an indoor space, and what it is like outside. They matter for a
+  reason MRT §2.1 states and understates — "this information could also be used to estimate
+  energy demands for heating or cooling". A building's thermal model is identified from the
+  temperature inside it, the temperature outside it, and the heat delivered in between, and
+  a fitted model is what turns "the roof will export at noon" into "start the compressor at
+  eleven". Without them `ohpcf` could start a compressor for a house whose thermal state
+  nothing on the wire reported: the plan was expressible and what it is planned against was
+  not.
+
+  A heat pump measures both anyway — its own heating curve runs on nothing else — and the
+  outdoor sensor is on the wall of *this* building rather than in a forecast for the grid
+  square, which on the days it matters is a difference of several degrees.
+
+  `Quantity::RoomTemperature` and `Quantity::OutdoorTemperature` join the measurement layer,
+  both on `commodityType: air`, so both are read through the `Readings` an MPC or MGCP
+  appliance already runs. MDT, MRT and MOT are now one exchange under three names —
+  `hvac::temperature` — differing in the `useCaseName`, the actor that serves it, and the
+  `scopeType` that says which temperature. All three publish under `measurementId` 1 by their
+  own reckoning, so the scope is the only thing that tells them apart on a heat pump that
+  serves all three.
+
+- **`ohpcf::CompressorPeer::follow` — the binding a CEM had no way to know it needed.** The
+  two OHPCF scenarios are served from one feature and ask for different pre-scenario
+  communication: §3.4.1.1 says of scenario 1 that "Binding SHOULD NOT be used for this
+  Scenario", and §3.4.2 says of scenario 2 that an actor writing part of the feature "needs
+  to create a binding […] Only one binding partner is allowed to write the data specified in
+  this Scenario". Nothing in `locate`, `CompressorPeer` or the four command constructors said
+  so, and every other use case a monitoring-shaped controller has met here needs no binding
+  at all — so a CEM subscribed, read a perfectly good offer, and had `activate` answered
+  `BindingRequired` before the compressor's own state machine ever saw it. An offer it could
+  see, report, and never take up.
+
+  `follow` sends the binding, the subscription and the initial read in the order the two
+  scenarios put them, and returns a `Following` with the three counters separately: a refused
+  binding and a refused subscription are different commissioning faults, and
+  `ResultReceived` is the only place either is visible. The documentation on `locate`, on
+  `CompressorPeer` and on all four of `activate`/`stop`/`pause`/`resume` now says which
+  privilege each needs.
+
+- **The other seven HVAC use cases, so the family is complete.** `hvac::cdsf`,
+  `hvac::mrhsf`, `hvac::crhsf`, `hvac::mrcsf`, `hvac::crcsf`, `hvac::crht` and `hvac::crct`
+  join the five already here, which is every use case in both HVAC specification bundles —
+  the hot water's mode, overrun and temperature; a room's heating and cooling modes and
+  setpoints; the room and outdoor thermometers. Both actors of each.
+
+  The one an energy manager reaches for first is **CDSF scenario 2**: starting a one-time
+  DHW loading is the shortest path there is from "the roof is exporting" to "the tank is
+  absorbing it". Unlike a setpoint, which the circuit's own controller may decline to act
+  on, and unlike `ohpcf`'s process, which the compressor has to have announced first, it is
+  the button in the bathroom pressed over the wire — and scenario 3 gives it back when a
+  cloud arrives. CDSF also closes a hole the crate documented against itself: [CDT-005]
+  makes MDSF or CDSF mandatory beside CDT, and a circuit that served CDSF instead of MDSF
+  had no mode this crate could read, so `write_effective` refused every setpoint write with
+  `ModeUnknown` for ever.
+
+  Twelve use cases, three exchanges. `hvac::system_function` is the operation-mode one and
+  serves six of them, told apart by `systemFunctionType` and by whether the actor may write;
+  `hvac::setpoint` is the temperature-setting one and serves three; `hvac::temperature` is
+  the measurement one and serves three. `SystemFunction` replaces `mdsf::DhwSystemFunction`
+  and `Setpoints` replaces `cdt::DhwSetpoints`, each told at construction which function or
+  scope it is following — because one `HVAC` feature carries every system function the
+  appliance has (§3.2.2.2.1 gives an entity one feature of a type) and picking the wrong one
+  is invisible: same payloads, peer's identifiers, answer about a different room.
+
+  `SystemFunction::set_mode_named` is the writing half, and it refuses what the peer would:
+  a mode this system function does not relate to — the modes are described once for the
+  device and a subset is related to each function, so `eco` may be a hot water mode and not
+  a room one — or a peer that said `isOperationModeIdChangeable: false`. `SystemFunction::apply`
+  is the server's side, turning an incoming write into a `Request` or a `ModeRefused` before
+  the acknowledgement rather than after it. It takes the write's **fragment**, which is the
+  opposite of the rule everywhere else here and is the right way round for a list function
+  with more than one entry: the resolved state holds every system function the appliance
+  has, each with the mode it was already in, so it cannot say which entry the peer
+  addressed. `ModeRefused::NotAddressed` is how a server with two functions on one feature
+  dispatches — "this names the other one, try it" — and only when no reader claims a write
+  is it an answer to send back.
+
+- **Plural publishers for a device that serves more than one system function.**
+  `system_function::descriptions`, `operation_mode_relations_of`, `states`,
+  `setpoint::descriptions`, `constraints_of`, `values` and `relations_of`. A room that heats
+  *and* cools has to publish both functions in **one** `hvacSystemFunctionListData` and both
+  setpoints in one `setpointDescriptionListData`; publishing them one at a time replaces
+  rather than adds, and the crate could not express the conformant shape at all.
+
+- **`RemoteDevice::use_cases_played`** — every entity of a peer that plays a use case as an
+  actor, where `use_case` returns the first. §7.5 keys use-case information by address and a
+  device may announce the same actor on several entities, which `hvac::mrt::locate_all` and
+  `hvac::mdt::locate_all` are built on.
+
+### Fixed
+
+- **Every unbound write was refused, which made the whole HVAC family unusable.** The
+  engine applied `TC_SPINE_BIND_002` as a rule of the protocol: a write from a peer holding
+  no binding came back `errorNumber` 9, whatever it was addressed to. But §7.3 puts the
+  requirement on the **feature** — "please note that some feature types define requirements
+  for binding!" — and the test case says the same, rejecting an unbound write "if the target
+  feature **requires** a binding (e.g. LoadControl)". The use cases then say which do, and
+  they disagree: LPC/LPP, OPEV/OSCEV, COB, EVCS and OHPCF scenario 2 each require one, while
+  **every** HVAC use case, including all six that write, says "Binding SHOULD NOT be used
+  for this Scenario".
+
+  So a conformant Configuration Appliance's hot water setpoint write was answered
+  `bindingRequired` by a circuit built on this crate, and CDT could not run at all against
+  any other implementation. It was invisible here because the crate's own test bound first —
+  the one thing a real peer will not do. `LocalFeature::with_unbound_writes` and
+  `spine::WriteBinding` are the fix; the default stays `Required`, which is the safe way
+  round, and `hot_water_over_the_wire` now runs its whole suite with no binding anywhere.
+
+- **A setpoint relation was keyed by the operation mode alone, and the mode is not unique.**
+  `hvacSystemFunctionSetpointRelationData` is keyed by `systemFunctionId` (PRIMARY) *and*
+  `operationModeId` (SUB) — the crate's own generated identifier table had it right — but
+  the CDT reader stored one entry per mode. Operation modes are described once for the
+  device and shared between system functions, so a room that heats and cools relates the
+  same `auto` twice, and `for_mode(auto)` returned whichever entry arrived last. A manager
+  asking which setpoint to write for heating would be handed the **cooling** setpoint: the
+  room applies it, acknowledges it, and gets colder. `Setpoints::for_mode` now takes both
+  identifiers, and `describes` tells "relates to no setpoint" apart from "never described".
+
+- **`system_function_id` was one number for every system function.** A device serving CDT
+  and CRHT published the hot water and the room heating under `systemFunctionId` 1 — one
+  system function claiming to be both, and a client reading whichever description arrived
+  last. It is now per kind: `dhw` 1, `heating` 2, `cooling` 3.
+
+- **Declaring a function twice on a `LocalFeature` appended a second entry.** §7.1.2's
+  `supportedFunction` list names each function once, so the duplicate was announced twice in
+  detailed discovery — and the *first* of the two decided what a peer was allowed to do with
+  it. A feature built up in layers, which is how every configuration use case here is built
+  (the writeable feature is the read-only one plus two writes), therefore declared a write
+  and refused it, with nothing in either end's logs saying why. The later declaration now
+  replaces the earlier one.
+
+- **A Monitoring Appliance held one unit per device, so the second entity evicted the
+  first.** `MonitoringApplianceActor` keyed its units by `AddressDevice`: `attach` dropped
+  any unit already tracked on that device, and `handle_event` resolved a notification against
+  the *first* unit of the device it came from. One device is regularly several units — the
+  use-case implementation guide §3.3 puts an actor's features on the entity that announced
+  it, and §7.5 keys use-case information by address, so a heat-pump gateway announces one
+  `HVACRoom` per room — and the failure is silent in the worst way: the bedroom's temperature
+  is reported as the living room's, in the right unit, in a plausible range. Units are now
+  keyed by `UnitId` (device **and** entity), a notification is attributed by the feature
+  address it arrived on rather than by its device, and several units of one device sit side
+  by side. Latent for MPC and MGCP, where a device with two `MonitoredUnit` entities is
+  unusual; unavoidable for MRT, where more than one room is the normal case.
+
+### Changed
+
+- **`mdsf::DhwSystemFunction` is `hvac::system_function::SystemFunction`, and
+  `cdt::DhwSetpoints` is `hvac::setpoint::Setpoints`.** Both are told at construction which
+  system function or scope they follow — `SystemFunction::dhw()`, `Setpoints::room_air()`,
+  and each use-case module has a `reader()` that picks the right one. `SetpointEffect` and
+  `WriteRefused` move to `hvac::setpoint`, `OverrunReport` to `hvac::system_function`.
+  `hvac::SYSTEM_FUNCTION_ID` becomes `hvac::system_function_id(kind)`, and
+  `hvac::find_dhw_system_function` becomes `find_system_function(data, kind)`.
+
+- **`Quantity` gained two variants**, `RoomTemperature` and `OutdoorTemperature`, so an
+  exhaustive `match` on it downstream no longer compiles. Deliberately not
+  `#[non_exhaustive]`: a controller that reads temperatures off a heat pump should be made
+  to say what it does with a room and with the weather, rather than have them fall into a
+  wildcard arm beside a heatsink.
+
+- **`MonitoringApplianceActor` is addressed by `UnitId`, not by `AddressDevice`.** The fix
+  above, as an API: `readings`, `curtailment`, `feed_in_limit` and `detach` take a
+  `&UnitId`, and `MonitoringEvent::UnitDescribed`, `Measured` and `CurtailmentChanged` carry
+  `unit: UnitId` where they carried `device`. `MonitoredUnitPeer::id()` is where one comes
+  from, `UnitId::device` is still there for a caller that wants only that, and
+  `detach_device` removes every unit of a device — what a lost connection takes with it.
+
+## [0.6.0] — 2026-09-05
 
 Everything in this release came out of one round of feedback from a consumer (`hems`), and
 half of it is bugs that consumer could not have found from the outside — the shape of the
@@ -269,7 +447,7 @@ API stopped it looking.
 - **`runtime::TrustReporter` is public** and takes a `PendingPeer`.
 - **`LocalDevice`, `LocalEntity`, `LocalFeature` and `FunctionEntry` derive `PartialEq`.**
 
-## [0.5.0] — unreleased
+## [0.5.0] — 2026-09-04
 
 ### Fixed
 
@@ -1075,7 +1253,10 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
-[0.4.0]: https://github.com/hupe1980/eebus/compare/v0.3.0...HEAD
+[0.7.0]: https://github.com/hupe1980/eebus/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/hupe1980/eebus/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/hupe1980/eebus/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/hupe1980/eebus/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/eebus/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/eebus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/eebus/releases/tag/v0.1.0

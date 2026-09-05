@@ -12,11 +12,11 @@ grid. They are the same measurements named from two sides, and they share their
 implementation here.
 
 This machinery is not only MPC and MGCP. The same "describe a measurement twice and read it
-back" serves nine use cases: those two, [EVCEM and EVSOC](@/docs/e-mobility.md) for a car,
+back" serves eleven use cases: those two, [EVCEM and EVSOC](@/docs/e-mobility.md) for a car,
 [MOI, MPS, MOB](@/docs/storage.md) and COB for an inverter, a PV string and a battery, and
-[MDT](@/docs/hot-water.md) for hot water. Each adds vocabulary — charged energy, state of
-charge, DC power, yields, insulation resistance, water temperature — and none adds
-mechanism.
+[MDT, MRT and MOT](@/docs/hot-water.md) for the hot water, a room and the outdoors. Each
+adds vocabulary — charged energy, state of charge, DC power, yields, insulation resistance,
+three different temperatures — and none adds mechanism.
 
 ## A measurement without its description means nothing
 
@@ -114,12 +114,17 @@ the description and subscribes, and the factor arrives as an event:
 
 ```rust,ignore
 match appliance.handle_event(&event) {
-    Some(MonitoringEvent::CurtailmentChanged { device, factor_percent }) => {
-        let ceiling = appliance.feed_in_limit(&device, 12_000.0);
+    Some(MonitoringEvent::CurtailmentChanged { unit, factor_percent }) => {
+        let ceiling = appliance.feed_in_limit(&unit, 12_000.0);
     }
     _ => {}
 }
 ```
+
+`unit` is a `UnitId` — a device **and** an entity — because one device is regularly several
+units: a heat-pump gateway announces one `HVACRoom` per room, each with its own
+`Measurement` feature. `attach` takes one peer per entity, `MonitoredUnitPeer::id()`
+produces the key, and `readings`, `curtailment`, `feed_in_limit` and `detach` all take one.
 
 There is no `mgcp::curtailment_client_feature` to go with `curtailment_feature`, and the
 asymmetry is the specification's: LPC IG §3.3 asks each actor to hold **one** client feature
@@ -156,4 +161,15 @@ use eebus::usecases::hvac::mdt;
 
 let tank = mdt::locate(remote)?;          // measurement only; no phases to describe
 appliance.attach(&mut engine, tank, now); // the same actor as a grid connection point
+```
+
+So do the two temperatures a building is planned against — `hvac::mrt` for a room and
+`hvac::mot` for outdoors — which are the same shape again. A room comes in the plural:
+
+```rust
+use eebus::usecases::hvac::mrt;
+
+for room in mrt::locate_all(remote) {     // one HVACRoom entity per room
+    appliance.attach(&mut engine, room, now);
+}
 ```

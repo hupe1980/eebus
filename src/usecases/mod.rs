@@ -10,16 +10,19 @@
 //! what a device publishes in `nodeManagementUseCaseData` and what a peer reads to find
 //! out what it is talking to. Where two use cases share their machinery, that machinery
 //! lives in a module of its own and the use-case modules carry only what distinguishes
-//! them — which, for both of the pairs here, is a handful of lines:
+//! them, which is usually a handful of constants:
 //!
 //! * [`limitation`] serves [`lpc`] and [`lpp`], the same state machine pointed in
 //!   opposite directions.
 //! * [`monitoring`] serves [`mpc`] and [`mgcp`], the same measurements named from the
-//!   appliance's side or the grid's — and [`moi`], [`mob`], [`mps`], [`cob`],
-//!   [`hvac::mdt`] and two of the [`emobility`] family besides, which are the same
-//!   "describe a measurement twice and read it back" with a wider vocabulary.
+//!   appliance's side or the grid's — and [`moi`], [`mob`], [`mps`], [`cob`], the three
+//!   temperatures of [`hvac`] and two of the [`emobility`] family besides, which are the
+//!   same "describe a measurement twice and read it back" with a wider vocabulary.
 //! * [`emobility::charging`] serves [`emobility::opev`] and [`emobility::oscev`], the same
 //!   per-phase current ceiling for opposite reasons.
+//! * [`hvac`] is three exchanges serving **twelve** use cases: [`hvac::system_function`]
+//!   for the six operation-mode ones, [`hvac::setpoint`] for the three temperature-setting
+//!   ones, [`hvac::temperature`] for the three thermometers.
 //!
 //! # What is here
 //!
@@ -27,19 +30,30 @@
 //! |---|---|---|
 //! | **Grid** | [`lpc`], [`lpp`] | Controllable System, Energy Guard |
 //! | | [`mpc`], [`mgcp`] | Monitored Unit / Grid Connection Point, Monitoring Appliance |
-//! | **E-mobility** | [`emobility`] | six use cases: the wallbox, the car, its ceiling, its surplus, and what it measured |
+//! | **E-mobility** | [`emobility`] | seven use cases: the wallbox, the car, its ceiling, its surplus, what it measured, and what the session cost |
 //! | **Generation and storage** | [`moi`] | Inverter, Monitoring Appliance |
 //! | | [`mps`] | PV String, Monitoring Appliance |
 //! | | [`mob`] | Battery, Monitoring Appliance |
 //! | | [`cob`] | Inverter, CEM — the only *control* use case outside the grid pair |
-//! | **Heating** | [`hvac::cdt`] | DHW Circuit, Configuration Appliance — a hot water *setpoint* |
-//! | | [`hvac::mdsf`] | DHW Circuit, Monitoring Appliance — which mode it is in |
-//! | | [`hvac::mdt`] | DHW Circuit, Monitoring Appliance — what the water got to |
+//! | **Heating and cooling** | [`hvac`] | all twelve HVAC use cases: the hot water's mode, overrun and temperature; a room's heating and cooling modes and setpoints; the room and outdoor thermometers |
+//! | | [`ohpcf`] | Compressor, CEM — the CEM *starts* the compressor, and stops, pauses and resumes it |
 //!
-//! Every control use case here but one can only ask an appliance to do **less**: a limit,
-//! a ceiling, a current not to exceed. [`hvac`] is the exception, and that is why it is
-//! here — a hot water tank is a thermal battery, and asking it for a higher temperature
-//! while the roof is exporting is something no limit can express.
+//! Every use case in the grid, e-mobility and storage rows can only ask an appliance to do
+//! **less**: a limit, a ceiling, a current not to exceed. [`hvac`] and [`ohpcf`] are the
+//! four levers that can ask for more — a temperature setpoint, an operation mode, a
+//! one-time hot water loading, and the compressor's own optional consumption.
+//!
+//! # Bindings, and where they are not wanted
+//!
+//! SPINE §7.3 makes a binding a property of the **feature**: "some feature types define
+//! requirements for binding". The use cases say which, and they do not agree:
+//!
+//! | | |
+//! |---|---|
+//! | binds | [`lpc`]/[`lpp`], [`emobility::opev`]/[`emobility::oscev`], [`cob`], [`emobility::evcs`], [`ohpcf`] scenario 2 |
+//! | does not | every use case in [`hvac`], including all six that write |
+//!
+//! So [`crate::spine::WriteBinding`] is per feature, and the constructors here set it.
 
 //! # Driving an actor
 //!

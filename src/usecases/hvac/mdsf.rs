@@ -2,7 +2,8 @@
 //!
 //! A *Monitoring Appliance* reads which operation mode a *DHW Circuit* is in, and whether
 //! a one-time hot water heating is running. It is the half of the DHW pair that says
-//! **what the circuit is doing**; [`cdt`](super::cdt) is the half that changes it.
+//! **what the circuit is doing**; [`cdt`](super::cdt) is the half that changes the
+//! temperature and [`cdsf`](super::cdsf) the half that changes the mode.
 //!
 //! Two scenarios:
 //!
@@ -17,28 +18,47 @@
 //! A setpoint written into the wrong operation mode is applied and does nothing. CDT
 //! Table 10 relates each mode to the setpoints it uses, so "raise the tank to 60 °C" is
 //! only a complete instruction once the current mode is known — and the mode is here.
-//! [`DhwSystemFunction::current_setpoints`] is that join.
+//! [`current_setpoints`](super::system_function::SystemFunction::current_setpoints) is
+//! that join.
 //!
 //! The overrun matters for the opposite reason. A one-time heating overrides the mode
 //! until it is done, so a manager that sees the tank drawing power while the mode says
 //! `off` is not looking at a fault; it is looking at somebody pressing the button in the
 //! bathroom. Reporting that as an anomaly is how an energy manager loses a user's trust.
-
-use alloc::vec;
-use alloc::vec::Vec;
+//!
+//! # The reader
+//!
+//! [`SystemFunction::dhw`] — the same reader the other five system-function use cases use,
+//! told which function it is following. Everything it does is described in
+//! [`super::system_function`].
+//!
+//! ```
+//! use eebus::model::HvacOperationModeType;
+//! use eebus::usecases::hvac::{mdsf, system_function::SystemFunction};
+//!
+//! let modes = [HvacOperationModeType::Auto, HvacOperationModeType::Off];
+//! let mut circuit = SystemFunction::dhw();
+//! circuit.learn(&mdsf::system_function_description());
+//! circuit.learn(&mdsf::operation_mode_descriptions(&modes).expect("two modes"));
+//! circuit.learn(&mdsf::operation_mode_relations(&modes).expect("two modes"));
+//! circuit.learn(&mdsf::system_function_state(
+//!     mdsf::operation_mode_id(&HvacOperationModeType::Off).unwrap(),
+//!     false,
+//!     Some(true),
+//! ));
+//!
+//! assert_eq!(circuit.mode(), Some(&HvacOperationModeType::Off));
+//! ```
 
 use crate::model::{
-    CmdData, EntityType, FeatureType, Function, HvacOperationModeDescriptionData,
-    HvacOperationModeDescriptionListData, HvacOperationModeId, HvacOperationModeType,
-    HvacOverrunData, HvacOverrunDescriptionData, HvacOverrunDescriptionListData, HvacOverrunId,
-    HvacOverrunListData, HvacOverrunStatus, HvacOverrunType, HvacSystemFunctionData,
-    HvacSystemFunctionId, HvacSystemFunctionListData, HvacSystemFunctionOperationModeRelationData,
-    HvacSystemFunctionOperationModeRelationListData, Role,
+    CmdData, EntityType, FeatureType, Function, HvacOperationModeId, HvacOperationModeType,
+    HvacOverrunId, HvacOverrunStatus, HvacOverrunType, HvacSystemFunctionId,
 };
-use crate::spine::{LocalFeature, Operations};
+use crate::spine::LocalFeature;
 use crate::usecases::descriptor::{ActorRole, FunctionUse, Scenario, Support, UseCaseDescriptor};
 
-use super::{OperationModes, SYSTEM_FUNCTION_ID};
+use super::system_function::{self, SystemFunction};
+use super::{DHW, system_function_id};
 
 /// The version this implementation speaks.
 pub const VERSION: &str = "1.0.0";
@@ -60,46 +80,28 @@ pub const ONE_TIME_DHW: HvacOverrunType = HvacOverrunType::OneTimeDhw;
 /// A local choice, `<o1#(1..1)>`. A peer's is found by its `overrunType`.
 pub const OVERRUN_ID: HvacOverrunId = HvacOverrunId(1);
 
+/// The `systemFunctionId` **this** implementation publishes the hot water under.
+pub const SYSTEM_FUNCTION_ID: HvacSystemFunctionId = system_function_id(&DHW);
+
 /// The `operationModeId`s **this** implementation gives the four modes.
 ///
-/// Local choices, `<om1#(2..4)>`. The specification's own worked example numbers them this
-/// way — `auto` → `<om1#1>`, `on` → `<om1#2>`, `off` → `<om1#3>`, `eco` → `<om1#4>` — and
-/// a peer's are read from [`OperationModes`] rather than assumed.
+/// See [`system_function::operation_mode_id`], which every use case in the family shares:
+/// modes are described once for the device, and which of them a function *has* is the
+/// relation rather than a second numbering.
 pub fn operation_mode_id(kind: &HvacOperationModeType) -> Option<HvacOperationModeId> {
-    Some(HvacOperationModeId(match kind {
-        HvacOperationModeType::Auto => 1,
-        HvacOperationModeType::On => 2,
-        HvacOperationModeType::Off => 3,
-        HvacOperationModeType::Eco => 4,
-        _ => return None,
-    }))
+    system_function::operation_mode_id(kind)
 }
 
 // ---- the feature a DHW Circuit serves -----------------------------------------------
 
 /// Builds the `HVAC` feature both scenarios are served from (Table 8).
 ///
-/// Read-only throughout: this use case reports, and [`cdt`](super::cdt) is where anything
+/// Read-only throughout: this use case reports, and [`cdsf`](super::cdsf) is where the mode
 /// is changed. §3.2.2.2.1 adds a rule worth honouring — **at most one** `HVAC` feature per
 /// entity — so a circuit serving CDT as well puts both use cases' functions on this one
 /// feature. [`with_cdt`] does that.
 pub fn hvac_feature(address: u32) -> LocalFeature {
-    LocalFeature::new(address, FeatureType::HVAC, Role::Server)
-        .with_function(
-            Function::HvacSystemFunctionDescriptionListData,
-            Operations::read(),
-        )
-        .with_function(
-            Function::HvacOperationModeDescriptionListData,
-            Operations::read(),
-        )
-        .with_function(
-            Function::HvacSystemFunctionOperationModeRelationListData,
-            Operations::read(),
-        )
-        .with_function(Function::HvacSystemFunctionListData, Operations::read())
-        .with_function(Function::HvacOverrunDescriptionListData, Operations::read())
-        .with_function(Function::HvacOverrunListData, Operations::read())
+    system_function::hvac_feature(address, true)
 }
 
 /// The same feature, also carrying [`cdt`](super::cdt)'s setpoint relations.
@@ -109,91 +111,40 @@ pub fn hvac_feature(address: u32) -> LocalFeature {
 /// of the two system-function use cases is mandatory alongside CDT [CDT-005] — cannot have
 /// an `HVAC` feature each. This is the one they share.
 pub fn with_cdt(address: u32) -> LocalFeature {
-    hvac_feature(address).with_function(
-        Function::HvacSystemFunctionSetpointRelationListData,
-        Operations::read(),
-    )
+    system_function::with_setpoint_relations(hvac_feature(address))
 }
 
 // ---- what a DHW Circuit publishes ---------------------------------------------------
 
+/// The system function description this use case publishes (Table 9).
+pub fn system_function_description() -> CmdData {
+    system_function::description(SYSTEM_FUNCTION_ID, DHW)
+}
+
 /// The operation modes the circuit supports (Table 10).
 ///
-/// [`None`] for fewer than two, which §2.3.1.1 does not permit: a circuit with one mode
-/// cannot report a *change* of mode, which is the whole of scenario 1. Refusing here is
-/// the same choice [`cdt::system_function_relations`](super::cdt::system_function_relations)
-/// makes — a payload that breaks the rule tells a Monitoring Appliance nothing it can act
-/// on, and it is better not to publish it.
+/// [`None`] for fewer than two, which §2.3.1.1 does not permit.
 pub fn operation_mode_descriptions(modes: &[HvacOperationModeType]) -> Option<CmdData> {
-    if modes.len() < 2 {
-        return None;
-    }
-    let mut data = Vec::new();
-    for kind in modes {
-        data.push(HvacOperationModeDescriptionData {
-            operation_mode_id: Some(operation_mode_id(kind)?),
-            operation_mode_type: Some(kind.clone()),
-            ..Default::default()
-        });
-    }
-    Some(CmdData::HvacOperationModeDescriptionListData(
-        HvacOperationModeDescriptionListData {
-            hvac_operation_mode_description_data: Some(data),
-        },
-    ))
+    system_function::operation_mode_descriptions(modes)
 }
 
 /// Which modes belong to the DHW system function (Table 11).
-///
-/// At least two, for the reason [`operation_mode_descriptions`] gives.
 pub fn operation_mode_relations(modes: &[HvacOperationModeType]) -> Option<CmdData> {
-    if modes.len() < 2 {
-        return None;
-    }
-    let ids: Option<Vec<HvacOperationModeId>> = modes.iter().map(operation_mode_id).collect();
-    Some(CmdData::HvacSystemFunctionOperationModeRelationListData(
-        HvacSystemFunctionOperationModeRelationListData {
-            hvac_system_function_operation_mode_relation_data: Some(vec![
-                HvacSystemFunctionOperationModeRelationData {
-                    system_function_id: Some(SYSTEM_FUNCTION_ID),
-                    operation_mode_id: Some(ids?),
-                },
-            ]),
-        },
-    ))
+    system_function::operation_mode_relations(SYSTEM_FUNCTION_ID, modes)
 }
 
 /// The mode the circuit is in now, and whether an overrun is overriding it (Table 12).
-///
-/// `changeable` is `isOperationModeIdChangeable`, which is `O`: it says whether a
-/// Configuration Appliance running "Configuration of DHW System Function" could change the
-/// mode. This use case only reports.
 pub fn system_function_state(
     current: HvacOperationModeId,
     overrun_active: bool,
     changeable: Option<bool>,
 ) -> CmdData {
-    CmdData::HvacSystemFunctionListData(HvacSystemFunctionListData {
-        hvac_system_function_data: Some(vec![HvacSystemFunctionData {
-            system_function_id: Some(SYSTEM_FUNCTION_ID),
-            current_operation_mode_id: Some(current),
-            is_operation_mode_id_changeable: changeable,
-            is_overrun_active: Some(overrun_active),
-            ..Default::default()
-        }]),
-    })
+    system_function::state(SYSTEM_FUNCTION_ID, current, overrun_active, changeable)
 }
 
 /// The one-time hot water heating this circuit offers (Table 13).
 pub fn overrun_description() -> CmdData {
-    CmdData::HvacOverrunDescriptionListData(HvacOverrunDescriptionListData {
-        hvac_overrun_description_data: Some(vec![HvacOverrunDescriptionData {
-            overrun_id: Some(OVERRUN_ID),
-            overrun_type: Some(ONE_TIME_DHW),
-            affected_system_function_id: Some(vec![SYSTEM_FUNCTION_ID]),
-            ..Default::default()
-        }]),
-    })
+    system_function::overrun_description(OVERRUN_ID, ONE_TIME_DHW, &[SYSTEM_FUNCTION_ID])
 }
 
 /// What the one-time heating is doing (Table 14).
@@ -202,305 +153,16 @@ pub fn overrun_description() -> CmdData {
 /// **MAY only be used as a notification directly after the overrun finished**, the status
 /// SHALL become `inactive` after that, and it SHOULD NOT appear in a reply. A circuit that
 /// leaves `finished` standing tells every appliance that reads it later that a heating has
-/// just completed — repeatedly. [`OverrunReport`] is the type that makes that shape hard
-/// to get wrong.
+/// just completed — repeatedly.
+/// [`OverrunReport`](super::system_function::OverrunReport) is the type that makes that
+/// shape hard to get wrong.
 pub fn overrun_state(status: HvacOverrunStatus) -> CmdData {
-    CmdData::HvacOverrunListData(HvacOverrunListData {
-        hvac_overrun_data: Some(vec![HvacOverrunData {
-            overrun_id: Some(OVERRUN_ID),
-            overrun_status: Some(status),
-            ..Default::default()
-        }]),
-    })
+    system_function::overrun_state(OVERRUN_ID, status)
 }
 
-/// The one-time heating's status, with Table 14's transient built in.
-///
-/// `finished` is not a state a circuit rests in — it is an announcement, sent once as a
-/// notification and then replaced by `inactive`. Modelling it as a state is what leads to
-/// a reply that says a heating has just finished when it finished an hour ago.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OverrunReport {
-    /// Requested, not yet heating.
-    Active,
-    /// Heating now.
-    Running,
-    /// Not running, and nothing pending.
-    Inactive,
-}
-
-impl OverrunReport {
-    /// The status a *reply* may carry.
-    pub fn as_status(self) -> HvacOverrunStatus {
-        match self {
-            Self::Active => HvacOverrunStatus::Active,
-            Self::Running => HvacOverrunStatus::Running,
-            Self::Inactive => HvacOverrunStatus::Inactive,
-        }
-    }
-
-    /// Reads a status into a resting state.
-    ///
-    /// `finished` reads as [`Inactive`](Self::Inactive) plus a `true` — the boolean is the
-    /// announcement, and a caller that wants to know a heating *just* completed uses it
-    /// rather than storing the status.
-    pub fn read(status: &HvacOverrunStatus) -> Option<(Self, bool)> {
-        Some(match status {
-            HvacOverrunStatus::Active => (Self::Active, false),
-            HvacOverrunStatus::Running => (Self::Running, false),
-            HvacOverrunStatus::Inactive => (Self::Inactive, false),
-            HvacOverrunStatus::Finished => (Self::Inactive, true),
-            _ => return None,
-        })
-    }
-}
-
-// ---- what a Monitoring Appliance reads ----------------------------------------------
-
-/// What a Monitoring Appliance has learned about one DHW circuit.
-///
-/// Six functions between them, and the identifiers in every one of them are the circuit's:
-/// `<sf1#(1..1)>` for the system function, `<om1#(2..4)>` for the modes, `<o1#(1..1)>` for
-/// the overrun. Feed it every payload that arrives from the circuit's `HVAC` feature.
-///
-/// Nothing is dropped for arriving early. Every payload is kept under the identifier it
-/// named and resolved against the descriptions whenever those turn up, so the six replies
-/// may come back in any order — which they may, and which no test whose other end is this
-/// crate would ever show.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct DhwSystemFunction {
-    /// The circuit's own `systemFunctionId` for the hot water.
-    function: Option<HvacSystemFunctionId>,
-    modes: OperationModes,
-    /// The modes each system function relates to (Table 11), by function.
-    related: Vec<(HvacSystemFunctionId, Vec<HvacOperationModeId>)>,
-    /// Table 12, by function.
-    states: Vec<(HvacSystemFunctionId, SystemFunctionState)>,
-    /// Table 13, by overrun: what kind it is and which functions it affects.
-    overruns: Vec<(HvacOverrunId, HvacOverrunType, Vec<HvacSystemFunctionId>)>,
-    /// Table 14, by overrun.
-    overrun_states: Vec<(HvacOverrunId, (OverrunReport, bool))>,
-}
-
-/// One system function's state, as Table 12 gives it.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct SystemFunctionState {
-    current: Option<HvacOperationModeId>,
-    changeable: Option<bool>,
-    overrun_active: Option<bool>,
-}
-
-impl DhwSystemFunction {
-    /// Nothing known yet.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Takes in one payload, and reports whether it was one this use case carries.
-    pub fn learn(&mut self, data: &CmdData) -> bool {
-        if self.modes.learn(data) {
-            return true;
-        }
-        match data {
-            CmdData::HvacSystemFunctionDescriptionListData(_) => {
-                // An HVAC feature carries every system function the appliance has; only
-                // the one typed `dhw` is this use case's.
-                if let Some(id) = super::find_dhw_system_function(data) {
-                    self.function = Some(id);
-                }
-                true
-            }
-            CmdData::HvacSystemFunctionOperationModeRelationListData(list) => {
-                for entry in list
-                    .hvac_system_function_operation_mode_relation_data
-                    .iter()
-                    .flatten()
-                {
-                    let Some(id) = entry.system_function_id else {
-                        continue;
-                    };
-                    let modes = entry.operation_mode_id.clone().unwrap_or_default();
-                    match self.related.iter_mut().find(|(known, _)| *known == id) {
-                        Some((_, stored)) => *stored = modes,
-                        None => self.related.push((id, modes)),
-                    }
-                }
-                true
-            }
-            CmdData::HvacSystemFunctionListData(list) => {
-                for entry in list.hvac_system_function_data.iter().flatten() {
-                    let Some(id) = entry.system_function_id else {
-                        continue;
-                    };
-                    let found = SystemFunctionState {
-                        current: entry.current_operation_mode_id,
-                        changeable: entry.is_operation_mode_id_changeable,
-                        overrun_active: entry.is_overrun_active,
-                    };
-                    match self.states.iter_mut().find(|(known, _)| *known == id) {
-                        Some((_, stored)) => *stored = found,
-                        None => self.states.push((id, found)),
-                    }
-                }
-                true
-            }
-            CmdData::HvacOverrunDescriptionListData(list) => {
-                for entry in list.hvac_overrun_description_data.iter().flatten() {
-                    let (Some(id), Some(kind)) = (entry.overrun_id, entry.overrun_type.clone())
-                    else {
-                        continue;
-                    };
-                    let affects = entry
-                        .affected_system_function_id
-                        .clone()
-                        .unwrap_or_default();
-                    match self.overruns.iter_mut().find(|(known, ..)| *known == id) {
-                        Some(stored) => *stored = (id, kind, affects),
-                        None => self.overruns.push((id, kind, affects)),
-                    }
-                }
-                true
-            }
-            CmdData::HvacOverrunListData(list) => {
-                for entry in list.hvac_overrun_data.iter().flatten() {
-                    let (Some(id), Some(status)) =
-                        (entry.overrun_id, entry.overrun_status.as_ref())
-                    else {
-                        continue;
-                    };
-                    let Some(state) = OverrunReport::read(status) else {
-                        continue;
-                    };
-                    match self
-                        .overrun_states
-                        .iter_mut()
-                        .find(|(known, _)| *known == id)
-                    {
-                        Some((_, stored)) => *stored = state,
-                        None => self.overrun_states.push((id, state)),
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// This circuit's state, once the hot water's identifier is known.
-    fn state(&self) -> Option<&SystemFunctionState> {
-        let function = self.function?;
-        self.states
-            .iter()
-            .find(|(known, _)| *known == function)
-            .map(|(_, state)| state)
-    }
-
-    /// The `overrunId` of the one-time heating that affects *this* system function.
-    ///
-    /// A heat pump describes all of its overruns together and a party mode is not hot
-    /// water, so both the type and the affected function have to match. An overrun naming
-    /// no affected function is taken as this one's — Table 13 makes the element mandatory,
-    /// and `oneTimeDhw` is not ambiguous about what it heats.
-    fn overrun_id(&self) -> Option<HvacOverrunId> {
-        let function = self.function?;
-        self.overruns
-            .iter()
-            .find(|(_, kind, affects)| {
-                kind == &ONE_TIME_DHW && (affects.is_empty() || affects.contains(&function))
-            })
-            .map(|(id, ..)| *id)
-    }
-
-    /// The circuit's `systemFunctionId` for the hot water, once described.
-    pub fn system_function(&self) -> Option<HvacSystemFunctionId> {
-        self.function
-    }
-
-    /// The modes the circuit described.
-    pub fn modes(&self) -> &OperationModes {
-        &self.modes
-    }
-
-    /// The mode the circuit is in now [MDSF-001].
-    pub fn mode(&self) -> Option<&HvacOperationModeType> {
-        self.modes.kind_of(self.mode_id()?)
-    }
-
-    /// The identifier of that mode, which is what CDT's relations are keyed by.
-    pub fn mode_id(&self) -> Option<HvacOperationModeId> {
-        self.state()?.current
-    }
-
-    /// The modes this circuit relates to its hot water (Table 11).
-    ///
-    /// At least two, where the circuit follows §2.3.1.1. Empty until both the system
-    /// function description and the relations have arrived.
-    pub fn related_modes(&self) -> &[HvacOperationModeId] {
-        let Some(function) = self.function else {
-            return &[];
-        };
-        self.related
-            .iter()
-            .find(|(known, _)| *known == function)
-            .map(|(_, modes)| modes.as_slice())
-            .unwrap_or_default()
-    }
-
-    /// The setpoints CDT says the *current* mode uses.
-    ///
-    /// This is the join between the two halves of the family, and it is what makes a
-    /// temperature write a complete instruction: a setpoint the circuit is not currently
-    /// reading can be written, acknowledged, and change nothing anybody can measure.
-    ///
-    /// Empty until both the mode and CDT's relations have arrived, and for a mode the
-    /// circuit relates to no setpoint — which `off` is allowed to be [CDT-003/3].
-    pub fn current_setpoints<'a>(
-        &self,
-        setpoints: &'a super::cdt::DhwSetpoints,
-    ) -> &'a [crate::model::SetpointId] {
-        match self.mode_id() {
-            Some(mode) => setpoints.for_mode(mode),
-            None => &[],
-        }
-    }
-
-    /// Whether the circuit says an overrun is overriding the mode (Table 12).
-    pub fn overrun_active(&self) -> Option<bool> {
-        self.state()?.overrun_active
-    }
-
-    /// Whether a Configuration Appliance could change the mode (Table 12, `O`).
-    pub fn mode_changeable(&self) -> Option<bool> {
-        self.state()?.changeable
-    }
-
-    /// What the one-time hot water heating is doing (Table 14).
-    pub fn overrun(&self) -> Option<OverrunReport> {
-        self.overrun_state().map(|(state, _)| state)
-    }
-
-    fn overrun_state(&self) -> Option<(OverrunReport, bool)> {
-        let id = self.overrun_id()?;
-        self.overrun_states
-            .iter()
-            .find(|(known, _)| *known == id)
-            .map(|(_, state)| *state)
-    }
-
-    /// Whether the last payload announced that a heating had *just* finished.
-    ///
-    /// Table 14's `finished` is a one-shot notification, not a state. This is it, and it
-    /// is deliberately not part of [`overrun`](Self::overrun): a caller that stored
-    /// `finished` would go on reporting a completed heating for as long as nothing else
-    /// arrived.
-    pub fn overrun_just_finished(&self) -> bool {
-        self.overrun_state().is_some_and(|(_, finished)| finished)
-    }
-
-    /// Whether scenario 1 can be reported at all: the function, two modes, and a current one.
-    pub fn is_complete(&self) -> bool {
-        self.function.is_some() && self.modes.is_sufficient() && self.mode_id().is_some()
-    }
+/// A reader following this circuit's hot water.
+pub fn reader() -> SystemFunction {
+    SystemFunction::dhw()
 }
 
 // ---- descriptors ---------------------------------------------------------------------
@@ -561,8 +223,8 @@ const CLIENT_OVERRUN: &[FunctionUse] = &[
     FunctionUse::client(FeatureType::HVAC, Function::HvacOverrunListData),
 ];
 
-const MODE: &str = "Monitor DHW operation mode";
-const OVERRUN: &str = "Monitor DHW overrun";
+const MONITOR_MODE: &str = "Monitor DHW operation mode";
+const MONITOR_OVERRUN: &str = "Monitor DHW overrun";
 
 /// The DHW Circuit: the actor being watched.
 pub static DHW_CIRCUIT: UseCaseDescriptor = UseCaseDescriptor {
@@ -576,15 +238,13 @@ pub static DHW_CIRCUIT: UseCaseDescriptor = UseCaseDescriptor {
     scenarios: &[
         Scenario {
             number: 1,
-            name: MODE,
+            name: MONITOR_MODE,
             support: Support::Mandatory,
             functions: SERVER_MODE,
         },
         Scenario {
             number: 2,
-            // Table 1: `R` for the circuit, `M` for the appliance — an appliance must be
-            // able to read an overrun, a circuit need not offer one.
-            name: OVERRUN,
+            name: MONITOR_OVERRUN,
             support: Support::Recommended,
             functions: SERVER_OVERRUN,
         },
@@ -603,13 +263,13 @@ pub static MONITORING_APPLIANCE: UseCaseDescriptor = UseCaseDescriptor {
     scenarios: &[
         Scenario {
             number: 1,
-            name: MODE,
+            name: MONITOR_MODE,
             support: Support::Mandatory,
             functions: CLIENT_MODE,
         },
         Scenario {
             number: 2,
-            name: OVERRUN,
+            name: MONITOR_OVERRUN,
             support: Support::Mandatory,
             functions: CLIENT_OVERRUN,
         },
@@ -619,16 +279,21 @@ pub static MONITORING_APPLIANCE: UseCaseDescriptor = UseCaseDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usecases::hvac;
+    use crate::model::{
+        HvacOverrunData, HvacOverrunDescriptionData, HvacOverrunDescriptionListData,
+        HvacOverrunListData, HvacSystemFunctionData, HvacSystemFunctionListData,
+    };
+    use crate::usecases::hvac::{self, system_function::OverrunReport};
+    use alloc::vec;
 
-    fn a_circuit() -> DhwSystemFunction {
+    fn a_circuit() -> SystemFunction {
         let modes = [
             HvacOperationModeType::Auto,
             HvacOperationModeType::On,
             HvacOperationModeType::Off,
         ];
-        let mut known = DhwSystemFunction::new();
-        known.learn(&hvac::system_function_description());
+        let mut known = reader();
+        known.learn(&system_function_description());
         known.learn(&operation_mode_descriptions(&modes).expect("three modes"));
         known.learn(&operation_mode_relations(&modes).expect("three modes"));
         known
@@ -654,8 +319,8 @@ mod tests {
             "no current mode has been notified yet"
         );
 
-        let eco_free = operation_mode_id(&HvacOperationModeType::Off).unwrap();
-        known.learn(&system_function_state(eco_free, false, Some(true)));
+        let off = operation_mode_id(&HvacOperationModeType::Off).unwrap();
+        known.learn(&system_function_state(off, false, Some(true)));
 
         assert!(known.is_complete());
         assert_eq!(known.mode(), Some(&HvacOperationModeType::Off));
@@ -670,31 +335,18 @@ mod tests {
     /// is off while the house is being heated.
     #[test]
     fn the_hot_water_is_found_among_the_other_system_functions() {
-        use crate::model::{
-            HvacSystemFunctionDescriptionData, HvacSystemFunctionDescriptionListData,
-            HvacSystemFunctionType,
-        };
-
         let theirs = HvacSystemFunctionId(4);
-        let descriptions =
-            CmdData::HvacSystemFunctionDescriptionListData(HvacSystemFunctionDescriptionListData {
-                hvac_system_function_description_data: Some(vec![
-                    HvacSystemFunctionDescriptionData {
-                        system_function_id: Some(SYSTEM_FUNCTION_ID),
-                        system_function_type: Some(HvacSystemFunctionType::Heating),
-                        ..Default::default()
-                    },
-                    HvacSystemFunctionDescriptionData {
-                        system_function_id: Some(theirs),
-                        system_function_type: Some(HvacSystemFunctionType::Dhw),
-                        ..Default::default()
-                    },
-                ]),
-            });
+        let descriptions = system_function::descriptions(&[
+            (SYSTEM_FUNCTION_ID, hvac::HEATING),
+            (theirs, hvac::DHW),
+        ]);
 
-        assert_eq!(hvac::find_dhw_system_function(&descriptions), Some(theirs));
+        assert_eq!(
+            hvac::find_system_function(&descriptions, &hvac::DHW),
+            Some(theirs)
+        );
 
-        let mut known = DhwSystemFunction::new();
+        let mut known = reader();
         known.learn(&descriptions);
         assert_eq!(known.system_function(), Some(theirs));
 
@@ -776,7 +428,7 @@ mod tests {
         let auto = operation_mode_id(&HvacOperationModeType::Auto).unwrap();
         let off = operation_mode_id(&HvacOperationModeType::Off).unwrap();
 
-        let mut setpoints = cdt::DhwSetpoints::new();
+        let mut setpoints = cdt::reader();
         setpoints.learn(
             &cdt::system_function_relations(&[
                 (auto, HvacOperationModeType::Auto, vec![SetpointId(1)]),
@@ -822,10 +474,10 @@ mod tests {
             overrun_description(),
             operation_mode_relations(&modes).expect("three modes"),
             operation_mode_descriptions(&modes).expect("three modes"),
-            hvac::system_function_description(),
+            system_function_description(),
         ];
 
-        let mut known = DhwSystemFunction::new();
+        let mut known = reader();
         for payload in &payloads {
             assert!(
                 known.learn(payload),
@@ -883,6 +535,16 @@ mod tests {
                 .iter()
                 .any(|f| f.function == Function::HvacOverrunListData),
             "beside this use case's own"
+        );
+    }
+
+    /// Read-only: this use case reports, and `cdsf` is the one that changes anything.
+    #[test]
+    fn nothing_here_is_writeable() {
+        let feature = hvac_feature(1);
+        assert!(
+            feature.functions().iter().all(|f| !f.operations.write),
+            "MDSF Table 8 gives every function `read` and no `write`"
         );
     }
 }
