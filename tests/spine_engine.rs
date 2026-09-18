@@ -3254,3 +3254,46 @@ fn a_partial_use_case_read_narrows_the_answer_and_not_the_record() {
         "and the answer to the wide one is not thrown away by asking a narrow one"
     );
 }
+
+/// A datagram whose *source* is this node's own device address is not from a peer.
+///
+/// Nothing in SPINE forbids sending one — it does not occur to the text that a node might
+/// meet itself — but every consequence lands in this engine, because the source address is
+/// the key for the peer record, the relations, the message counters and the §14a audit
+/// entry. Accepted, it files this node as its own peer, and `peers()` reports it.
+///
+/// The innocent cause is the one the runtime's `AddressConflict` already names: two devices
+/// shipped with the same vendor and serial, one of them this one. The hostile cause is a
+/// peer choosing the address on purpose, which costs it nothing.
+#[test]
+fn a_datagram_claiming_this_node_s_own_address_is_not_a_peer() {
+    let mut engine = heat_pump();
+    let own = engine.device().address().clone();
+
+    let datagram = Datagram {
+        header: Some(eebus::model::Header {
+            specification_version: Some(eebus::model::SpecificationVersion::from("1.3.0")),
+            address_source: Some(node_management(&own)),
+            address_destination: Some(node_management(&own)),
+            msg_counter: Some(MsgCounter(1)),
+            cmd_classifier: Some(CmdClassifier::Read),
+            ..Default::default()
+        }),
+        payload: Some(Payload::default()),
+    };
+
+    assert!(
+        !engine.handle_datagram(&datagram, Duration::ZERO),
+        "a datagram from this node's own address is not served"
+    );
+    assert_eq!(
+        engine.peers().count(),
+        0,
+        "and this node is not filed as its own peer"
+    );
+    assert!(
+        engine.poll_transmit().is_none(),
+        "nor answered: every reply is addressed to `source`, so an error would go to this \
+         node's own address — a loop, or a confirmation to an impostor"
+    );
+}

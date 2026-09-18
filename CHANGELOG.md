@@ -4,7 +4,130 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.9.0] — unreleased
+## [0.10.0] — unreleased
+
+A node that announced itself and looked for peers found itself, and could connect to
+itself; and a control box that only ever dialled was announcing a port it never bound.
+Two defects that hid each other, both reachable from the setup the documentation
+recommended, and neither visible to a test suite whose every party is a fresh key.
+
+### Fixed
+
+- **A node no longer connects to itself.** Announcing `_ship._tcp` and browsing for it —
+  which is the whole of a device's networking, and what `Hub::browse` recommended in as many
+  words — means meeting your own announcement. Nothing compared that record's SKI against
+  the node's own, and there was no harmless outcome. Untrusted, it arrived as a sighting, so
+  an application showing sightings to a user asked them to **pair the device with itself**;
+  one `y` wrote the node's own SKI into its own trust store, where it persisted. Trusted and
+  not listening, the node dialled itself for ever against a port nothing served. Trusted and
+  listening, the dial *succeeded* — TLS cannot refuse it, the certificate, the key and the
+  SKI being exactly the ones the verifier was told to demand — and the node then held two
+  connections to itself, both ends of one message counter, and a peer whose device address
+  was its own, tearing the whole thing down as an address conflict and starting again.
+
+  `Hub::remember_discovered` now ignores this node's own announcement and no `HubEvent::Found`
+  is raised for it; `Hub::remember` answers `false`; `Hub::approve` does nothing, so a trust
+  store carried over from an earlier version cannot put it back on the dial list. None of
+  those can be the invariant, because `Hub::dial` takes an *address* and an address carries
+  no identity — so the rule is stated in `Hub::adopt`, the one funnel every connection
+  passes through, at the first instant the peer's SKI is a proven fact. The new
+  `ConnectionError::SelfConnection` says so, and the peer is forgotten rather than redialled.
+
+- **Every SHIP node listens.** "The Energy Guard dials, the Controllable System listens" is
+  true about who opens a §14a exchange and false about sockets, and the loose reading had
+  reached `examples/steuerbox.rs`, which announced `_ship._tcp` on a port it never bound —
+  so every peer that browsed dialled it and got `ECONNREFUSED`, for ever, the redial backoff
+  having no give-up. §8.1 offers no opt-out: §623 puts the floor at one simultaneously
+  active connection, §624 requires a node limited to one to "provide a listening TCP
+  server", and §638 wants that port open whenever the node is under its limit. The Steuerbox
+  now listens, and both simulators announce the port they actually bound rather than the one
+  they were asked for, which differ whenever `--port 0` is used.
+
+- **A connection slot is reserved in each direction (§8.1).** §628 asks a node holding more
+  than one connection to "always reserve one connection for the TCP server port" — of `x`
+  connections at most `x-1` may be ones it dialled — and §632 says the same in reverse.
+  `max_connections` was a single number over the links, which satisfies §623 and neither of
+  the others, and the case it got wrong is ordinary rather than adversarial: a gateway that
+  has dialled every peer it knows about had nothing left to accept a Steuerbox with. Each
+  link now records which end opened it, and handshakes still running are counted per
+  direction, because the socket is already spent. The reservation applies only above one
+  connection, which is what both sentences say in their first clause.
+
+- **`Hub::set_max_connections(0)` is raised to one**, the floor §623 sets. A node that can
+  hold no connection cannot take part at all, which is never what a caller means.
+
+- **A peer could claim this node's own SPINE device address.** D101's mistake one layer
+  down, and the same audit found it. The hub refused a peer that claimed *another peer's*
+  address, but the scan behind it looked only at the other connections, and this node's own
+  device is not one of them — so the collision it missed was the one the innocent cause
+  produces most directly: two devices shipped with the same vendor and serial give the same
+  address, and there is no reason the second should be a stranger rather than this node.
+
+  Underneath, the engine was worse than permissive: it checks `destination.device` and
+  answers `errorNumber` 5 for anything that is not its own, and checked nothing about
+  `source.device` at all. That address is the key for the peer record, the relations, the
+  message counters and the §14a audit entry, so a datagram claiming this node's own address
+  filed **this node as its own peer** and `peers()` reported it. The engine now discards
+  such a datagram — every reply is addressed to `source`, so an error would go to this
+  node's own address — and the hub, which knows which socket it arrived on, closes it with
+  `Disconnect::AddressConflict`.
+
+- **A pairing request signed by this node was honoured.** `devZ` being this node means a
+  request whose trusted party is our own certificate: the digest covers both fingerprints
+  and is signed with the secret, so nobody else could have produced one — it authenticates
+  perfectly and means nothing. It would have filled the single unit slot §10.3 reserves for
+  the *one* control unit, and §4.3 would then have protected that non-relationship for
+  fifteen minutes against the real one.
+
+- **The mDNS tests took the first announcement that arrived**, which made them a claim
+  about the network rather than about this crate: a second test in the same binary, or an
+  actual EEBUS device on the segment, failed them. They now pick out the instance they
+  announced by name.
+
+### Added
+
+- **`Hub::close(&Ski, reason)`** — SPINE IG §2.6.2's fourth escalation step, which the
+  engine deliberately does not take (§2.6.4: one unresponsive use case is not a reason to
+  drop a connection carrying others) and which the application therefore had no way to take
+  either. `forget_peer` documented itself as leaving any connection up, `adopt` took one in,
+  and nothing handed one back. Closing leaves the redial schedule alone, so a wedged peer
+  gets a fresh session; §2.6.3's *block the peer* is `forget_peer` then `close`, in that
+  order. Neither touches trust.
+
+- **`--dial <address>` on the Steuerbox simulator**, for an installation where the appliance
+  is known in advance and for any host without multicast. With `--trust` the address is
+  remembered and redialled; without, it is a single dial and the appliance decides. mDNS
+  becomes best-effort when `--dial` is given, rather than a reason not to start.
+
+- **`cargo xtask simulators`, run on every push** — the two simulators against each other,
+  over `--dial` so no multicast is needed, asserting the §14a exchange completes *and* that
+  the control box serves the port it announces. CI ran `grid_limit` and `networked` and
+  never started either simulator, which is why the port defect above shipped: the examples
+  are the only place the stack is wired the way a device wires it.
+
+### Changed
+
+- **`Hub::adopt` returns `Result<Ski, Refused>`** rather than handing back a bare
+  `Box<ShipConnection>`. There are now three reasons a connection is refused and the caller
+  cannot act sensibly without knowing which: `Refused::reason()` gives the
+  `ConnectionError`, `Refused::ski()` the peer TLS proved, and `Refused::into_connection()`
+  the connection back.
+- **`Hub::remember` returns `bool`** — whether the peer was taken up. It answers `false` for
+  this node's own SKI.
+- **`simulator::show_identity` no longer takes a port** (examples only). A port is not a
+  fact until a listener is bound; `simulator::show_listening` prints it once it is.
+
+### Added
+
+- `tests/runtime_over_a_socket.rs` gains `twins()`, which builds one identity twice, and
+  the tests that use it, and `tests/mdns_on_the_network.rs` gains the arrangement
+  `Hub::browse` recommends — a real hub listening, announcing and browsing at once, over
+  real multicast. Its absence is why none of this was caught: every other party in
+  that file comes from a helper that mints a fresh certificate per call, so "the peer is us"
+  was a state the harness could not express — which reads, from the outside, exactly like
+  having ruled it out.
+
+## [0.9.0] — 2026-09-05
 
 Times off the wire, read in both the forms SPINE permits; a descriptor that says what
 the *absence* of the next message means; and the bugs that asking those two questions

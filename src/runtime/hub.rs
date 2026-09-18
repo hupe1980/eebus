@@ -129,9 +129,11 @@ pub enum Disconnect {
     /// It lost the double-connection arbitration of SHIP §12.2.3.
     Duplicate,
     /// The peer named a SPINE device address that is not its own to use: it restated a
-    /// different one than this connection is bound to, or claimed one another connection
-    /// holds. Routing is by that address, so either would misdeliver another peer's
-    /// datagrams. Two devices sharing a vendor and serial produce it without any malice.
+    /// different one than this connection is bound to, claimed one another connection
+    /// holds, or claimed **this node's own**. Routing is by that address, so any of the
+    /// three would misdeliver datagrams. Two devices sharing a vendor and serial produce
+    /// all three without any malice, and the third — the peer's address colliding with
+    /// ours — is the one that collision produces most directly.
     AddressConflict,
     /// This node closed it.
     Local,
@@ -182,6 +184,50 @@ impl core::fmt::Display for Origin {
         }
     }
 }
+
+/// A connection [`Hub::adopt`] would not take, handed back with the reason.
+///
+/// The connection is still open and still the caller's: close it, hand it somewhere else,
+/// or drop it. It comes back boxed because a [`ShipConnection`] is two kilobytes and
+/// every ordinary call would otherwise carry that on the stack.
+#[derive(Debug)]
+pub struct Refused {
+    reason: ConnectionError,
+    ski: Ski,
+    connection: Box<ShipConnection>,
+}
+
+impl Refused {
+    /// Why the hub would not take it.
+    ///
+    /// [`ConnectionError::SelfConnection`] or [`ConnectionError::TooManyConnections`];
+    /// the second covers both the overall cap and SHIP §8.1's per-direction reservation.
+    pub fn reason(&self) -> &ConnectionError {
+        &self.reason
+    }
+
+    /// The peer the connection proved, which TLS established before it was refused.
+    pub fn ski(&self) -> Ski {
+        self.ski
+    }
+
+    /// Takes the connection back.
+    pub fn into_connection(self) -> Box<ShipConnection> {
+        self.connection
+    }
+}
+
+impl core::fmt::Display for Refused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "the connection to {} was refused: {}",
+            self.ski, self.reason
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Something that happened on one of the hub's connections.
 // `SpineEvent` carries a payload; boxing it would make every match arm indirect for the
@@ -401,6 +447,8 @@ enum Wake {
 struct Link {
     ski: Ski,
     connection: ShipConnection,
+    /// Which end opened it, which is what SHIP §8.1's reservation counts.
+    origin: Origin,
     /// The peer's SPINE device address, once its discovery has answered.
     device: Option<AddressDevice>,
     /// When the connection was established, for the double-connection rule.
@@ -519,8 +567,11 @@ pub struct Hub {
     /// requests, and what mDNS found.
     inbox: mpsc::UnboundedReceiver<Inbound>,
     inbox_tx: mpsc::UnboundedSender<Inbound>,
-    /// Handshakes running in the background, counted against the cap.
-    in_flight: usize,
+    /// Handshakes running in the background, counted against the cap — split by which
+    /// end opened them, because SHIP §8.1 reserves a slot for each direction and a
+    /// handshake that has not finished has already taken the socket it will need.
+    in_flight_dialed: usize,
+    in_flight_accepted: usize,
     /// Handshakes held in the SHIP pending state, waiting on a decision.
     ///
     /// Keyed by [`Origin`] rather than by SKI, because that is what the outcome comes
@@ -529,6 +580,12 @@ pub struct Hub {
     /// Bounded by [`MAX_PENDING_TRUST`] — an unapproved peer holds a connection slot on
     /// nobody's authority, so the number of them is not left to whoever is on the wire.
     awaiting_trust: Vec<(Origin, Ski)>,
+    /// The mDNS instance name this node's own announcement arrived under.
+    ///
+    /// Kept for one reason: a `Found` that was suppressed must have its `Lost` suppressed
+    /// as well, or an application pairing the two sees a departure with no arrival.
+    #[cfg(feature = "mdns")]
+    own_instance: Option<String>,
     /// `devA`'s end of the SHIP Pairing Service, once an application has turned it on.
     #[cfg(all(feature = "mdns", feature = "pairing"))]
     pairing: Option<Pairing>,
@@ -555,8 +612,11 @@ impl Hub {
             writing: None,
             inbox,
             inbox_tx,
-            in_flight: 0,
+            in_flight_dialed: 0,
+            in_flight_accepted: 0,
             awaiting_trust: Vec::new(),
+            #[cfg(feature = "mdns")]
+            own_instance: None,
             #[cfg(all(feature = "mdns", feature = "pairing"))]
             pairing: None,
             tasks: Vec::new(),
@@ -660,6 +720,12 @@ impl Hub {
     /// the same, plus the dial. Persist the store afterwards, or the approval is gone at
     /// the next restart.
     pub fn approve(&mut self, ski: Ski) {
+        // This node's own SKI is not something a user can usefully approve, and a trust
+        // store restored from disk may carry one. Refusing it here keeps it off the dial
+        // list whatever the store says.
+        if ski == self.node.ski() {
+            return;
+        }
         self.node.trust_store().trust(ski);
         if let Some(index) = self.sightings.iter().position(|s| s.ski == ski) {
             let sighting = self.sightings.remove(index);
@@ -737,7 +803,7 @@ impl Hub {
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let origin = Origin::Accepted { from };
-        if !self.has_room() {
+        if !self.has_room_for(origin) {
             drop(stream);
             self.pending.push_back(HubEvent::HandshakeFailed {
                 origin,
@@ -746,7 +812,7 @@ impl Hub {
             });
             return;
         }
-        self.in_flight += 1;
+        self.in_flight_accepted += 1;
         let node = self.node.clone();
         let inbox = self.inbox_tx.clone();
         let report = self.reporter(origin);
@@ -770,20 +836,60 @@ impl Hub {
 
     /// Adds a connection the caller established itself.
     ///
+    /// Every connection this hub holds arrives here — the listener's, the dialler's and
+    /// the application's alike — which is what makes it the place to state the invariants
+    /// that must hold of *all* of them rather than of one path.
+    ///
     /// # Errors
     ///
-    /// Hands the connection back when the hub is already holding
-    /// [`max_connections`](Self::max_connections), or a second connection to this peer
-    /// already exists and is being arbitrated. The caller owns the refused connection and
-    /// decides how to end it. It comes back boxed because a `ShipConnection` is two
-    /// kilobytes and every ordinary call would otherwise carry that on the stack.
-    pub fn adopt(&mut self, connection: ShipConnection) -> Result<Ski, Box<ShipConnection>> {
+    /// Hands the connection back, with the reason, when the peer is this node itself
+    /// ([`ConnectionError::SelfConnection`]), when the hub is already holding
+    /// [`max_connections`](Self::max_connections) or has no slot left in this direction
+    /// (SHIP §8.1, [`ConnectionError::TooManyConnections`]), or when a second connection
+    /// to this peer already exists and is being arbitrated. The caller owns the refused
+    /// connection and decides how to end it.
+    pub fn adopt(&mut self, connection: ShipConnection) -> Result<Ski, Refused> {
+        self.adopt_from(connection, None)
+    }
+
+    /// [`adopt`](Self::adopt), knowing which end opened the connection.
+    ///
+    /// `origin` is [`None`] for a connection an application made itself and did not say
+    /// how; it is then counted as a dialled one, which is the conservative reading of
+    /// §8.1 — it leaves the accepting slot free.
+    fn adopt_from(
+        &mut self,
+        connection: ShipConnection,
+        origin: Option<Origin>,
+    ) -> Result<Ski, Refused> {
         let ski = connection.peer();
         let now = self.now();
 
+        // The invariant, before anything else: a node is not its own peer. TLS cannot
+        // catch this — the certificate presented is the one the verifier was told to
+        // demand — so the first moment the SKI is a proven fact is the last moment this
+        // can be refused cheaply. Left to run, it costs two connection slots, both ends
+        // of a message counter, and a device address the engine then reports as a
+        // conflict with itself.
+        if ski == self.node.ski() {
+            return Err(Refused {
+                reason: ConnectionError::SelfConnection,
+                ski,
+                connection: Box::new(connection),
+            });
+        }
+
+        let origin = origin.unwrap_or(Origin::Dialed {
+            address: SocketAddr::from(([0, 0, 0, 0], 0)),
+        });
+
         let to_this_peer = self.links.iter().filter(|l| l.ski == ski).count();
-        if self.links.len() >= self.max_connections || to_this_peer >= MAX_CONNECTIONS_PER_PEER {
-            return Err(Box::new(connection));
+        if to_this_peer >= MAX_CONNECTIONS_PER_PEER || !self.has_slot_for(origin) {
+            return Err(Refused {
+                reason: ConnectionError::TooManyConnections,
+                ski,
+                connection: Box::new(connection),
+            });
         }
 
         if to_this_peer > 0 && !self.duplicates.iter().any(|d| d.ski == ski) {
@@ -797,6 +903,7 @@ impl Hub {
         self.links.push(Link {
             ski,
             connection,
+            origin,
             device: None,
             opened: now,
             last_seen: now,
@@ -814,9 +921,79 @@ impl Hub {
         Ok(ski)
     }
 
-    /// Whether another handshake fits under the cap.
-    fn has_room(&self) -> bool {
-        self.links.len() + self.in_flight < self.max_connections
+    /// Whether another handshake in this direction fits, under the cap and under
+    /// SHIP §8.1's reservation.
+    ///
+    /// §8.1 is two rules. §623 caps the total. §628–631 then lets a node holding `x`
+    /// connections spend at most `x-1` on ones it dialled — *"always reserve one connection
+    /// for the TCP server port"* — and §632–635 says the same in reverse. The case the
+    /// reservation is for is ordinary: a gateway that has dialled every peer it knows about
+    /// must still be able to accept a Steuerbox.
+    ///
+    /// Handshakes still running count, because the socket is already spent. The reservation
+    /// applies only above one connection, as both sentences say in their first clause;
+    /// §624–627 describes a one-connection node separately.
+    fn has_room_for(&self, origin: Origin) -> bool {
+        let held = self.links.len() + self.in_flight_dialed + self.in_flight_accepted;
+        if held >= self.max_connections {
+            return false;
+        }
+        if self.max_connections <= 1 {
+            return true;
+        }
+        let reserved = self.max_connections - 1;
+        match origin {
+            Origin::Dialed { .. } => self.dialed() < reserved,
+            Origin::Accepted { .. } => self.accepted() < reserved,
+        }
+    }
+
+    /// Whether an established connection fits, which is the same question without the
+    /// handshake that produced it — it has finished, so it is no longer in flight.
+    fn has_slot_for(&self, origin: Origin) -> bool {
+        if self.links.len() >= self.max_connections {
+            return false;
+        }
+        if self.max_connections <= 1 {
+            return true;
+        }
+        let reserved = self.max_connections - 1;
+        let held =
+            |kind: fn(&Origin) -> bool| self.links.iter().filter(|l| kind(&l.origin)).count();
+        match origin {
+            Origin::Dialed { .. } => held(|o| matches!(o, Origin::Dialed { .. })) < reserved,
+            Origin::Accepted { .. } => held(|o| matches!(o, Origin::Accepted { .. })) < reserved,
+        }
+    }
+
+    /// Gives a finished handshake's in-flight slot back, in the direction it took one.
+    fn release_in_flight(&mut self, origin: Origin) {
+        match origin {
+            Origin::Dialed { .. } => {
+                self.in_flight_dialed = self.in_flight_dialed.saturating_sub(1)
+            }
+            Origin::Accepted { .. } => {
+                self.in_flight_accepted = self.in_flight_accepted.saturating_sub(1)
+            }
+        }
+    }
+
+    /// Connections this node opened, held or being opened.
+    fn dialed(&self) -> usize {
+        self.links
+            .iter()
+            .filter(|l| matches!(l.origin, Origin::Dialed { .. }))
+            .count()
+            + self.in_flight_dialed
+    }
+
+    /// Connections this node accepted, held or being accepted.
+    fn accepted(&self) -> usize {
+        self.links
+            .iter()
+            .filter(|l| matches!(l.origin, Origin::Accepted { .. }))
+            .count()
+            + self.in_flight_accepted
     }
 
     /// A callback that turns a handshake's trust request into an event on this hub.
@@ -830,7 +1007,7 @@ impl Hub {
     /// Starts a dial in the background, looking for `expected` if it is a redial.
     fn spawn_dial(&mut self, address: SocketAddr, expected: Option<Ski>) {
         let origin = Origin::Dialed { address };
-        if !self.has_room() {
+        if !self.has_room_for(origin) {
             self.pending.push_back(HubEvent::HandshakeFailed {
                 origin,
                 ski: expected,
@@ -842,7 +1019,7 @@ impl Hub {
             }
             return;
         }
-        self.in_flight += 1;
+        self.in_flight_dialed += 1;
         if let Some(known) = expected.and_then(|ski| self.known.iter_mut().find(|k| k.ski == ski)) {
             known.dialing = true;
         }
@@ -895,7 +1072,16 @@ impl Hub {
     /// Only a trusted peer is worth remembering — an untrusted one will be held in the
     /// SHIP hello phase and time out — but the hub does not enforce that, because a user
     /// may be approving it while the connection is being made.
-    pub fn remember(&mut self, ski: Ski, address: SocketAddr) {
+    ///
+    /// **This node's own SKI is never remembered**, and the call answers `false`. A node
+    /// that announces `_ship._tcp` and browses for it meets its own announcement, and an
+    /// application driving its own browse reaches this function with it; dialling it
+    /// either fails for ever against a port nothing serves, or succeeds and produces a
+    /// connection to itself. Returns whether the peer was taken up.
+    pub fn remember(&mut self, ski: Ski, address: SocketAddr) -> bool {
+        if ski == self.node.ski() {
+            return false;
+        }
         let now = self.now();
         match self.known.iter_mut().find(|k| k.ski == ski) {
             Some(known) => {
@@ -912,6 +1098,7 @@ impl Hub {
                 dialing: false,
             }),
         }
+        true
     }
 
     /// Remembers a peer mDNS found, if it is one this node trusts.
@@ -924,9 +1111,18 @@ impl Hub {
     /// Everything in a TXT record is a claim rather than a fact — the SKI included. It
     /// becomes a fact when TLS proves the peer holds the matching key, which is why the
     /// hub checks what it connected to rather than what it was told.
+    ///
+    /// **This node's own announcement is ignored.** A node that announces and browses —
+    /// which is the whole of a device's networking, and what [`browse`](Self::browse)
+    /// recommends — sees itself, and its own SKI is the one TXT record whose claim is
+    /// already known to be true. Neither remembered nor kept as a sighting, so it is
+    /// never dialled and never offered to a user as something to pair with.
     #[cfg(feature = "mdns")]
     #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
     pub fn remember_discovered(&mut self, found: &crate::mdns::Discovered) -> bool {
+        if found.ski == self.node.ski() {
+            return false;
+        }
         let Some(address) = found.socket_address() else {
             return false;
         };
@@ -963,7 +1159,38 @@ impl Hub {
         Some(self.known.remove(index).ski)
     }
 
-    /// Stops dialling a peer. Any connection to it stays up.
+    /// Closes every connection to a peer, with a `connectionClose` rather than a dropped
+    /// socket. Returns how many were closed.
+    ///
+    /// SPINE IG §2.6.2's fourth escalation step, which the engine does not take on its own:
+    /// §2.6.4 says one unresponsive use case is not a reason to drop a connection carrying
+    /// others, and only the application knows which it has. The engine reports
+    /// [`SpineEvent::RequestTimedOut`](crate::spine::SpineEvent); the decision arrives here.
+    ///
+    /// **A closed peer comes back.** Closing says nothing about the future, so a remembered
+    /// peer is redialled on the usual backoff — which is what a wedged session needs.
+    /// §2.6.3's *block the peer* is two calls, in this order, because between them the
+    /// redial schedule is still live:
+    ///
+    /// ```no_run
+    /// # fn example(hub: &mut eebus::runtime::Hub, ski: &eebus::ship::Ski) {
+    /// use eebus::ship::ConnectionCloseReason;
+    ///
+    /// hub.forget_peer(ski);                                    // stop dialling it back
+    /// hub.close(ski, ConnectionCloseReason::RemovedConnection); // and end what is up
+    /// # }
+    /// ```
+    ///
+    /// Neither touches trust: a closed peer that dials back in is still approved, and
+    /// [`TrustStore::forget`](super::TrustStore::forget) is the other decision. The close
+    /// runs off the loop, and each connection is reported as [`HubEvent::Disconnected`]
+    /// with [`Disconnect::Local`].
+    pub fn close(&mut self, ski: &Ski, reason: ConnectionCloseReason) -> usize {
+        self.close_links_with(ski, reason)
+    }
+
+    /// Stops dialling a peer. Any connection to it stays up — [`close`](Self::close) is
+    /// what ends one, and the two together are §2.6.3's "block the peer".
     pub fn forget_peer(&mut self, ski: &Ski) {
         self.known.retain(|k| &k.ski != ski);
     }
@@ -1085,6 +1312,17 @@ impl Hub {
                 return;
             }
         };
+        // `devZ` is this node. A request whose trusted party is our own certificate can
+        // only come from us: the digest covers both fingerprints and is signed with the
+        // secret, so nobody else could have produced one — which means it authenticates
+        // perfectly and means nothing. Pairing with it would fill the single unit slot
+        // §10.3 reserves for the *one* control unit with this node's own certificate, and
+        // §4.3 would then protect that non-relationship for fifteen minutes against the
+        // real control unit trying to take it. The same family as a node dialling its own
+        // announcement, one service along.
+        if request.trust_par == self.node.fingerprint() {
+            return;
+        }
         let unit = PairedUnit::from_request(&request);
         // A unit that re-pairs — a reboot, a fresh nonce — displaces "itself", which is
         // not a revocation and must not close its connection or be reported as one.
@@ -1133,6 +1371,10 @@ impl Hub {
     /// caller that can wait.
     #[cfg(all(feature = "mdns", feature = "pairing"))]
     fn close_links_to(&mut self, ski: &Ski) {
+        self.close_links_with(ski, ConnectionCloseReason::Unspecific);
+    }
+
+    fn close_links_with(&mut self, ski: &Ski, reason: ConnectionCloseReason) -> usize {
         let doomed: Vec<usize> = self
             .links
             .iter()
@@ -1140,17 +1382,16 @@ impl Hub {
             .filter(|(_, link)| &link.ski == ski)
             .map(|(index, _)| index)
             .collect();
+        let closed = doomed.len();
         for index in doomed.into_iter().rev() {
             let link = self.links.remove(index);
             let device = link.device.clone();
             tokio::spawn(async move {
-                let _ = link
-                    .connection
-                    .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
-                    .await;
+                let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
             });
             self.forget_peer_state(*ski, device, Disconnect::Local);
         }
+        closed
     }
 
     /// Browses for `_ship._tcp` on `mdns` for as long as the hub lives.
@@ -1161,6 +1402,12 @@ impl Hub {
     /// listener and an announcement beside it, this is the whole of a device's networking:
     /// it finds its peers, is found by them, and asks the application only when a trust
     /// decision is needed.
+    ///
+    /// A node that announces and browses necessarily meets **its own** announcement. That
+    /// is not reported: it is not a peer, its SKI is never remembered, and it is never
+    /// offered for pairing. Should one be dialled anyway — an address configured by hand,
+    /// a trust store restored from elsewhere — the connection is refused when TLS proves
+    /// who answered, with [`ConnectionError::SelfConnection`].
     #[cfg(feature = "mdns")]
     #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
     pub fn browse(&mut self, mdns: &crate::mdns::Mdns) -> Result<(), crate::mdns::MdnsError> {
@@ -1206,7 +1453,10 @@ impl Hub {
     /// *accepted*, and closing a working session to satisfy a setting would be worse
     /// than being over it.
     pub fn set_max_connections(&mut self, limit: usize) {
-        self.max_connections = limit;
+        // §623: "A SHIP node MUST support a minimum of '1' simultaneously active
+        // connection." Nought is a node that cannot take part at all — an arithmetic slip
+        // on a configured value, never an intention — so it is raised to that floor.
+        self.max_connections = limit.max(1);
     }
 
     // ---- key material -----------------------------------------------------------
@@ -1553,7 +1803,7 @@ impl Hub {
                 origin,
                 expected,
             } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
+                self.release_in_flight(origin);
                 let now = self.now();
                 let ski = connection.peer();
                 self.awaiting_trust.retain(|(held, _)| held != &origin);
@@ -1564,7 +1814,7 @@ impl Hub {
                 {
                     known.dialing = false;
                 }
-                match self.adopt(*connection) {
+                match self.adopt_from(*connection, Some(origin)) {
                     Ok(_) => match expected {
                         Some(expected) if expected == ski => {
                             if let Some(known) = self.known.iter_mut().find(|k| k.ski == ski) {
@@ -1579,22 +1829,30 @@ impl Hub {
                         None => {}
                     },
                     Err(refused) => {
-                        // No room, or a third connection to one peer. Closed politely,
-                        // off the loop: the peer is given `maxTime` to confirm and nothing
-                        // here waits for it.
+                        // Ourselves, no room, or a third connection to one peer. Closed
+                        // politely, off the loop: the peer is given `maxTime` to confirm
+                        // and nothing here waits for it.
+                        let reason = refused.reason;
+                        let connection = refused.connection;
                         tokio::spawn(async move {
-                            let _ = refused
+                            let _ = connection
                                 .close(ConnectionCloseReason::Unspecific, CLOSE_MAX_TIME)
                                 .await;
                         });
+                        // Having refused *itself*, do not redial: the address is our own,
+                        // so retrying loops. Forgotten outright, so a trust store that
+                        // holds this node's own SKI cannot keep the schedule alive.
+                        if matches!(reason, ConnectionError::SelfConnection) {
+                            self.known.retain(|k| k.ski != ski);
+                            self.sightings.retain(|s| s.ski != ski);
+                        } else if let Some(expected) = expected {
+                            self.defer_redial(&expected, now);
+                        }
                         self.pending.push_back(HubEvent::HandshakeFailed {
                             origin,
                             ski: Some(ski),
-                            error: Arc::new(ConnectionError::TooManyConnections),
+                            error: Arc::new(reason),
                         });
-                        if let Some(expected) = expected {
-                            self.defer_redial(&expected, now);
-                        }
                     }
                 }
             }
@@ -1604,7 +1862,7 @@ impl Hub {
                 ski,
                 error,
             } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
+                self.release_in_flight(origin);
                 // One lookup, two jobs: name the peer, which a handshake that reached
                 // the pending state proved, and give its slot back — whatever the
                 // failure, or a refused peer's slot never returns to the pool.
@@ -1631,6 +1889,16 @@ impl Hub {
             }
             #[cfg(feature = "mdns")]
             Inbound::Found(found) => {
+                // Our own announcement is not an event about a peer: an application that
+                // shows untrusted sightings to a user would be asking them to pair the
+                // device with itself.
+                if found.ski == self.node.ski() {
+                    // Remembered only so that its withdrawal can be suppressed too. An
+                    // application that pairs `Found` with `Lost` would otherwise see a
+                    // peer depart that it had never seen arrive.
+                    self.own_instance = Some(found.instance.clone());
+                    return;
+                }
                 let trusted = self.remember_discovered(&found);
                 self.pending.push_back(HubEvent::Found {
                     peer: *found,
@@ -1639,6 +1907,10 @@ impl Hub {
             }
             #[cfg(feature = "mdns")]
             Inbound::Lost(instance) => {
+                if self.own_instance.as_deref() == Some(instance.as_str()) {
+                    self.own_instance = None;
+                    return;
+                }
                 let ski = self.forget_discovered(&instance);
                 self.pending.push_back(HubEvent::Lost { instance, ski });
             }
@@ -1720,9 +1992,16 @@ impl Hub {
                 Some(bound) if bound != &device => return Some(Disconnect::AddressConflict),
                 Some(_) => {}
                 None => {
-                    let taken = self.links.iter().enumerate().any(|(other, link)| {
-                        other != index && link.device.as_ref() == Some(&device)
-                    });
+                    // Taken by another connection — or by *this node*. The local device is
+                    // not in `links`, so scanning only the links misses the case the
+                    // innocent cause below produces most directly: two devices shipped
+                    // with the same vendor and serial, one of them ours. Routing is by
+                    // this address, and an address this node answers to cannot also name
+                    // somewhere to send.
+                    let taken = self.engine.device().address() == &device
+                        || self.links.iter().enumerate().any(|(other, link)| {
+                            other != index && link.device.as_ref() == Some(&device)
+                        });
                     if taken {
                         return Some(Disconnect::AddressConflict);
                     }

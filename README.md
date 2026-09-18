@@ -351,6 +351,12 @@ the handshake it is waiting in and `hub.refuse(ski)` answers `hello: aborted`. T
 is the other path, where a control unit proves it knows a printed secret and nobody is
 asked at all. There is no auto accept, and no third path.
 
+**A node is not its own peer.** A hub that announces `_ship._tcp` and browses for it meets
+its own announcement and drops it; a connection proving this node's own SKI, or a peer
+claiming its device address, is refused rather than left half-working. And every node
+listens, whichever end opens the conversation: SHIP §8.1 gives no opt-out and reserves a
+connection slot in each direction.
+
 ## Building
 
 ```sh

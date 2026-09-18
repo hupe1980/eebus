@@ -13,6 +13,7 @@ mod fixtures;
 mod floats;
 mod naming;
 mod rfe;
+mod simulators;
 mod xsd;
 
 fn main() {
@@ -55,6 +56,16 @@ fn main() {
         Some("rfe-table") => {
             let root = repo_root();
             match rfe::run(&root) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("simulators") => {
+            let root = repo_root();
+            match simulators::run(&root) {
                 Ok(report) => println!("{report}"),
                 Err(e) => {
                     eprintln!("error: {e}");

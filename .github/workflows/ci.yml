@@ -58,6 +58,11 @@ jobs:
       # first against a virtual clock and then over a real socket.
       - run: cargo run --example grid_limit
       - run: cargo run --example networked --features runtime,ring
+      # And the two simulators against each other: two processes, two identities on disk,
+      # a listener, an announcement, and a limit that has to be acknowledged. No multicast
+      # — the box is pointed at an address with `--dial`, because a runner is exactly the
+      # sort of host where mDNS does not work and a gate that skips is not a gate.
+      - run: cargo run -p xtask -- simulators
 
   lint:
     name: Format and lint

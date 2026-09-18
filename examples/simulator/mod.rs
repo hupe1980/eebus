@@ -173,12 +173,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The SKI in groups of four is what SHIP §13.4.5 asks a user to compare; the QR payload
 /// is what the installation-process specification asks a device to display, and scanning
 /// it is what replaces the comparing.
-pub fn show_identity(
-    ship_id: &ShipId,
-    identity: &Identity,
-    port: u16,
-    secret: Option<&PairingSecret>,
-) {
+/// The port is deliberately absent: it is not a fact until a listener is bound, and
+/// `--port 0` — which is how a test or a second instance on one machine starts — makes
+/// the number asked for and the number served different. [`show_listening`] prints it at
+/// the moment it becomes true.
+pub fn show_identity(ship_id: &ShipId, identity: &Identity, secret: Option<&PairingSecret>) {
     let ski = identity.ski;
     let mut qr = ShipQr::new(ski, ship_id.clone());
     // What the Pairing Service asks a devA's code to carry beyond the SKI: the
@@ -189,10 +188,19 @@ pub fn show_identity(
     println!("┌─ this device ─────────────────────────────────────────────");
     println!("│ SHIP ID  {}", ship_id.as_str());
     println!("│ SKI      {}", ski.to_display_string());
-    println!("│ port     {port}");
     println!("│ FPH256   {}", identity.fingerprint());
     println!("│ QR       {}", qr.to_payload());
     println!("└───────────────────────────────────────────────────────────");
+}
+
+/// What the node is actually reachable at, once the listener is bound.
+///
+/// Every SHIP node has one: §623 puts the floor at one active connection, §624 and §628
+/// both require a listening TCP server, and §638 asks for it to be open whenever the node
+/// is under its connection limit. Which side opens the §14a conversation is a use case's
+/// business and not the transport's.
+pub fn show_listening(bound: std::net::SocketAddr) {
+    println!("listening on {bound}\n");
 }
 
 /// Starts announcing the node as `_ship._tcp`, with the TXT record set the installation
@@ -217,6 +225,19 @@ const SERVICE: &str = eebus::ship::SERVICE_TYPE;
 /// simulators are usually run on one machine or two on the same subnet, so loopback plus
 /// whatever the host resolves to covers both; `--address` overrides it when neither is
 /// what you meant.
+/// One socket address from whatever a person typed: `127.0.0.1:4712`, `heatpump.local:4712`.
+///
+/// A host name is resolved here rather than handed to the hub, because `Hub::dial` takes a
+/// `SocketAddr` on purpose — a name that resolves differently on a redial is a different
+/// peer, and the hub's redial schedule is keyed by SKI and address.
+pub fn resolve(address: &str) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    use std::net::ToSocketAddrs;
+    address
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| format!("`{address}` resolved to no address").into())
+}
+
 fn local_addresses() -> Vec<std::net::IpAddr> {
     let mut addresses = vec![std::net::IpAddr::from([127, 0, 0, 1])];
     if let Some(extra) = std::env::var_os("EEBUS_ADDRESS")

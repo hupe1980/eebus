@@ -1422,6 +1422,22 @@ impl Engine {
             return false;
         }
 
+        // A datagram whose *source* is this node's own device address is not from a peer.
+        // That address keys the peer record, the relations, the counters and the § 14a
+        // audit entry, so serving one files this node as its own peer. Two devices sharing
+        // a vendor and serial produce it without malice; a peer can also choose it.
+        //
+        // Discarded rather than answered, as §2.1 asks of any untrustworthy header: a reply
+        // goes to `source`, so an error here is a loop or a confirmation to an impostor.
+        // `Hub` knows which socket it arrived on and closes that.
+        if source
+            .device
+            .as_ref()
+            .is_some_and(|device| device == self.device.address())
+        {
+            return false;
+        }
+
         // Implementation guide §2.5: a version string that does not match the pattern,
         // or a major this implementation does not speak, is refused. `TC_SPINE_COMP_006`
         // calls that the recommended behaviour — answering a datagram whose header

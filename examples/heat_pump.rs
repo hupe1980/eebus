@@ -26,8 +26,10 @@
 //!
 //! What it is here to show, beyond `networked.rs`:
 //!
-//! * **The Controllable System listens.** A control box connects *to* the household, not
-//!   the other way round, so this is the side that binds a port and announces itself.
+//! * **The Controllable System is the side that is dialled.** A control box opens the
+//!   §14a conversation, not the household. Both nodes bind a port all the same — SHIP §8.1
+//!   gives no node an opt-out — so what this side shows is the *accept* path: a peer it
+//!   has never met arriving, and a person deciding about it.
 //! * **Pairing is interactive.** An unknown peer is reported as `TrustRequested` while
 //!   it waits in the SHIP hello phase, and `hub.approve` completes the handshake it is
 //!   waiting in — no reconnection, no SKI typed in advance.
@@ -91,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // no purpose.
     let secret = args.flag("--pairing").then(|| store.pairing_secret());
     let secret = secret.transpose()?;
-    simulator::show_identity(&ship_id, &identity, port, secret.as_ref());
+    simulator::show_identity(&ship_id, &identity, secret.as_ref());
     if trust.is_empty() {
         println!(
             "nothing is trusted yet — a control box that connects is held in the SHIP\n\
@@ -116,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The hub owns the listener: every socket it accepts goes through TLS and the SHIP
     // handshake in the background, and arrives here as an event.
     let bound = hub.listen(("0.0.0.0", port)).await?;
+    simulator::show_listening(bound);
     let record = ShipTxtRecord::new(ship_id.clone(), ski)
         .with_brand("eebus-rs")
         .with_model("heat-pump-simulator")
