@@ -69,6 +69,15 @@ pub enum ConnectionError {
     /// A dial did not complete within the hub's connect timeout.
     #[error("the peer did not complete the connection in time")]
     Timeout,
+    /// The peer at the other end proved *this* node's own identity.
+    ///
+    /// TLS cannot refuse it: the certificate, the key and the SKI are the ones the verifier
+    /// asks for. Nothing above it works, though — the two ends would share a message
+    /// counter, a device address and a trust store — so the connection is refused as soon
+    /// as the SKI is a proven fact. A node that announces `_ship._tcp` and browses for it
+    /// meets its own announcement, which is the ordinary way to arrive here.
+    #[error("the peer is this node itself")]
+    SelfConnection,
     /// The TLS configuration was refused.
     #[error("{0}")]
     Tls(#[from] crate::tls::TlsError),

@@ -25,6 +25,25 @@ fn node(ship_id: &str, trust: TrustStore) -> Node {
     Node::new(ship_id, ShipTls::new(identity), trust)
 }
 
+/// Two `Node`s that are the **same** node: one identity, one SKI, one trust store.
+///
+/// This exists because its absence hid a defect. Every other party in this file comes
+/// from [`node`], which mints a fresh key on every call, so "the peer is us" was a state
+/// the harness could not express and therefore a state nothing tested — while a hub that
+/// announced `_ship._tcp` and browsed for it reached that state on its own, on the first
+/// run, without anybody doing anything unusual.
+fn twins(ship_id: &str, trust: TrustStore) -> (Node, Node) {
+    let identity = cert::self_signed(CertParams::new(ship_id)).expect("a certificate");
+    let key = cert::key_from_pem(&identity.key_pem()).expect("its own key back");
+    let again =
+        cert::self_signed_with(CertParams::new(ship_id), key).expect("the same key, issued again");
+    assert_eq!(identity.ski, again.ski, "the same key is the same SKI");
+    (
+        Node::new(ship_id, ShipTls::new(identity), trust.clone()),
+        Node::new(ship_id, ShipTls::new(again), trust),
+    )
+}
+
 /// Two nodes that already trust each other, as after commissioning.
 fn pair() -> (Node, Node) {
     let box_trust = TrustStore::new();
@@ -1482,4 +1501,343 @@ async fn one_peer_dialling_repeatedly_holds_one_pending_slot() {
         dial.abort();
     }
     second.abort();
+}
+
+// ---- a node is not its own peer -------------------------------------------------
+
+/// A hub that is handed its own SKI and its own address does not connect to itself.
+///
+/// The realistic route to this is mDNS and takes no misconfiguration at all: a node
+/// announces `_ship._tcp`, browses for `_ship._tcp`, and finds its own announcement. What
+/// follows is decided by whether it trusts that SKI, and it takes one `y` at a prompt
+/// naming the device in front of the installer to make it so — after which the answer is
+/// on disk.
+///
+/// `remember` is the same call `remember_discovered` makes for a trusted announcement, so
+/// driving it directly is the discovery path without the multicast.
+///
+/// Left unrefused this is not a harmless loop: TLS *passes*, because the certificate, the
+/// key and the SKI are the very ones the verifier was told to demand, and the node then
+/// holds two connections to itself, shares both ends of a message counter, and hands the
+/// engine a peer whose device address is its own.
+#[tokio::test]
+async fn a_hub_will_not_connect_to_itself() {
+    let trust = TrustStore::new();
+    let (node, _twin) = twins("i:46925_u:Selfy-1", trust.clone());
+    // Exactly what answering `y` to a self-pairing prompt used to leave behind.
+    trust.trust(node.ski());
+    let own = node.ski();
+
+    let mut hub = Hub::new(node, pump_engine());
+    let bound = hub.listen("127.0.0.1:0").await.unwrap();
+
+    assert!(
+        !hub.remember(own, bound),
+        "a hub does not take up its own SKI, however it is offered one"
+    );
+    assert_eq!(
+        hub.remembered().count(),
+        0,
+        "and nothing is left on the dial schedule to retry for ever"
+    );
+
+    // Nothing should happen at all. A `Tick` past the deadline is the pass.
+    let deadline = hub.now() + Duration::from_secs(3);
+    loop {
+        hub.wake_at(deadline);
+        match hub.next().await.expect("no transport error") {
+            HubEvent::Tick if hub.now() >= deadline => break,
+            HubEvent::Tick => {}
+            HubEvent::Connected { ski, .. } => panic!("the hub connected to itself as {ski}"),
+            other => panic!("an unexpected event: {other:?}"),
+        }
+    }
+}
+
+/// And if something dials it anyway, the refusal happens where the SKI becomes a fact.
+///
+/// `remember` is one door; a hand-configured address is another, and `Hub::dial` takes an
+/// address with no SKI to check. So the invariant lives at the point TLS has proved who
+/// answered — which is also the only point at which it *can* live, because until then the
+/// peer's identity is a claim.
+#[tokio::test]
+async fn a_connection_that_turns_out_to_be_us_is_refused() {
+    let trust = TrustStore::new();
+    let (node, _twin) = twins("i:46925_u:Selfy-1", trust.clone());
+    trust.trust(node.ski());
+    let own = node.ski();
+
+    let mut hub = Hub::new(node, pump_engine());
+    let bound = hub.listen("127.0.0.1:0").await.unwrap();
+    hub.dial(bound);
+
+    let (ski, error) = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::HandshakeFailed { ski, error, .. } => Some((ski, error)),
+        HubEvent::Connected { ski, .. } => panic!("the hub connected to itself as {ski}"),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(ski, Some(own), "the refusal names the peer TLS proved");
+    assert!(
+        matches!(*error, ConnectionError::SelfConnection),
+        "refused for being ourselves, not for some downstream symptom: {error}"
+    );
+    assert_eq!(
+        hub.peers().count(),
+        0,
+        "and no link was kept from either end of it"
+    );
+    assert_eq!(
+        hub.remembered().count(),
+        0,
+        "nor is a redial scheduled, which is what made this a hot loop"
+    );
+}
+
+/// Approving this node's own SKI is not a decision anybody can usefully make.
+#[tokio::test]
+async fn a_hub_will_not_approve_itself() {
+    let trust = TrustStore::new();
+    let (node, _twin) = twins("i:46925_u:Selfy-1", trust.clone());
+    let own = node.ski();
+    let mut hub = Hub::new(node, pump_engine());
+
+    hub.approve(own);
+
+    assert!(
+        !trust.is_trusted(&own),
+        "a trust store that holds this node's own SKI is a dial loop that survives a restart"
+    );
+}
+
+// ---- SHIP §8.1: a slot is reserved in each direction ----------------------------
+
+/// §628: *"it SHALL always reserve one connection for the TCP server port"*.
+///
+/// A gateway that has dialled every peer it knows about must still be able to accept the
+/// Steuerbox that turns up afterwards. With a cap of `x`, at most `x-1` connections may be
+/// ones this node dialled — and the mirror rule in §632 says the same of accepted ones, so
+/// a node cannot be filled from either side alone.
+#[tokio::test]
+async fn a_dial_leaves_the_accepting_slot_free() {
+    let guard_trust = TrustStore::new();
+    let first_trust = TrustStore::new();
+    let second_trust = TrustStore::new();
+
+    let guard = node("i:46925_u:ControlBox-1", guard_trust.clone());
+    let first = node("i:46925_u:HeatPump-1", first_trust.clone());
+    let second = node("i:46925_u:HeatPump-2", second_trust.clone());
+
+    for peer in [first.ski(), second.ski()] {
+        guard_trust.trust(peer);
+    }
+    first_trust.trust(guard.ski());
+    second_trust.trust(guard.ski());
+    let second_ski = second.ski();
+
+    let mut first_hub = Hub::new(first, pump_engine());
+    let first_address = first_hub.listen("127.0.0.1:0").await.unwrap();
+    let _first = serve(first_hub);
+
+    let mut second_hub = Hub::new(second, pump_engine());
+    let second_address = second_hub.listen("127.0.0.1:0").await.unwrap();
+
+    let mut hub = Hub::new(guard, box_engine());
+    // Two connections: one may be dialled, one must stay free to accept.
+    hub.set_max_connections(2);
+    let guard_address = hub.listen("127.0.0.1:0").await.unwrap();
+
+    hub.dial(first_address);
+    wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::Connected { .. } => Some(()),
+        HubEvent::HandshakeFailed { error, .. } => panic!("the first dial failed: {error}"),
+        _ => None,
+    })
+    .await;
+
+    // The second dial is refused although the hub holds only one of its two connections.
+    hub.dial(second_address);
+    let error = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::HandshakeFailed { error, .. } => Some(error),
+        HubEvent::Connected { ski, .. } => {
+            panic!("a second dial took the slot §628 reserves for the server: {ski}")
+        }
+        _ => None,
+    })
+    .await;
+    assert!(
+        matches!(*error, ConnectionError::TooManyConnections),
+        "refused for want of a slot: {error}"
+    );
+
+    // And the slot it was refused for is genuinely there: the second node dials in.
+    second_hub.dial(guard_address);
+    let serving = serve(second_hub);
+    let ski = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::Connected { ski, .. } => Some(ski),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        ski, second_ski,
+        "the reserved slot accepted the peer that dialled in"
+    );
+
+    serving.abort();
+    hub.shutdown(ConnectionCloseReason::Unspecific).await;
+}
+
+/// §623: *"A SHIP node MUST support a minimum of '1' simultaneously active connection."*
+#[tokio::test]
+async fn a_cap_of_nothing_is_raised_to_the_floor_the_specification_sets() {
+    let trust = TrustStore::new();
+    let mut hub = Hub::new(node("i:46925_u:ControlBox-1", trust), box_engine());
+
+    hub.set_max_connections(0);
+
+    assert_eq!(
+        hub.max_connections(),
+        1,
+        "a node that can hold no connection cannot take part at all, which is never meant"
+    );
+}
+
+/// A peer that claims **this node's own** SPINE device address is disconnected too.
+///
+/// The existing conflict test pits one peer against another, and the scan behind it looked
+/// only at the other links — so the collision it missed was the one the innocent cause
+/// produces most directly. Two devices shipped with the same vendor and serial give the
+/// *same* address, and there is no reason the second of them should be a stranger rather
+/// than this node.
+///
+/// Routing is by this address, and an address this node answers to cannot also name
+/// somewhere to send. Below the transport the engine refuses the datagram outright (it
+/// cannot close a socket it has never seen); here the socket is closed and the application
+/// is told which peer and why.
+#[tokio::test]
+async fn a_peer_cannot_claim_this_node_s_own_device_address() {
+    let box_trust = TrustStore::new();
+    let pump_trust = TrustStore::new();
+
+    let control_box = node("i:46925_u:ControlBox-1", box_trust.clone());
+    let impostor = node("i:46925_u:Impostor-1", pump_trust.clone());
+    box_trust.trust(impostor.ski());
+    pump_trust.trust(control_box.ski());
+    let impostor_ski = impostor.ski();
+
+    // The impostor runs `box_engine()` — the *control box's* device — so the address it
+    // announces in discovery is the one the dialling hub already answers to.
+    let mut server = Hub::new(impostor, box_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
+    let serving = serve(server);
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.dial(address);
+
+    let (ski, reason) = wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::Disconnected { ski, reason } => Some((ski, reason)),
+        HubEvent::PeerDiscovered { device, .. } => {
+            panic!("a peer was admitted under this node's own address: {device:?}")
+        }
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(ski, impostor_ski);
+    assert_eq!(
+        reason,
+        Disconnect::AddressConflict,
+        "closed for the address, and named as such"
+    );
+    assert_eq!(hub.peers().count(), 0, "and nothing was kept");
+
+    serving.abort();
+}
+
+/// SPINE IG §2.6.2's fourth step, and §2.6.3's, as two calls an application can make.
+///
+/// The engine walks the escalation path and stops before the last rung on purpose: §2.6.4
+/// says one unresponsive use case is not a reason to drop a connection carrying others, and
+/// only the application knows which it has (D92). It reported `RequestTimedOut` and had
+/// nowhere to send the answer — `forget_peer` documented itself as leaving any connection
+/// up, `adopt` took one in, and nothing handed one back.
+///
+/// Closing alone is "this session is no good", and the peer is redialled. Forgetting first
+/// is §2.6.3's "block the peer", and it is not.
+#[tokio::test]
+async fn a_peer_can_be_closed_and_can_be_blocked() {
+    use eebus::ship::ConnectionCloseReason;
+
+    let (control_box, heat_pump) = pair();
+    let pump_ski = heat_pump.ski();
+
+    let mut server = Hub::new(heat_pump, pump_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
+    let serving = serve(server);
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.remember(pump_ski, address);
+
+    wait_for(&mut hub, Duration::from_secs(10), |_, event| match event {
+        HubEvent::Connected { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // §2.6.2 step four. The peer is still remembered, so it comes back — which is the
+    // point: a wedged peer needs a fresh session, not a divorce.
+    assert_eq!(hub.close(&pump_ski, ConnectionCloseReason::Unspecific), 1);
+    let reason = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::Disconnected { reason, .. } => Some(reason),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        reason,
+        Disconnect::Local,
+        "closed by us, and reported as such"
+    );
+
+    wait_for(&mut hub, Duration::from_secs(20), |_, event| match event {
+        HubEvent::Connected { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        hub.peers().count(),
+        1,
+        "a closed peer is not a forgotten one"
+    );
+
+    // §2.6.3. Forgetting first is what makes it stick: between the two calls the redial
+    // schedule is still live, and a peer closed while remembered is a peer being dialled.
+    hub.forget_peer(&pump_ski);
+    assert_eq!(
+        hub.close(&pump_ski, ConnectionCloseReason::RemovedConnection),
+        1
+    );
+    wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::Disconnected { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let deadline = hub.now() + Duration::from_secs(8);
+    loop {
+        hub.wake_at(deadline);
+        match hub.next().await.expect("no transport error") {
+            HubEvent::Tick if hub.now() >= deadline => break,
+            HubEvent::Connected { ski, .. } => panic!("a blocked peer was dialled again: {ski}"),
+            _ => {}
+        }
+    }
+
+    // And trust is untouched: blocking is about this session, not about whose device it is.
+    assert!(
+        hub.node().trust_store().is_trusted(&pump_ski),
+        "closing a connection is not a revocation"
+    );
+
+    serving.abort();
 }

@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -78,7 +78,6 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "net", "time"] }
 
-# The sans-IO example needs nothing; the networked one needs a socket.
 # The cross-implementation suite. `required-features` is what keeps it out of an
 # ordinary `cargo test`; it is not part of `full`, because "everything" should not mean
 # "needs Docker".
@@ -86,6 +85,7 @@ tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "net", "tim
 name = "interop"
 required-features = ["interop", "runtime", "ring"]
 
+# The sans-IO example needs nothing; the networked one needs a socket.
 [[example]]
 name = "grid_limit"
 
@@ -93,7 +93,9 @@ name = "grid_limit"
 name = "networked"
 required-features = ["runtime"]
 
-# The two simulators: a control box and a household appliance, on a real network.
+# The two simulators: a control box and a household appliance, as separate processes.
+# They are built with `mdns` because they announce and browse; `cargo xtask simulators`
+# drives them over `--dial` instead, for hosts that carry no multicast.
 [[example]]
 name = "steuerbox"
 required-features = ["runtime", "mdns"]

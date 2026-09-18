@@ -18,7 +18,7 @@ everything else over as events.
 
 ```rust
 let mut hub = Hub::new(node, engine);
-hub.listen("0.0.0.0:4712").await?;          // the household end listens…
+hub.listen("0.0.0.0:4712").await?;          // every node binds a port (§8.1)…
 hub.browse(&mdns)?;                          // …and finds its peers
 hub.dial("192.0.2.10:4712".parse()?);        // or is told one
 
@@ -209,6 +209,25 @@ withdrawal to `forget_discovered` and gets the same behaviour.
 A record whose SKI cannot be read is skipped rather than reported with the missing part
 guessed at: the SKI is what a trust decision rests on.
 
+### A node is not its own peer
+
+A node that announces `_ship._tcp` and browses for it meets its own announcement. That is
+not reported, not remembered and not offered for pairing: its SKI is the one TXT record
+whose claim is already known to be true.
+
+The rule belongs in the library because TLS cannot enforce it. A node dialling itself
+presents exactly the certificate, the key and the SKI the verifier was told to demand, so
+the handshake succeeds. The invariant is therefore stated where identity stops being a
+claim: a connection proving this node's own SKI is refused with
+`ConnectionError::SelfConnection`, whichever end opened it and however it was reached —
+`remember`, a configured address, or `adopt` from an application's own transport.
+`Hub::approve` refuses the same SKI.
+
+The same holds one layer down. Routing is by SPINE device address, so a peer claiming this
+node's own is `Disconnect::AddressConflict`, and the engine — which cannot close a socket it
+has never seen — discards such a datagram rather than filing this node as its own peer. Two
+devices shipped with the same vendor and serial produce this without any malice.
+
 ## Reconnection
 
 `remember` is what keeps a §14a installation working across a router reboot. Nothing tells
@@ -265,8 +284,24 @@ what §12.2.3 legitimately produces while a double connection is arbitrated. The
 handshakes still running as well as connections held: a peer that dials in and sits in the
 pending state has taken a slot, and a hundred of them would otherwise be a hundred TLS
 sessions waiting for a user who is not there. `Hub::set_max_connections` raises it for a
-gateway that serves more. SHIP caps none of this, and a device that malfunctions and dials
-in a thousand times takes the memory of every node that answers.
+gateway that serves more, and lowers it to no less than one, which is the floor §623 sets.
+SHIP caps none of the above, and a device that malfunctions and dials in a thousand times
+takes the memory of every node that answers.
+
+**A slot is reserved in each direction**, which SHIP §8.1 does specify and which a single
+number cannot express. §628 asks a node holding more than one connection to *"always reserve
+one connection for the TCP server port"* — so of `x` connections at most `x-1` may be ones
+this node dialled — and §632 says the same in reverse for ones it accepted. The case the
+reservation is for is ordinary: a gateway that has dialled every peer it knows about must
+still be able to accept the Steuerbox that turns up afterwards. Past either limit the
+outcome is the same `TooManyConnections` as the overall cap.
+
+**Every SHIP node listens.** §623 puts the floor at one active connection, §624 and §628
+both require a listening TCP server, and §638 asks for it to be open whenever the node is
+under its limit. Which end opens the §14a conversation is a use case's business — the
+Energy Guard dials, the Controllable System is dialled — and it says nothing about which
+end binds a port. A node that announces `_ship._tcp` at a port it does not serve is an
+invitation every peer on the segment retries for ever.
 
 Beyond the cap a socket is dropped before TLS and reported as
 `HandshakeFailed { error: TooManyConnections }`; a connection that completed its handshake
@@ -280,6 +315,33 @@ the table stays open for somebody a user might want to approve. Beyond the cap a
 `hello: aborted` at once and reported as `TooManyPendingPairings`, so it retries rather than
 squatting. Keying that on the SKI is safe where keying it on an address would not be: the SKI
 came out of a completed TLS handshake.
+
+## Closing a connection, and blocking a peer
+
+SPINE IG §2.6.2 escalates a peer that stops answering, and its fourth step is *close the
+SHIP connection*. The engine deliberately stops before it: §2.6.4 says one unresponsive use
+case is not a reason to drop a connection carrying others, and only the application knows
+which it has. So the engine reports `SpineEvent::RequestTimedOut` and the decision is yours.
+
+```rust
+hub.close(&ski, ConnectionCloseReason::Unspecific);       // §2.6.2: end this session
+```
+
+**A closed peer comes back.** Closing says nothing about the future, so a remembered peer is
+redialled on the usual backoff — which is what a wedged peer needs, and is the common case.
+§2.6.3's *block the peer* is the other decision, and it is two calls:
+
+```rust
+hub.forget_peer(&ski);                                     // stop dialling it back
+hub.close(&ski, ConnectionCloseReason::RemovedConnection); // and end what is up
+```
+
+Forgetting first matters: between the two the redial schedule is still live, and a peer
+closed while remembered is a peer being dialled again.
+
+Neither touches trust. A closed peer that dials back in is still approved, because "this
+session is no good" and "this device is not ours" are different decisions with different
+audiences — the second is `TrustStore::forget`.
 
 ## Deciding is not answering
 
@@ -344,6 +406,21 @@ or pass `--trust <SKI>` to either and skip the question. They persist their iden
 their trust store between runs, and print the `lpc:` runtime signals of
 [Certification](@/docs/certification.md) as the state moves. `--reset` is the EEBUS reset
 of SHIP §12.2.2: forget every peer, and the identity with it.
+
+Where there is no multicast — a container, a hardened host, a CI runner — the control box
+takes the address instead:
+
+```sh
+cargo run --example steuerbox --features full -- \
+    --dial 127.0.0.1:4712 --trust <the appliance's SKI> --limit 4200
+```
+
+With `--trust` the address is *remembered*, so it is redialled across a reboot at the other
+end; without, it is a single dial and the appliance decides whether to trust this box.
+
+`cargo xtask simulators` is that arrangement as a gate, run on every push: both simulators
+against each other, asserting the §14a exchange completes and that the control box serves the
+port it announces.
 
 Between them they cover the parts a single-process example cannot show — a person deciding
 whether to trust a device while it waits on the wire, a device that comes back after a

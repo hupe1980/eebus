@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let port: u16 = args.value_or("--port", "4713").parse()?;
-    simulator::show_identity(&ship_id, &identity, port, None);
+    simulator::show_identity(&ship_id, &identity, None);
 
     // What the grid is asking for. `--release` is not the absence of a limit: LPC
     // implementation guide §2.13 wants a deactivation sent, and sent only when the grid
@@ -114,27 +114,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(payload) => Some(pairing_request(payload, &node, &trust)?),
         None => None,
     };
-    // §4.2: the request goes up before any connection exists — `devA` cannot trust this
-    // box until it has heard it, so waiting for a connection would be waiting for
-    // something this box's own silence prevents.
+    let (engine, client, diagnosis) = build();
+    let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
+    let mut hub = Hub::new(node, engine);
+
+    // A control box dials — the §14a conversation is its to open — but SHIP §8.1 is about
+    // sockets rather than about initiative, and it has no opt-out: §623 says every node
+    // supports at least one active connection, §628 says a node holding more than one
+    // "SHALL always reserve one connection for the TCP server port", and §638 says a node
+    // under its limit "SHALL always have an open TCP server port". A box that only dialled
+    // would also be announcing `_ship._tcp` at a port nothing answers on, which is an
+    // invitation every peer on the segment retries for ever.
+    let bound = hub.listen(("0.0.0.0", port)).await?;
+    simulator::show_listening(bound);
+
+    // An address given on the command line, for an installation where the household
+    // device is known in advance — a commissioning tool, a fixed lease, a test. With
+    // `--trust` it is *remembered*, so the box redials it across a reboot at the other end;
+    // without, it is a single dial and the appliance decides whether to trust this box.
+    // Either way it needs no multicast, which is what makes an installation reproducible.
+    let dial: Option<std::net::SocketAddr> = match args.value("--dial") {
+        Some(address) => Some(simulator::resolve(address)?),
+        None => None,
+    };
+    if let Some(address) = dial {
+        match args.value("--trust").map(|ski| ski.parse()).transpose()? {
+            Some(peer) => {
+                hub.remember(peer, address);
+                println!("dialling {address} and keeping it dialled\n");
+            }
+            None => {
+                hub.dial(address);
+                println!("dialling {address} once; it decides whether to trust this box\n");
+            }
+        }
+    }
+
+    // §4.2: the pairing request goes up before any connection exists — `devA` cannot trust
+    // this box until it has heard it, so waiting for a connection would be waiting for
+    // something this box's own silence prevents. The `_ship._tcp` record carries the port
+    // actually bound, not the one asked for, because `--port 0` is a real answer.
     let record = ShipTxtRecord::new(ship_id.clone(), ski)
         .with_brand("eebus-rs")
         .with_model("control-box-simulator")
         .with_device_type("GridConnectionHub");
-    let mut mdns = simulator::announce(&record, ship_id.as_str(), port)?;
-    if let Some(requester) = requester.as_mut() {
-        drive_pairing(&mut mdns, requester, ship_id.as_str(), port)?;
+    // Best effort, and only fatal when it is the only way to find anybody. A container, a
+    // hardened host or a network without multicast is a place a configured box still works
+    // in, and refusing to start there would be refusing to do the one job it was given.
+    let mut mdns = match simulator::announce(&record, ship_id.as_str(), bound.port()) {
+        Ok(mdns) => Some(mdns),
+        Err(error) if dial.is_some() => {
+            eprintln!("no mDNS here ({error}); carrying on with --dial");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    if let (Some(mdns), Some(requester)) = (mdns.as_mut(), requester.as_mut()) {
+        drive_pairing(mdns, requester, ship_id.as_str(), bound.port())?;
     }
 
-    let (engine, client, diagnosis) = build();
-    let mut guard = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, Duration::ZERO);
-    let mut hub = Hub::new(node, engine);
     // The hub browses: a trusted peer it finds is dialled and kept dialled; an untrusted
-    // one is reported, and dialled the moment it is approved.
-    hub.browse(&mdns)?;
+    // one is reported, and dialled the moment it is approved. Its own announcement is not
+    // reported at all — a box is not a peer of itself.
+    if let Some(mdns) = mdns.as_ref() {
+        hub.browse(mdns)?;
+        println!("browsing for _ship._tcp …\n");
+    }
     let answers = simulator::Console::start();
-
-    println!("browsing for _ship._tcp …\n");
     loop {
         hub.wake_at(guard.poll_timeout());
         hub.wake_at(hub.now() + Duration::from_secs(1));
@@ -215,9 +261,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reports = guard.handle_timeout(hub.engine_mut(), now);
                 // §4.2: fifteen uninterrupted minutes, and the request is withdrawn for
                 // good — reboots included, which is why a real device would persist this.
-                if let Some(requester) = requester.as_mut() {
+                if let (Some(mdns), Some(requester)) = (mdns.as_mut(), requester.as_mut()) {
                     requester.handle_timeout(now);
-                    drive_pairing(&mut mdns, requester, ship_id.as_str(), port)?;
+                    drive_pairing(mdns, requester, ship_id.as_str(), bound.port())?;
                 }
                 for (ski, yes) in answers.decided() {
                     if yes {

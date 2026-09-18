@@ -14,8 +14,9 @@
 //! | Layer | Module | Specification |
 //! |---|---|---|
 //! | Use cases | [`usecases`] | `EEBus_UC_TS_*` + the 2026 implementation guides |
-//! | E-mobility | [`usecases::emobility`] | EVSECC, EVCC, OPEV, OSCEV, EVCEM, EVSOC |
+//! | E-mobility | [`usecases::emobility`] | EVSECC, EVCC, OPEV, OSCEV, EVCEM, EVSOC, EVCS |
 //! | Generation, storage | [`usecases::moi`], [`usecases::mps`], [`usecases::mob`], [`usecases::cob`] | MOI, MPS, MOB, COB |
+//! | Heating and hot water | [`usecases::hvac`], [`usecases::ohpcf`] | the twelve HVAC use cases, and OHPCF |
 //! | Protocol | [`spine`] | SPINE 1.3.0 Protocol Specification |
 //! | Information model | [`model`] | SPINE 1.3.0 Resource Specification |
 //! | Transport | [`ship`] | SHIP 1.0.1 / 1.1.0 |
