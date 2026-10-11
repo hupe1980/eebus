@@ -467,6 +467,25 @@ struct Link {
     asked_for_keys: bool,
 }
 
+impl Link {
+    /// Where the keep-alive stands at `now`, counting a pong that has come in as the
+    /// liveness it is. A pong never surfaces as a message, so this is the only place an
+    /// answered ping is learned about.
+    fn keepalive(&mut self, now: Duration) -> KeepAlive {
+        let state = keepalive::check(
+            self.pinged_at,
+            self.connection.awaiting_pong(),
+            now,
+            PONG_TIMEOUT,
+        );
+        if state == KeepAlive::Answered {
+            self.pinged_at = None;
+            self.last_seen = now;
+        }
+        state
+    }
+}
+
 /// A peer holding more than one connection, mid-arbitration (SHIP §12.2.3).
 #[derive(Clone, Copy, Debug)]
 struct Duplicate {
@@ -2163,18 +2182,33 @@ impl Hub {
                 // The peer had the bigger SKI and did not act. One ping round, and one
                 // only — `Resolution` is what remembers that, so the decision below can
                 // be reached from a unit test with no socket in it.
+                let mut failed = Vec::new();
                 for index in 0..self.links.len() {
                     if self.links[index].ski == ski {
+                        // The probe shares `awaiting_pong` with the keep-alive. A pong
+                        // already in for an outstanding keep-alive is counted first, or
+                        // the probe would set the flag again and the keep-alive would
+                        // read the answered ping as unanswered.
+                        self.links[index].keepalive(now);
                         self.writing = Some(index);
-                        let _ = self.links[index].connection.ping().await;
+                        let sent = self.links[index].connection.ping().await;
                         self.writing = None;
+                        // A ping that did not go out leaves the flag as it was, which
+                        // could read as answered: the socket has failed, so it goes.
+                        if sent.is_err() {
+                            failed.push(index);
+                        }
                     }
                 }
                 if let Some(entry) = self.duplicates.iter_mut().find(|d| d.ski == ski) {
                     entry.probed = true;
                 }
+                let dropped = !failed.is_empty();
+                for index in failed.into_iter().rev() {
+                    self.drop_link(index, Disconnect::Remote);
+                }
                 self.wake_at(now + PONG_TIMEOUT);
-                Ok(false)
+                Ok(dropped)
             }
             Resolution::CloseAfterProbe => {
                 let unanswered: Vec<usize> = self
@@ -2268,24 +2302,13 @@ impl Hub {
             let _ = link.connection.handle_timeout();
         }
 
-        // Connections that stopped answering, and connections that have gone quiet. A
-        // pong never surfaces as a message, so an answered ping is learned about here.
-        let mut dead = Vec::new();
-        for (index, link) in self.links.iter_mut().enumerate() {
-            match keepalive::check(
-                link.pinged_at,
-                link.connection.awaiting_pong(),
-                now,
-                PONG_TIMEOUT,
-            ) {
-                KeepAlive::Answered => {
-                    link.pinged_at = None;
-                    link.last_seen = now;
-                }
-                KeepAlive::Dead => dead.push(index),
-                KeepAlive::Idle | KeepAlive::Waiting => {}
-            }
-        }
+        // Connections that stopped answering, and connections that have gone quiet.
+        let dead: Vec<usize> = self
+            .links
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, link)| (link.keepalive(now) == KeepAlive::Dead).then_some(index))
+            .collect();
         for index in dead.into_iter().rev() {
             self.drop_link(index, Disconnect::Unresponsive);
         }

@@ -4,7 +4,7 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [Unreleased]
+## [0.10.1] — unreleased
 
 ### Fixed
 
@@ -17,7 +17,13 @@ Notable changes to `eebus`. The format follows
   tests. A ping whose send fails is no longer recorded as outstanding: the link is closed
   as failed at once, rather than ten seconds later as unresponsive.
 
-## [0.10.0] — unreleased
+- **The double-connection probe of SHIP §12.2.3 judged a link by a ping it never sent.**
+  A probe ping whose send failed left `awaiting_pong` as it was, so a dead socket could
+  read as having answered and survive the arbitration; it is now closed as failed at once.
+  And a probe sent while a keep-alive pong was already in, but not yet counted, no longer
+  overwrites that answer and drops a live link as unresponsive.
+
+## [0.10.0] — 2026-09-18
 
 A node that announced itself and looked for peers found itself, and could connect to
 itself; and a control box that only ever dialled was announcing a port it never bound.
@@ -1681,7 +1687,9 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
-[0.9.0]: https://github.com/hupe1980/eebus/compare/v0.8.0...HEAD
+[0.10.1]: https://github.com/hupe1980/eebus/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/hupe1980/eebus/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/hupe1980/eebus/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hupe1980/eebus/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hupe1980/eebus/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hupe1980/eebus/compare/v0.5.0...v0.6.0
