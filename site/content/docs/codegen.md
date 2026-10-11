@@ -61,12 +61,11 @@ cargo run -p xtask -- devices /tmp/devices   # tests/fixtures/devices
 ```
 
 That corpus is captures from real hardware, MIT-licensed and stored as ordinary JSON, so
-the converter projects it into the JSON-UTF8 of SHIP §11.4. Re-running it when the corpus
-has not changed produces no diff.
+the converter projects it into the JSON-UTF8 of SHIP §11.4.
 
-`specs/` is git-ignored; only generated Rust is committed. The generator formats its output
-through rustfmt, so re-running it when nothing has changed produces no diff — which makes
-"is the checked-in model current?" a question CI can answer.
+`specs/` is git-ignored. `codegen` formats its output through rustfmt, so re-running any of
+the three generators on unchanged input produces no diff — which makes "is the checked-in
+model current?" a question CI can answer.
 
 ## Fuzzing
 

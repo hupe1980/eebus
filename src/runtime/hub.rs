@@ -42,12 +42,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
-use std::time::Instant;
 
 use std::net::SocketAddr;
 
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::model::{AddressDevice, Datagram, MsgCounter};
 use crate::ship::{CURVE_SECP256R1, ConnectionCloseReason, PeerKeys, Resolution, Ski};
@@ -62,7 +62,7 @@ use super::reconnect::reconnect_delay_for;
 
 /// How long a connection may be idle before a keep-alive ping goes out.
 ///
-/// SHIP §10.4 sets the floor at fifty seconds; going lower wastes radio time on a
+/// SHIP §10.4 asks for a ping at least every fifty seconds; going lower wastes radio time on a
 /// battery-powered peer, going higher risks a NAT dropping the flow.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
 
@@ -74,17 +74,9 @@ pub const CLOSE_MAX_TIME: Duration = Duration::from_secs(2);
 
 /// How many connections one hub holds at once, unless told otherwise.
 ///
-/// SHIP puts no cap on this, and the omission is the problem: nothing in the protocol
-/// stops a malfunctioning — or hostile — device on the LAN from dialling in a thousand
-/// times and taking the memory of every node that answers. A household has a handful of
-/// EEBUS devices, and a node that has run out of room is a node that keeps serving the
-/// peers it already had.
-///
-/// The cap counts handshakes still in progress as well as connections held: a peer that
-/// dials in and then sits in the SHIP pending state has taken a slot, and a hundred of
-/// them would otherwise be a hundred TLS sessions waiting for a user who is not there.
-///
-/// Raise it with [`Hub::set_max_connections`] on a gateway that really does serve more.
+/// SHIP sets no cap. Handshakes in progress count as well as connections held; past the
+/// cap a new connection is refused and existing peers keep being served. Raise it with
+/// [`Hub::set_max_connections`] on a gateway that serves more.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
 
 /// How many connections to the *same* peer a hub tolerates.
@@ -104,12 +96,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many peers may be waiting on a trust decision at once.
 ///
-/// A peer held in the SHIP `hello: pending` state occupies a connection slot for as long
-/// as its own timers allow — up to four minutes, and longer if it keeps asking for
-/// prolongation — while nothing about it has been approved by anybody. Four is more than
-/// a commissioning visit needs and few enough that unapproved peers cannot fill the
-/// table: past it a peer is answered `hello: aborted` at once, which tells it to try
-/// again later rather than leaving it to time out.
+/// A peer in SHIP `hello: pending` holds a slot for up to four minutes, longer with
+/// prolongation. Past four, a peer is answered `hello: aborted` at once (try again later).
 pub const MAX_PENDING_TRUST: usize = 4;
 
 /// How many untrusted peers seen on the network a hub remembers the address of.
@@ -454,7 +442,7 @@ struct Link {
     device: Option<AddressDevice>,
     /// When the connection was established, for the double-connection rule.
     opened: Duration,
-    /// When the last frame was seen, for the keep-alive.
+    /// The last sign of life — a frame or an answered ping — for the keep-alive.
     last_seen: Duration,
     /// When the outstanding keep-alive ping went out.
     pinged_at: Option<Duration>,
@@ -468,9 +456,7 @@ struct Link {
 }
 
 impl Link {
-    /// Where the keep-alive stands at `now`, counting a pong that has come in as the
-    /// liveness it is. A pong never surfaces as a message, so this is the only place an
-    /// answered ping is learned about.
+    /// Where the keep-alive stands at `now`; an answered ping counts as a sign of life.
     fn keepalive(&mut self, now: Duration) -> KeepAlive {
         let state = keepalive::check(
             self.pinged_at,
@@ -885,12 +871,7 @@ impl Hub {
         let ski = connection.peer();
         let now = self.now();
 
-        // The invariant, before anything else: a node is not its own peer. TLS cannot
-        // catch this — the certificate presented is the one the verifier was told to
-        // demand — so the first moment the SKI is a proven fact is the last moment this
-        // can be refused cheaply. Left to run, it costs two connection slots, both ends
-        // of a message counter, and a device address the engine then reports as a
-        // conflict with itself.
+        // A node is not its own peer; TLS cannot catch this, so it is refused here.
         if ski == self.node.ski() {
             return Err(Refused {
                 reason: ConnectionError::SelfConnection,
@@ -1332,14 +1313,8 @@ impl Hub {
                 return;
             }
         };
-        // `devZ` is this node. A request whose trusted party is our own certificate can
-        // only come from us: the digest covers both fingerprints and is signed with the
-        // secret, so nobody else could have produced one — which means it authenticates
-        // perfectly and means nothing. Pairing with it would fill the single unit slot
-        // §10.3 reserves for the *one* control unit with this node's own certificate, and
-        // §4.3 would then protect that non-relationship for fifteen minutes against the
-        // real control unit trying to take it. The same family as a node dialling its own
-        // announcement, one service along.
+        // A request naming our own certificate (`devZ` is this node) authenticates
+        // trivially and means nothing; it is ignored.
         if request.trust_par == self.node.fingerprint() {
             return;
         }
@@ -1386,8 +1361,7 @@ impl Hub {
     /// The same shape as the double-connection close: `connectionClose{announce}` goes
     /// out and the peer is given `maxTime` to confirm, but nothing here waits for it —
     /// this is called from the event path, where an await would hold up every other
-    /// connection. Only the Pairing Service needs it today, for §10.3's displaced
-    /// control unit; [`disconnect`](Self::disconnect) is the public equivalent for a
+    /// connection. The Pairing Service uses it for §10.3's displaced control unit; [`disconnect`](Self::disconnect) is the public equivalent for a
     /// caller that can wait.
     #[cfg(all(feature = "mdns", feature = "pairing"))]
     fn close_links_to(&mut self, ski: &Ski) {
@@ -1625,14 +1599,10 @@ impl Hub {
     /// **half a frame on the wire**: the peer's parser is then out of step with the
     /// stream, and every datagram after it is misread.
     ///
-    /// **The hub notices, which is the one thing it can do about it.** A write in flight
-    /// is marked before the `await` and unmarked after, so a future dropped in between
-    /// leaves the mark set; the next call finds it, closes that connection with
-    /// [`Disconnect::InterruptedWrite`] and redials. A reconnection costs a second. The
-    /// alternative — carrying on over a stream the peer can no longer parse — reappears
-    /// minutes later as a subscription that was never granted, a heartbeat that never
-    /// arrived, and a limit refused for want of one, with nothing in any log to connect
-    /// them to a `select!` written weeks earlier.
+    /// **The hub detects it.** A write in flight is marked before the `await` and unmarked
+    /// after, so a future dropped in between leaves the mark set. The next call closes
+    /// that connection with [`Disconnect::InterruptedWrite`] and redials; a reconnection
+    /// costs a second.
     ///
     /// Everything a caller would reach for `select!` to do has somewhere else to go:
     ///
@@ -1672,12 +1642,8 @@ impl Hub {
             self.redial(now);
             let deadline = self.next_deadline(now);
 
-            // A deadline that has already passed is dealt with *before* the sockets are
-            // touched, and not by reading with a zero-length timeout. A zero timeout
-            // cancels the read immediately, and a caller that keeps handing back a stale
-            // instant — an actor whose timers have not caught up, most easily — would
-            // spin here forever and never read a byte. The connection would look alive
-            // and carry nothing.
+            // Due timers run before reading; a zero-length read timeout would starve the
+            // sockets.
             if deadline.is_some_and(|at| at <= now) {
                 self.fire_timers(now);
                 self.keepalive().await?;
@@ -2185,16 +2151,13 @@ impl Hub {
                 let mut failed = Vec::new();
                 for index in 0..self.links.len() {
                     if self.links[index].ski == ski {
-                        // The probe shares `awaiting_pong` with the keep-alive. A pong
-                        // already in for an outstanding keep-alive is counted first, or
-                        // the probe would set the flag again and the keep-alive would
-                        // read the answered ping as unanswered.
+                        // The probe re-arms `awaiting_pong`: count an answered
+                        // keep-alive first.
                         self.links[index].keepalive(now);
                         self.writing = Some(index);
                         let sent = self.links[index].connection.ping().await;
                         self.writing = None;
-                        // A ping that did not go out leaves the flag as it was, which
-                        // could read as answered: the socket has failed, so it goes.
+                        // A failed send is a failed socket.
                         if sent.is_err() {
                             failed.push(index);
                         }
@@ -2269,7 +2232,7 @@ impl Hub {
     }
 
     /// The earliest instant anything wants attention.
-    fn next_deadline(&self, _now: Duration) -> Option<Duration> {
+    fn next_deadline(&self, now: Duration) -> Option<Duration> {
         let mut next = self.wake_at;
         let mut consider = |at: Duration| {
             next = Some(next.map_or(at, |current: Duration| current.min(at)));
@@ -2284,8 +2247,9 @@ impl Hub {
             }
         }
         for link in &self.links {
+            // SHIP timers are on the connection's clock; convert to the hub's.
             if let Some(at) = link.connection.poll_timeout() {
-                consider(at);
+                consider(now + at.saturating_sub(link.connection.age()));
             }
             match link.pinged_at {
                 Some(at) => consider(at + PONG_TIMEOUT),
@@ -2302,7 +2266,7 @@ impl Hub {
             let _ = link.connection.handle_timeout();
         }
 
-        // Connections that stopped answering, and connections that have gone quiet.
+        // Connections whose keep-alive ping went unanswered.
         let dead: Vec<usize> = self
             .links
             .iter_mut()
@@ -2389,9 +2353,7 @@ impl Hub {
                 self.writing = Some(index);
                 let sent = self.links[index].connection.ping().await;
                 self.writing = None;
-                // Only a ping that went out is waited for: a socket that cannot carry one
-                // has failed, and a recorded ping beside a clear `awaiting_pong` would
-                // otherwise read as answered.
+                // Only a ping that went out is waited for; a failed send is a failed socket.
                 match sent {
                     Ok(()) => self.links[index].pinged_at = Some(now),
                     Err(_) => failed.push(index),

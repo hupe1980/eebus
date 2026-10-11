@@ -11,7 +11,7 @@ hero_code = """
 // A heat pump answers the grid operator's limit itself —
 // under §14a EnWG the acknowledgement *is* the record.
 if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
-    let write = limitation::read_limit_write(&w.resolved)?;
+    let write = limitation::read_limit_write(&w.resolved, LIMIT_ID)?;
     let outcome = system.on_limit_write(&write, decide(&write), now);
     if outcome.is_accepted() {
         engine.accept_write(w.token, now)?;                         // ACK
@@ -41,7 +41,7 @@ body = "The SHIP handshake and the SPINE engine touch neither sockets nor clocks
 
 [[extra.features]]
 title = "Certifiable, not just interoperable"
-body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data and every one is driven; cargo test prints 189/203. The fourteen missing are exactly the device-level cases — a factory reset, a power cut — each listed with its reason."
+body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data and every one is driven; cargo test prints 189/203. The fourteen missing are exactly the device-level cases — a factory reset, a power cut — each listed with its reason, and shipped as a harness (eebus::conformance::harness) to run against your own binary."
 
 [[extra.features]]
 title = "Illegal states are unrepresentable"
@@ -57,7 +57,7 @@ body = "Everything below the runtime builds for no_std + alloc, checked in CI ag
 
 [[extra.features]]
 title = "Checked against other implementations"
-body = "Fifteen datagrams captured from eight real devices by seven manufacturers are driven through an engine, resolved into a device model, and used to seed the fuzzers. An opt-in suite runs eebus-go's own examples in a container and drives the whole §14a exchange against them — this crate dialling, and the peer dialling in."
+body = "Fifteen datagrams captured from eight real devices are driven through an engine, resolved into a device model, and used to seed the fuzzers. An opt-in suite runs eebus-go's own examples in a container and drives the whole §14a exchange against them — this crate dialling, and the peer dialling in."
 
 [[extra.features]]
 title = "The wire format, directly"
@@ -116,17 +116,16 @@ building the crate never needs the specifications.
 
 ## Checked against implementations it did not write
 
-Round trips over fixtures a crate wrote itself prove that its encoder agrees with its
-decoder, which is not the question anyone is asking. Two things answer the real one.
+Two checks go beyond round trips over self-written fixtures:
 
-**Recorded traffic.** Fifteen datagrams captured from eight real devices by seven
-manufacturers — Elli, evcc, Kostal, Porsche, SMA, Spelsberg, Vaillant, Viessmann — are
+**Recorded traffic.** Fifteen datagrams captured from eight real devices — Elli, evcc, Kostal, Porsche, SMA, Spelsberg, Vaillant, Viessmann — are
 driven through an engine, resolved into a device model, and used to seed the fuzzers, so the
 corpus explores the shapes real hardware produces.
 
 **A live peer.** An opt-in suite runs `eebus-go`'s own examples in a container at a pinned
-revision and drives the whole §14a exchange against them in both directions: their control
-box against this crate's Controllable System, their EVSE against its Energy Guard.
+revision and drives the whole §14a exchange against them three ways: their control box
+against this crate's Controllable System, their EVSE against its Energy Guard, and their
+control box dialling in to a listener of ours.
 
 ## One rule you cannot get wrong twice
 

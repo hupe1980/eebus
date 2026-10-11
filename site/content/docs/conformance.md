@@ -53,8 +53,8 @@ would be a lie. `Skipped` is allowed only where the case is not mandatory for th
 the two black starts are `r`, and mandatory only for one that declares itself black-start
 capable.
 
-`report().coverage()` gives the fourteen as a `Coverage`, to add to the protocol-level number
-rather than quoting 189 of 203 for ever.
+`report().coverage()` gives the fourteen as a `Coverage`, to add to the protocol-level 189 of
+203.
 
 ## Every claim points at a sentence
 
@@ -72,20 +72,11 @@ specification text or the 2026 implementation guides.
 
 **No "auto accept" mode, and `register` is never `true`.** SHIP IG §2.3 forbids both.
 
-**Double connections follow §12.2.3 as written**: the larger SKI keeps the *most recent*
-connection, and the smaller one waits three seconds and then pings. `ship-go` keeps the
-initiator's connection instead — a deliberate deviation, because "most recent" is a local
-judgement two nodes can disagree about, and disagreeing can leave both with nothing. The
-rule is followed here and the hazard bounded instead: one ping round, then a decision, and a
-redial if it does go wrong. [More](@/docs/ship.md#two-nodes-that-dial-each-other-at-once).
+**Double connections follow §12.2.3 as written**, where `ship-go` keeps the initiator's
+connection — [SHIP](@/docs/ship.md#two-nodes-that-dial-each-other-at-once).
 
-**Every table a peer can grow is capped.** Connections — handshakes in progress included —
-peers waiting on an approval, tracked device addresses, bindings and subscriptions per
-peer, remembered functions per peer, entries per function, and writes waiting on the
-application. SHIP and SPINE cap none
-of them; a peer that reaches a cap is told so — `errorNumber` 3 for a write or a relation,
-a dropped socket or a `connectionClose` for a connection — rather than served until the
-memory runs out.
+**Every table a peer can grow is capped**, where SHIP and SPINE cap none —
+[Security](@/docs/security.md#resource-exhaustion) lists the bounds.
 
 **A binding or subscription call acts only in the sender's name.** The client address in
 the payload has to belong to the device SHIP authenticated, or the call is refused with
@@ -113,17 +104,16 @@ beside its SKI records and admits a peer whose fingerprint matches — which §1
 "SHALL be seen like a successful trust in an SKI".
 
 **A write the application never decides is abandoned** once §5.2.5's maximum response delay
-has passed, and reported as `SpineEvent::WriteAbandoned`. An answer after that would reach a
-peer that has already given up, and under §14a a limit that was never decided is worth a
-log line rather than a silent disappearance.
+has passed, and reported as `SpineEvent::WriteAbandoned`: an answer after that would reach a
+peer that has already given up.
 
 **`accessMethods.id` is populated**, which SHIP 1.1.0 makes mandatory and which a peer needs
 in order to dial back in the other direction.
 
 **TLS 1.2 only**, because §9 says 1.3 "is not considered in this version".
 
-**Session resumption is off.** §9.6 makes it a SHOULD, but a resumed session skips the
-certificate exchange, and the certificate is what identifies a SHIP peer.
+**Session resumption is off**, against §9.6's SHOULD —
+[Security](@/docs/security.md#tls-1-2-mutual-no-resumption).
 
 **`scale` is always sent**, per the SPINE IG §3.2.1 erratum, and a partial update merges into
 the stored value rather than replacing it.
@@ -173,11 +163,6 @@ certificate authorities and a SHIP node certificate is a leaf, so without this t
 
 ## Interoperability, measured
 
-Conformance to a specification and interoperability with the implementations that also
-claim it are different properties, and only one of them can be checked by reading. Round
-trips over fixtures a crate produced itself prove that its encoder agrees with its decoder,
-which is not the question.
-
 **Recorded traffic.** `tests/fixtures/devices` carries fifteen datagrams captured from
 eight devices by seven manufacturers — Elli, evcc, Kostal, Porsche, SMA, Spelsberg,
 Vaillant and Viessmann — recorded with `eebus-go` and published as MIT-licensed
@@ -208,30 +193,16 @@ Docker daemon cannot give it that, and `tests/interop/Dockerfile` carries the re
 
 **Pointing the peer at a daemon of your own.** The same image runs against a listener
 *outside* the container — a household daemon under development, rather than this test's
-`Hub::listen`. The comment block at the foot of `tests/interop/Dockerfile` is the recipe,
-and the three things that trip people up are there:
+`Hub::listen`:
 
 ```sh
 docker run --rm --network host eebus-interop-controlbox:pinned \
     controlbox -port 4713 -remoteski <the listener's SKI>
 ```
 
-1. **The peer discovers; it does not dial an address.** `eebus-go`'s examples take
-   `-remoteski` and then look for that SKI over mDNS. There is no `-remoteip`, so
-   `--add-host=host.docker.internal:host-gateway` does not help — there is nowhere to put
-   the name. The container has to be on the host's own network stack instead, which
-   `--network host` gives on a native Linux daemon and does not give on Docker Desktop.
-2. **The listener has to announce itself, with an address.** Opening a socket is not
-   enough: announce `_ship._tcp` with `eebus::mdns::Mdns::announce`, carrying the SKI in
-   the TXT record, and name the addresses it accepts connections on. DNS-SD resolves an
-   instance to a host name and the host name to an address, so an announcement with none is
-   one the peer finds and cannot dial.
-3. **Both SKIs have to be exchanged first.** Pass the listener's with `-remoteski`, and
-   trust the container's — it prints `Local SKI:` on start-up, since it generates a fresh
-   certificate every run — in the listener's trust store.
-
-Testing a household daemon against this crate's own Energy Guard proves the two ends agree;
-it does not prove either agrees with anyone else. This is what closes that.
+The comment block at the foot of `tests/interop/Dockerfile` is the recipe, and lists the
+three things that trip people up — mDNS rather than an address, an announcement that names
+its addresses, and both SKIs exchanged first.
 
 ```sh
 cargo test --features interop,full --test interop -- --nocapture

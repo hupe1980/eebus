@@ -61,7 +61,7 @@ SPINE carries physical quantities as a `ScaledNumber`: an integer `number` and a
 `scale`. 4200 W is `{"number": 42, "scale": 2}`. There is no floating point on the wire,
 which is deliberate — a limit is a legal quantity and must round-trip exactly.
 
-Three rules follow, and all three are easy to get wrong:
+These rules follow, and each is easy to get wrong:
 
 * **`scale` is always sent.** The SPINE implementation guide §3.2.1 erratum says so, and
   a peer that assumes a missing scale means zero will be wrong by orders of magnitude.

@@ -73,20 +73,23 @@ mpc::MONITORING_APPLIANCE.features_needing_subscription();
 ```
 
 `tests/use_case_delivery.rs` holds every actor to it: what an actor's `attach` or `follow`
-asks to subscribe to is exactly what its descriptor names. The features easiest to leave out
-are the ones that check catches, and none of them is a formality — the Monitoring Appliance's
+asks to subscribe to is exactly what its descriptor names. That includes the features
+easiest to leave out: the Monitoring Appliance's
 `ElectricalConnection`, where `acMeasuredPhases` says what a per-phase value *means*; the
 Energy Guard's `DeviceConfiguration` and `ElectricalConnection`, where the failsafe pair is
 writable at the appliance too and the contractual maximum is what a §14a agreement sets; and
 the EV guard's `permittedValueSet`, which changes mid-session when a car raises its minimum
 current.
 
-That leaves the question a consumer actually has to answer, which is what to make of a
-value that has not arrived for ten minutes. Since everything is subscribed, the distinction
-is not notification-versus-poll but whether the notification comes on a **clock**:
+A value that has not arrived for ten minutes is either a peer that stopped answering or one
+with nothing to say, and the answer decides whether to drop the unit or leave it where it
+is. Since everything is subscribed, what tells them apart is whether the notification comes
+on a **clock**, and the descriptors carry that as data:
 
 ```rust
+use eebus::model::{FeatureType, Function};
 use eebus::usecases::descriptor::Delivery;
+use eebus::usecases::{lpc, mpc};
 
 mpc::MONITORING_APPLIANCE.delivery_of(&FeatureType::Measurement, &Function::MeasurementListData);
 // Some(Delivery::OnChange) — a room holding its temperature sends nothing, and is fine
@@ -95,10 +98,12 @@ lpc::CONTROLLABLE_SYSTEM.delivery_of(&FeatureType::DeviceDiagnosis, &Function::D
 // Some(Delivery::Periodic(60 s)) — [LPC-005]; silence past this arms the failsafe
 ```
 
-The heartbeats are the only functions any of these specifications puts a clock on: 60 s for
-LPC, LPP and COB, and 4 s for OPEV and OSCEV, because a car follows a current at once. The
-period is the specification's "at least every", not a tolerance — how many missed beats to
-allow stays the consumer's, and LPC allows two where OPEV allows none.
+The heartbeats are the only functions any of these specifications puts a clock on, and
+`periodic_functions()` lists them: 60 s for LPC, LPP and COB, and 4 s for OPEV and OSCEV,
+because a car follows a current at once. The period is the specification's "at least
+every", not a tolerance — how many missed beats to allow stays the consumer's, and LPC allows
+two where OPEV allows none. Everything else is `OnChange`, and its age is a fact about the
+world rather than about the peer.
 
 ## Addressing a peer's data
 
@@ -125,9 +130,9 @@ let failsafe = keys.get(&DeviceConfigurationKeyName::FailsafeDurationMinimum);
 let what_is_it = keys.name_of(some_key_from_a_value_list);
 ```
 
-This is the one class of protocol error that produces no error. The write is well-formed,
-it names a real entry of the peer's, the peer applies it and acknowledges it, and the value
-has gone somewhere else — invisible to any test whose other end is this same crate.
+Getting this wrong produces no error: the write is well-formed, names a real entry of the
+peer's, and is applied and acknowledged — with the value somewhere else, invisible to any
+test whose other end is this same crate.
 
 Each use case wraps the resolver its own data needs — `limitation::PeerIds`,
 `mgcp::Curtailment`, `charging::PhaseLimits`, `evcc::EvReader` — and the actors do it for
@@ -175,20 +180,18 @@ The twelve HVAC rows are the **complete** contents of the two HVAC specification
 `EEBUS_HVAC_SystemFunction_UseCases_V1.0.0` and `EEBUS_HVAC_Temperature_UseCases_V1.0.0`.
 Nothing in either is left out.
 
-Not implemented: **CEVC** (Coordinated EV Charging), which is a different shape from
-everything above — three actors, power sequences, incentive tables, and a charging plan
-negotiated rather than a ceiling imposed. **ITPCM** (Incentive Table Based Power
-Consumption Management) is the other absence, and it is the same shape: a price signal over
-`incentiveTable` that an appliance plans against, rather than an instruction it follows.
+Not implemented: **CEVC** (Coordinated EV Charging — see
+[Not here: CEVC](@/docs/e-mobility.md#not-here-cevc)) and **ITPCM** (Incentive Table Based
+Power Consumption Management), which is the same shape: a price signal over `incentiveTable`
+that an appliance plans against, rather than an instruction it follows.
 Nothing in the eight-device corpus announces either; the SMA Home Manager 2 announces
 [OHPCF](https://docs.rs/eebus/latest/eebus/usecases/ohpcf/index.html), which is the
 direct-control answer to the same question and is implemented.
 
 ## The four levers that can ask for *more*
 
-Every use case in the grid, e-mobility and storage rows can only ask an appliance to do
-less, and a ceiling an appliance is already under changes nothing at all — so a manager
-holding only those can never spend a surplus. Four can ask for more, and they are not
+The grid, e-mobility and storage use cases can only ask an appliance to do less (see
+[Heat pumps](@/docs/hot-water.md)). Four can ask for more, and they are not
 interchangeable:
 
 * **CDT / CRHT / CRCT** raise a **setpoint** and leave the appliance's own controller to
@@ -198,19 +201,12 @@ interchangeable:
   expensive, `on` while it is not. Slower, and available only where the appliance says
   `isOperationModeIdChangeable`.
 * **CDSF scenario 2** starts a **one-time hot water loading** outright: the button in the
-  bathroom, pressed over the wire. The shortest path there is from "the roof is exporting"
-  to "the tank is absorbing it", and scenario 3 gives it back when a cloud arrives.
+  bathroom, pressed over the wire; scenario 3 stops it. See
+  [Changing the mode, and pressing the button](@/docs/hot-water.md#changing-the-mode-and-pressing-the-button).
 * **OHPCF** **starts a process**: the compressor's optional power consumption, at a time
-  the CEM names, with stop, pause and resume afterwards. It is what makes a heat pump
-  pre-heat while the roof is exporting — the one thing a thermal model exists to do, and
-  the thing no limit can express.
-
-`ohpcf` is one function on one feature, and what a payload *means* is which of four phases
-the compressor is in: an offer (`inactive`, no schedule), a process (`scheduled`, `running`
-or `paused`), an ending (`completed` or `invalid`), or nothing (no `alternatives`). The
-compressor refuses what the specification does not allow — a pause on something not running,
-a stop it never announced as stoppable — before acknowledging it, the shape LPC's
-Controllable System established.
+  the CEM names, with stop, pause and resume afterwards — what makes a heat pump pre-heat
+  while the roof is exporting, which no limit can express. See
+  [The other lever: OHPCF](@/docs/hot-water.md#the-other-lever-ohpcf).
 
 ## Two use cases, one implementation
 
@@ -226,15 +222,15 @@ ControllableSystemActor::builder(system, lpp::DIRECTION, features).install(&mut 
 
 `features` is a [`CsFeatures`](https://docs.rs/eebus/latest/eebus/usecases/limitation/struct.CsFeatures.html)
 with named fields rather than a row of `FeatureAddress` arguments, because nothing but the
-order would say which is which — and a device that answers a grid operator's limit write on
-its heartbeat feature is a device that compiles.
+order would say which is which, and a device that answers a limit write on its heartbeat
+feature still compiles.
 
 `install` publishes the limit description and locks the two features to one binding partner,
 and it is the *only* way to obtain an actor. Skipping it leaves a device that looks perfectly
 healthy — discovery answered, bindings and subscription granted, heartbeats flowing — whose
 empty limit list gives an Energy Guard no `limitId` to write to.
 
-Three more pairs work the same way:
+The same sharing runs elsewhere:
 
 * **MPC and MGCP** are the same measurements named from the appliance's side or the grid's.
 * **OPEV and OSCEV** are the same per-phase current ceiling for opposite reasons, pointed

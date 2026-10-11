@@ -6,16 +6,12 @@ template = "section.html"
 page_template = "page.html"
 +++
 
-This documentation explains both halves of the problem: **what EEBUS actually requires**,
-and **how this crate expresses it**. Neither is much use alone — the standard is four
-specifications and a stack of implementation guides, and a Rust API is meaningless without
-knowing which sentence of which document it is honouring.
+This documentation explains **what EEBUS requires** and **how this crate expresses it**.
 
 ## Where to start
 
 If you have never met EEBUS, read [What EEBUS is](@/docs/introduction.md) first: the
-players, the layers, and why a German grid regulation made this a certifiable protocol
-rather than a hobby one.
+players, the layers, and why a German grid regulation made this a certifiable protocol.
 
 If you know the standard and want the code, go straight to
 [Getting started](@/docs/getting-started.md) and then the use case you need:
@@ -30,7 +26,7 @@ If you are evaluating the crate, [Architecture](@/docs/architecture.md),
 [Conformance](@/docs/conformance.md) and [Certification](@/docs/certification.md) are the
 pages that answer "is this real", and
 [Which functions can be exchanged in part](@/docs/functions.md) answers the one SPINE
-question that has no short answer — it is the generated table itself, all 142 rows.
+question that has no short answer — it is the generated table of all 142 functions.
 
 ## Conventions
 
@@ -40,4 +36,4 @@ requirement from a use-case implementation guide. Every one of them appears in t
 too, next to the code that satisfies it.
 
 The API reference — every type, every function — lives on
-[docs.rs](https://docs.rs/eebus). These pages are the map; that is the territory.
+[docs.rs](https://docs.rs/eebus).

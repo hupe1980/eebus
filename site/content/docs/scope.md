@@ -10,7 +10,7 @@ group = "Foundations"
 
 1. **Certifiable** implementations of LPC, LPP, MPC and MGCP on **both** sides of each —
    an energy manager needs the client actors as much as a heat pump needs the server ones.
-   The same for every use case added afterwards.
+   Every other use case likewise ships both sides.
 2. **Correct where the reference implementations deviate**, and explicit about the
    difference. Each departure is listed under [Conformance](@/docs/conformance.md).
 3. **Implementation-guide compliant by construction.** The 2026 guides are errata as much

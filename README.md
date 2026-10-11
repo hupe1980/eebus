@@ -66,10 +66,9 @@ element by element: an omitted element means *unchanged*, all the way down. Send
 `scaledNumber` with a bare `number` and the stored `scale` has to survive, or a 4.2 kW limit
 becomes 42 MW. Nothing in the schemas links a data type to its selectors and elements
 filters — the link is a naming convention — so the generator resolves it into a table
-covering 141 functions, and merge, delete and partial read are written once. A command may
-ask for more than one of them — LPC's own worked example carries two filters, one deleting a
-limit's `endTime` and one writing its new value — so they are applied in order, and a
-delete's `selectors` choose the entries while its `elements` choose the parts of them.
+covering 141 functions, and merge, delete and partial read are written once. Several filters
+per command are applied in order; a delete's `selectors` choose entries, its `elements`
+choose parts of them.
 
 **Announce nothing you cannot do.** `possibleOperations` is a promise, so partial reads are
 announced only for functions that table covers; a filtered request for anything else gets
@@ -92,7 +91,7 @@ applied, so it has to say what the appliance actually did.
 
 ```rust
 if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
-    let write = limitation::read_limit_write(&w.resolved)?;   // merged, not the fragment
+    let write = limitation::read_limit_write(&w.resolved, LIMIT_ID)?;   // merged, not the fragment
     let outcome = system.on_limit_write(&write, decide(&write), now);
     if outcome.is_accepted() {
         engine.accept_write(w.token, now)?;                         // ACK — or what the peer was told instead
@@ -112,11 +111,13 @@ guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 
 and nothing before it: the guard takes up a peer that announces the Controllable System by
 itself, and a limit required before that peer is reachable is held rather than dropped.
-Behind that line: a heartbeat immediately before the write and only once the peer has
-subscribed to it (§2.11); never a deactivation as the first limit after a reconnection
-(§2.13); never a zero duration on an activated limit (§2.2); a refusal retried a minute later
-and a minute later again, with the device kept (§2.5); and no more than one write every five
-minutes otherwise (§2.10).
+Behind that line:
+
+- a heartbeat immediately before the write, once the peer has subscribed to it (§2.11);
+- never a deactivation as the first limit after a reconnection (§2.13);
+- never a zero duration on an activated limit (§2.2);
+- a refusal retried a minute later and again a minute after, with the device kept (§2.5);
+- otherwise no more than one write every five minutes (§2.10).
 
 **Two use cases, one implementation.** LPC and LPP are the same use case pointed in opposite
 directions — the same four scenarios, table numbers and thirteen transitions — so the state
@@ -140,12 +141,9 @@ SHIP's escalating penalty, and a PIN in a support bundle has none.
 **Every number off the wire is treated as hostile.** `scale` is signed 16-bit, so a `number`
 near `i64::MAX` reaches infinity in one well-formed message; `to_f64` answers `None`, and a
 use case handed a present-but-unreadable value NACKs the write rather than substituting one.
-A duration pointing backwards reads as zero, not as its magnitude. The same rule covers the
-*times*, where reading past a bad value is the dangerous direction rather than the sloppy
-one: an absent `endTime` on an LPC limit means "no expiry", so a limit whose duration cannot
-be read is refused rather than applied for ever — and where a use case narrows the schema,
-the narrower rule wins, so a heat-pump compressor refuses a `startTime` its own feature
-restricts to a span.
+A duration pointing backwards reads as zero, not as its magnitude. An LPC limit whose
+duration cannot be read is refused, not applied indefinitely; where a use case narrows the
+schema (a compressor's `startTime`), the narrower rule is enforced.
 
 **And converted exactly.** A scale is applied in steps of at most `10^22`, the largest power
 of ten an `f64` holds exactly, so a negative scale *divides* by an exact constant rather
@@ -154,25 +152,15 @@ too large for an `i64` raises the scale instead of saturating. `cargo xtask chec
 keeps hand-rolled powers of ten and float casts out of the two modules where the wire meets
 a number.
 
-**A time on the wire is two things, and both are readable.** `AbsoluteOrRelativeTimeType`
-is an `xs:union` of `xs:duration` and `xs:dateTime`, so one element arrives as an instant
-or as a span and nothing in it says which. `parse()` returns whichever came. The relative
-form on a measurement is an **age** — the instant is `arrived − duration`, which
-`Reading::taken_at_relative_to` is. The absolute form is *not* RFC 3339: `xs:dateTime`
-makes the offset optional, so `2026-09-05T08:15:00` is a valid timestamp that fixes no
-instant, and a consumer reaching for an RFC 3339 parser rejects a conformant peer in a way
-that looks exactly like a peer that sent nothing. `as_timestamp()` reads all of it, and
-`unix_seconds()` is `None` for precisely the case with no answer.
+**A time on the wire is an instant or a span.** `AbsoluteOrRelativeTimeType` is either;
+`parse()` returns whichever came. A measurement's relative time is an age
+(`Reading::taken_at_relative_to`). `xs:dateTime` is not RFC 3339 (the offset is optional):
+`as_timestamp()` reads all of it, and `unix_seconds()` is `None` when no instant is fixed.
 
-**What silence means is a fact about the use case, not a guess.** Every scenario of every
-use case says "Actors SHALL create a subscription for each server Feature that is relevant
-for the corresponding Actor within this Scenario"; polling is what §3.3.4 falls back to
-when a subscription is *refused*. So the question is not notification-versus-poll but
-whether the notification comes on a clock, and the descriptors answer it:
-`Delivery::OnChange` for everything a peer sends when it changes — age it by arrival and a
-room holding its temperature vanishes from the site — and `Delivery::Periodic` for the
-heartbeats alone, at the 60 s of LPC, LPP and COB or the 4 s of OPEV and OSCEV. A test
-holds every actor's subscriptions to what its own descriptor names.
+**Delivery is a fact about the use case.** Every scenario is subscription-driven.
+Descriptors mark each function `Delivery::OnChange` or `Delivery::Periodic` (heartbeats:
+60 s for LPC/LPP/COB, 4 s for OPEV/OSCEV), and a test holds each actor's subscriptions to
+its descriptor.
 
 **Nothing a peer sends can grow without bound.** SHIP and SPINE cap neither connections nor
 stored state. A hub holds sixteen connections and two per peer, handshakes in progress
@@ -195,15 +183,15 @@ through the engine — and property tests cover the round trips, the merge laws,
 arithmetic above. On a heat-pump controller a panic is a reboot.
 
 **Tested against implementations it did not write.** Fifteen datagrams captured from eight
-real devices by seven manufacturers ([`enbility/devices`](https://github.com/enbility/devices))
-are parsed, **driven through an engine**, resolved into a device model, and used to seed the
-fuzzers — as are all twenty-nine Restricted Function Exchange examples from the
-specification's own annex, which are served rather than only decoded. And
-`cargo test --features interop` runs `eebus-go`'s own examples in a container at a pinned
-revision, driving the whole §14a exchange three ways: their control box against this crate's
-Controllable System, their EVSE against its Energy Guard, and — the direction §14a actually
-describes — their control box **dialling in** to a listener of ours. Opt-in and its own CI
-job, so an ordinary `cargo test` needs no Docker.
+real devices ([`enbility/devices`](https://github.com/enbility/devices)) are parsed,
+**driven through an engine**, resolved into a device model, and used to seed the fuzzers —
+as are all twenty-nine Restricted Function Exchange examples from the specification's own
+annex, which are served rather than only decoded. And `cargo test --features interop` runs
+`eebus-go`'s own examples in a container at a pinned revision, driving the whole §14a
+exchange three ways: their control box against this crate's Controllable System, their EVSE
+against its Energy Guard, and — the direction §14a actually describes — their control box
+**dialling in** to a listener of ours. Opt-in and its own CI job, so an ordinary `cargo
+test` needs no Docker.
 
 **Tests carry the certification's identifiers.** `TC_SHIP_HELLO_002`, `TC_SPINE_COMP_006`
 and their siblings name the tests that cover them. For the four certifiable use cases,
@@ -297,10 +285,7 @@ in that position loses it, which is the interoperable answer.
 Where the crate deliberately departs from the reference implementations — the §12.2.3
 double-connection rule, no session resumption, refusing unsupported selectors rather than
 approximating them, and seven more — each departure and the sentence driving it is listed
-under [Conformance](https://hupe1980.github.io/eebus/docs/conformance/). Where the
-*specification* is the thing at fault — §12.2.3 can starve both peers of connections, which
-`enbility`'s 2025 analysis sets out — the rule is followed and the hazard is bounded, rather
-than either being ignored. What is
+under [Conformance](https://hupe1980.github.io/eebus/docs/conformance/). What is
 deliberately *not* here — JSON-UTF16, Brainpool curves, enhanced-mode routing, a
 persistence layer — is listed under
 [Scope and non-goals](https://hupe1980.github.io/eebus/docs/scope/).
@@ -312,9 +297,9 @@ cargo run --example grid_limit                          # against a virtual cloc
 cargo run --example networked --features runtime,ring   # over a real socket
 ```
 
-Both play out the §14a exchange: handshake, discovery, binding, a 3 kW limit, its
-acknowledgement, and the failsafe taking over when the control box goes quiet. `grid_limit`
-does it without a socket; `networked` generates certificates, approves SKIs and completes
+Both play out the §14a exchange: handshake, discovery, binding, a 3 kW limit and its
+acknowledgement. `grid_limit` does it without a socket, then lets the control box go quiet
+so the failsafe takes over; `networked` generates certificates, approves SKIs and completes
 TLS 1.2 with mutual authentication over loopback first.
 
 ### The two simulators
@@ -428,7 +413,7 @@ so re-running it when nothing has changed produces no diff.
 | `ring` | — | `rustls` and `rcgen` backed by `ring`. |
 | `aws-lc-rs` | — | The same, backed by `aws-lc-rs`. |
 | `interop` | — | The cross-implementation test suite. Needs Docker; nothing in the library depends on it, and `full` deliberately excludes it. |
-| `full` | — | Everything above, on `ring`. |
+| `full` | — | Everything above except `interop` and `aws-lc-rs`. |
 
 ### The cryptography provider is yours to pick
 

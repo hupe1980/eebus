@@ -8,20 +8,20 @@ Notable changes to `eebus`. The format follows
 
 ### Fixed
 
-- **An answered keep-alive ping no longer counts as silence.** `ShipConnection` consumes a
-  WebSocket pong inside its read loop and clears `awaiting_pong`, but the hub decided
-  liveness from its own `pinged_at`, which only a *message* cleared. A peer that answered
-  the ping but sent nothing else within `PONG_TIMEOUT` was dropped as unresponsive — two
-  `Hub`s with a quiet link between them parted every couple of minutes. The hub now takes
-  the pong as the answer it is; the decision lives in a small sans-IO function with its own
-  tests. A ping whose send fails is no longer recorded as outstanding: the link is closed
-  as failed at once, rather than ten seconds later as unresponsive.
+- **An answered keep-alive ping no longer counts as silence.** The pong is consumed inside
+  the connection's read loop, but the hub judged liveness by messages only, so two `Hub`s
+  on a quiet link dropped each other every couple of minutes. A ping whose send fails now
+  closes the link as failed at once.
+- **The SHIP §12.2.3 duplicate probe** closes a link whose ping fails to send, instead of
+  letting it pass as answered, and no longer overwrites a keep-alive pong that is already in.
+- **A hub no longer busy-loops on a connection's SHIP timer.** Those timers run on the
+  connection's clock; the hub read them on its own, so on a long-running hub a data-phase
+  timer (key-material response, PIN penalty) looked overdue until it really was.
 
-- **The double-connection probe of SHIP §12.2.3 judged a link by a ping it never sent.**
-  A probe ping whose send failed left `awaiting_pong` as it was, so a dead socket could
-  read as having answered and survive the arbitration; it is now closed as failed at once.
-  And a probe sent while a keep-alive pong was already in, but not yet counted, no longer
-  overwrites that answer and drops a live link as unresponsive.
+### Changed
+
+- **`Hub` and `ShipConnection` use `tokio::time::Instant`**, so they follow a paused Tokio
+  clock in tests. Unpaused, it is identical to `std::time::Instant`.
 
 ## [0.10.0] — 2026-09-18
 

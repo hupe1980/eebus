@@ -13,12 +13,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Nothing here is unavailable elsewhere; the module exists so that building a device
-//! does not begin with a dozen `use` lines. What it deliberately leaves out is anything
-//! ambiguous: the use-case modules are re-exported as modules rather than glob-imported,
-//! because `lpc::ENERGY_GUARD` and `lpp::ENERGY_GUARD` are different constants — as are
-//! `limitation::GuardEvent` and `emobility::opev::GuardEvent` — and a prelude that hid
-//! the difference would be a trap.
+//! Nothing here is unavailable elsewhere; the module saves a dozen `use` lines. Use-case
+//! modules are re-exported as modules, not glob-imported, because names such as
+//! `lpc::ENERGY_GUARD`/`lpp::ENERGY_GUARD` and `limitation::GuardEvent`/
+//! `emobility::opev::GuardEvent` collide.
 
 pub use crate::model::{
     AddressDevice, CmdData, DeviceType, EntityType, ErrorNumber, FeatureAddress, FeatureType,

@@ -1,9 +1,7 @@
 //! Whether a link's keep-alive ping has been answered (SHIP §10.4).
 //!
-//! The pong is a WebSocket control frame: the connection consumes it inside its read loop
-//! and clears its `awaiting_pong` flag, and nothing surfaces as a message. So the hub
-//! cannot learn about it from the frames it is handed. It asks here instead, on every timer
-//! pass, with what it knows about the link, and the decision needs no socket to test.
+//! The connection consumes a pong inside its read loop and only clears `awaiting_pong`;
+//! nothing surfaces as a message, so the hub checks here on every timer pass.
 
 use core::time::Duration;
 
@@ -57,8 +55,7 @@ mod tests {
         assert_eq!(check(None, false, PINGED, TIMEOUT), KeepAlive::Idle);
     }
 
-    /// The defect this module exists for: a peer that answered the ping and said nothing
-    /// else was dropped as unresponsive once the timeout ran out.
+    /// A pong with no other traffic keeps the link, however late the hub looks.
     #[test]
     fn a_pong_alone_keeps_the_link() {
         assert_eq!(

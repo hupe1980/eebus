@@ -56,15 +56,13 @@ pub struct TrustedPeer {
     pub fingerprint: Option<Fingerprint>,
     /// What this key is trusted **at** (SHIP §12.3.2, Table 10).
     ///
-    /// Not decoration, and not a boolean by accident: §12.3.2 and §12.5 state three rules
-    /// about the numbers, and the one that bites is "the SHIP node PIN SHALL NOT be
-    /// transmitted if the public key of the corresponding communication partner has a user
-    /// trust level that is less than '32'". A store that only knows "trusted" cannot answer
-    /// that question, and answers it wrongly by default.
+    /// A level, not a boolean: §12.3.2 and §12.5 state rules about the numbers, among them
+    /// "the SHIP node PIN SHALL NOT be transmitted if the public key of the corresponding
+    /// communication partner has a user trust level that is less than '32'".
     ///
     /// [`TrustLevel::USER_VERIFIED`] is the default because it is what
     /// [`TrustStore::trust`] means: a person compared the SKI with the label and said yes.
-    /// A store restored from JSON written before this field existed reads the same way.
+    /// It is also the value when stored JSON has no such field.
     #[serde(default = "default_trust_level")]
     pub trust: TrustLevel,
 }
@@ -646,11 +644,9 @@ pub struct Node {
 /// A peer that has proved who it is and is waiting for somebody to approve it.
 ///
 /// It has completed TLS — the SKI and the fingerprint are *proved*, not claimed — and has
-/// been told `hello: pending` (SHIP §13.4.4.1). It stays connected for as long as its own
-/// SHIP timers allow, so there is a window in which a person can be shown these forty hex
-/// digits and asked whether they match the label on the box in front of them. Field
-/// reports make that exchange the most common §14a commissioning failure, and a box that
-/// cannot *display* the SKI cannot take part in it at all.
+/// been told `hello: pending` (SHIP §13.4.4.1). While its SHIP timers allow, a person can
+/// compare these forty hex digits with the label on the box; field reports make that
+/// exchange the most common §14a commissioning failure.
 ///
 /// Answer with [`TrustStore::trust`] or [`Node::refuse_pairing`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -762,11 +758,7 @@ impl Node {
 
     /// The peers whose handshake is waiting on a trust decision right now.
     ///
-    /// **This is what a box shows an installer.** An unapproved peer completes TLS, so its
-    /// SKI is proved rather than claimed, and is then held in the SHIP pending state —
-    /// which exists precisely so that a person can compare it with the label on the
-    /// device. Without a way to read it out, the SKI has to come off the other box
-    /// instead, and that exchange is the most common §14a commissioning failure there is.
+    /// **This is what a box shows an installer** (see [`PendingPeer`]).
     ///
     /// Every peer here is also reported once through the
     /// [`TrustReporter`](super::TrustReporter) a call to

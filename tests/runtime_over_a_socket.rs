@@ -495,6 +495,70 @@ async fn the_hub_discovers_a_peer_and_routes_to_it() {
     server.abort();
 }
 
+/// A link with no traffic stays up: the keep-alive pings, the peer pongs (SHIP §10.4).
+///
+/// The sockets are real; time is paused and stepped by hand, since Tokio's auto-advance
+/// could fire the pong timeout while a pong is still in the loopback.
+#[tokio::test]
+async fn a_quiet_link_survives_its_keepalives() {
+    use eebus::runtime::{KEEPALIVE_INTERVAL, PONG_TIMEOUT};
+
+    /// Runs a hub in the background, reporting why any of its connections ended.
+    fn watch(
+        mut hub: Hub,
+        side: &'static str,
+        dropped: tokio::sync::mpsc::UnboundedSender<(&'static str, Disconnect)>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Ok(event) = hub.next().await {
+                if let HubEvent::Disconnected { reason, .. } = event {
+                    let _ = dropped.send((side, reason));
+                }
+            }
+        })
+    }
+
+    /// Lets real I/O catch up with the paused clock. Yielding keeps the runtime busy, so
+    /// it polls the sockets without advancing the clock on its own.
+    async fn settle() {
+        let until = std::time::Instant::now() + Duration::from_millis(20);
+        while std::time::Instant::now() < until {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let (control_box, heat_pump) = pair();
+    let mut server = Hub::new(heat_pump, pump_engine());
+    let address = server.listen("127.0.0.1:0").await.unwrap();
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.dial(address);
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let server = watch(server, "heat pump", dropped.clone());
+    wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::PeerDiscovered { .. } => Some(()),
+        HubEvent::HandshakeFailed { error, .. } => panic!("the handshake failed: {error}"),
+        HubEvent::Disconnected { .. } => panic!("the connection ended early"),
+        _ => None,
+    })
+    .await;
+    let client = watch(hub, "control box", dropped);
+
+    tokio::time::pause();
+    let step = Duration::from_secs(5);
+    let rounds = (KEEPALIVE_INTERVAL + PONG_TIMEOUT) * 3;
+    for _ in 0..rounds.as_secs() / step.as_secs() {
+        tokio::time::advance(step).await;
+        settle().await;
+        if let Ok((side, reason)) = drops.try_recv() {
+            panic!("the {side} dropped the quiet link: {reason:?}");
+        }
+    }
+
+    client.abort();
+    server.abort();
+}
+
 /// A peer nobody has approved is reported, and approving it completes the handshake it
 /// is waiting in — no reconnection, no timeout, no forty hex digits typed in advance.
 ///

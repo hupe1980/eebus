@@ -38,7 +38,7 @@
 //! [`limitation::client_feature`](crate::usecases::limitation::client_feature), which is
 //! the same constructor an Energy Guard uses, and hand it to
 //! [`MonitoringApplianceActor`](crate::usecases::monitoring::MonitoringApplianceActor).
-//! That actor now serves the whole use case: [`monitoring::locate`] finds the connection
+//! That actor serves the whole use case: [`monitoring::locate`] finds the connection
 //! point's `DeviceConfiguration` feature alongside its measurements, and the factor
 //! arrives as
 //! [`MonitoringEvent::CurtailmentChanged`](crate::usecases::monitoring::MonitoringEvent::CurtailmentChanged).

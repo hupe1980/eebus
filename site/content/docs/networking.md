@@ -7,8 +7,7 @@ group = "Deployment"
 +++
 
 The protocol core owns no socket and reads no clock, which is what makes every timer in the
-standard an ordinary unit test. The `runtime` feature is the part that does own them, and
-it is the only part that does.
+standard an ordinary unit test. The `runtime` feature is the only part that owns them.
 
 ## The Hub
 
@@ -53,9 +52,8 @@ What it does for you:
 
 Routing is *by* the peer's SPINE device address, so that address is bound to a connection
 once and not afterwards: a peer that restates a different one, or claims one another
-connection holds, is disconnected with `Disconnect::AddressConflict`. The innocent cause is
-common enough to report rather than drop in silence — two devices shipped with the same
-vendor and serial produce exactly this.
+connection holds, is disconnected with `Disconnect::AddressConflict`. Two devices shipped
+with the same vendor and serial produce this without any malice.
 
 `Disconnected` is not the end of a use case. The state machine survives the socket, which
 is the correct behaviour — a heat pump under a limit stays under it while the LAN
@@ -225,8 +223,7 @@ claim: a connection proving this node's own SKI is refused with
 
 The same holds one layer down. Routing is by SPINE device address, so a peer claiming this
 node's own is `Disconnect::AddressConflict`, and the engine — which cannot close a socket it
-has never seen — discards such a datagram rather than filing this node as its own peer. Two
-devices shipped with the same vendor and serial produce this without any malice.
+has never seen — discards such a datagram rather than filing this node as its own peer.
 
 ## Reconnection
 
@@ -239,26 +236,16 @@ given up after `CONNECT_TIMEOUT` rather than the operating system's own minutes.
 
 ## `next` is not cancel-safe
 
-The one rule for the event loop: **do not put `hub.next()` in a `tokio::select!` or a
-`timeout`.** `Hub::run(handler)` is the loop that cannot get this wrong.
+**Do not put `hub.next()` in a `tokio::select!` or a `timeout`.** `Hub::run(handler)` is
+the loop that cannot get this wrong.
 
-The hazard is the *sending* half. Reading is cancel-safe — `WebSocketStream` buffers a
-partial frame and resumes — but `next` flushes the engine's queue before it reads, and
-`Sink::send` carries no such guarantee. Dropped part-way through it leaves **half a frame on
-the wire**, and the peer's parser is then out of step with the stream.
+Reading is cancel-safe — `WebSocketStream` buffers a partial frame — but `next` flushes the
+engine's queue first, and a `Sink::send` dropped part-way leaves **half a frame on the
+wire**. A `next` dropped mid-write leaves a mark; the next call closes that connection with
+`Disconnect::InterruptedWrite` rather than leave the peer's parser out of step.
 
-**The hub notices.** A write in flight is marked before the `await` and unmarked after, so a
-future dropped in between leaves the mark set; the next call finds it and closes that
-connection with `Disconnect::InterruptedWrite`. A reconnection costs a second. Carrying on
-costs the session, and costs it silently — minutes later, as a subscription that was never
-granted, a heartbeat that never arrived, and a limit refused for want of one.
-
-Everything a caller would reach for `select!` to do has somewhere else to go. Sockets, the
-listener and mDNS are the hub's own and arrive as events. Timers go to `wake_at`, which the
-hub folds into its own deadlines and answers with `HubEvent::Tick` — and **a deadlock guard
-is a timer**, which is the most natural reason to reach for `timeout` and the one to
-resist. Anything else arriving from elsewhere — a command channel, a user's answer to a
-pairing question — is drained *between* calls, on the tick:
+Sockets, the listener and mDNS arrive as events. Timers — a deadlock guard included — go to
+`wake_at`; drain other channels, such as a command inbox, on `HubEvent::Tick`:
 
 ```rust
 loop {
@@ -272,10 +259,8 @@ loop {
 }
 ```
 
-`wake_at` takes an instant on the same clock as `hub.now()`, and an instant already in the
-past is not an error: the hub runs its timers and comes straight back rather than reading
-with a zero-length timeout, which would starve the connection it was supposed to be
-watching.
+`wake_at` takes an instant on the clock of `hub.now()`; one already in the past runs the
+timers and returns at once rather than reading with a zero-length timeout.
 
 ## How many connections
 
@@ -285,36 +270,32 @@ handshakes still running as well as connections held: a peer that dials in and s
 pending state has taken a slot, and a hundred of them would otherwise be a hundred TLS
 sessions waiting for a user who is not there. `Hub::set_max_connections` raises it for a
 gateway that serves more, and lowers it to no less than one, which is the floor §623 sets.
-SHIP caps none of the above, and a device that malfunctions and dials in a thousand times
-takes the memory of every node that answers.
+SHIP caps none of this; [Security](@/docs/security.md#resource-exhaustion) lists every bound.
 
 **A slot is reserved in each direction**, which SHIP §8.1 does specify and which a single
 number cannot express. §628 asks a node holding more than one connection to *"always reserve
 one connection for the TCP server port"* — so of `x` connections at most `x-1` may be ones
-this node dialled — and §632 says the same in reverse for ones it accepted. The case the
-reservation is for is ordinary: a gateway that has dialled every peer it knows about must
-still be able to accept the Steuerbox that turns up afterwards. Past either limit the
-outcome is the same `TooManyConnections` as the overall cap.
+this node dialled — and §632 says the same in reverse for ones it accepted — so a gateway
+that has dialled every peer it knows still accepts the Steuerbox that turns up afterwards.
+Past either limit the outcome is the same `TooManyConnections` as the overall cap.
 
 **Every SHIP node listens.** §623 puts the floor at one active connection, §624 and §628
 both require a listening TCP server, and §638 asks for it to be open whenever the node is
 under its limit. Which end opens the §14a conversation is a use case's business — the
 Energy Guard dials, the Controllable System is dialled — and it says nothing about which
-end binds a port. A node that announces `_ship._tcp` at a port it does not serve is an
-invitation every peer on the segment retries for ever.
+end binds a port. A node that announces `_ship._tcp` at a port it does not serve is
+retried by every peer on the segment for ever.
 
 Beyond the cap a socket is dropped before TLS and reported as
 `HandshakeFailed { error: TooManyConnections }`; a connection that completed its handshake
 in the meantime is closed with a `connectionClose`. Nothing already held is dropped to make
 room: a cap decides what is *accepted*.
 
-**A second cap covers the unapproved,** who hold a slot on nobody's authority.
-`MAX_PENDING_TRUST` — four — is how many peers may be waiting for a decision, **one slot per
-SKI**: a peer that dials four times is still one decision, so it keeps the slot it has and
-the table stays open for somebody a user might want to approve. Beyond the cap a peer is told
-`hello: aborted` at once and reported as `TooManyPendingPairings`, so it retries rather than
-squatting. Keying that on the SKI is safe where keying it on an address would not be: the SKI
-came out of a completed TLS handshake.
+**A second cap covers the unapproved.** `MAX_PENDING_TRUST` — four — is how many peers may
+be waiting for a decision, **one slot per SKI**: a peer that dials four times is still one
+decision. Beyond the cap a peer is told `hello: aborted` at once and reported as
+`TooManyPendingPairings`, so it retries rather than squatting. Keying on the SKI is safe
+where an address would not be: the SKI came out of a completed TLS handshake.
 
 ## Closing a connection, and blocking a peer
 
@@ -421,8 +402,3 @@ end; without, it is a single dial and the appliance decides whether to trust thi
 `cargo xtask simulators` is that arrangement as a gate, run on every push: both simulators
 against each other, asserting the §14a exchange completes and that the control box serves the
 port it announces.
-
-Between them they cover the parts a single-process example cannot show — a person deciding
-whether to trust a device while it waits on the wire, a device that comes back after a
-restart still paired, and a control box that finds a household appliance it has never been
-told the address of.

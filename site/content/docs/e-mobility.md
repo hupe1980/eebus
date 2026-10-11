@@ -51,9 +51,8 @@ car.supports_data_exchange();   // true — so EVSOC can be asked
 
 A car on **IEC 61851** has a pilot wire and nothing else. It can be offered a current and
 it cannot be asked anything: no state of charge, no charging plan, however willing the
-energy manager is. A car on **ISO 15118** has a data link. Reading that one field before
-sending the first request is the difference between a working integration and a queue of
-reads nothing will ever answer.
+energy manager is. A car on **ISO 15118** has a data link. Read that one field before the
+first request, or queue reads nothing will ever answer.
 
 Two more fields decide real behaviour. `asymmetric_charging` is what OPEV needs before it
 writes three different currents. And the charging power band's *minimum* is the number that
@@ -100,7 +99,7 @@ Table 6 spells the three identifiers `<x1>`, `<x2>`, `<x3>` — placeholders. No
 wire ties a `limitId` to a phase directly: the limit description points at a
 `measurementId`, and the *parameter* descriptions give that `measurementId` its phase. A
 manager has to read both and compose them, which is what `PhaseLimits` does and what
-`OverloadGuardActor::attach` now waits for before it writes anything.
+`OverloadGuardActor::attach` waits for before it writes anything.
 
 Getting it wrong is quiet. Curtailing "phase A" by writing to `limitId` 1 on a car that
 numbers them the other way limits a phase the supply was not worried about, leaves the one

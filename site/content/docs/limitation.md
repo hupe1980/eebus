@@ -105,7 +105,7 @@ because a refusal proves a controller is there. **`unlimited/autonomous`** means
 in control and the device is running its own logic, which it may only do once the failsafe
 duration has elapsed.
 
-The failsafe is not optional and not a suggestion. §14a fixes 4.2 kW as the floor an
+The failsafe is mandatory. §14a fixes 4.2 kW as the floor an
 installation must keep available, and the failsafe duration has a minimum so that a brief
 network hiccup does not leave a house heating at full power for hours.
 
@@ -141,17 +141,16 @@ match engine.poll_event() {
 
 ## The other half: the Energy Guard
 
-The 2026 implementation guides spend most of their pages on the controlling side, and its
-rules are unforgiving. Here they live behind one call:
+The 2026 implementation guides spend most of their pages on the controlling side. Here its
+rules live behind one call:
 
 ```rust
 guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 ```
 
 and nothing before it: the guard takes up a peer that announces the Controllable System by
-itself, because §2.11 requires the opening limit write as soon as the bindings settle,
-whether or not the grid is asking for anything. `require` does not depend on ordering
-either — a limit asked for before the peer is reachable is held, not discarded.
+itself. `require` does not depend on ordering either — a limit asked for before the peer is
+reachable is held, not discarded.
 
 Behind that line:
 
@@ -179,16 +178,14 @@ Behind that line:
 §3.1.8.2: "Durations used within this Use Case SHALL be presented as relative times. The
 same holds for the `endTime` Element used for the duration of validity ([LPC-004])." The
 *schema* is looser than that — `timePeriod.endTime` is the `AbsoluteOrRelativeTimeType`
-union, so `2026-09-05T10:00:00Z` is schema-valid and use-case-invalid, and a guard written
-against the one rather than the other sends it in good faith.
+union, so `2026-09-05T10:00:00Z` is schema-valid and use-case-invalid.
 
-`read_limit_write` refuses such a write rather than reading past it, and the reason is which
-way the mistake falls. An absent `endTime` means *no expiry*: read the unreadable one as
-absent and a limit the guard meant to lift after two hours is held until something else
-replaces it. Refusing produces a NACK, which is a fact the guard can act on. It is the same
-rule the crate applies to a `scaledNumber` whose scale overflows — a present-but-unreadable
-value is not a value — and [COB](https://docs.rs/eebus/latest/eebus/usecases/cob/index.html)
-applies it to its own setpoint duration, whose §3.1.8.2 says the same thing.
+`read_limit_write` refuses an `endTime` it cannot read as a relative duration, and the
+refusal reaches the guard as a NACK; reading it as absent would mean no expiry. The same
+rule covers a `scaledNumber` whose scale overflows, and
+[COB](https://docs.rs/eebus/latest/eebus/usecases/cob/index.html) applies it to its own
+setpoint duration, whose §3.1.8.2 says the same thing. See
+[Where a use case is narrower than the schema](@/docs/wire-format.md#where-a-use-case-is-narrower-than-the-schema-the-use-case-wins).
 
 A peer whose `LoadControl` feature describes no limit for this guard's direction reports
 `GuardEvent::NoLimitPublished` and is then left alone. That installation looks commissioned
@@ -227,9 +224,8 @@ An Energy Guard reads it in the pre-scenario exchange and hears about it as
 ## The §14a record
 
 Every accepted or refused limit is recorded with its timestamp, its value and the outcome.
-That log is the evidence a grid operator's limit was honoured — which is the entire point
-of the regulation, and something an implementation that only moves messages will not
-produce.
+That log is the evidence a grid operator's limit was honoured, which is what the regulation
+asks for.
 
 ```rust
 guard.audit().records();   // what was asked, what was answered, when
