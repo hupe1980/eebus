@@ -54,6 +54,7 @@ use crate::ship::{CURVE_SECP256R1, ConnectionCloseReason, PeerKeys, Resolution, 
 use crate::spine::{Engine, SpineEvent};
 
 use super::connection::{ConnectionError, ShipConnection, TrustReporter};
+use super::keepalive::{self, KeepAlive};
 use super::node::Node;
 #[cfg(all(feature = "mdns", feature = "pairing"))]
 use super::node::PairedUnit;
@@ -2267,14 +2268,24 @@ impl Hub {
             let _ = link.connection.handle_timeout();
         }
 
-        // Connections that stopped answering, and connections that have gone quiet.
-        let dead: Vec<usize> = self
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.pinged_at.is_some_and(|at| now >= at + PONG_TIMEOUT))
-            .map(|(index, _)| index)
-            .collect();
+        // Connections that stopped answering, and connections that have gone quiet. A
+        // pong never surfaces as a message, so an answered ping is learned about here.
+        let mut dead = Vec::new();
+        for (index, link) in self.links.iter_mut().enumerate() {
+            match keepalive::check(
+                link.pinged_at,
+                link.connection.awaiting_pong(),
+                now,
+                PONG_TIMEOUT,
+            ) {
+                KeepAlive::Answered => {
+                    link.pinged_at = None;
+                    link.last_seen = now;
+                }
+                KeepAlive::Dead => dead.push(index),
+                KeepAlive::Idle | KeepAlive::Waiting => {}
+            }
+        }
         for index in dead.into_iter().rev() {
             self.drop_link(index, Disconnect::Unresponsive);
         }
@@ -2347,15 +2358,25 @@ impl Hub {
     /// part of the timer handling that has to await.
     pub async fn keepalive(&mut self) -> Result<(), ConnectionError> {
         let now = self.now();
+        let mut failed = Vec::new();
         for index in 0..self.links.len() {
             let link = &self.links[index];
             if link.pinged_at.is_none() && now.saturating_sub(link.last_seen) >= KEEPALIVE_INTERVAL
             {
                 self.writing = Some(index);
-                let _ = self.links[index].connection.ping().await;
+                let sent = self.links[index].connection.ping().await;
                 self.writing = None;
-                self.links[index].pinged_at = Some(now);
+                // Only a ping that went out is waited for: a socket that cannot carry one
+                // has failed, and a recorded ping beside a clear `awaiting_pong` would
+                // otherwise read as answered.
+                match sent {
+                    Ok(()) => self.links[index].pinged_at = Some(now),
+                    Err(_) => failed.push(index),
+                }
             }
+        }
+        for index in failed.into_iter().rev() {
+            self.drop_link(index, Disconnect::Remote);
         }
         Ok(())
     }

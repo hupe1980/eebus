@@ -25,6 +25,8 @@ pub use connection::*;
 mod hub;
 pub use hub::*;
 
+mod keepalive;
+
 mod node;
 pub use node::*;
 
