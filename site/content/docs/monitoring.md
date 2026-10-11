@@ -20,7 +20,7 @@ three different temperatures — and none adds mechanism.
 
 ## A measurement without its description means nothing
 
-This is the whole difficulty of the use case. A notification looks like this:
+A notification looks like this:
 
 ```json
 {"measurementId": 3, "value": {"number": 2300}}
@@ -45,11 +45,9 @@ Two rules the crate enforces rather than leaving to the caller:
 * A value whose description never arrived is **dropped**, not guessed at.
 * A value flagged `error` **or** `outOfRange` is not handed back as a number. §2.5.2 lists
   the three states together and says the same of both abnormal ones: they "SHALL be ignored
-  by the Monitoring Appliance" ([MPC-003]). Reading `outOfRange` as "high but real" is
-  tempting — a meter reporting 14 kW against an 11 kW constraint looks like a number worth
-  having — and the specification does not permit it. `Reading::usable()` returns `None` for
-  both; the raw `value` field is still there for a display, which is a different thing from
-  acting on it.
+  by the Monitoring Appliance" ([MPC-003]) — so a meter reporting 14 kW `outOfRange` against
+  an 11 kW constraint is not "high but real". `Reading::usable()` returns `None` for both;
+  the raw `value` field is still there for a display.
 
 ### When the reading was taken, not when it arrived
 
@@ -61,10 +59,10 @@ verbatim, and `Readings::read_at` hands it back beside the value:
 let (degrees, taken_at) = readings.read_at(&mrt::MEASURAND)?;
 ```
 
-The obvious substitute is wrong. An appliance subscribes rather than polls, so a
-notification arrives when something **changes** — and a room holding its temperature sends
-nothing at all. Age the readings by arrival and you discard the ones most likely to still be
-true, and cannot tell that room from a sensor that died an hour ago.
+Arrival time is no substitute. An appliance subscribes rather than polls, so a notification
+arrives when something **changes**, and a room holding its temperature sends nothing at all.
+Ageing readings by arrival discards the ones most likely to still be true, and cannot tell
+that room from a sensor that died an hour ago.
 
 Most peers send none, so `taken_at` is usually `None`; what that means is the application's
 call. A Monitored Unit on this side stamps with `MonitoredUnit::set_at`, or
@@ -73,10 +71,8 @@ clock is monotonic uptime, not a time of day.
 
 ### One element, two things
 
-`timestamp` is `AbsoluteOrRelativeTimeType`, which the schema defines as
-`xs:union memberTypes="xs:duration xs:dateTime"`. So it is either an instant or a **span**,
-nothing in the element says which, and the two mean opposite things. `parse()` reads
-whichever arrived:
+`timestamp` is `AbsoluteOrRelativeTimeType`: an instant or a **span**, and nothing in the
+element says which. `taken_at()?.parse()` reads whichever arrived:
 
 ```rust
 use eebus::model::TimeValue;
@@ -89,52 +85,17 @@ let taken_at = match reading.taken_at()?.parse()? {
 };
 ```
 
-The relative form is the sharper half and it is unambiguous: on a measurement it is an age,
-so the instant is `arrived − duration`. `Reading::taken_at_relative_to` is that subtraction
-against the same monotonic clock the engine is already given, saturating at zero rather than
-wrapping.
-
-The absolute form is **not RFC 3339**, and reaching for a parser that assumes it is will
-silently reject conformant peers. `xs:dateTime` makes the offset *optional*, so
-`2026-09-05T08:15:00` names a wall-clock reading and fixes no instant at all; it permits
-`24:00:00` as midnight ending the day; and it permits years outside four digits.
-`AbsoluteOrRelativeTime::as_timestamp` reads all of it into a `DateTime`, whose
-`unix_seconds()` is `None` for exactly the case that has no answer — the timezone-less one —
-and whose `unix_seconds_at()` makes the caller name the zone it means to assume.
-
-What stays yours is the **policy**. A household device sets its clock from NTP or from
-nothing, and how far a peer's clock may be wrong before its timestamps are worth less than
-the arrival time is not a decision a protocol crate can make. `is_absolute()` says which
-form the peer meant; `as_timestamp()` says whether it could be read. The two disagreeing is
-how you learn a peer sent something it believed was a timestamp.
+A relative timestamp is an age, so `Reading::taken_at_relative_to` subtracts it from the
+arrival time, saturating at zero. An absolute one is `xs:dateTime`, not RFC 3339, and
+`unix_seconds()` is `None` when it carries no offset; `as_timestamp()` says whether it could
+be read at all. How far to trust a peer's clock stays the application's policy. See
+[Times](@/docs/wire-format.md#times).
 
 ### What silence means
 
-A value that has not arrived for ten minutes is either a peer that stopped answering or a
-peer with nothing to say. Nothing in the message says which, and the answer decides whether
-to drop the unit from the site or leave it exactly where it is.
-
-The use case answers it, and the descriptors carry the answer as data:
-
-```rust
-use eebus::model::{FeatureType, Function};
-use eebus::usecases::descriptor::Delivery;
-use eebus::usecases::{lpc, mpc};
-
-mpc::MONITORING_APPLIANCE.delivery_of(&FeatureType::Measurement, &Function::MeasurementListData);
-// Some(Delivery::OnChange) — silence is the protocol working.
-
-lpc::CONTROLLABLE_SYSTEM.delivery_of(&FeatureType::DeviceDiagnosis, &Function::DeviceDiagnosisHeartbeatData);
-// Some(Delivery::Periodic(60 s)) — silence past this is a fault.
-```
-
-Every scenario of every use case here is subscription-driven — each UC TS §3.4.n.1 says
-"Actors SHALL create a subscription for each server Feature that is relevant for the
-corresponding Actor within this Scenario", and §3.3.4 names polling only as what to do when
-a subscription request is *refused*. So the distinction that matters is not
-notification-versus-poll: it is whether the notification comes on a **clock**. Exactly one
-family of functions does, the heartbeats, and `periodic_functions()` lists them. Everything
-else is `OnChange`, and its age is a fact about the world rather than about the peer.
+A value that has not arrived for ten minutes is either a peer that stopped answering or one
+with nothing to say. The descriptors say which; see
+[Who has to subscribe, and what silence means](@/docs/use-cases.md#who-has-to-subscribe-and-what-silence-means).
 
 ## Curtailment
 

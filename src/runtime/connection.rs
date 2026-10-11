@@ -2,10 +2,10 @@
 
 use alloc::string::{String, ToString};
 use core::time::Duration;
-use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Message, protocol::CloseFrame};
 
@@ -103,7 +103,6 @@ pub struct ShipConnection {
     peer: Ski,
     peer_fingerprint: crate::ship::Fingerprint,
     peer_ship_id: Option<String>,
-    started: Instant,
     awaiting_pong: bool,
     /// What happened about PINs, waiting to be reported (SHIP §12.5).
     pin_events: Vec<PinOutcome>,
@@ -230,15 +229,11 @@ impl ShipConnection {
     /// every turn of its loop. Whatever it returns has to be passed to
     /// [`handle_message`](Self::handle_message); the state machine has not seen it yet.
     ///
-    /// **It is not that nothing is written.** The WebSocket layer answers a ping with a
-    /// pong and a close with a close while reading, so bytes can leave here — what makes
-    /// that safe is that `tungstenite` "never blocks on write" for them and carries an
-    /// unflushed one forward to the next read, so a dropped future leaves no half-written
-    /// frame. Two things follow, and both are why this is worth stating rather than
-    /// glossing: an inbound partial frame is buffered and resumed on the next call, which
-    /// is a documented guarantee of `WebSocketStream`; and nothing the *caller* queued is
-    /// ever fed here, which is the half [`Hub::next`](crate::runtime::Hub::next) cannot
-    /// promise.
+    /// The WebSocket layer may write pong/close replies while reading; `tungstenite` never
+    /// blocks on them and carries an unflushed one to the next read, so a dropped future
+    /// leaves no partial frame. An inbound partial frame is buffered and resumed on the
+    /// next call (a `WebSocketStream` guarantee), and nothing the caller queued is sent
+    /// here — the half [`Hub::next`](crate::runtime::Hub::next) cannot promise.
     ///
     /// A frame SHIP §10.3 forbids comes back as an error rather than being answered here,
     /// because that answer is a close frame this node composes rather than one the
@@ -249,9 +244,7 @@ impl ShipConnection {
 
     /// Closes the socket with a WebSocket status code, for a frame SHIP does not allow.
     ///
-    /// §10.3: a text frame is answered with 1003, "unsupported data". Telling the peer
-    /// which rule it broke is the difference between a bug it can find and a connection
-    /// that mysteriously drops.
+    /// §10.3: a text frame is answered with 1003, "unsupported data".
     pub async fn reject(mut self, code: u16, reason: &str) {
         let _ = self
             .socket
@@ -278,14 +271,14 @@ impl ShipConnection {
 
     /// Advances the SHIP timers, which the close handshake and its `maxTime` run on.
     pub fn handle_timeout(&mut self) -> Result<(), ConnectionError> {
-        // A handshake that has finished has nothing left to time out, and says so by
-        // refusing the call rather than by pretending.
+        // A finished handshake refuses the call; that is expected.
         let _ = self.handshake.handle_timeout(self.clock.elapsed());
         self.absorb_events();
         Ok(())
     }
 
-    /// When the SHIP state machine wants to be woken, if it does.
+    /// When the SHIP state machine wants to be woken, if it does, measured like
+    /// [`age`](Self::age) rather than on [`Hub::now`](super::Hub::now)'s clock.
     pub fn poll_timeout(&self) -> Option<Duration> {
         self.handshake.poll_timeout()
     }
@@ -350,7 +343,7 @@ impl ShipConnection {
 
     /// How long this connection has been up.
     pub fn age(&self) -> Duration {
-        self.started.elapsed()
+        self.clock.elapsed()
     }
 
     /// Sends everything the handshake has queued.
@@ -448,12 +441,9 @@ impl ShipConnection {
 
 /// What happened about a PIN on one connection (SHIP §12.5).
 ///
-/// Both halves are worth surfacing rather than logging. A withheld PIN looks, from the far
-/// end, exactly like having none — the connection carries on with data exchange restricted
-/// — so an installer watching a commissioning fail needs to be told which it was. And a
-/// verified one is a *second factor*: §12.5 makes the first peer to present a valid PIN
-/// since a factory default eligible to act as a SHIP commissioning tool, and that is a
-/// decision a device may want to show somebody.
+/// Surfaced so an installer can tell a withheld PIN from none, and see who became the
+/// commissioning tool: §12.5 makes the first peer to present a valid PIN since a factory
+/// default eligible for that role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PinOutcome {
     /// The peer proved it holds this node's PIN.
@@ -504,7 +494,6 @@ pub(crate) async fn run_handshake(
     node: &Node,
     report: Option<TrustReporter>,
 ) -> Result<ShipConnection, ConnectionError> {
-    let started = Instant::now();
     let clock = Instant::now();
     // Dropped however this function ends — the peer stopped waiting, the socket failed,
     // the caller's future was cancelled — so a pending entry cannot outlive the handshake
@@ -537,10 +526,8 @@ pub(crate) async fn run_handshake(
                 Event::PeerKeyMaterialCounter { update_counter } => {
                     peer_key_counter = Some(update_counter);
                 }
-                // §12.5: proving it holds this node's PIN earns the peer a second factor,
-                // and the store applies the once-only rule because only it survives the
-                // connection. Doing it here rather than leaving it to the application is
-                // the difference between a rule that is stated and one that happens.
+                // §12.5: a verified PIN earns the peer a second factor; the store applies
+                // the once-only rule because only it survives the connection.
                 Event::PeerPinVerified => {
                     let level = node.trust_store().award_pin_trust(&peer.ski);
                     pin_events.push(PinOutcome::Verified { level });
@@ -577,7 +564,6 @@ pub(crate) async fn run_handshake(
                 peer: peer.ski,
                 peer_fingerprint: peer.fingerprint,
                 peer_ship_id,
-                started,
                 awaiting_pong: false,
                 pin_events: core::mem::take(&mut pin_events),
                 peer_key_material: Vec::new(),

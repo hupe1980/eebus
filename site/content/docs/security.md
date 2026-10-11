@@ -12,8 +12,8 @@ There is no certificate authority in EEBUS and no central directory. Each node h
 self-signed ECDSA P-256 certificate, and its identity is the **Subject Key Identifier** —
 twenty bytes derived from the public key. Pairing means each side records the other's SKI.
 
-That is the whole model, and it is a good fit for a building: nobody has to be online, and
-no vendor can revoke a heat pump's ability to talk to its own energy manager.
+Nobody has to be online, and no vendor can revoke a heat pump's ability to talk to its own
+energy manager.
 
 The crate enforces it with a custom `rustls` verifier on both sides. The certificate chain
 is not validated against a root store — there is no root — but the presented certificate
@@ -60,8 +60,7 @@ whether the thing on the other end may set a grid limit is that layer.
 * **1.2 only**, because SHIP §9 says 1.3 "is not considered in this version".
 * **Mutual authentication** always: both sides present certificates.
 * **Session resumption is off.** §9.6 makes it a SHOULD, but a resumed session skips the
-  certificate exchange, and the certificate is what identifies a SHIP peer. The saving is
-  not worth losing the identity check.
+  certificate exchange, and the certificate is what identifies a SHIP peer.
 * The cipher suites are those §9.1 mandates; a peer offering only CBC suites will not
   connect.
 
@@ -71,11 +70,8 @@ whether the thing on the other end may set a grid limit is that layer.
 `cert`, `tls` and `runtime` require exactly one of the `ring` and `aws-lc-rs` features, and
 a build that names both — or neither — stops with a `compile_error!` that says why.
 
-The reason is not tidiness. `rustls`' provider is *process-global*: a binary that links both
-panics the first time anything asks for the default. A library that quietly pulled one in
-would be making that choice for every consumer downstream of it, including one whose
-`deny.toml` bans it — and the result is not a compile error but a household box that panics
-the first time a control box connects.
+`rustls`' provider is *process-global* and linking both panics on first use, so the choice
+belongs to the binary, not a library.
 
 ```sh
 cargo add eebus --features runtime,ring
@@ -152,20 +148,8 @@ datagrams and bad certificates at any node.
   differing byte. A PIN's whole defence is the escalating penalty of SHIP §13.4.4.3.4, and
   that penalty counts *attempts*: an equality that leaks a byte at a time turns eight hex
   digits into thirty-two guesses, and the penalty never notices.
-* **Resource exhaustion** — every table a peer can grow is bounded. The hub holds at most
-  `DEFAULT_MAX_CONNECTIONS` connections and two per peer, handshakes still running
-  included, and drops the rest; at most `MAX_PENDING_TRUST` peers may be *waiting on an
-  approval* at once, because an unapproved peer occupies a slot for minutes on nobody's
-  authority, and the one past the cap is answered `hello: aborted` at once so that it
-  retries rather than squatting; the engine tracks at most `MAX_PEERS` device addresses,
-  evicting the one that has told it least together with everything filed under it, at most
-  `MAX_REMOTE_FUNCTIONS` of each peer's functions, and at most `MAX_RELATIONS_PER_PEER`
-  bindings and as many subscriptions from each peer; at most `MAX_DEFERRED_WRITES` writes
-  may be waiting on the application, and one function holds at most `MAX_LIST_ENTRIES` —
-  after any of which a peer is answered `errorNumber` 3, overload, rather than served. A
-  device address is bounded and printable or the datagram is discarded. SHIP itself caps
-  none of this, and the omission is exploitable: a device that dials in a thousand times
-  takes the memory of every node that answers.
+* **Resource exhaustion** — every table a peer can grow is bounded; see
+  [below](#resource-exhaustion).
 * **A paired peer acting in another's name** — a binding or subscription call names its
   client in the payload, and the engine accepts it only from the device SHIP authenticated
   as the sender. Without that, one paired peer could release another's binding — the one
@@ -178,3 +162,20 @@ datagrams and bad certificates at any node.
 What is *not* defended: an attacker with the private key is the node, and an attacker who
 can make the user approve their SKI is paired. Both are the intended semantics of the
 standard.
+
+### Resource exhaustion
+
+SHIP and SPINE cap none of these, and the omission is exploitable: a device that dials in a
+thousand times takes the memory of every node that answers.
+
+| Constant | Bounds | At the limit |
+|---|---|---|
+| `DEFAULT_MAX_CONNECTIONS` = 16 | connections per hub, handshakes still running included; `Hub::set_max_connections` changes it | socket dropped before TLS, or `connectionClose`; `TooManyConnections` |
+| `MAX_CONNECTIONS_PER_PEER` = 2 | connections to one peer, while §12.2.3 arbitrates | as above |
+| `MAX_PENDING_TRUST` = 4 | peers waiting on an approval, one slot per SKI | `hello: aborted` at once, so it retries rather than squats |
+| `MAX_PEERS` = 32 | device addresses the engine tracks | the one that has told it least is evicted, with everything filed under it |
+| `MAX_REMOTE_FUNCTIONS` = 32 | functions remembered per peer | least recently updated is evicted |
+| `MAX_RELATIONS_PER_PEER` = 32 | bindings, and as many subscriptions, from each peer | `errorNumber` 3, overload |
+| `MAX_DEFERRED_WRITES` = 16 | writes waiting on the application | `errorNumber` 3 |
+| `MAX_LIST_ENTRIES` = 128 | entries in one function's list | `errorNumber` 3 |
+| `MAX_DEVICE_ADDRESS_LEN` = 256 | a device address, which must also be printable | datagram discarded |

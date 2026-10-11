@@ -4,20 +4,26 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [Unreleased]
+## [0.10.1] — unreleased
 
 ### Fixed
 
-- **An answered keep-alive ping no longer counts as silence.** `ShipConnection` consumes a
-  WebSocket pong inside its read loop and clears `awaiting_pong`, but the hub decided
-  liveness from its own `pinged_at`, which only a *message* cleared. A peer that answered
-  the ping but sent nothing else within `PONG_TIMEOUT` was dropped as unresponsive — two
-  `Hub`s with a quiet link between them parted every couple of minutes. The hub now takes
-  the pong as the answer it is; the decision lives in a small sans-IO function with its own
-  tests. A ping whose send fails is no longer recorded as outstanding: the link is closed
-  as failed at once, rather than ten seconds later as unresponsive.
+- **An answered keep-alive ping no longer counts as silence.** The pong is consumed inside
+  the connection's read loop, but the hub judged liveness by messages only, so two `Hub`s
+  on a quiet link dropped each other every couple of minutes. A ping whose send fails now
+  closes the link as failed at once.
+- **The SHIP §12.2.3 duplicate probe** closes a link whose ping fails to send, instead of
+  letting it pass as answered, and no longer overwrites a keep-alive pong that is already in.
+- **A hub no longer busy-loops on a connection's SHIP timer.** Those timers run on the
+  connection's clock; the hub read them on its own, so on a long-running hub a data-phase
+  timer (key-material response, PIN penalty) looked overdue until it really was.
 
-## [0.10.0] — unreleased
+### Changed
+
+- **`Hub` and `ShipConnection` use `tokio::time::Instant`**, so they follow a paused Tokio
+  clock in tests. Unpaused, it is identical to `std::time::Instant`.
+
+## [0.10.0] — 2026-09-18
 
 A node that announced itself and looked for peers found itself, and could connect to
 itself; and a control box that only ever dialled was announcing a port it never bound.
@@ -1681,7 +1687,9 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
-[0.9.0]: https://github.com/hupe1980/eebus/compare/v0.8.0...HEAD
+[0.10.1]: https://github.com/hupe1980/eebus/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/hupe1980/eebus/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/hupe1980/eebus/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hupe1980/eebus/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hupe1980/eebus/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hupe1980/eebus/compare/v0.5.0...v0.6.0

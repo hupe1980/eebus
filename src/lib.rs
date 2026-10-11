@@ -117,12 +117,8 @@
 //!
 //! # Matching on an event
 //!
-//! Every enum this crate *reports* things through is `#[non_exhaustive]`, so a `match` on
-//! one needs a `_` arm. That is deliberate and it is the reverse of an inconvenience: the
-//! crate keeps finding things worth reporting — a peer withholding a PIN, a use case
-//! appearing at runtime, a request that walked the whole retry ladder — and without the
-//! attribute every one of those is a breaking change for every consumer that matches
-//! exhaustively.
+//! Every enum this crate *reports* things through is `#[non_exhaustive]`: a `match` on
+//! one needs a `_` arm, so a new variant is not a breaking change.
 //!
 //! The line is drawn by *who closes the set*:
 //!

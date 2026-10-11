@@ -6,10 +6,10 @@ weight = 135
 group = "Project"
 +++
 
-Certification for LPC, LPP, MPC and MGCP is a laboratory booking, and the bill arrives
-whether or not the device passes. What the laboratory runs is not a secret: each use case
-has a High-Level Test Specification listing its *abstract test cases* — an identifier, the
-requirements it covers, which actor is under test, and whether it is mandatory.
+Certification for LPC, LPP, MPC and MGCP is a paid laboratory booking. What the laboratory
+runs is published: each use case has a High-Level Test Specification listing its *abstract
+test cases* — an identifier, the requirements it covers, which actor is under test, and
+whether it is mandatory.
 
 This crate carries all 203 of them as data, **drives every one of them**, and prints what
 that adds up to.
@@ -56,8 +56,8 @@ MGCP  MonitoringAppliance     29/29  100%
       total                  189/203  93%
 ```
 
-**The fourteen that are missing are the whole point.** They are exactly the seven
-device-level test cases, counted once for LPC and once for LPP; a test holds the gap to that
+The fourteen missing are exactly the seven device-level test cases, counted once for LPC
+and once for LPP; a test holds the gap to that
 set, so the number moves neither by dropping a case nor by relabelling one. The Energy
 Guard's 62 % is the same arithmetic, not a shortfall: three of its eight cases are about a
 device rebooting. Each is listed with the reason:
@@ -72,13 +72,10 @@ Not covered here, and why (the same list for LPP):
   EGConnection_001     the test rebuilds the actor rather than rebooting a device
 ```
 
-A coverage number that quietly counted "we cannot test this" would be worth nothing. Each of
-these is a real obligation that lands on the integrator, and the list is that integrator's
-checklist **as data**: `conformance::device_level()` yields each case with its reason, so a
-harness that drives a real device — one that can cut its power and press its reset — can
-iterate exactly the cases the library left it, filtered by actor and by what the parameter
-sheet commits to. This crate's own suite derives its list from the same table and asserts
-the two agree, so the checklist cannot drift from the number.
+Each is an obligation on the integrator. `conformance::device_level()` yields them with
+their reasons, so a harness that drives a real device — one that can cut its power and press
+its reset — can iterate exactly those cases, filtered by actor and by what the parameter
+sheet commits to. The suite asserts the list matches the number.
 
 ```rust
 use eebus::conformance;
@@ -101,11 +98,9 @@ defect: anything where the two sides agree on a convention the *specification* l
 device. Identifiers are the sharp edge. `limitId`, the failsafe `keyId`s, MGCP's curtailment
 key and a car's per-phase limits are all placeholders — `<l1#(1..1)>`, `<k1#(1..1)>`,
 `<x1>`…`<x3>` — and a client that assumes its own numbering writes a well-formed message to
-a real entry of the peer's and is acknowledged. Four such defects were found by reading the
-tables rather than by running anything, and every abstract test case still passed while they
-were there.
+a real entry of the peer's and is acknowledged — and every abstract test case still passes.
 
-Two things guard against it now. `tests/interop.rs` runs against a live `eebus-go` peer, and
+Two suites cover it. `tests/interop.rs` runs against a live `eebus-go` peer, and
 `tests/foreign_identifiers.rs` builds a Controllable System by hand that numbers everything
 differently — its limit on `7`, its failsafe keys on `5` and `6`, and both directions on one
 `LoadControl` feature so that `limitId` 1 is the *production* limit an LPC guard must not
@@ -164,6 +159,6 @@ the `NT_` test cases in those two specifications.
 
 ## What this does not claim
 
-That a passing test here would pass there. Only that the rules are the ones the laboratory
-will check, under the same names — and that what is *not* checked is written down rather
-than discovered on the day.
+A passing test here does not mean a pass in the laboratory — only that the rules are the
+ones the laboratory checks, under the same names, and that what is *not* checked is written
+down.

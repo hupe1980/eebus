@@ -33,10 +33,8 @@ const POW10_OVERFLOWS_AT: u32 = 309;
 impl ScaledNumber {
     /// A scaled number with both elements set.
     ///
-    /// The SPINE implementation guide §3.2.1 makes `scale` mandatory on the wire — an
-    /// erratum to the Resource Specification, which used to let it default to zero and
-    /// which "severe misinterpretations" in the field made untenable. Constructing
-    /// values through this function keeps messages on the right side of that rule.
+    /// SPINE IG §3.2.1 makes `scale` mandatory on the wire; this constructor always sets
+    /// it.
     ///
     /// ```
     /// use eebus::model::ScaledNumber;

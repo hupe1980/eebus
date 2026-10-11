@@ -5,12 +5,9 @@
 //! no leading zero on the major. The same rule applies to the versions in detailed
 //! discovery and in use-case discovery.
 //!
-//! The strictness is not pedantry. A peer that sends `TS1.3.0` or `0.3.0` is a peer whose
-//! header parser this implementation cannot make assumptions about, and the certification
-//! test `TC_SPINE_COMP_006` asks a device either to refuse such a datagram outright or —
-//! tolerated for now, with a warning — to answer it anyway. This module refuses, which is
-//! what the test calls the recommended behaviour, while tolerating the one deviation the
-//! same test permits: a leading `v` or `V`.
+//! `TC_SPINE_COMP_006` lets a device refuse a version such as `TS1.3.0` or `0.3.0` (the
+//! recommended behaviour) or, with a warning, answer it; this module refuses, tolerating
+//! only the deviation the same test permits: a leading `v` or `V`.
 //!
 //! ```
 //! use eebus::spine::SpecVersion;

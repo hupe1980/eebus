@@ -106,9 +106,8 @@ state.overrun();               // Active | Running | Inactive
 state.overrun_just_finished(); // the one-shot, not stored
 ```
 
-It matters defensively too: a tank drawing power while the mode says `off` is not a fault,
-it is somebody pressing the button, and reporting it as an anomaly is how a manager loses a
-user's trust.
+It matters defensively too: a tank drawing power while the mode says `off` is somebody
+pressing the button, not a fault to report.
 
 ### And whether it worked
 
@@ -318,24 +317,21 @@ if read.is_available() {
 }
 ```
 
-**The start time is a span, not an instant**, and that is the schema's doing rather than a
-simplification. `SmartEnergyManagementPs` *restricts* `schedule.startTime` to `xs:duration`
-where the generic `PowerSequences` feature it derives from allows the
-`AbsoluteOrRelativeTimeType` union — so `Duration::ZERO` is "now" and two hours is "in two
-hours", and a wall-clock instant cannot be expressed here at all. Which is the right answer
-for a compressor that may have no clock to read one against.
-
-It is an easy thing to get wrong from the outside, so the compressor side refuses rather
-than stores: a `startTime` that is not a duration comes back `UnreadableStartTime`, because
-a compressor that accepted `2026-09-04T13:00:00Z` would announce itself `scheduled` for a
-time neither side could act on.
+**The start time is a span, not an instant**: `Duration::ZERO` is "now" and two hours is
+"in two hours", and the compressor side refuses any other `startTime` as
+`UnreadableStartTime` rather than announcing itself `scheduled` for a time neither side
+could act on. See
+[Where a use case is narrower than the schema](@/docs/wire-format.md#where-a-use-case-is-narrower-than-the-schema-the-use-case-wins).
 
 One function on one `SmartEnergyManagementPs` feature, and what a payload *means* is which
-of four phases the compressor is in: an offer, a process, an ending, or nothing at all. Two
+of four phases the compressor is in: an offer (`inactive`, no schedule), a process
+(`scheduled`, `running` or `paused`), an ending (`completed` or `invalid`), or nothing (no
+`alternatives`). Two
 things it tells a planner that nothing else does — [OHPCF-008], the least time the
 compressor must run once started, and [OHPCF-009], the least time it must rest before
 starting again.
 
 The compressor refuses what the specification does not allow — a pause on something that is
-not running, a stop it never announced as stoppable — before acknowledging it. [OHPCF-011/7]
+not running, a stop it never announced as stoppable — before acknowledging it, as LPC's
+Controllable System does. [OHPCF-011/7]
 guarantees it always announces at least one way out, so `Interrupt` has no empty case.

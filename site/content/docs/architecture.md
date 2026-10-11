@@ -14,7 +14,7 @@ flowchart LR
   model["model<br><small>830 generated types</small>"]
   ship["ship<br><small>framing · handshake · trust</small>"]
   spine["spine<br><small>device model · engine · RFE</small>"]
-  uc["usecases<br><small>14, both actors</small>"]
+  uc["usecases<br><small>28, both actors</small>"]
   rt["runtime<br><small>sockets and clock</small>"]
 
   codec --> model --> ship --> spine --> uc
@@ -46,12 +46,11 @@ handshake.poll_timeout();                 engine.poll_timeout();
 handshake.poll_event();                   engine.poll_event();
 ```
 
-Time is a parameter. That is the whole trick, and it buys three things:
+Time is a parameter, and that buys three things:
 
 **Every timeout in the standard is an ordinary unit test.** The two-minute hello
 prolongation, SHIP's PIN penalty, the SPINE ten-second response deadline, LPC's two-hour
-failsafe — each is a few lines against a virtual clock, running in microseconds. Testing a
-two-hour timeout by waiting two hours is not testing it.
+failsafe — each is a few lines against a virtual clock, running in microseconds.
 
 **The same code runs anywhere.** Under Tokio, inside a simulator, on a microcontroller
 with a bare TCP stack, or in a fuzz target that feeds it bytes with no I/O at all.

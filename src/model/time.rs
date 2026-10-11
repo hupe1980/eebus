@@ -975,8 +975,7 @@ mod tests {
             Some(TimeValue::Relative(Duration::from_secs(30)))
         );
 
-        // The bug this closes: a value that says it is absolute and cannot be read is
-        // now distinguishable from one that is a duration.
+        // A value that says it is absolute and cannot be read is still not a duration.
         let broken = AbsoluteOrRelativeTime::from("2026-09-05 08:15:00");
         assert!(broken.is_absolute(), "the peer meant a timestamp");
         assert_eq!(broken.as_timestamp(), None, "and this crate cannot read it");

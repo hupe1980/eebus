@@ -1295,9 +1295,8 @@ mod tests {
 
     /// The set that belongs to another quantity is not read as a charging band.
     ///
-    /// A car that publishes a power parameter alongside its per-phase currents used to
-    /// have whichever set came first taken as the band, so a manager could clamp amperes
-    /// into a range in watts — and then write a "curtailment" of 11 000 A.
+    /// A car may publish a power parameter alongside its per-phase currents; only the
+    /// current set is the band, or a manager would clamp amperes into a range in watts.
     #[test]
     fn a_permitted_set_for_another_parameter_is_not_the_charging_band() {
         let mut parameters = ParameterIds::new();

@@ -36,9 +36,7 @@
 //! * **…or nobody is asked at all.** With `--pairing`, a control unit that proves it
 //!   knows this device's printed secret is trusted on the strength of its certificate
 //!   fingerprint, which is the whole point of the Pairing Service.
-//! * **Identity and trust survive a restart.** A device that came back with a new SKI
-//!   would have to be paired again by hand every time, which is why SHIP §12.1.1 asks for
-//!   the opposite.
+//! * **Identity and trust persist across restarts** (SHIP §12.1.1).
 //! * **The tester hooks are printed on every change** — the `lpc:` signals a certification
 //!   laboratory reads, which is the only way to watch a timed transition go by.
 

@@ -30,10 +30,9 @@
 //! end instead:
 //!
 //! * The fallback is **bounded**. [`Resolution::Probe`] runs exactly one ping round;
-//!   [`Resolution::CloseAfterProbe`] then decides, whatever came back. The earlier shape
-//!   pinged again whenever every connection answered, which against a peer that had
-//!   stopped arbitrating — crashed, or reading the rule the way `ship-go` does — never
-//!   terminated.
+//!   [`Resolution::CloseAfterProbe`] then decides, whatever came back, so it terminates
+//!   against a peer that has stopped arbitrating — crashed, or reading the rule the way
+//!   `ship-go` does.
 //! * Losing every connection is recoverable rather than fatal:
 //!   [`runtime::Hub`](crate::runtime::Hub) redials a remembered peer, so starvation costs
 //!   a reconnection rather than the relationship.
@@ -210,10 +209,8 @@ mod tests {
 
     /// The fallback runs one ping round and then decides, whatever came back.
     ///
-    /// This is the case that used to livelock. Against a peer that has stopped
-    /// arbitrating — crashed, or applying `ship-go`'s rule instead — every connection
-    /// answers every ping, and a node that answered "all alive" with another ping would
-    /// hold the duplicate for as long as the peer stayed up.
+    /// Against a peer that has stopped arbitrating — crashed, or applying `ship-go`'s rule
+    /// instead — every connection answers every ping, so another round would never end.
     #[test]
     fn the_fallback_terminates_even_when_every_connection_answers() {
         let opened = vec![Duration::from_secs(1), Duration::from_secs(5)];

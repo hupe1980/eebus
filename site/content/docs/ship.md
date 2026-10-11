@@ -8,7 +8,7 @@ group = "Protocol"
 
 SHIP — *Smart Home IP* — gets two devices from "on the same LAN" to "exchanging SPINE
 datagrams". It covers discovery, transport security, trust establishment and framing, and
-it is where most interoperability failures actually happen.
+it is where most interoperability failures happen.
 
 ## Finding a peer
 
@@ -33,15 +33,13 @@ address yourself.
 There is no username, no central authority and no PKI. A node holds a self-signed ECDSA
 P-256 certificate, and its name is the **Subject Key Identifier** — twenty bytes derived
 from the public key, written as forty hex characters. Two devices are paired when each has
-recorded the other's SKI. Everything else follows from that.
-
-The consequences are worth stating plainly, because they are unusual:
+recorded the other's SKI.
 
 * Trust is per-node and symmetric. There is nobody to revoke it centrally.
 * A certificate cannot be replaced casually — replacing it changes the node's name. SHIP
   §12.1.3 defines a rotation procedure with an `updateCounter` for exactly this reason.
-* **Session resumption is off.** §9.6 makes it a SHOULD, but a resumed session skips the
-  certificate exchange, and the certificate is what identifies the peer.
+* TLS session resumption is off, because it skips the certificate exchange — see
+  [Security](@/docs/security.md#tls-1-2-mutual-no-resumption).
 
 ## TLS 1.2, and only 1.2
 
@@ -49,8 +47,7 @@ SHIP §9 says TLS 1.3 "is not considered in this version", so the crate offers 1
 mutual authentication and the cipher suites §9.1 mandates. A peer offering only CBC suites
 will not connect.
 
-The `cert` feature generates conforming node certificates. One detail is easy to miss and
-fatal: `rcgen` writes the Subject Key Identifier extension only for certificate
+The `cert` feature generates conforming node certificates. `rcgen` writes the Subject Key Identifier extension only for certificate
 authorities, and a SHIP node certificate is a leaf. Without the extension written by hand
 the field §12.2 expects is simply absent, and a peer cannot identify the node at all.
 
@@ -60,16 +57,9 @@ Once the WebSocket is up, five phases run before any SPINE datagram may cross (�
 
 1. **`init`** — a single byte in each direction.
 2. **`hello`** — each side declares whether it is `ready`, `pending` or `aborted`, with a
-   waiting time. Trust is settled here: an untrusted peer stays `pending` while the user is
-   asked, and the wait is prolonged for as long as the decision takes. `T_hello_init` is
-   two minutes and a person takes longer, so the prolongation is what carries a
-   commissioning through: the `pending` node asks, and granting a request restarts the
-   granter's own Wait-For-Ready-Timer (§13.4.4.1.3). It is not unbounded — a Wait-For-Ready
-   timer that expires aborts, whichever phase the node is in — but once the peer has
-   announced `ready` the pending node retires its own timer and keeps the connection up by
-   asking, which is what gives a person as long as the peer will allow. On a network the
-   `Hub` reports the waiting peer as `TrustRequested`, and `approve` or `refuse` answers it
-   in place — [Pairing](@/docs/networking.md#pairing).
+   waiting time. An untrusted peer stays `pending`; the pending node sends prolongation
+   requests, and each grant restarts the granter's Wait-For-Ready timer (§13.4.4.1.3). The
+   `Hub` reports it as `TrustRequested` — [Pairing](@/docs/networking.md#pairing).
 3. **`protocolHandshake`** — agree the SHIP version and the message format. JSON-UTF8 in
    practice; the specification allows others. §13.4.4.2.2 requires support for every version
    from 1.0 up to a node's own maximum, so two peers settle on the lower. `Node::handshake_config`
@@ -157,21 +147,14 @@ where one should. SHIP §12.2.3 resolves it deterministically: the node with the
 SKI** keeps the **most recent** connection and drops the older; the node with the smaller
 SKI waits three seconds and then pings to confirm which survived.
 
-Both halves are implemented, and the rule has a flaw worth knowing about. **"The most
-recent connection" is a local judgement** — each node decides it from its own clock, about
-two events milliseconds apart on two machines, and nothing makes the two agree.
-`enbility`'s [2025 analysis of SHIP](https://enbility.net/blog/20250704-analysis-documents/)
-shows this can end with both connections closed and none left; `ship-go` deviates
-deliberately, keeping the *initiator's* connection, which both ends judge identically.
-
-This crate follows §12.2.3 — a laboratory tests the specification, not a reference
-implementation — and bounds the hazard instead: the smaller-SKI side runs exactly one ping
-round and then decides, and a lost connection is redialled. Interoperating with `ship-go`
-needs no compatibility switch: whichever rule the far end applies, one side closes something
-and the other's bounded fallback settles the rest. See
-[Conformance](@/docs/conformance.md).
+Each node judges "most recent" by its own clock, so both can close and leave none
+([enbility, 2025](https://enbility.net/blog/20250704-analysis-documents/)); `ship-go` keeps
+the *initiator's* connection instead. This crate follows §12.2.3 and bounds the hazard: one
+ping round, then a decision, then a redial. That also interoperates with `ship-go` without a
+compatibility switch.
 
 ## Framing
 
-SHIP messages are length-prefixed binary frames with a one-byte type. The framing layer is
+Each SHIP message is one binary WebSocket message whose first byte names its type
+(§13.4.3); text frames are refused with 1003 (§10.3). The framing layer is
 one of the five fuzz targets, because it is the first thing an attacker on the LAN reaches.

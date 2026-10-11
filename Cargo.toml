@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -25,10 +25,8 @@ std = ["serde/std", "serde_json/std", "thiserror/std"]
 # The SHIP Pairing Service: automated trust establishment from a QR-code secret, in both
 # roles. With `runtime` and `mdns` it also turns on the hub's end of it.
 pairing = ["dep:hmac", "dep:sha2"]
-# The four High-Level Test Specifications as data: 203 abstract test cases with their
-# descriptions and requirements. A few tens of kilobytes of static strings that a device
-# in the field never reads, so a firmware build leaves it out — `--no-default-features`
-# already does. Certification work, and `tests/conformance.rs`, need it.
+# The 203 HLTS abstract test cases as data (tens of KB). Needed by `tests/conformance.rs`;
+# firmware builds omit it.
 conformance = []
 # Cross-implementation tests against a containerised `eebus-go` peer. Off by default and
 # behind `required-features` on the test target: an ordinary `cargo test` stays hermetic,
@@ -76,7 +74,7 @@ mdns-sd = { version = "0.21", default-features = false, optional = true }
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
 
 # The cross-implementation suite. `required-features` is what keeps it out of an
 # ordinary `cargo test`; it is not part of `full`, because "everything" should not mean
