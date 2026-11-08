@@ -4,13 +4,55 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.10.1] — unreleased
+## [0.11.0] — unreleased
+
+### Added
+
+- **`Identity::from_pem` and `Identity::from_der` restore a stored identity** (#5, reported
+  by `defigli`). Until now an `Identity` could only be made by signing a certificate, so a
+  device that stored its key and came back from a restart signed a *new* one. The SKI
+  survived that, because it follows the key. The fingerprint did not, because it follows
+  the certificate, and the fingerprint is what the Pairing Service trusts (SHIP §10.2) and
+  what the QR code prints as `FPH256`. Each restart made the device's own label wrong, and a
+  unit that restarted between being paired and its first connection was refused. A
+  restored identity now presents the stored certificate byte for byte.
+
+  A restore refuses a pair that does not belong together, each with its own `CertError`: a
+  key from another device (`KeyMismatch`), a certificate or key not on secp256r1
+  (`WrongCurve`), a certificate whose Subject Key Identifier is not the SHA-1 of its key
+  (`SkiMismatch`, the RFC 7093 truncated SHA-256 that common tooling writes), and text that
+  holds no PKCS#8 key (`NoPrivateKey`, `InvalidKey`). Each of those used to load and fail
+  later, as a handshake nobody could complete or as a node whose announced SKI was not the
+  one peers read from its certificate. An expired certificate restores; SHIP has no
+  certificate authority to judge it.
 
 ### Changed
+
+- **Restart by restoring, not by re-issuing.** The documentation of `cert::self_signed`
+  told a device to call `self_signed_with` on every start after the first. That is the
+  defect above, and it now says to store `certificate_pem` and `key_pem` and restore them.
+  `self_signed_with` is documented as a deliberate re-issue that changes the fingerprint.
+  The simulators keep `identity.cert.pem` beside `identity.key.pem`. A state directory
+  holding only the key, as earlier versions wrote it, keeps its SKI and is issued a
+  certificate once.
+
+  **Breaking.** `CertError` is `#[non_exhaustive]` and has four new variants, so a `match`
+  on it needs a wildcard arm. Two behaviour changes compile unchanged:
+
+  | | 0.10 | 0.11 |
+  |---|---|---|
+  | `match` on `CertError` | exhaustive | needs `_ =>` |
+  | ⚠️ silent: `key_from_der`, `key_from_pem` on a key that does not parse | `CertError::Generate(_)` | `CertError::InvalidKey(_)` |
+  | ⚠️ silent: `key_from_pem` on a block not labelled `PRIVATE KEY` | parsed if the bytes happened to parse | `CertError::NoPrivateKey` |
+  | restarting a stored identity | `self_signed_with(params, key_from_pem(&key)?)` | `Identity::from_pem(&certificate, &key)` |
+
+  `hems` builds `eebus` without the `cert` feature, so none of this reaches it.
 
 - **Regenerating the model:** `cargo xtask codegen` and `cargo xtask fixtures` read the
   specifications from `$EEBUS_REFERENCE`, with the SPINE bundle under `spine/` and the SHIP
   bundle under `ship/`. Contributor tooling only; the crate is unchanged.
+
+## [0.10.1] — 2026-10-11
 
 ### Fixed
 

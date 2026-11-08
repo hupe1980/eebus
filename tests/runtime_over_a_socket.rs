@@ -34,10 +34,14 @@ fn node(ship_id: &str, trust: TrustStore) -> Node {
 /// run, without anybody doing anything unusual.
 fn twins(ship_id: &str, trust: TrustStore) -> (Node, Node) {
     let identity = cert::self_signed(CertParams::new(ship_id)).expect("a certificate");
-    let key = cert::key_from_pem(&identity.key_pem()).expect("its own key back");
-    let again =
-        cert::self_signed_with(CertParams::new(ship_id), key).expect("the same key, issued again");
-    assert_eq!(identity.ski, again.ski, "the same key is the same SKI");
+    let again = cert::Identity::from_pem(&identity.certificate_pem(), &identity.key_pem())
+        .expect("the same identity, restored");
+    assert_eq!(identity.ski, again.ski, "the same node has the same SKI");
+    assert_eq!(
+        identity.fingerprint(),
+        again.fingerprint(),
+        "and the same certificate"
+    );
     (
         Node::new(ship_id, ShipTls::new(identity), trust.clone()),
         Node::new(ship_id, ShipTls::new(again), trust),
@@ -1301,6 +1305,66 @@ async fn a_unit_paired_by_certificate_is_let_through_without_its_ski() {
     // — routing, the redial schedule, what a user is shown — can name the unit.
     assert_eq!(manager_trust.unit().unwrap().ski, Some(unit_ski));
     assert!(manager_trust.is_trusted(&unit_ski));
+}
+
+/// A unit paired by certificate that restarts **before** its first connection still gets
+/// in, because it comes back with the certificate it was paired with, not a re-issue.
+///
+/// This is the window issue #5 opens. Once a paired unit has connected, the store records
+/// its SKI (§10.2's note) and admits it by that from then on, so a re-issue goes unnoticed
+/// between two `eebus` nodes. Before that first connection the fingerprint is all the
+/// manager has, and a unit that re-issued its certificate on restart would stay pending.
+#[tokio::test]
+async fn a_unit_paired_by_certificate_survives_a_restart_before_it_first_connects() {
+    use eebus::cert::Identity;
+    use eebus::runtime::PairedUnit;
+
+    let unit_id = "i:983327_u:ControlUnit-1";
+    let manager_trust = TrustStore::new();
+    let manager = node("i:46925_u:HeatPump-1", manager_trust.clone());
+
+    // The unit's identity, as it was when the pairing request named its fingerprint.
+    let paired = cert::self_signed(CertParams::new(unit_id)).expect("a certificate");
+    manager_trust.trust_unit(PairedUnit::new(unit_id, paired.fingerprint(), "secp256r1"));
+    assert!(
+        !manager_trust.is_trusted(&paired.ski),
+        "no SKI is known yet"
+    );
+
+    // It powers off with its identity on disk…
+    let (certificate_pem, key_pem) = (paired.certificate_pem(), paired.key_pem());
+    let paired_fingerprint = paired.fingerprint();
+
+    // …and the negative control: re-issuing from the stored key, as the crate used to
+    // advise, would come back as a certificate the manager has never been told about.
+    // (A pending handshake would only end in a timeout, so this is asserted on the store.)
+    let reissued = cert::self_signed_with(
+        CertParams::new(unit_id),
+        cert::key_from_pem(&key_pem).expect("the stored key"),
+    )
+    .expect("a re-issue");
+    assert!(!manager_trust.is_certificate_trusted(&reissued.fingerprint()));
+
+    // It restarts by restoring what it stored.
+    let restored = Identity::from_pem(&certificate_pem, &key_pem).expect("the stored identity");
+    let unit_trust = TrustStore::new();
+    unit_trust.trust(manager.ski());
+    let unit = Node::new(unit_id, ShipTls::new(restored), unit_trust);
+    assert_eq!(unit.fingerprint(), paired_fingerprint);
+
+    let listener = manager.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        manager.accept(stream).await.expect("the handshake")
+    });
+    let _client = unit.connect(address).await.expect("the handshake");
+    let served = server.await.unwrap();
+    assert_eq!(
+        served.peer_fingerprint(),
+        paired_fingerprint,
+        "the restored unit presents the certificate it was paired with"
+    );
 }
 
 /// §10.3: a node considers at most one control unit, and pairing a second revokes the

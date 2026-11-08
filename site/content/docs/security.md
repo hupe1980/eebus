@@ -100,6 +100,27 @@ reach. It returns how many peers were forgotten, and it deliberately does not re
 node's own certificate — §12.1.1 asks a factory reset to bring back the identity printed on
 the label, and only the device knows where that was stored.
 
+## Keeping an identity across restarts
+
+A node is known by two values, and they follow different things. The **SKI** follows the
+key: every certificate issued over the same key has the same one. The **fingerprint**
+follows the certificate: it is the SHA-256 of the whole thing, and it is what the SHIP
+Pairing Service trusts (§10.2) and what the installation QR code carries as `FPH256`.
+
+So a device stores both halves at first boot, `Identity::certificate_pem` and
+`Identity::key_pem`, and restores them on every start with `Identity::from_pem`. It does
+not issue a fresh certificate from the stored key. That would keep the SKI, but give the
+node a new fingerprint each time, and make the QR code on its label wrong.
+
+`Identity::from_pem` refuses a pair that does not belong together: a key from another
+device, a certificate or key on a curve other than secp256r1, or a certificate whose
+Subject Key Identifier was computed by a different method than SHIP's. Each of those would
+otherwise load and fail later, as a handshake no peer can complete or as a SKI that differs
+between what the node announces and what peers read from its certificate.
+
+Issuing a new certificate from the same key is a deliberate act, a longer validity or a
+corrected name, and peers are told through the procedure below.
+
 ## Rotating a certificate
 
 Replacing a certificate changes the node's name, so SHIP §12.1.3 defines a procedure rather

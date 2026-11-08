@@ -46,8 +46,21 @@ const OID_SUBJECT_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 14];
 /// DER tag for an `OCTET STRING`.
 const DER_OCTET_STRING: u8 = 0x04;
 
-/// Why a certificate could not be made or read.
+/// How PEM is written: the configuration `rcgen` uses, so a certificate's PEM is the same
+/// text whether it was just signed or restored.
+const PEM_ENCODING: pem::EncodeConfig =
+    pem::EncodeConfig::new().set_line_ending(if cfg!(target_family = "windows") {
+        pem::LineEnding::CRLF
+    } else {
+        pem::LineEnding::LF
+    });
+
+/// Why a certificate could not be made, read or restored.
+///
+/// No variant carries the bytes it was given: a refused private key must not end up in a
+/// log because its error was printed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CertError {
     /// The certificate could not be generated.
     #[error("generating the certificate failed: {0}")]
@@ -61,6 +74,20 @@ pub enum CertError {
     /// The PEM text held no certificate.
     #[error("no certificate found in the PEM input")]
     NoCertificate,
+    /// The bytes were not a PKCS#8 private key.
+    #[error("the private key could not be parsed: {0}")]
+    InvalidKey(String),
+    /// The PEM text held no `PRIVATE KEY` block. Only PKCS#8 is read — the form
+    /// [`Identity::key_pem`] writes — so a SEC1 `EC PRIVATE KEY` block lands here too.
+    #[error("no PKCS#8 private key (a `PRIVATE KEY` block) found in the PEM input")]
+    NoPrivateKey,
+    /// The private key is not the one the certificate was issued for.
+    #[error("the private key does not belong to the certificate")]
+    KeyMismatch,
+    /// The certificate's Subject Key Identifier is not the SHA-1 of its public key
+    /// (RFC 5280 §4.2.1.2 method 1), so peers would read a SKI this node does not have.
+    #[error("the certificate's subject key identifier is not the SHA-1 of its public key")]
+    SkiMismatch,
 }
 
 /// What a certificate is to say about the node it identifies.
@@ -118,7 +145,9 @@ impl CertParams {
 pub struct Identity {
     /// The SKI, which is this node's identity everywhere else in SHIP.
     pub ski: Ski,
-    certificate: rcgen::Certificate,
+    /// DER, exactly as issued: restoring an identity has to give back these bytes, and
+    /// `rcgen` can only make a certificate by signing a new one.
+    certificate: Vec<u8>,
     key: rcgen::KeyPair,
 }
 
@@ -131,20 +160,101 @@ impl core::fmt::Debug for Identity {
 }
 
 impl Identity {
+    /// Restores a stored identity: **the restart path**.
+    ///
+    /// Gives back the certificate exactly as it was stored, and its key, so the node
+    /// presents the same SKI *and* the same fingerprint as before it restarted. The
+    /// fingerprint matters as much as the SKI. It is what the Pairing Service trusts
+    /// (SHIP §10.2) and what the installation QR code carries as `FPH256`, so a device
+    /// that re-issued its certificate on every start would make its own label wrong.
+    ///
+    /// Reads the forms [`certificate_pem`](Self::certificate_pem) and
+    /// [`key_pem`](Self::key_pem) write. The first `CERTIFICATE` block and the first
+    /// `PRIVATE KEY` (PKCS#8) block are used.
+    ///
+    /// ```
+    /// use eebus::cert::{self, CertParams, Identity};
+    ///
+    /// // First boot: make an identity and store both halves.
+    /// let identity = cert::self_signed(CertParams::new("i:46925_u:HeatPump-1")).unwrap();
+    /// let (certificate, key) = (identity.certificate_pem(), identity.key_pem());
+    ///
+    /// // Every boot after that: restore them.
+    /// let restored = Identity::from_pem(&certificate, &key).unwrap();
+    /// assert_eq!(restored.ski, identity.ski);
+    /// assert_eq!(restored.fingerprint(), identity.fingerprint());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Refuses, in this order: text that holds no certificate ([`CertError::Parse`],
+    /// [`CertError::NoCertificate`]) or no PKCS#8 key ([`CertError::NoPrivateKey`],
+    /// [`CertError::InvalidKey`]); a key or certificate that is not on secp256r1
+    /// ([`CertError::WrongCurve`], SHIP §9.3); a key that is not the certificate's
+    /// ([`CertError::KeyMismatch`]); and a certificate whose Subject Key Identifier is not
+    /// the SHA-1 of its key ([`CertError::SkiMismatch`]). It never panics, and no error
+    /// carries the input.
+    pub fn from_pem(certificate_pem: &str, key_pem: &str) -> Result<Identity, CertError> {
+        let certificate =
+            first_block(certificate_pem, "CERTIFICATE")?.ok_or(CertError::NoCertificate)?;
+        let key = first_block(key_pem, "PRIVATE KEY")?.ok_or(CertError::NoPrivateKey)?;
+        Self::from_der(certificate.contents(), key.contents())
+    }
+
+    /// Restores a stored identity from the DER forms
+    /// [`certificate_der`](Self::certificate_der) and [`key_der`](Self::key_der) wrote.
+    ///
+    /// Everything [`from_pem`](Self::from_pem) says applies; this is the same restore
+    /// without the PEM wrapping.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_pem`](Self::from_pem), except that there is no PEM to be missing a block.
+    pub fn from_der(certificate_der: &[u8], key_der: &[u8]) -> Result<Identity, CertError> {
+        use x509_parser::prelude::*;
+
+        let (_, certificate) = X509Certificate::from_der(certificate_der)
+            .map_err(|e| CertError::Parse(format!("{e}")))?;
+        let key = key_from_der(key_der)?;
+        if !is_ship_curve(&certificate) {
+            return Err(CertError::WrongCurve);
+        }
+        // The same public-key bits the SKI is computed from on both sides, so a match here
+        // is "the key's SKI is the certificate's SKI".
+        let public_key = &certificate.public_key().subject_public_key.data;
+        if public_key.as_ref() != rcgen::PublicKeyData::der_bytes(&key) {
+            return Err(CertError::KeyMismatch);
+        }
+        let ski = ski_from_public_key(&key);
+        // Of any length: one peer reading a 20-byte identifier and another falling back to
+        // the digest would each see a different node.
+        if ski_extension(&certificate).is_some_and(|id| id != ski.as_bytes()) {
+            return Err(CertError::SkiMismatch);
+        }
+        Ok(Identity {
+            ski,
+            certificate: certificate_der.to_vec(),
+            key,
+        })
+    }
+
     /// The certificate in DER form, which is what TLS sends.
     pub fn certificate_der(&self) -> &[u8] {
-        self.certificate.der()
+        &self.certificate
     }
 
     /// The SHA-256 fingerprint of the certificate: what the Pairing Service trusts, and
     /// what goes into the QR code as `FPH256`.
     pub fn fingerprint(&self) -> Fingerprint {
-        Fingerprint::of_der(self.certificate.der())
+        Fingerprint::of_der(&self.certificate)
     }
 
     /// The certificate in PEM form, for storing on disk.
     pub fn certificate_pem(&self) -> String {
-        self.certificate.pem()
+        pem::encode_config(
+            &pem::Pem::new("CERTIFICATE", self.certificate.clone()),
+            PEM_ENCODING,
+        )
     }
 
     /// The private key in PKCS#8 DER form.
@@ -166,24 +276,32 @@ impl Identity {
 /// The result satisfies everything SHIP asks of a node certificate: secp256r1, a SHA-1
 /// Subject Key Identifier, and the SHIP ID as the common name.
 ///
-/// # A device needs [`self_signed_with`] more than this
+/// # Call this once, at first boot
 ///
 /// A node's SKI is derived from its public key, so generating a *fresh* key generates a
 /// new identity: every peer that had approved the old one no longer recognises the
 /// device, and an installer has to walk the building comparing forty hex digits again.
-/// [`self_signed_with`] re-issues from a key that already exists, which is what keeps a
-/// SKI stable across a restart and across a certificate renewal. Use this one once, at
-/// first boot; use that one every time after.
+///
+/// So a device calls this once, stores [`Identity::certificate_pem`] and
+/// [`Identity::key_pem`], and on every later start restores both with
+/// [`Identity::from_pem`]. That keeps the SKI *and* the certificate's fingerprint, which
+/// the Pairing Service trusts and the QR code prints. [`self_signed_with`] keeps only the
+/// SKI, and is for a deliberate re-issue.
 pub fn self_signed(params: CertParams) -> Result<Identity, CertError> {
     let key = rcgen::KeyPair::generate_for(ALGORITHM)?;
     self_signed_with(params, key)
 }
 
-/// Generates a self-signed certificate from an existing key.
+/// Re-issues a self-signed certificate from an existing key.
 ///
-/// Use this to re-issue a certificate — a longer validity, a corrected common name —
-/// without changing the node's identity: the SKI follows the key, so a re-issue from the
-/// same key keeps every trust relationship the node has established.
+/// Use this to change a certificate on purpose — a longer validity, a corrected common
+/// name. The SKI follows the key, so peers that trusted the SKI keep trusting the node.
+///
+/// **The fingerprint does not survive a re-issue.** It is the hash of the certificate,
+/// so a re-issue is a new one, and a peer that trusted the old fingerprint through the
+/// Pairing Service (SHIP §10.2) no longer recognises the node until SHIP §12.1.3's
+/// certificate update reaches it. Restarting is not a re-issue: restore the stored
+/// certificate with [`Identity::from_pem`] instead.
 pub fn self_signed_with(params: CertParams, key: rcgen::KeyPair) -> Result<Identity, CertError> {
     use rcgen::{
         CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod,
@@ -223,7 +341,7 @@ pub fn self_signed_with(params: CertParams, key: rcgen::KeyPair) -> Result<Ident
     let certificate = certificate.self_signed(&key)?;
     Ok(Identity {
         ski,
-        certificate,
+        certificate: certificate.der().to_vec(),
         key,
     })
 }
@@ -251,12 +369,27 @@ fn subject_key_identifier_extension(ski: &Ski) -> rcgen::CustomExtension {
 /// Pair it with [`self_signed_with`] to re-issue a certificate without changing the
 /// node's identity.
 pub fn key_from_der(der: &[u8]) -> Result<rcgen::KeyPair, CertError> {
-    on_ship_curve(rcgen::KeyPair::try_from(der).map_err(CertError::Generate)?)
+    let key = rcgen::KeyPair::try_from(der).map_err(|e| CertError::InvalidKey(e.to_string()))?;
+    on_ship_curve(key)
 }
 
 /// Reads a private key back from the PKCS#8 PEM [`Identity::key_pem`] produced.
+///
+/// The first block labelled `PRIVATE KEY` is used, and any other block is skipped, so a
+/// file that also carries parameters or a certificate still reads. A SEC1
+/// `EC PRIVATE KEY` block is not read: [`CertError::NoPrivateKey`].
 pub fn key_from_pem(pem: &str) -> Result<rcgen::KeyPair, CertError> {
-    on_ship_curve(rcgen::KeyPair::from_pem(pem).map_err(CertError::Generate)?)
+    key_from_der(
+        first_block(pem, "PRIVATE KEY")?
+            .ok_or(CertError::NoPrivateKey)?
+            .contents(),
+    )
+}
+
+/// The first PEM block with this label, if the text is PEM at all.
+fn first_block(text: &str, label: &str) -> Result<Option<pem::Pem>, CertError> {
+    let blocks = pem::parse_many(text).map_err(|e| CertError::Parse(e.to_string()))?;
+    Ok(blocks.into_iter().find(|block| block.tag() == label))
 }
 
 /// Refuses a key that is not on secp256r1.
@@ -287,15 +420,28 @@ pub fn ski_from_der(der: &[u8]) -> Result<Ski, CertError> {
     let (_, certificate) =
         X509Certificate::from_der(der).map_err(|e| CertError::Parse(format!("{e}")))?;
 
-    if let Ok(Some(extension)) =
-        certificate.get_extension_unique(&oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
-        && let ParsedExtension::SubjectKeyIdentifier(id) = extension.parsed_extension()
-        && let Ok(bytes) = <[u8; Ski::LEN]>::try_from(id.0)
+    if let Some(id) = ski_extension(&certificate)
+        && let Ok(bytes) = <[u8; Ski::LEN]>::try_from(id)
     {
         return Ok(Ski::from_bytes(bytes));
     }
 
     Ok(ski_of(&certificate.public_key().subject_public_key.data))
+}
+
+/// The value of a certificate's Subject Key Identifier extension, of whatever length.
+fn ski_extension<'a>(
+    certificate: &'a x509_parser::certificate::X509Certificate<'_>,
+) -> Option<&'a [u8]> {
+    use x509_parser::extensions::ParsedExtension;
+
+    let extension = certificate
+        .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+        .ok()??;
+    match extension.parsed_extension() {
+        ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0),
+        _ => None,
+    }
 }
 
 /// Reads the first certificate out of PEM text and returns its DER.
@@ -317,10 +463,19 @@ pub fn uses_ship_curve(der: &[u8]) -> Result<(), CertError> {
 
     let (_, certificate) =
         X509Certificate::from_der(der).map_err(|e| CertError::Parse(format!("{e}")))?;
-    match certificate.public_key().parsed() {
-        Ok(x509_parser::public_key::PublicKey::EC(point)) if point.key_size() == 256 => Ok(()),
-        _ => Err(CertError::WrongCurve),
+    if is_ship_curve(&certificate) {
+        Ok(())
+    } else {
+        Err(CertError::WrongCurve)
     }
+}
+
+/// Whether a parsed certificate's key is on secp256r1.
+fn is_ship_curve(certificate: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    matches!(
+        certificate.public_key().parsed(),
+        Ok(x509_parser::public_key::PublicKey::EC(point)) if point.key_size() == 256
+    )
 }
 
 /// SHA-1 of a public key's bits.
@@ -370,7 +525,7 @@ mod tests {
         );
 
         let extension = certificate
-            .get_extension_unique(&oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+            .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
             .unwrap()
             .expect("SHIP 12.2: the extension is present");
         let ParsedExtension::SubjectKeyIdentifier(id) = extension.parsed_extension() else {
@@ -411,6 +566,238 @@ mod tests {
         let identity = self_signed(CertParams::new("i:46925_u:Device")).unwrap();
         let key = key_from_pem(&identity.key_pem()).unwrap();
         assert_eq!(ski_from_public_key(&key), identity.ski);
+    }
+
+    // ---- restoring a stored identity (issue #5) ----------------------------------------
+
+    /// What a device that stored its identity at first boot gets back on every later
+    /// start: the same certificate, so the same fingerprint the Pairing Service trusts.
+    fn assert_same_identity(restored: &Identity, original: &Identity) {
+        assert_eq!(restored.ski, original.ski);
+        assert_eq!(restored.fingerprint(), original.fingerprint());
+        assert_eq!(restored.certificate_der(), original.certificate_der());
+        assert_eq!(restored.certificate_pem(), original.certificate_pem());
+        assert_eq!(restored.key_der(), original.key_der());
+    }
+
+    #[test]
+    fn restoring_from_pem_gives_back_the_same_certificate() {
+        let original = self_signed(CertParams::new("i:46925_u:HeatPump-1")).unwrap();
+        let restored =
+            Identity::from_pem(&original.certificate_pem(), &original.key_pem()).unwrap();
+        assert_same_identity(&restored, &original);
+    }
+
+    #[test]
+    fn restoring_from_der_gives_back_the_same_certificate() {
+        let original = self_signed(CertParams::new("i:46925_u:HeatPump-1")).unwrap();
+        let restored = Identity::from_der(original.certificate_der(), &original.key_der()).unwrap();
+        assert_same_identity(&restored, &original);
+    }
+
+    /// The defect issue #5 reports, as two lines: a re-issue keeps the SKI and moves the
+    /// fingerprint, and a restore keeps both.
+    #[test]
+    fn a_re_issue_changes_the_fingerprint_and_a_restore_does_not() {
+        let original = self_signed(CertParams::new("i:46925_u:HeatPump-1")).unwrap();
+
+        let reissued = self_signed_with(
+            CertParams::new("i:46925_u:HeatPump-1"),
+            key_from_pem(&original.key_pem()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reissued.ski, original.ski, "the SKI follows the key");
+        assert_ne!(
+            reissued.fingerprint(),
+            original.fingerprint(),
+            "the fingerprint follows the certificate"
+        );
+
+        let restored =
+            Identity::from_pem(&original.certificate_pem(), &original.key_pem()).unwrap();
+        assert_eq!(restored.fingerprint(), original.fingerprint());
+    }
+
+    /// A self-signed P-256 certificate over `key`, shaped by `shape`: the way another
+    /// tool would have made one, so the restore can be shown what it has to refuse.
+    fn foreign_certificate(
+        key: &rcgen::KeyPair,
+        shape: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(alloc::vec![]).unwrap();
+        shape(&mut params);
+        params.self_signed(key).unwrap().der().to_vec()
+    }
+
+    fn p256() -> rcgen::KeyPair {
+        rcgen::KeyPair::generate_for(ALGORITHM).unwrap()
+    }
+
+    fn p384() -> rcgen::KeyPair {
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap()
+    }
+
+    #[test]
+    fn a_key_from_another_identity_is_refused() {
+        let a = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        let b = self_signed(CertParams::new("i:46925_u:B")).unwrap();
+        assert!(matches!(
+            Identity::from_pem(&a.certificate_pem(), &b.key_pem()),
+            Err(CertError::KeyMismatch)
+        ));
+        assert!(matches!(
+            Identity::from_der(a.certificate_der(), &b.key_der()),
+            Err(CertError::KeyMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_certificate_on_another_curve_is_refused() {
+        let key = p384();
+        let certificate = foreign_certificate(&key, |_| {});
+        let ship_key = self_signed(CertParams::new("i:46925_u:A"))
+            .unwrap()
+            .key_der();
+        assert!(matches!(
+            Identity::from_der(&certificate, &ship_key),
+            Err(CertError::WrongCurve)
+        ));
+    }
+
+    #[test]
+    fn a_key_on_another_curve_is_refused() {
+        let identity = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        assert!(matches!(
+            Identity::from_der(identity.certificate_der(), &p384().serialize_der()),
+            Err(CertError::WrongCurve)
+        ));
+    }
+
+    /// Tooling that writes RFC 7093's truncated SHA-256 (or anything else) as the key
+    /// identifier makes a certificate peers would read a SKI out of that is not this
+    /// node's. It verifies as TLS, which is exactly why it has to be refused here.
+    #[test]
+    fn a_certificate_whose_ski_is_not_its_keys_is_refused() {
+        let key = p256();
+        let certificate = foreign_certificate(&key, |params| {
+            params.custom_extensions = alloc::vec![subject_key_identifier_extension(
+                &Ski::from_bytes([0xAA; Ski::LEN])
+            )];
+        });
+        assert!(matches!(
+            Identity::from_der(&certificate, &key.serialize_der()),
+            Err(CertError::SkiMismatch)
+        ));
+    }
+
+    #[test]
+    fn swapped_arguments_are_refused() {
+        let identity = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        assert!(matches!(
+            Identity::from_pem(&identity.key_pem(), &identity.certificate_pem()),
+            Err(CertError::NoCertificate)
+        ));
+        assert!(matches!(
+            Identity::from_pem(&identity.certificate_pem(), &identity.certificate_pem()),
+            Err(CertError::NoPrivateKey)
+        ));
+    }
+
+    #[test]
+    fn an_ec_private_key_block_is_refused() {
+        let identity = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        let sec1_labelled = identity.key_pem().replace("PRIVATE KEY", "EC PRIVATE KEY");
+        assert!(matches!(
+            Identity::from_pem(&identity.certificate_pem(), &sec1_labelled),
+            Err(CertError::NoPrivateKey)
+        ));
+        assert!(matches!(
+            key_from_pem(&sec1_labelled),
+            Err(CertError::NoPrivateKey)
+        ));
+    }
+
+    #[test]
+    fn garbage_is_refused() {
+        let identity = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        assert!(matches!(
+            Identity::from_der(b"not a certificate", &identity.key_der()),
+            Err(CertError::Parse(_))
+        ));
+        assert!(matches!(
+            Identity::from_der(identity.certificate_der(), b"not a key"),
+            Err(CertError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            Identity::from_pem("", &identity.key_pem()),
+            Err(CertError::NoCertificate)
+        ));
+        assert!(matches!(
+            key_from_der(b"not a key"),
+            Err(CertError::InvalidKey(_))
+        ));
+    }
+
+    /// A refused key must not reach a log by way of its error message.
+    #[test]
+    fn no_refusal_quotes_its_input() {
+        let a = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        let b = self_signed(CertParams::new("i:46925_u:B")).unwrap();
+        let key_pem = b.key_pem();
+        let secret = key_pem.lines().nth(1).unwrap();
+        let truncated = &key_pem[..key_pem.len() / 2];
+        let errors = [
+            Identity::from_pem(&a.certificate_pem(), &key_pem).unwrap_err(),
+            Identity::from_pem(&a.certificate_pem(), truncated).unwrap_err(),
+            Identity::from_pem(&key_pem, &key_pem).unwrap_err(),
+            Identity::from_der(a.certificate_der(), &b.key_der()[..20]).unwrap_err(),
+        ];
+        for error in errors {
+            let text = alloc::format!("{error} {error:?}");
+            for window in secret.as_bytes().windows(16) {
+                let window = core::str::from_utf8(window).unwrap();
+                assert!(!text.contains(window), "{text} quotes the key");
+            }
+        }
+    }
+
+    // ---- the edge cases a restore has to accept --------------------------------------
+
+    /// SHIP has no certificate authority and peers do not judge validity, so an expired
+    /// certificate is still this node's; renewing it is a re-issue, not a refusal to boot.
+    #[test]
+    fn an_expired_certificate_is_restored() {
+        let key = p256();
+        let certificate = foreign_certificate(&key, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        });
+        let restored = Identity::from_der(&certificate, &key.serialize_der()).unwrap();
+        assert_eq!(restored.certificate_der(), certificate);
+    }
+
+    /// §12.2 lets a peer compute the digest when the extension is missing, and what it
+    /// computes is the key's SKI, so there is nothing to disagree with.
+    #[test]
+    fn a_certificate_without_a_ski_extension_is_restored() {
+        let key = p256();
+        let certificate = foreign_certificate(&key, |_| {});
+        let restored = Identity::from_der(&certificate, &key.serialize_der()).unwrap();
+        assert_eq!(restored.ski, ski_from_public_key(&key));
+        assert_eq!(ski_from_der(&certificate).unwrap(), restored.ski);
+    }
+
+    #[test]
+    fn the_first_certificate_and_the_first_private_key_are_used() {
+        let ours = self_signed(CertParams::new("i:46925_u:A")).unwrap();
+        let other = self_signed(CertParams::new("i:46925_u:B")).unwrap();
+        let chain = alloc::format!("{}{}", ours.certificate_pem(), other.certificate_pem());
+        let key = alloc::format!(
+            "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n{}",
+            ours.key_pem()
+        );
+        let restored = Identity::from_pem(&chain, &key).unwrap();
+        assert_eq!(restored.fingerprint(), ours.fingerprint());
     }
 
     #[test]
