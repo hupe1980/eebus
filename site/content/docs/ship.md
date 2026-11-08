@@ -6,9 +6,8 @@ weight = 50
 group = "Protocol"
 +++
 
-SHIP — *Smart Home IP* — gets two devices from "on the same LAN" to "exchanging SPINE
-datagrams". It covers discovery, transport security, trust establishment and framing, and
-it is where most interoperability failures happen.
+SHIP — *Smart Home IP* — takes two devices from "on the same LAN" to "exchanging SPINE
+datagrams": discovery, transport security, trust establishment and framing.
 
 ## Finding a peer
 
@@ -23,21 +22,21 @@ register=false             whether it is inviting pairing
 ```
 
 `register` is **never** `true` in this crate: SHIP IG §2.3 forbids advertising open
-registration, and forbids an "auto accept" mode along with it. Pairing is a deliberate act.
+registration and an "auto accept" mode.
 
 With the `mdns` feature the crate both announces and browses; without it you supply the
 address yourself.
 
 ## Identity is the certificate
 
-There is no username, no central authority and no PKI. A node holds a self-signed ECDSA
-P-256 certificate, and its name is the **Subject Key Identifier** — twenty bytes derived
-from the public key, written as forty hex characters. Two devices are paired when each has
-recorded the other's SKI.
+There is no central authority and no PKI. A node holds a self-signed ECDSA P-256
+certificate, and its name is the **Subject Key Identifier** — twenty bytes derived from the
+public key, written as forty hex characters. Two devices are paired when each has recorded
+the other's SKI.
 
-* Trust is per-node and symmetric. There is nobody to revoke it centrally.
-* A certificate cannot be replaced casually — replacing it changes the node's name. SHIP
-  §12.1.3 defines a rotation procedure with an `updateCounter` for exactly this reason.
+* Trust is per-node and symmetric, with nobody to revoke it centrally.
+* Replacing the certificate changes the node's name, so SHIP §12.1.3 defines a rotation
+  procedure with an `updateCounter`.
 * TLS session resumption is off, because it skips the certificate exchange — see
   [Security](@/docs/security.md#tls-1-2-mutual-no-resumption).
 
@@ -47,9 +46,9 @@ SHIP §9 says TLS 1.3 "is not considered in this version", so the crate offers 1
 mutual authentication and the cipher suites §9.1 mandates. A peer offering only CBC suites
 will not connect.
 
-The `cert` feature generates conforming node certificates. `rcgen` writes the Subject Key Identifier extension only for certificate
-authorities, and a SHIP node certificate is a leaf. Without the extension written by hand
-the field §12.2 expects is simply absent, and a peer cannot identify the node at all.
+The `cert` feature generates conforming node certificates. `rcgen` writes the Subject Key
+Identifier extension only for certificate authorities, so the crate writes it by hand for
+the leaf a SHIP node uses; without it a peer cannot identify the node (§12.2).
 
 ## The handshake
 
@@ -64,12 +63,11 @@ Once the WebSocket is up, five phases run before any SPINE datagram may cross (�
    practice; the specification allows others. §13.4.4.2.2 requires support for every version
    from 1.0 up to a node's own maximum, so two peers settle on the lower. `Node::handshake_config`
    sets the ceiling — `ShipVersion::V1_0` pins a device to the certification minimum — and
-   `ShipConnection::ship_version`, `Hub::ship_version` and `HubEvent::Connected` report what
-   came of it. It matters: 1.0 has no `accessMethods.id`, so a 1.0 peer cannot be dialled back.
+   `ShipConnection::ship_version`, `Hub::ship_version` and `HubEvent::Connected` report the
+   result. 1.0 has no `accessMethods.id`, so a 1.0 peer cannot be dialled back.
 4. **`pinVerification`** — optional, with penalties for wrong attempts.
-5. **`accessMethods`** — exchange identities. `accessMethods.id` is populated, which SHIP
-   1.1.0 makes mandatory and which a peer needs in order to dial back in the other
-   direction.
+5. **`accessMethods`** — exchange identities. `accessMethods.id` is populated: SHIP 1.1.0
+   makes it mandatory, and a peer needs it to dial back.
 
 ```mermaid
 sequenceDiagram
@@ -117,9 +115,9 @@ handshake.poll_event();                // "trust needed", "ready", "closed"
 
 ## The Pairing Service
 
-Beyond manual SKI approval, the Pairing Service 1.0.0 lets an installer configure a
-control unit from a QR code and have trust established with nobody asked anything. It is
-behind the `pairing` feature, on by default, and both roles are implemented: `devA`, the
+The Pairing Service 1.0.0 lets an installer configure a control unit from a QR code and
+have trust established with nobody asked anything. It is behind the `pairing` feature, on
+by default, and both roles are implemented: `devA`, the
 household device that evaluates requests (§9), and `devZ`, the control unit that announces
 them (§8). The digest is an HMAC-SHA256 over the TXT record's fields in the order §7 fixes,
 keyed by the printed secret and a fresh nonce, and a replay guard (§11) refuses a captured
@@ -127,18 +125,15 @@ announcement twice.
 
 What is trusted is a **certificate fingerprint** rather than a SKI: §10.2 has it checked at
 the TLS handshake and treated as equivalent, and §10.3 allows one control unit at a time.
-Trust lives in the same store as SHIP's (§10.4). The timing rules are the subtle part —
-when a request is on the air (§4.2) and when a node will look at one at all (§4.3) — and
-both are worked through in [Pairing](@/docs/networking.md#or-nobody-is-asked-at-all); the
-two simulators do the whole exchange over a real network.
+Trust lives in the same store as SHIP's (§10.4). The timing rules — when a request is on
+the air (§4.2) and when a node will consider one (§4.3) — are covered in
+[Pairing](@/docs/networking.md#or-nobody-is-asked-at-all).
 
 `Fingerprint` is the SHA-256 of the DER certificate in the 64-uppercase-hex wire form, and
-it is strict about case: the digest covers the text as sent, so a lowercase value would
-mean verifying a message the sender never signed.
+is strict about case: the digest covers the text as sent.
 
-Keys the QR payload grammar gains later are skipped on the way in (`SRIP-310/15`) and
-written back out unchanged, so a tool that re-renders a code — onto a screen after a
-certificate update, say — does not strip fields it happens not to understand.
+Unknown QR payload keys are skipped on the way in (`SRIP-310/15`) and written back out
+unchanged, so a tool that re-renders a code keeps fields it does not understand.
 
 ## Two nodes that dial each other at once
 
@@ -150,11 +145,9 @@ SKI waits three seconds and then pings to confirm which survived.
 Each node judges "most recent" by its own clock, so both can close and leave none
 ([enbility, 2025](https://enbility.net/blog/20250704-analysis-documents/)); `ship-go` keeps
 the *initiator's* connection instead. This crate follows §12.2.3 and bounds the hazard: one
-ping round, then a decision, then a redial. That also interoperates with `ship-go` without a
-compatibility switch.
+ping round, a decision, then a redial — which also interoperates with `ship-go`.
 
 ## Framing
 
 Each SHIP message is one binary WebSocket message whose first byte names its type
-(§13.4.3); text frames are refused with 1003 (§10.3). The framing layer is
-one of the five fuzz targets, because it is the first thing an attacker on the LAN reaches.
+(§13.4.3); text frames are refused with 1003 (§10.3). The framing layer is a fuzz target.

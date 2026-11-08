@@ -635,3 +635,40 @@ proptest! {
         }
     }
 }
+
+// ---- restoring a stored identity -------------------------------------------------
+
+/// The identity files are not reached by a peer, but they are read at every boot from
+/// storage that may be corrupt or half-written, and a panic there is a device that does
+/// not start.
+#[cfg(feature = "cert")]
+mod restore {
+    use eebus::cert::{self, CertParams, Identity};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn restore_never_panics_from_pem(certificate in ".{0,512}", key in ".{0,512}") {
+            let _ = Identity::from_pem(&certificate, &key);
+        }
+
+        #[test]
+        fn restore_never_panics_from_der(
+            certificate in proptest::collection::vec(any::<u8>(), 0..512),
+            key in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let _ = Identity::from_der(&certificate, &key);
+        }
+
+        /// One half real and the other arbitrary is where a parser that trusts the first
+        /// half to vouch for the second would go wrong.
+        #[test]
+        fn restore_never_panics_with_one_half_real(
+            noise in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let identity = cert::self_signed(CertParams::new("i:46925_u:A")).unwrap();
+            let _ = Identity::from_der(identity.certificate_der(), &noise);
+            let _ = Identity::from_der(&noise, &identity.key_der());
+        }
+    }
+}

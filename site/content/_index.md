@@ -37,38 +37,38 @@ label = "mutual auth, SKI-pinned"
 
 [[extra.features]]
 title = "Sans-IO protocol core"
-body = "The SHIP handshake and the SPINE engine touch neither sockets nor clocks. Time is a parameter, so the two-minute hello, the SPINE response deadline and LPC's two-hour failsafe are ordinary unit tests against a virtual clock."
+body = "The SHIP handshake and the SPINE engine touch neither sockets nor clocks. Time is a parameter, so the two-minute hello, the SPINE response deadline and LPC's two-hour failsafe are unit tests against a virtual clock."
 
 [[extra.features]]
 title = "Certifiable, not just interoperable"
-body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data and every one is driven; cargo test prints 189/203. The fourteen missing are exactly the device-level cases — a factory reset, a power cut — each listed with its reason, and shipped as a harness (eebus::conformance::harness) to run against your own binary."
+body = "The 203 abstract test cases of the four High-Level Test Specifications are carried as data and all are driven; cargo test prints 189/203. The fourteen missing are device-level cases — a factory reset, a power cut — each listed with its reason and shipped as a harness (eebus::conformance::harness) to run against your own binary."
 
 [[extra.features]]
 title = "Illegal states are unrepresentable"
-body = "A command carries a payload choice, so two payloads in one command cannot be built. A LoadControlLimitId cannot be passed where a MeasurementId belongs — a mix-up that matters, because LPC requires the two to match."
+body = "A command carries a payload choice, so two payloads in one command cannot be built. A LoadControlLimitId cannot be passed where a MeasurementId belongs."
 
 [[extra.features]]
 title = "One implementation per pair"
-body = "LPC and LPP are the same use case pointed in opposite directions, as are OPEV and OSCEV. Eleven use cases share one measurement layer; the twelve HVAC ones are three exchanges. Each is written once, so a fix to one is a fix to all."
+body = "LPC and LPP are the same use case pointed in opposite directions, as are OPEV and OSCEV. Eleven use cases share one measurement layer; the twelve HVAC ones are three exchanges. Each is written once."
 
 [[extra.features]]
 title = "Runs on the controller"
-body = "Everything below the runtime builds for no_std + alloc, checked in CI against thumbv7em-none-eabihf. Five fuzz targets cover everything the network can reach, because on a heat-pump controller a panic is a reboot."
+body = "Everything below the runtime builds for no_std + alloc, checked in CI against thumbv7em-none-eabihf. Five fuzz targets cover everything the network can reach."
 
 [[extra.features]]
 title = "Checked against other implementations"
-body = "Fifteen datagrams captured from eight real devices are driven through an engine, resolved into a device model, and used to seed the fuzzers. An opt-in suite runs eebus-go's own examples in a container and drives the whole §14a exchange against them — this crate dialling, and the peer dialling in."
+body = "Fifteen datagrams captured from eight real devices are driven through an engine and seed the fuzzers. An opt-in suite drives the whole §14a exchange against eebus-go's own examples in a container, dialling out and dialled in."
 
 [[extra.features]]
 title = "The wire format, directly"
-body = "EEBUS JSON-UTF8 is encoded through serde in a single streaming pass — no intermediate tree to rewrite, no allocation for field names. A schema-valid message round-trips byte for byte."
+body = "EEBUS JSON-UTF8 is encoded through serde in a single streaming pass, with no intermediate tree and no allocation for field names. A schema-valid message round-trips byte for byte."
 +++
 
 ## The exchange, end to end
 
-A distribution grid operator's control box tells a heat pump how much power it may draw.
-Under §14a EnWG the building has to honour that limit, and the acknowledgement it sends
-back is the record that it did. Every layer below is in this crate.
+A grid operator's control box tells a heat pump how much power it may draw. Under §14a
+EnWG the heat pump must honour the limit, and its acknowledgement is the record that it
+did. Every layer below is in this crate.
 
 ```mermaid
 flowchart LR
@@ -98,11 +98,10 @@ flowchart LR
 
 ## Both sides, not just the appliance
 
-A heat pump needs the Controllable System. An energy manager needs the Energy Guard, and
-the 2026 implementation guides spend most of their pages on that half. Both are here, and
-the guard's rules — heartbeat before write, no deactivation as the first limit after a
-reconnection, a refusal retried a minute later, one write per five minutes otherwise —
-live behind a single call.
+A heat pump needs the Controllable System; an energy manager needs the Energy Guard. Both
+are here, and the guard's rules — heartbeat before write, no deactivation as the first
+limit after a reconnection, a refusal retried a minute later, one write per five minutes
+otherwise — live behind a single call.
 
 ```rust
 guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
@@ -111,16 +110,13 @@ guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 ## Generated from the schemas, not from a reading of them
 
 830 SPINE types and 47 SHIP messages are emitted from the XML Schemas the specifications
-ship, so the model cannot drift from the standard. The generated Rust is committed:
-building the crate never needs the specifications.
+ship. The generated Rust is committed: building the crate never needs the specifications.
 
 ## Checked against implementations it did not write
 
-Two checks go beyond round trips over self-written fixtures:
-
-**Recorded traffic.** Fifteen datagrams captured from eight real devices — Elli, evcc, Kostal, Porsche, SMA, Spelsberg, Vaillant, Viessmann — are
-driven through an engine, resolved into a device model, and used to seed the fuzzers, so the
-corpus explores the shapes real hardware produces.
+**Recorded traffic.** Fifteen datagrams captured from eight real devices — Elli, evcc,
+Kostal, Porsche, SMA, Spelsberg, Vaillant, Viessmann — are driven through an engine,
+resolved into a device model, and used to seed the fuzzers.
 
 **A live peer.** An opt-in suite runs `eebus-go`'s own examples in a container at a pinned
 revision and drives the whole §14a exchange against them three ways: their control box
@@ -130,7 +126,7 @@ control box dialling in to a listener of ours.
 ## One rule you cannot get wrong twice
 
 Restricted Function Exchange merges partial updates element by element: an omitted element
-means *unchanged*, all the way down. Send a `scaledNumber` carrying a bare `number` and
-the stored `scale` has to survive — otherwise a 4.2 kW limit silently becomes 42 MW. The
-generator resolves the type-to-selector link the schemas leave implicit into a table over
-141 functions, and the merge is written once.
+means *unchanged*, all the way down. A `scaledNumber` carrying a bare `number` keeps the
+stored `scale` — otherwise a 4.2 kW limit silently becomes 42 MW. The generator resolves
+the type-to-selector link the schemas leave implicit into a table over 141 functions, and
+the merge is written once.

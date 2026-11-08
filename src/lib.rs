@@ -141,13 +141,8 @@
 //!
 //! # Status
 //!
-//! Under construction, and pre-1.0. The model, codec, SHIP handshake and
-//! transport including certificate updates, the SPINE engine, the runtime, and all four
-//! use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are implemented and
-//! tested on both sides of each. So are twenty-four more: seven of the e-mobility family
-//! ([`usecases::emobility`]), four for inverters, PV strings and batteries, all twelve
-//! HVAC ones ([`usecases::hvac`]), and the heat-pump compressor flexibility
-//! ([`usecases::ohpcf`]) a CEM uses to start a process. The API will change.
+//! Pre-1.0: a minor release may break the API, and `CHANGELOG.md` lists every break with
+//! its replacement. Every use case in the table above is implemented on both sides.
 //!
 //! EEBUS® is a trademark of EEBus Initiative e.V. This project is not affiliated with or
 //! endorsed by the EEBus Initiative.

@@ -8,15 +8,14 @@ group = "Use cases"
 
 **Monitoring of Power Consumption** reports what an appliance is drawing. **Monitoring of
 the Grid Connection Point** reports the same quantities at the building's boundary with the
-grid. They are the same measurements named from two sides, and they share their
-implementation here.
+grid. They share one implementation.
 
-This machinery is not only MPC and MGCP. The same "describe a measurement twice and read it
-back" serves eleven use cases: those two, [EVCEM and EVSOC](@/docs/e-mobility.md) for a car,
+The same machinery serves eleven use cases: MPC and MGCP,
+[EVCEM and EVSOC](@/docs/e-mobility.md) for a car,
 [MOI, MPS, MOB](@/docs/storage.md) and COB for an inverter, a PV string and a battery, and
 [MDT, MRT and MOT](@/docs/hot-water.md) for the hot water, a room and the outdoors. Each
-adds vocabulary — charged energy, state of charge, DC power, yields, insulation resistance,
-three different temperatures — and none adds mechanism.
+adds vocabulary (charged energy, state of charge, DC power, yields, insulation resistance,
+temperatures), not mechanism.
 
 ## A measurement without its description means nothing
 
@@ -26,12 +25,9 @@ A notification looks like this:
 {"measurementId": 3, "value": {"number": 2300}}
 ```
 
-Which is 2300 of *what*, on *which phase*, *scaled by* how much? None of that is in the
-message. It is in two other functions — the measurement descriptions and the electrical
-connection descriptions — which a Monitoring Appliance reads once at commissioning and
-keeps.
-
-So the appliance reads them, subscribes, and resolves everything afterwards:
+Quantity, phase and scale are not in the message. They are in the measurement
+descriptions and the electrical connection descriptions, which a Monitoring Appliance reads
+once, keeps, and resolves every value against:
 
 ```rust
 use eebus::model::ElectricalConnectionPhaseName as Phase;
@@ -40,14 +36,12 @@ readings.total_power();                                        // Some(2300.0) w
 readings.value(&Measurand::on(Quantity::Current, Phase::A));   // Some(3.5) amperes
 ```
 
-Two rules the crate enforces rather than leaving to the caller:
+Two rules the crate enforces:
 
 * A value whose description never arrived is **dropped**, not guessed at.
-* A value flagged `error` **or** `outOfRange` is not handed back as a number. §2.5.2 lists
-  the three states together and says the same of both abnormal ones: they "SHALL be ignored
-  by the Monitoring Appliance" ([MPC-003]) — so a meter reporting 14 kW `outOfRange` against
-  an 11 kW constraint is not "high but real". `Reading::usable()` returns `None` for both;
-  the raw `value` field is still there for a display.
+* A value flagged `error` **or** `outOfRange` is not handed back as a number: §2.5.2 says
+  both "SHALL be ignored by the Monitoring Appliance" ([MPC-003]). `Reading::usable()`
+  returns `None` for both; the raw `value` field is still there for a display.
 
 ### When the reading was taken, not when it arrived
 
@@ -59,13 +53,11 @@ verbatim, and `Readings::read_at` hands it back beside the value:
 let (degrees, taken_at) = readings.read_at(&mrt::MEASURAND)?;
 ```
 
-Arrival time is no substitute. An appliance subscribes rather than polls, so a notification
-arrives when something **changes**, and a room holding its temperature sends nothing at all.
-Ageing readings by arrival discards the ones most likely to still be true, and cannot tell
-that room from a sensor that died an hour ago.
+Arrival time is no substitute: a notification arrives when something **changes**, so a room
+holding its temperature sends nothing.
 
-Most peers send none, so `taken_at` is usually `None`; what that means is the application's
-call. A Monitored Unit on this side stamps with `MonitoredUnit::set_at`, or
+Most peers send no timestamp, so `taken_at` is usually `None`; how to treat that is up to
+the application. A Monitored Unit on this side stamps with `MonitoredUnit::set_at`, or
 `hvac::mrt::temperature_at` and its two siblings. `set` sends no timestamp: the engine's
 clock is monotonic uptime, not a time of day.
 
@@ -88,20 +80,20 @@ let taken_at = match reading.taken_at()?.parse()? {
 A relative timestamp is an age, so `Reading::taken_at_relative_to` subtracts it from the
 arrival time, saturating at zero. An absolute one is `xs:dateTime`, not RFC 3339, and
 `unix_seconds()` is `None` when it carries no offset; `as_timestamp()` says whether it could
-be read at all. How far to trust a peer's clock stays the application's policy. See
+be read at all. How far to trust a peer's clock is the application's policy. See
 [Times](@/docs/wire-format.md#times).
 
 ### What silence means
 
-A value that has not arrived for ten minutes is either a peer that stopped answering or one
-with nothing to say. The descriptors say which; see
+A value that has not arrived for a while comes from a peer that stopped answering or from
+one with nothing to say. The descriptors say which; see
 [Who has to subscribe, and what silence means](@/docs/use-cases.md#who-has-to-subscribe-and-what-silence-means).
 
 ## Curtailment
 
 MGCP scenario 1 carries the photovoltaic curtailment factor: how much of what the plant
-could produce it is currently allowed to. It is the measurement that closes the loop with
-[LPP](@/docs/limitation.md) — a limit was sent, and this is what actually happened.
+could produce it is currently allowed to feed in. It closes the loop with
+[LPP](@/docs/limitation.md): what actually happened after a limit was sent.
 
 [MGCP-011] states it as an equation rather than a value:
 
@@ -109,13 +101,9 @@ could produce it is currently allowed to. It is the measurement that closes the 
 P_PV,feed-in  ≤  PLF_PV,feed-in,max,pct  ×  Σ P_PV,AC,nom
 ```
 
-The factor is what crosses the wire. The sum of the installed systems' nominal peak power
-is a property of the building that no EEBUS message carries, so only the two together are a
-number of watts — and it is the watts an energy manager acts on. In Germany that number is
-the export ceiling of EEG §9.
-
-`FeedInLimit` keeps both terms, which is what stops a caller acting on a percentage as
-though it were a power:
+Only the factor crosses the wire. The sum of the installed nominal peak power is a property
+of the building that no EEBUS message carries; together they give the watts an energy
+manager acts on — in Germany, the export ceiling of EEG §9. `FeedInLimit` keeps both terms:
 
 ```rust
 use eebus::usecases::mgcp::FeedInLimit;
@@ -133,12 +121,11 @@ let write = limit.as_production_limit();
 
 MGCP Table 23 spells the identifier `<k1#(1..1)>`: the device picks the number and fixes
 the **name**, `pvCurtailmentLimitFactor`. A `DeviceConfiguration` feature carries every
-configuration key the device has, so key `1` on a real connection point is as likely to be
-its installed peak power in watts — a number that reads as a perfectly plausible percentage
-and becomes a wrong export ceiling with nothing on the wire to say so.
+configuration key the device has, so key `1` may be something else entirely, such as its
+installed peak power.
 
-`Curtailment` is the reader: hand it both functions, in whatever order they arrive, and it
-holds the description beside the value.
+`Curtailment` is the reader: hand it both functions, in either order, and it holds the
+description beside the value.
 
 ```rust
 use eebus::usecases::mgcp::{self, Curtailment};
@@ -149,8 +136,7 @@ assert_eq!(factor.apply(&mgcp::curtailment_value(70.0)), Some(70.0));
 assert_eq!(factor.limit(12_000.0).map(|l| l.watts()), Some(8_400.0));
 ```
 
-`factor_percent` is `None` until both halves are in, and `None` is not zero — an unread
-message is not a curtailment, and treating it as one stops a roof exporting.
+`factor_percent` is `None` until both halves are in; `None` is not zero.
 
 ### Or let the actor do it
 
@@ -167,24 +153,24 @@ match appliance.handle_event(&event) {
 }
 ```
 
-`unit` is a `UnitId` — a device **and** an entity — because one device is regularly several
+`unit` is a `UnitId` — a device **and** an entity — because one device is often several
 units: a heat-pump gateway announces one `HVACRoom` per room, each with its own
 `Measurement` feature. `attach` takes one peer per entity, `MonitoredUnitPeer::id()`
 produces the key, and `readings`, `curtailment`, `feed_in_limit` and `detach` all take one.
 
-There is no `mgcp::curtailment_client_feature` to go with `curtailment_feature`, and the
-asymmetry is the specification's: LPC IG §3.3 asks each actor to hold **one** client feature
-with featureType `Generic` for all of its client functionality. A Monitoring Appliance reads
-a `Measurement` server for scenarios 2 to 7 and a `DeviceConfiguration` server for scenario 1
-from the same one — `limitation::client_feature`, the same constructor an Energy Guard uses.
+There is no client counterpart to `mgcp::curtailment_feature`: LPC IG §3.3 asks each actor
+to hold **one** client feature with featureType `Generic` for all of its client
+functionality. A Monitoring Appliance reads the `Measurement` server (scenarios 2 to 7) and
+the `DeviceConfiguration` server (scenario 1) from `limitation::client_feature`, the same
+constructor an Energy Guard uses.
 
 ## Every feature a peer might not have
 
 MGCP §3.2.2.2.1 ties each feature type to the scenarios that use it, and then says the
 presence indications are "meant relative to the ones of the according Scenario stated in
 Table 1". `DeviceConfiguration` belongs to scenario 1; `Measurement` and
-`ElectricalConnection` belong to scenarios 2 to 7. So which features a peer serves depends
-on which scenarios it implements, and `MonitoredUnitPeer` carries all three as `Option`:
+`ElectricalConnection` belong to scenarios 2 to 7, so `MonitoredUnitPeer` carries all three
+as `Option`:
 
 ```rust
 let peer = monitoring::locate(remote, mgcp::NAME, actors::GRID_CONNECTION_POINT)?;
@@ -193,14 +179,11 @@ peer.electrical_connection;  // Option: absent wherever there are no phases to d
 peer.curtailment;            // Option: MGCP scenario 1, and absent from MPC entirely
 ```
 
-`attach` reads only what is there. What `locate` *does* require is that the peer serve at
-least one of them: a peer announcing the use case and none of its features would otherwise
-sit in the actor's list for the life of the connection, waiting for notifications that
-cannot come.
+`attach` reads only what is there; `locate` requires the peer to serve at least one of
+them.
 
-That is also what lets a hot water tank in through the same door. A DHW circuit has no
-`ElectricalConnection` at all — MDT Table 6 gives the use case one feature — so it has a
-`locate` of its own, and what it returns goes into the same actor:
+A DHW circuit has no `ElectricalConnection` (MDT Table 6 gives the use case one feature), so
+it has a `locate` of its own, and what it returns goes into the same actor:
 
 ```rust
 use eebus::usecases::hvac::mdt;
@@ -209,8 +192,7 @@ let tank = mdt::locate(remote)?;          // measurement only; no phases to desc
 appliance.attach(&mut engine, tank, now); // the same actor as a grid connection point
 ```
 
-So do the two temperatures a building is planned against — `hvac::mrt` for a room and
-`hvac::mot` for outdoors — which are the same shape again. A room comes in the plural:
+So do `hvac::mrt` for a room and `hvac::mot` for outdoors. Rooms come in the plural:
 
 ```rust
 use eebus::usecases::hvac::mrt;

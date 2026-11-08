@@ -39,6 +39,10 @@ impl DeviceStore {
         self.dir.join("identity.key.pem")
     }
 
+    fn cert_path(&self) -> PathBuf {
+        self.dir.join("identity.cert.pem")
+    }
+
     fn trust_path(&self) -> PathBuf {
         self.dir.join("trust.json")
     }
@@ -91,23 +95,40 @@ impl DeviceStore {
         Ok(())
     }
 
-    /// The device's identity, generated on first run and reused after that.
+    /// The device's identity: generated on first run, restored on every run after that.
     ///
     /// SHIP §12.1.1 is the reason this is persisted rather than regenerated: the SKI is
-    /// what a peer trusted, and on a real device it is printed on the label. A node that
-    /// came back with a new one would have to be paired again by hand every time it
-    /// restarted.
+    /// what a peer trusted, and on a real device it is printed on the label. Both halves
+    /// are kept, not just the key. The key alone would keep the SKI, but every start would
+    /// sign a new certificate with a new fingerprint, and the fingerprint is what the
+    /// Pairing Service trusts and what the `FPH256` in the QR code below says.
     pub fn identity(&self, ship_id: &str) -> Result<Identity, Box<dyn std::error::Error>> {
-        let path = self.key_path();
-        if let Ok(pem) = std::fs::read_to_string(&path) {
-            let key = cert::key_from_pem(&pem)?;
-            return Ok(cert::self_signed_with(CertParams::new(ship_id), key)?);
-        }
+        let (key_path, cert_path) = (self.key_path(), self.cert_path());
+        let key = std::fs::read_to_string(&key_path).ok();
+        let certificate = std::fs::read_to_string(&cert_path).ok();
 
-        let identity = cert::self_signed(CertParams::new(ship_id))?;
-        write_private(&path, identity.key_pem().as_bytes())?;
-        println!("generated a new identity in {}", path.display());
-        Ok(identity)
+        match (key, certificate) {
+            (Some(key), Some(certificate)) => Ok(Identity::from_pem(&certificate, &key)?),
+            // A state directory holding only the key: the SKI is kept, and the certificate
+            // is issued once and kept from now on.
+            (Some(key), None) => {
+                let identity =
+                    cert::self_signed_with(CertParams::new(ship_id), cert::key_from_pem(&key)?)?;
+                std::fs::write(&cert_path, identity.certificate_pem())?;
+                println!(
+                    "issued a certificate for the stored key in {}",
+                    cert_path.display()
+                );
+                Ok(identity)
+            }
+            (None, _) => {
+                let identity = cert::self_signed(CertParams::new(ship_id))?;
+                write_private(&key_path, identity.key_pem().as_bytes())?;
+                std::fs::write(&cert_path, identity.certificate_pem())?;
+                println!("generated a new identity in {}", self.dir.display());
+                Ok(identity)
+            }
+        }
     }
 
     /// The trust store, read back from disk.
@@ -132,12 +153,13 @@ impl DeviceStore {
     ///
     /// [`eebus::runtime::Node::eebus_reset`] empties the in-memory store; this removes the
     /// file behind it and the identity, so the device comes back as it left the factory.
-    /// A real device restores the *original* key rather than deleting it, because the SKI
-    /// on its label has to keep being true — this one has no label.
+    /// A real device restores its *original* identity rather than deleting it, because the
+    /// SKI and the QR code on its label have to keep being true. This one has no label.
     pub fn factory_reset(&self) -> std::io::Result<()> {
         for path in [
             self.trust_path(),
             self.key_path(),
+            self.cert_path(),
             self.secret_path(),
             self.guard_path(),
         ] {

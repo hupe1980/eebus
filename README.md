@@ -14,33 +14,31 @@ alongside the code. [What EEBUS is](https://hupe1980.github.io/eebus/docs/introd
 [LPC and LPP](https://hupe1980.github.io/eebus/docs/limitation/) ·
 [Conformance](https://hupe1980.github.io/eebus/docs/conformance/)
 
-> **Status: under construction.** The stack is complete from the socket to the use case,
-> and all four use cases certifiable since July 2026 — LPC, LPP, MPC and MGCP — are
-> implemented on **both** sides and measured against all 203 of their published abstract
-> test cases. So are twenty-four more: seven of the e-mobility family, four for inverters,
-> PV strings and batteries, all twelve HVAC ones, and the heat-pump compressor flexibility
-> a CEM uses to start a process. Published, but pre-1.0: the API will change.
+> **Status: pre-1.0; the API is unstable.** The stack is complete from the socket to the
+> use case. The four certifiable use cases — LPC, LPP, MPC and MGCP — are implemented on
+> **both** sides and measured against all 203 of their published abstract test cases.
+> Twenty-four more are implemented: seven e-mobility, four for inverters, PV strings and
+> batteries, all twelve HVAC ones, and heat-pump compressor flexibility.
 
 ## What EEBUS is, and why this exists
 
 EEBUS is how a heat pump, a wallbox, a battery and an energy manager talk to each other
-and to the grid operator's control box. Since July 2026 four of its use cases — limiting
-and monitoring power consumption and production — are formally certifiable, and in Germany
-they are the mechanism behind §14a EnWG and EEG §9: when the low-voltage grid is congested,
-the distribution operator sends a limit and the building has to honour it, whether it is
-drawing power or feeding it in.
+and to the grid operator's control box. Four of its use cases — limiting and monitoring
+power consumption and production — are formally certifiable, and in Germany they are the
+mechanism behind §14a EnWG and EEG §9: when the low-voltage grid is congested, the
+distribution operator sends a limit and the building has to honour it.
 
-The reference implementations are Go, Java and C. This crate is the Rust one, built to be
+The reference implementations are Go, Java and C. This crate is a Rust one, built to be
 certifiable rather than merely interoperable.
 
 ## Design
 
 **One crate, layered.** `codec` → `model` → `ship` → `spine` → `usecases`, with `runtime`
-on top for the socket. Feature flags rather than a family of crates to keep in step.
+on top for the socket, selected by feature flags.
 
 **Generated from the schemas.** 830 SPINE types and 47 SHIP messages, emitted by
-`cargo xtask codegen` from the XML Schemas the specifications ship, so the model cannot
-drift from the standard. The generated Rust is committed: building never needs the specs.
+`cargo xtask codegen` from the specifications' XML Schemas. The generated Rust is
+committed: building never needs the specs.
 
 **Sans-IO protocol core.** The SHIP handshake and the SPINE engine touch neither sockets
 nor clocks:
@@ -54,40 +52,36 @@ engine.poll_event();                      // what the application should know
 ```
 
 Every timeout in the standard — the hello prolongation dance, LPC's two-hour failsafe — is
-then an ordinary unit test against a virtual clock. Everything below `runtime` builds for
+an ordinary unit test against a virtual clock. Everything below `runtime` builds for
 `no_std + alloc`, checked in CI against `thumbv7em-none-eabihf`.
 
-The contract between the two halves is one line, and it is asserted rather than assumed:
-**waiting until exactly `poll_timeout()` is enough.** One test drives every state machine
-from nothing but its own deadlines.
+**Waiting until exactly `poll_timeout()` is enough** — asserted by a test that drives every
+state machine from nothing but its own deadlines.
 
 **The awkward rules are handled once.** Restricted Function Exchange merges partial updates
-element by element: an omitted element means *unchanged*, all the way down. Send a
-`scaledNumber` with a bare `number` and the stored `scale` has to survive, or a 4.2 kW limit
-becomes 42 MW. Nothing in the schemas links a data type to its selectors and elements
-filters — the link is a naming convention — so the generator resolves it into a table
-covering 141 functions, and merge, delete and partial read are written once. Several filters
-per command are applied in order; a delete's `selectors` choose entries, its `elements`
-choose parts of them.
+element by element: an omitted element means *unchanged*, all the way down — a bare
+`number` keeps the stored `scale`, or a 4.2 kW limit becomes 42 MW. The schemas link a data
+type to its selectors and elements filters only by naming convention, so the generator
+resolves it into a table covering 141 functions, and merge, delete and partial read are
+written once. Several filters per command are applied in order; a delete's `selectors`
+choose entries, its `elements` choose parts of them.
 
-**Announce nothing you cannot do.** `possibleOperations` is a promise, so partial reads are
-announced only for functions that table covers; a filtered request for anything else gets
-`errorNumber` 8 rather than an approximate answer. The binding and subscription tables are
-answered from the relations actually held. The table is
-[published](https://hupe1980.github.io/eebus/docs/functions/), generated from the same
-source the compiler reads, so "which SPINE variations does this implement" has an answer
-you can read before committing.
+**Announce nothing you cannot do.** Partial reads are announced in `possibleOperations`
+only for functions that table covers; a filtered request for anything else gets
+`errorNumber` 8. The binding and subscription tables are answered from the relations
+actually held. The table is [published](https://hupe1980.github.io/eebus/docs/functions/),
+generated from the same source the compiler reads.
 
-**A partial write is decided on the merged state.** The same rule, a layer up: the engine
-hands the application both — `data` for the entries a write addresses, `resolved` for what
-they become — and the use cases decide on `resolved`, where an absent `isLimitActive` still
-means *unchanged*. An entry without its identifiers is refused (UC IG §3.1), not appended.
-A partial *notification* is the same rule pointed the other way: the engine holds the merged
-state of every function a peer has sent, and hands over both payloads there too.
+**A partial write is decided on the merged state.** The engine hands the application
+`data` for the entries a write addresses and `resolved` for what they become; the use cases
+decide on `resolved`, where an absent `isLimitActive` still means *unchanged*. An entry
+without its identifiers is refused (UC IG §3.1), not appended. For a partial
+*notification*, the engine holds the merged state of every function a peer has sent and
+hands over both payloads too.
 
-**The application decides, not the library.** A limit write is answered by the use case,
-not a generic setter: under §14a EnWG the acknowledgement *is* the record that the limit was
-applied, so it has to say what the appliance actually did.
+**The application decides, not the library.** A limit write is answered by the use case:
+under §14a EnWG the acknowledgement *is* the record that the limit was applied, so it has to
+say what the appliance actually did.
 
 ```rust
 if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
@@ -102,16 +96,14 @@ if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
 ```
 
 **Both sides of every use case.** A heat pump needs the Controllable System; an energy
-manager needs the Energy Guard, and the 2026 implementation guides spend most of their pages
-on that half. Here the guard holds it:
+manager needs the Energy Guard, which carries most of the 2026 implementation guides' rules:
 
 ```rust
 guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 ```
 
-and nothing before it: the guard takes up a peer that announces the Controllable System by
-itself, and a limit required before that peer is reachable is held rather than dropped.
-Behind that line:
+The guard takes up a peer that announces the Controllable System by itself, and holds a
+limit required before that peer is reachable. Behind that line:
 
 - a heartbeat immediately before the write, once the peer has subscribed to it (§2.11);
 - never a deactivation as the first limit after a reconnection (§2.13);
@@ -124,30 +116,27 @@ directions — the same four scenarios, table numbers and thirteen transitions �
 machine and both actors are written once and pointed by a `Direction`. OPEV and OSCEV are
 the same pair on the e-mobility side, pointed by a `Purpose`; eleven use cases share one
 measurement layer; and the twelve HVAC use cases are three exchanges — the operation mode,
-the setpoint, the thermometer — with twelve modules of constants on top. The reference
-implementations duplicate each; here a fix to one is a fix to all.
+the setpoint, the thermometer — with twelve modules of constants on top.
 
 **Illegal states are unrepresentable.** A SPINE command carries a payload *choice*, so "two
 payloads in one command" cannot be built. Identifiers are distinct types, so a
-`LoadControlLimitId` cannot be passed where a `MeasurementId` belongs — a mix-up that
-matters, because LPC requires the limit's `measurementId` to match MPC's. A Controllable
-System comes from a builder that ends in `install`, so an actor that never published its
-limit description — and would therefore never be sent a limit — cannot be constructed.
+`LoadControlLimitId` cannot be passed where a `MeasurementId` belongs (LPC requires the
+limit's `measurementId` to match MPC's). A Controllable System comes from a builder that
+ends in `install`, so an actor that never published its limit description cannot be
+constructed.
 
 **Secrets redact themselves.** A PIN and a pairing secret print as `<redacted>` from the
-`Debug` of every type that holds one, and compare in constant time. A PIN's whole defence is
-SHIP's escalating penalty, and a PIN in a support bundle has none.
+`Debug` of every type that holds one, and compare in constant time.
 
 **Every number off the wire is treated as hostile.** `scale` is signed 16-bit, so a `number`
 near `i64::MAX` reaches infinity in one well-formed message; `to_f64` answers `None`, and a
-use case handed a present-but-unreadable value NACKs the write rather than substituting one.
-A duration pointing backwards reads as zero, not as its magnitude. An LPC limit whose
-duration cannot be read is refused, not applied indefinitely; where a use case narrows the
-schema (a compressor's `startTime`), the narrower rule is enforced.
+use case handed a present-but-unreadable value NACKs the write. A duration pointing
+backwards reads as zero. An LPC limit whose duration cannot be read is refused, not applied
+indefinitely; where a use case narrows the schema (a compressor's `startTime`), the narrower
+rule is enforced.
 
 **And converted exactly.** A scale is applied in steps of at most `10^22`, the largest power
-of ten an `f64` holds exactly, so a negative scale *divides* by an exact constant rather
-than multiplying by an inexact one, and a scale past the table is still that scale. A value
+of ten an `f64` holds exactly, so a negative scale *divides* by an exact constant. A value
 too large for an `i64` raises the scale instead of saturating. `cargo xtask check-floats`
 keeps hand-rolled powers of ten and float casts out of the two modules where the wire meets
 a number.
@@ -166,32 +155,30 @@ its descriptor.
 stored state. A hub holds sixteen connections and two per peer, handshakes in progress
 included; the engine tracks thirty-two device addresses, thirty-two remembered functions
 and thirty-two bindings and subscriptions per peer, sixteen undecided writes and 128
-entries per function, and answers `errorNumber` 3 beyond any of them. A device address — a
-routing key, a stored identity, a line in the §14a record — is bounded and printable or the
-datagram is discarded. A write nobody decides is abandoned once the peer has stopped
-waiting.
+entries per function, and answers `errorNumber` 3 beyond any of them. A device address must
+be bounded and printable or the datagram is discarded. A write nobody decides is abandoned
+once the peer has stopped waiting.
 
 **And nothing a peer sends speaks for another peer.** A binding or subscription call names
 its client in the payload; the engine honours it only from the device SHIP authenticated as
-the sender, so one paired peer cannot release another's binding. Discovery is filed under
-the header's source, not the payload's claim. A heartbeat keeps a Controllable System out of
-its failsafe state only when it comes from the Energy Guard that holds its bindings.
+the sender. Discovery is filed under the header's source, not the payload's claim. A
+heartbeat keeps a Controllable System out of its failsafe state only when it comes from the
+Energy Guard that holds its bindings.
 
 **Fuzzed and property-tested.** Five `cargo fuzz` targets cover everything the network can
 reach — SHIP framing, the JSON codec, the QR payload, the TXT record, a whole datagram
 through the engine — and property tests cover the round trips, the merge laws, and the
-arithmetic above. On a heat-pump controller a panic is a reboot.
+arithmetic above.
 
 **Tested against implementations it did not write.** Fifteen datagrams captured from eight
 real devices ([`enbility/devices`](https://github.com/enbility/devices)) are parsed,
 **driven through an engine**, resolved into a device model, and used to seed the fuzzers —
-as are all twenty-nine Restricted Function Exchange examples from the specification's own
-annex, which are served rather than only decoded. And `cargo test --features interop` runs
-`eebus-go`'s own examples in a container at a pinned revision, driving the whole §14a
-exchange three ways: their control box against this crate's Controllable System, their EVSE
-against its Energy Guard, and — the direction §14a actually describes — their control box
-**dialling in** to a listener of ours. Opt-in and its own CI job, so an ordinary `cargo
-test` needs no Docker.
+as are all twenty-nine Restricted Function Exchange examples from the specification's
+annex, which are served rather than only decoded. `cargo test --features interop` runs
+`eebus-go`'s own examples in a container at a pinned revision, driving the §14a exchange
+three ways: their control box against this crate's Controllable System, their EVSE against
+its Energy Guard, and their control box **dialling in** to a listener of ours. It is opt-in
+and its own CI job, so an ordinary `cargo test` needs no Docker.
 
 **Tests carry the certification's identifiers.** `TC_SHIP_HELLO_002`, `TC_SPINE_COMP_006`
 and their siblings name the tests that cover them. For the four certifiable use cases,
@@ -201,12 +188,12 @@ Specifications as data, the suite **drives every one of them**, and `cargo test`
 power cut, a start-up duration — counted once for LPC and once for LPP, each listed with its
 reason and held to that by a test.
 
-Those need a device, so `eebus::conformance::harness` carries their steps and
-expected results for a consumer to drive **against its own running binary**, judged against
-the device's declared parameter sheet: the failsafe defaults a factory reset must restore,
-the `StartUpDur` a black start has to come back inside, the sixty seconds a rebooted Energy
-Guard has to send a heartbeat and a limit in. A persistence test that writes back the value
-the device already held is reported *inconclusive*, not passed.
+For those, `eebus::conformance::harness` carries the steps and expected results for a
+consumer to drive **against its own running binary**, judged against the device's declared
+parameter sheet: the failsafe defaults a factory reset must restore, the `StartUpDur` a
+black start has to come back inside, the sixty seconds a rebooted Energy Guard has to send a
+heartbeat and a limit in. A persistence test that writes back the value the device already
+held is reported *inconclusive*.
 
 ## The wire format
 
@@ -223,11 +210,10 @@ becomes an **array of single-key objects** (SHIP §11.4). A heartbeat looks like
 ]}
 ```
 
-Other implementations serialise to ordinary JSON and rewrite the tree afterwards. This one
-encodes the format directly through `serde` in a single streaming pass, with no intermediate
-`Value` and no allocation for field names — so `to_json(&from_json_str(m)?)? == m`, byte for
-byte, **for a schema-valid message**. A peer that sends a field the schema does not define
-in that position loses it, which is the interoperable answer.
+The codec encodes the format directly through `serde` in a single streaming pass, with no
+intermediate `Value` and no allocation for field names, so `to_json(&from_json_str(m)?)? == m`,
+byte for byte, **for a schema-valid message**. A field the schema does not define in that
+position is dropped.
 [More on the wire format](https://hupe1980.github.io/eebus/docs/wire-format/).
 
 ## What is implemented
@@ -240,6 +226,7 @@ in that position loses it, which is the interoperable answer.
 | | the hello prolongation dance, driven by the side that is `pending` | §13.4.4.1.3 |
 | | double-connection resolution, both halves | §12.2.3 |
 | | certificate updates, end to end | §12.1.3 |
+| | a stored identity restored byte for byte: same SKI, same fingerprint (`Identity::from_pem`) | §10.2, §12.1.1 |
 | | SKI, SHIP ID, `_ship._tcp` TXT record, installation QR code | §5.4, installation requirements 1.1.0 |
 | | the Pairing Service end to end: both roles, the TXT record, the fingerprint trust, the §4.3 policy | Pairing Service 1.0.0 |
 | | trust as a number in three categories, and the three rules that read it — including the PIN a peer below user trust 32 is never sent | §12.3.2 Table 10, §12.5 |
@@ -304,8 +291,8 @@ TLS 1.2 with mutual authentication over loopback first.
 
 ### The two simulators
 
-A control box and a household appliance, on a real network — one on each side of the §14a
-exchange, so either can be tested without the other's hardware on the desk.
+A control box and a household appliance on a real network, one on each side of the §14a
+exchange.
 
 ```sh
 # In one terminal: the household end. Prints its SKI and its QR payload.
@@ -321,26 +308,21 @@ between runs, and print the `lpc:` runtime signals a certification laboratory re
 `--reset` is the EEBUS reset of SHIP §12.2.2: forget every peer, and the identity with it.
 
 On a network, [`Hub`](https://hupe1980.github.io/eebus/docs/networking/) owns the sockets
-and the clock. It listens, dials and browses **in the background** — a peer that is slow,
-unreachable or waiting for a user holds nothing else up — routes each datagram to the peer
-it names, keeps idle connections alive, resolves double connections, and redials with a
-backoff spread by the peer's SKI so a building coming back from a power cut does not dial
-all at once. `hub.run(handler)` is the loop, because `hub.next()` is not cancel-safe and a
-write cancelled anyway is closed with `Disconnect::InterruptedWrite` rather than left to
-corrupt the peer's stream.
+and the clock. It listens, dials and browses **in the background** — a slow or unapproved
+peer holds nothing else up — routes each datagram to the peer it names, keeps idle
+connections alive, resolves double connections, and redials with a backoff spread by the
+peer's SKI. `hub.run(handler)` is the loop: `hub.next()` is not cancel-safe, and a write
+cancelled anyway is closed with `Disconnect::InterruptedWrite`.
 
 **Pairing happens while the peer waits.** An unapproved peer completes TLS, is held in the
 SHIP `hello: pending` state and reported as `TrustRequested`; `hub.approve(ski)` completes
-the handshake it is waiting in and `hub.refuse(ski)` answers `hello: aborted`. The
-[SHIP Pairing Service](https://hupe1980.github.io/eebus/docs/networking/#or-nobody-is-asked-at-all)
-is the other path, where a control unit proves it knows a printed secret and nobody is
-asked at all. There is no auto accept, and no third path.
+the handshake and `hub.refuse(ski)` answers `hello: aborted`. The other path is the
+[SHIP Pairing Service](https://hupe1980.github.io/eebus/docs/networking/#or-nobody-is-asked-at-all),
+where a control unit proves it knows a printed secret. There is no auto accept.
 
-**A node is not its own peer.** A hub that announces `_ship._tcp` and browses for it meets
-its own announcement and drops it; a connection proving this node's own SKI, or a peer
-claiming its device address, is refused rather than left half-working. And every node
-listens, whichever end opens the conversation: SHIP §8.1 gives no opt-out and reserves a
-connection slot in each direction.
+**A node is not its own peer.** A hub drops its own `_ship._tcp` announcement when
+browsing; a connection proving this node's own SKI, or a peer claiming its device address,
+is refused. Every node listens, whichever end opens the conversation (SHIP §8.1).
 
 ## Building
 
@@ -356,10 +338,9 @@ to build the peer:
 cargo test --features interop,full --test interop -- --nocapture
 ```
 
-`--workspace` includes the code generator in `xtask/`, which is what produces the committed
-model. The fuzz targets are a workspace of their own and are compiled separately —
-`cargo check --manifest-path fuzz/Cargo.toml --all-targets`, which CI runs on every push so
-that a moved API cannot break them unnoticed.
+`--workspace` includes the code generator in `xtask/`. The fuzz targets are a workspace of
+their own, compiled separately with `cargo check --manifest-path fuzz/Cargo.toml --all-targets`,
+which CI runs on every push.
 
 The documentation site is [Zola](https://www.getzola.org):
 
@@ -377,8 +358,8 @@ cp tests/fixtures/spine/*.json fuzz/corpus/spine_datagram/
 cargo +nightly fuzz run spine_datagram
 ```
 
-The specifications are free but not redistributable, so they are not in this repository. To
-regenerate the model you need them locally — register at
+The specifications are free but not redistributable, so they are not in this repository.
+To regenerate the model, register at
 [eebus.org/specifications-media](https://www.eebus.org/specifications-media/), unpack
 `EEBus_SPINE_V1.3.0.zip` into `<dir>/spine/` and `EEBus_SHIP_TS_Specification_v1.1.0_public.zip`
 into `<dir>/ship/` of a directory outside the repository, and run:
@@ -387,7 +368,13 @@ into `<dir>/ship/` of a directory outside the repository, and run:
 export EEBUS_REFERENCE=<dir>
 cargo run -p xtask -- codegen    # regenerate src/model/generated and src/ship/generated
 cargo run -p xtask -- fixtures   # regenerate tests/fixtures from the specification's examples
+cargo run -p xtask -- check-schemas  # are these the schemas the committed model came from?
 ```
+
+`codegen` writes `schemas.sha256` beside each generated model, in `sha256sum` format: the
+schemas it read and their digests. `check-schemas` names any schema that is changed,
+missing or unexpected, and succeeds without checking anything where the specifications are
+absent.
 
 A third generator needs no specifications — it converts MIT-licensed captures from real
 hardware into wire-format fixtures:
@@ -397,8 +384,7 @@ git clone --depth=1 https://github.com/enbility/devices /tmp/devices
 cargo run -p xtask -- devices /tmp/devices   # tests/fixtures/devices
 ```
 
-Only generated Rust is committed. The generator formats its output,
-so re-running it when nothing has changed produces no diff.
+The generator formats its output, so re-running it on unchanged inputs produces no diff.
 
 ## Features
 
@@ -406,8 +392,8 @@ so re-running it when nothing has changed produces no diff.
 |---|---|---|
 | `std` | ✅ | Standard library. Without it the crate builds `no_std + alloc`. |
 | `pairing` | ✅ | SHIP Pairing Service, both roles (`hmac`, `sha2`); with `runtime` and `mdns`, the hub's end of it too. |
-| `conformance` | ✅ | The 203 abstract test cases of the four HLTS as data. Tens of kilobytes of static strings a device in the field never reads; `--no-default-features` leaves it out. |
-| `cert` | — | Generating and reading node certificates (`rcgen`, `x509-parser`). |
+| `conformance` | ✅ | The 203 abstract test cases of the four HLTS as data (tens of kilobytes of static strings); `--no-default-features` leaves it out. |
+| `cert` | — | Generating, restoring and reading node certificates (`rcgen`, `x509-parser`). |
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the SHIP handshake, the connection table. |
 | `mdns` | — | `_ship._tcp` announcement and discovery, and `_shippairing._tcp` with `pairing` (`mdns-sd`). |
@@ -418,9 +404,8 @@ so re-running it when nothing has changed produces no diff.
 
 ### The cryptography provider is yours to pick
 
-`cert`, `tls` and `runtime` need one of `ring` or `aws-lc-rs`, and this crate names neither
-by default: `rustls`' provider is process-global, so a library that pulled one in would
-choose for every consumer downstream of it.
+`cert`, `tls` and `runtime` need one of `ring` or `aws-lc-rs`, and neither is a default:
+`rustls`' provider is process-global, so the choice belongs to the binary.
 
 ```sh
 cargo add eebus --features runtime,ring
@@ -428,13 +413,11 @@ cargo add eebus --features runtime,ring
 cargo add eebus --no-default-features --features std,runtime,aws-lc-rs
 ```
 
-Naming both, or neither, is a `compile_error!` rather than a device that panics on its first
-connection. `eebus::tls::CRYPTO_PROVIDER` says which one a binary got. Nothing here reads
-`rustls`' process default — the provider is built explicitly, with exactly the suites SHIP §9
-permits — so a consumer that installed its own keeps it.
+Naming both, or neither, is a `compile_error!`. `eebus::tls::CRYPTO_PROVIDER` says which
+one a binary got. The provider is built explicitly, with exactly the suites SHIP §9 permits,
+so `rustls`' process default is never read and a consumer's own stays installed.
 
-`--all-features` is therefore not a configuration that can exist; `--features full` is
-everything, on `ring`.
+`--all-features` therefore does not compile; `--features full` is everything, on `ring`.
 
 Minimum supported Rust version: 1.88.
 

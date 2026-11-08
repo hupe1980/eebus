@@ -122,7 +122,7 @@ fn an_announcement_with_no_address_is_refused() {
 /// that "a listener and an announcement beside it" is the whole of a device's networking,
 /// and nothing in this repository ever built that arrangement — so nobody saw that a node
 /// doing all three finds its own announcement, offers the installer a pairing with the
-/// device in front of them, and, once trusted, connects to itself (D101). Every party in
+/// device in front of them, and, once trusted, connects to itself. Every party in
 /// every other test came from a factory that mints a fresh identity per call, which made
 /// "the peer is us" a state the suite could not express.
 ///

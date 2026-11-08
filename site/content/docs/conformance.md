@@ -9,21 +9,19 @@ group = "Project"
 ## Tests carry the certification's identifiers
 
 `TC_SHIP_HELLO_002`, `TC_SPINE_COMP_006`, `TC_SPINE_RTS_005` and their siblings name the
-tests that cover them. `cargo test` is therefore a pre-check for the laboratory rather than
-a separate exercise, and a failing conformance test says which published test case it
-corresponds to.
+tests that cover them, so `cargo test` is a pre-check for the laboratory and a failing
+conformance test names its published test case.
 
-For the four certifiable use cases this goes further: all 203 abstract test cases of the
-LPC, LPP, MPC and MGCP High-Level Test Specifications are carried as data **and driven**,
-`cargo test` prints 189/203, and the fourteen that are not covered are exactly the
-device-level ones — listed with the reason, and held to that by a test. See
+All 203 abstract test cases of the LPC, LPP, MPC and MGCP High-Level Test Specifications are
+carried as data and driven; `cargo test` prints 189/203, and the fourteen not covered are
+exactly the device-level ones, listed with the reason and held to that by a test. See
 [Certification](@/docs/certification.md).
 
 ## The fourteen the library cannot answer
 
-A factory reset, a power cut, a start-up duration, what the appliance actually draws. No
-library can answer those for the device it is linked into. `eebus::conformance::harness` is
-the other half: seven procedures — each covering the LPC case and its LPP twin — carrying the
+A factory reset, a power cut, a start-up duration, what the appliance actually draws: no
+library can answer those for the device it is linked into. `eebus::conformance::harness`
+provides seven procedures — each covering the LPC case and its LPP twin — carrying the
 High-Level Test Specification's own steps, driven against a consumer's running binary.
 
 ```rust
@@ -43,23 +41,21 @@ run.observe(DeviceObservation::FactoryReset {
 println!("{}", run.report());
 ```
 
-It **judges** against what the device declared — the failsafe defaults a reset must restore,
+It judges against what the device declared — the failsafe defaults a reset must restore,
 the `StartUpDur` a black start must return inside, the sixty seconds a rebooted Energy Guard
-has to send a heartbeat and the limit after it. What it does not do is press the button.
+has to send a heartbeat and the limit after it. It does not press the button.
 
-`Inconclusive` is the verdict that earns its place: a persistence test that wrote back the
-value the device already held proves nothing, and counting it as either a pass or a failure
-would be a lie. `Skipped` is allowed only where the case is not mandatory for this device —
-the two black starts are `r`, and mandatory only for one that declares itself black-start
-capable.
+`Inconclusive` covers a run that proves nothing either way, such as a persistence test that
+wrote back the value the device already held. `Skipped` is allowed only where the case is
+not mandatory for this device — the two black starts are `r`, mandatory only for a device
+that declares itself black-start capable.
 
 `report().coverage()` gives the fourteen as a `Coverage`, to add to the protocol-level 189 of
 203.
 
 ## Every claim points at a sentence
 
-Citations live next to the code that satisfies them, not in a separate document that drifts.
-To see what a given rule looks like in practice:
+Citations live next to the code that satisfies them. To find them:
 
 ```sh
 rg 'SHIP §|SPINE §|\[LPC-|\[OPEV-' src/
@@ -67,8 +63,8 @@ rg 'SHIP §|SPINE §|\[LPC-|\[OPEV-' src/
 
 ## Deliberate departures
 
-Each of these differs from what a reference implementation does, and each is driven by the
-specification text or the 2026 implementation guides.
+Each of these differs from a reference implementation and follows the specification text
+or the 2026 implementation guides.
 
 **No "auto accept" mode, and `register` is never `true`.** SHIP IG §2.3 forbids both.
 
@@ -81,8 +77,8 @@ connection — [SHIP](@/docs/ship.md#two-nodes-that-dial-each-other-at-once).
 **A binding or subscription call acts only in the sender's name.** The client address in
 the payload has to belong to the device SHIP authenticated, or the call is refused with
 `errorNumber` 7; a call that leaves the device part out is completed from the header. The
-reference implementation fills the address in and checks nothing, which lets one paired
-peer release another's binding.
+reference implementation checks nothing, which lets one paired peer release another's
+binding.
 
 **Discovery is filed under the header's source, not the payload's device.** A peer's
 detailed discovery describes the device the *header* says sent it; a payload naming another
@@ -95,8 +91,7 @@ failsafe at bay.
 
 **A pairing is decided while the peer waits.** An unapproved peer is held in the SHIP
 `hello: pending` state and reported; approving its SKI completes the handshake it is
-waiting in, refusing it answers `hello: aborted`. There is no auto accept and no third
-path.
+waiting in, refusing it answers `hello: aborted`.
 
 **The SHIP Pairing Service is implemented, and trusts a certificate.** No reference
 implementation has it. Its request names no SKI, so the trust store holds a `PairedUnit`
@@ -132,8 +127,8 @@ naming convention.
 
 **The binding and subscription tables are served from the live relations** (§7.3.2, §7.4.2)
 and **tailored to their recipient** (§7.4.3) — absent rather than empty when nothing concerns
-them (Table 18). Serving the whole table tells every peer which other peers this device is
-talking to.
+them (Table 18). The whole table would tell every peer which other peers this device talks
+to.
 
 **Discovery is subscribed to** (§7.5.4), which is the only way a peer's *departing* entity
 is ever heard about.
@@ -154,12 +149,11 @@ Wait-For-Ready-Timer.
 **A malformed `specificationVersion` is refused**, which `TC_SPINE_COMP_006` calls the
 recommended behaviour, while tolerating the one deviation it permits: a leading `v`.
 
-**Unchanged data is not notified** (SPINE IG §2.4), which is what makes a dozen
-subscriptions affordable.
+**Unchanged data is not notified** (SPINE IG §2.4).
 
 **The Subject Key Identifier extension is written by hand.** `rcgen` emits it only for
-certificate authorities and a SHIP node certificate is a leaf, so without this the extension
-§12.2 expects is absent and a peer cannot identify the node.
+certificate authorities, and a SHIP node certificate is a leaf; without it a peer cannot
+identify the node by the extension §12.2 expects.
 
 ## Interoperability, measured
 
@@ -168,9 +162,8 @@ eight devices by seven manufacturers — Elli, evcc, Kostal, Porsche, SMA, Spels
 Vaillant and Viessmann — recorded with `eebus-go` and published as MIT-licensed
 [`enbility/devices`](https://github.com/enbility/devices). Every one must parse, carry a
 header this crate would accept off a socket, and resolve into a device model; between them
-they name a dozen use cases and exercise eight feature types. They seed the fuzz corpora
-too, so the fuzzers explore shapes real hardware produces rather than shapes this crate
-produces.
+they name a dozen use cases and exercise eight feature types. They also seed the fuzz
+corpora with shapes real hardware produces.
 
 **A live peer, in both directions.** An opt-in suite runs `eebus-go`'s own examples in a
 container at a **pinned** revision and drives the whole §14a exchange against them:
@@ -186,31 +179,29 @@ handshake, SPINE discovery, the binding and the subscription, and a limit writte
 and recorded.
 
 The third row is the direction §14a describes — the control box dials, the household
-appliance listens — and it is the one that exercises this crate's accept path against
-something it did not write. `eebus-go` discovers its peer over mDNS rather than taking an
-address, so it needs the host's own network stack; the test skips with the reason where the
-Docker daemon cannot give it that, and `tests/interop/Dockerfile` carries the recipe.
+appliance listens — and exercises this crate's accept path. `eebus-go` discovers its peer
+over mDNS, so it needs the host's network stack; the test skips with the reason where the
+Docker daemon cannot provide it.
 
 **Pointing the peer at a daemon of your own.** The same image runs against a listener
-*outside* the container — a household daemon under development, rather than this test's
-`Hub::listen`:
+outside the container, such as a household daemon under development:
 
 ```sh
 docker run --rm --network host eebus-interop-controlbox:pinned \
     controlbox -port 4713 -remoteski <the listener's SKI>
 ```
 
-The comment block at the foot of `tests/interop/Dockerfile` is the recipe, and lists the
-three things that trip people up — mDNS rather than an address, an announcement that names
-its addresses, and both SKIs exchanged first.
+The comment block at the foot of `tests/interop/Dockerfile` is the recipe and lists the
+three common pitfalls — mDNS rather than an address, an announcement that names its
+addresses, and both SKIs exchanged first.
 
 ```sh
 cargo test --features interop,full --test interop -- --nocapture
 ```
 
 It is behind `required-features` and runs as its own CI job, so an ordinary `cargo test`
-stays hermetic, needs no Docker and finishes in seconds. Pinning the peer is what makes a
-failure legible: it means *this crate* changed, not that the other one did.
+stays hermetic and needs no Docker. Because the peer is pinned, a failure means this crate
+changed.
 
 ## How the crate is checked
 
@@ -233,8 +224,8 @@ failure legible: it means *this crate* changed, not that the other one did.
 | Minimum Rust version | `cargo +1.88.0 check` |
 | Embedded | `cargo build --no-default-features --target thumbv7em-none-eabihf` |
 
-`--workspace` covers the code generator in `xtask/`; the fuzz targets are a workspace of
-their own and are compiled separately. `--all-features` is not used because it cannot be:
-the two cryptography providers are mutually exclusive, and `full` is everything on `ring`.
+`--workspace` covers the code generator in `xtask/`; the fuzz targets are a separate
+workspace. `--all-features` is not used: the two cryptography providers are mutually
+exclusive, and `full` is everything on `ring`.
 
 All of it runs in CI on every push.

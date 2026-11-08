@@ -6,13 +6,13 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Unofficial EEBUS (SHIP + SPINE + Use Cases) protocol implementation in Rust"
 repository = "https://github.com/hupe1980/eebus"
-homepage = "https://github.com/hupe1980/eebus"
+homepage = "https://hupe1980.github.io/eebus"
 documentation = "https://docs.rs/eebus"
 keywords = ["eebus", "ship", "spine", "energy", "smart-home"]
 categories = ["network-programming", "embedded", "encoding"]
@@ -39,9 +39,9 @@ interop = []
 ring = ["rustls?/ring", "tokio-rustls?/ring", "rcgen?/ring"]
 aws-lc-rs = ["rustls?/aws_lc_rs", "tokio-rustls?/aws_lc_rs", "rcgen?/aws_lc_rs"]
 
-# Certificates: generating a node's own, and reading a peer's SKI out of one.
+# Certificates: making, storing and restoring a node's own, and reading a peer's SKI out of one.
 # Needs a provider: `--features cert,ring` or `--features cert,aws-lc-rs`.
-cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:sha2", "dep:time"]
+cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:sha2", "dep:time", "dep:pem"]
 # TLS 1.2 as SHIP §9 mandates, with the trust decision deferred to the SHIP handshake.
 tls = ["cert", "dep:rustls"]
 # Sockets: TCP, TLS and WebSocket on Tokio, driving the sans-IO cores.
@@ -61,6 +61,7 @@ hmac = { version = "0.12", default-features = false, optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
 # No provider here: `crypto` comes with whichever of `ring`/`aws_lc_rs` the consumer picks.
 rcgen = { version = "0.14", default-features = false, features = ["pem"], optional = true }
+pem = { version = "4", default-features = false, features = ["std"], optional = true }
 x509-parser = { version = "0.18", optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 time = { version = "0.3", default-features = false, optional = true }

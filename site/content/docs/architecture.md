@@ -27,11 +27,10 @@ flowchart LR
 ```
 
 Each layer depends only on those to its left. `runtime` is the only module that opens a
-socket or reads a clock, and it sits outside the dependency chain rather than inside it.
+socket or reads a clock, and it sits outside the dependency chain.
 
-Feature flags rather than a family of crates: `eebus-codec`, `eebus-ship`, `eebus-spine`
-and friends would have to be version-locked to each other forever, and the boundary they
-would enforce is already enforced by the module graph.
+One crate with feature flags, not a family of crates: the module graph already enforces the
+boundary, and nothing has to be version-locked.
 
 ## Sans-IO
 
@@ -46,46 +45,43 @@ handshake.poll_timeout();                 engine.poll_timeout();
 handshake.poll_event();                   engine.poll_event();
 ```
 
-Time is a parameter, and that buys three things:
+Time is a parameter, so:
 
-**Every timeout in the standard is an ordinary unit test.** The two-minute hello
-prolongation, SHIP's PIN penalty, the SPINE ten-second response deadline, LPC's two-hour
-failsafe — each is a few lines against a virtual clock, running in microseconds.
+**Every timeout in the standard is a unit test.** The two-minute hello prolongation, SHIP's
+PIN penalty, the SPINE ten-second response deadline, LPC's two-hour failsafe — each runs
+against a virtual clock in microseconds.
 
-**The same code runs anywhere.** Under Tokio, inside a simulator, on a microcontroller
-with a bare TCP stack, or in a fuzz target that feeds it bytes with no I/O at all.
+**The same code runs anywhere.** Under Tokio, in a simulator, on a microcontroller with a
+bare TCP stack, or in a fuzz target with no I/O at all.
 
 **Failure is reproducible.** A packet trace and a timestamp sequence reproduce a bug
-exactly, because there is nothing else the core can depend on.
+exactly.
 
 ## Generated from the schemas
 
 The SPINE and SHIP specifications ship XML Schemas. `cargo xtask codegen` reads them and
 emits 830 SPINE types and 47 SHIP messages, so the model cannot drift from the standard by
 transcription error. The generated Rust is committed, so building the crate never needs the
-specifications; the generator normalises its output through rustfmt, so re-running it when
-nothing has changed produces no diff.
+specifications; output goes through rustfmt, so re-running on unchanged input produces no
+diff.
 
 See [Regenerating the model](@/docs/codegen.md).
 
-**Macros, not emitted implementations.** The generated model is 830 types. Emitting
-`Serialize`/`Deserialize` for each would be some 30,000 lines nobody reads, in which a
-wire-format bug could hide in a single type. So the generator emits declarations only, and
-the encoding rules live in ten hand-written, hand-tested macros — a fix to the wire format
-is a fix everywhere.
+**Macros, not emitted implementations.** The generator emits declarations only; the
+encoding rules for all 830 types live in eleven hand-written, hand-tested macros, so a fix to
+the wire format is a fix everywhere.
 
 ## Illegal states are unrepresentable
 
 A SPINE command carries a payload *choice*, so "two payloads in one command" cannot be
 constructed. Identifiers are distinct newtypes, so a `LoadControlLimitId` cannot be passed
-where a `MeasurementId` belongs — a mix-up that matters in practice, because LPC requires a
-limit's `measurementId` to match the one MPC reports against.
+where a `MeasurementId` belongs — LPC requires a limit's `measurementId` to match the one
+MPC reports against.
 
 ## no_std
 
 Everything below `runtime` builds for `no_std + alloc`, checked in CI against
-`thumbv7em-none-eabihf` — a Cortex-M4F, the class of part a heat-pump controller actually
-uses. See [Embedded targets](@/docs/embedded.md).
+`thumbv7em-none-eabihf` (Cortex-M4F). See [Embedded targets](@/docs/embedded.md).
 
 ## Feature flags
 
@@ -106,12 +102,11 @@ uses. See [Embedded targets](@/docs/embedded.md).
 `runtime` implies `tls` and `cert`. A device that only parses datagrams — a test harness,
 a gateway, a simulator — pays for none of them.
 
-All three of those also need a cryptography provider, and the crate names neither: exactly
-one of `ring` and `aws-lc-rs` must be selected, or the build stops with a `compile_error!`
-saying so. `rustls`' provider is process-global, so the choice belongs to whoever builds the
-binary rather than to a library in the middle of it —
+`tls`, `cert` and `runtime` need exactly one of `ring` and `aws-lc-rs`, or the build stops
+with a `compile_error!`. `rustls`' provider is process-global, so the binary's builder
+chooses —
 [the security model](@/docs/security.md#the-cryptography-provider-is-the-consumer-s-choice)
 has the reasoning.
 
-That makes `--all-features` a configuration that cannot exist. `--features full` is
-everything, on `ring`, and it is what CI and docs.rs build.
+`--all-features` therefore cannot build. `--features full` is everything, on `ring`, and is
+what CI and docs.rs build.

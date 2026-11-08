@@ -3,7 +3,9 @@
 //! `cargo xtask codegen` regenerates `src/model/generated/` from the SPINE 1.3.0 XML
 //! Schemas. The schemas are not redistributable, so they live in a git-ignored
 //! reference directory (see [`reference_dir`]) and the *generated* Rust is what gets
-//! committed: building the crate never requires access to the specification.
+//! committed: building the crate never requires access to the specification. Beside the
+//! generated code, `schemas.sha256` records which schemas it came from, and
+//! `cargo xtask check-schemas` compares the ones on this machine against it.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +15,7 @@ mod fixtures;
 mod floats;
 mod naming;
 mod rfe;
+mod schemas;
 mod simulators;
 mod xsd;
 
@@ -73,6 +76,16 @@ fn main() {
                 }
             }
         }
+        Some("check-schemas") => {
+            let root = repo_root();
+            match schemas::check(&root) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("check-floats") => {
             let root = repo_root();
             match floats::run(&root) {
@@ -84,7 +97,9 @@ fn main() {
             }
         }
         other => {
-            eprintln!("usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats>");
+            eprintln!(
+                "usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats|check-schemas>"
+            );
             if let Some(o) = other {
                 eprintln!("unknown task: {o}");
             }

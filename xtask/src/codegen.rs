@@ -13,13 +13,13 @@ use crate::naming::{field_name, module_name, pascal, snake, type_name, variant_n
 use crate::xsd::{self, ComplexDef, GroupDef, Particle, Schema, SimpleDef};
 
 /// How one schema is turned into Rust.
-struct Profile {
+pub(crate) struct Profile {
     /// Human-readable name, used in the report and in module docs.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// Specification version, for the `@generated` banner.
     version: &'static str,
-    xsd_dir: PathBuf,
-    out_dir: PathBuf,
+    pub(crate) xsd_dir: PathBuf,
+    pub(crate) out_dir: PathBuf,
     /// `Some(name)` collapses the whole schema into one module file.
     single_module: Option<&'static str>,
     /// Types written by hand instead of generated.
@@ -46,8 +46,16 @@ const SHIP_CHOICES: &[(&str, &str, &str)] = &[
     ("MsgTypeEndGroup", "EndMessage", "end"),
 ];
 
-pub fn run(root: &Path) -> Result<String, String> {
-    let reference = crate::reference_dir(root);
+/// The two schemas the generator reads, and where each one's Rust goes.
+///
+/// Shared with `cargo xtask check-schemas`, so the check looks exactly where the generator
+/// reads.
+pub(crate) fn profiles(root: &Path) -> [Profile; 2] {
+    profiles_at(root, &crate::reference_dir(root))
+}
+
+/// [`profiles`], reading the specifications from `reference` instead of the default.
+pub(crate) fn profiles_at(root: &Path, reference: &Path) -> [Profile; 2] {
     let spine = Profile {
         label: "SPINE",
         version: "1.3.0",
@@ -77,9 +85,13 @@ pub fn run(root: &Path) -> Result<String, String> {
         inline_choices: &["MsgTypeControlKeyMaterialExchangeGroup"],
         parent_use: "super::super",
     };
+    [spine, ship]
+}
 
+pub fn run(root: &Path) -> Result<String, String> {
+    let reference = crate::reference_dir(root);
     let mut report = String::new();
-    for profile in [spine, ship] {
+    for profile in profiles(root) {
         if !profile.xsd_dir.is_dir() {
             return Err(format!(
                 "{} schemas not found at {}.\n\
@@ -98,6 +110,12 @@ pub fn run(root: &Path) -> Result<String, String> {
         })?;
         let lowered = lower(&profile, &schema)?;
         write_modules(&profile, &lowered)?;
+        // Last, because `write_modules` clears the directory: which schemas this model
+        // came from, for `cargo xtask check-schemas`.
+        let record = crate::schemas::record(&profile.xsd_dir)?;
+        let record_path = profile.out_dir.join(crate::schemas::RECORD);
+        std::fs::write(&record_path, record)
+            .map_err(|e| format!("writing {record_path:?}: {e}"))?;
         writeln!(
             report,
             "{}: {} types ({} structs, {} enums, {} newtypes, {} choices, {} aliases) \

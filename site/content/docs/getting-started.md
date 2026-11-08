@@ -13,13 +13,11 @@ cargo add eebus
 ```
 
 Default features are `std`, `pairing` and `conformance`. Sockets, TLS and certificates are
-opt-in — see
-[Feature flags](@/docs/architecture.md#feature-flags). Minimum supported Rust version is
-**1.88**.
+opt-in — see [Feature flags](@/docs/architecture.md#feature-flags). Minimum supported Rust
+version is **1.88**.
 
-Anything that touches TLS also needs a cryptography provider, and the crate does not pick
-one for you: add `ring` or `aws-lc-rs`, exactly one, or the build stops with an explanation.
-The choice is process-global in `rustls`, so it belongs to whoever builds the binary — see
+Anything that touches TLS also needs exactly one cryptography provider, `ring` or
+`aws-lc-rs`; otherwise the build stops with an explanation. See
 [the security model](@/docs/security.md#the-cryptography-provider-is-the-consumer-s-choice).
 
 ```sh
@@ -28,8 +26,7 @@ cargo add eebus --features runtime,ring
 
 ## Run the exchange
 
-Two examples play out the whole stack, and between them they are the fastest way to
-understand it.
+Two examples play out the whole stack.
 
 ```sh
 git clone https://github.com/hupe1980/eebus && cd eebus
@@ -98,15 +95,13 @@ engine.poll_timeout();                    // when to come back
 engine.poll_event();                      // what the application should know
 ```
 
-That is the whole shape of it, and the SHIP handshake works the same way. See
-[Architecture](@/docs/architecture.md) for why, and [On a network](@/docs/networking.md)
-for the `Hub` that supplies the sockets and the clock when you would rather not.
+The SHIP handshake works the same way. See [Architecture](@/docs/architecture.md), and
+[On a network](@/docs/networking.md) for the `Hub` that supplies sockets and the clock.
 
 ## Answer a limit
 
-Under §14a EnWG the acknowledgement is the record that the limit was applied, so a write
-is answered by the use case rather than by a generic setter — only the application knows
-what the appliance actually did.
+Under §14a EnWG the acknowledgement is the record that the limit was applied, so the
+application answers the write through the use case, not a generic setter.
 
 ```rust
 use eebus::spine::SpineEvent;
@@ -114,7 +109,7 @@ use eebus::usecases::limitation::{self, WriteOutcome};
 
 if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
     // `resolved` is the update merged into what is stored; `data` is what arrived.
-    let write = limitation::read_limit_write(&w.resolved)?;
+    let write = limitation::read_limit_write(&w.resolved, limitation::LIMIT_ID)?;
     let outcome = system.on_limit_write(&write, decide(&write), now);
     if outcome.is_accepted() {
         engine.accept_write(w.token, now)?;                          // ACK — or what the peer was told instead
