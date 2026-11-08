@@ -55,7 +55,15 @@ They are free but **not redistributable**, so they are not in the repository.
 export EEBUS_REFERENCE=<dir>
 cargo run -p xtask -- codegen    # regenerate src/model/generated and src/ship/generated
 cargo run -p xtask -- fixtures   # regenerate tests/fixtures from the specification's examples
+cargo run -p xtask -- check-schemas  # are these the schemas the committed model came from?
 ```
+
+Beside each generated model, `codegen` writes `schemas.sha256`: every schema it read and
+its SHA-256, with line endings normalised, in the format `sha256sum` prints.
+`check-schemas` compares the schemas it finds through `EEBUS_REFERENCE` against those
+records and names every file that is changed, missing or unexpected. Without the
+specifications it says so and succeeds, which is why it can run anywhere. The schemas
+themselves cannot be committed, but which ones the model came from can be.
 
 A third generator needs no specifications at all:
 

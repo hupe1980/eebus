@@ -75,18 +75,7 @@ pub fn local(qname: &str) -> &str {
 }
 
 pub fn load_dir(dir: &Path, module_of: impl Fn(&str) -> String) -> Result<Schema, String> {
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| format!("reading {}: {e}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "xsd"))
-        .filter(|p| {
-            !p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with("_overview"))
-        })
-        .collect();
-    files.sort();
+    let files = crate::schemas::schema_files(dir)?;
 
     let mut schema = Schema::default();
     for path in &files {

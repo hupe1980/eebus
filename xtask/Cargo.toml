@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 roxmltree = "0.21"
+# The digests in `schemas.sha256`; already in the lockfile through `eebus/cert`.
+sha2 = "0.10"
 # `preserve_order`, because the EEBUS JSON projection is an *ordered* sequence: a
 # converter that let a map reorder the keys would produce a valid-looking document that
 # says something different.

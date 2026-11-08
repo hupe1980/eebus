@@ -387,7 +387,13 @@ into `<dir>/ship/` of a directory outside the repository, and run:
 export EEBUS_REFERENCE=<dir>
 cargo run -p xtask -- codegen    # regenerate src/model/generated and src/ship/generated
 cargo run -p xtask -- fixtures   # regenerate tests/fixtures from the specification's examples
+cargo run -p xtask -- check-schemas  # are these the schemas the committed model came from?
 ```
+
+`codegen` writes `schemas.sha256` beside each generated model, in `sha256sum` format: the
+schemas it read and their digests. `check-schemas` names any schema that is changed,
+missing or unexpected, and succeeds without checking anything where the specifications are
+absent.
 
 A third generator needs no specifications — it converts MIT-licensed captures from real
 hardware into wire-format fixtures:

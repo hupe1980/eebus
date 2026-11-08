@@ -8,6 +8,12 @@ Notable changes to `eebus`. The format follows
 
 ### Added
 
+- **`cargo xtask check-schemas`** (contributor tooling). `cargo xtask codegen` now commits
+  `schemas.sha256` beside each generated model: the schemas it was generated from, in
+  `sha256sum` format. `check-schemas` names every schema on a maintainer's machine that is
+  changed, missing or unexpected against that record, and passes, saying so, where the
+  specifications are absent. The crate itself is unchanged.
+
 - **`Identity::from_pem` and `Identity::from_der` restore a stored identity** (#5, reported
   by `defigli`). Until now an `Identity` could only be made by signing a certificate, so a
   device that stored its key and came back from a restart signed a *new* one. The SKI
