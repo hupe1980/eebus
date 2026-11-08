@@ -12,7 +12,7 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Unofficial EEBUS (SHIP + SPINE + Use Cases) protocol implementation in Rust"
 repository = "https://github.com/hupe1980/eebus"
-homepage = "https://github.com/hupe1980/eebus"
+homepage = "https://hupe1980.github.io/eebus"
 documentation = "https://docs.rs/eebus"
 keywords = ["eebus", "ship", "spine", "energy", "smart-home"]
 categories = ["network-programming", "embedded", "encoding"]
@@ -39,7 +39,7 @@ interop = []
 ring = ["rustls?/ring", "tokio-rustls?/ring", "rcgen?/ring"]
 aws-lc-rs = ["rustls?/aws_lc_rs", "tokio-rustls?/aws_lc_rs", "rcgen?/aws_lc_rs"]
 
-# Certificates: generating a node's own, and reading a peer's SKI out of one.
+# Certificates: making, storing and restoring a node's own, and reading a peer's SKI out of one.
 # Needs a provider: `--features cert,ring` or `--features cert,aws-lc-rs`.
 cert = ["std", "dep:rcgen", "dep:x509-parser", "dep:sha1", "dep:sha2", "dep:time", "dep:pem"]
 # TLS 1.2 as SHIP §9 mandates, with the trust decision deferred to the SHIP handshake.

@@ -1,7 +1,7 @@
 //! Which schemas the committed model was generated from.
 //!
-//! The model is committed and the schemas are not, because they are not redistributable
-//! (D42). So nothing can say whether the schemas on a maintainer's machine are the ones the
+//! The model is committed and the schemas are not, because they are not redistributable.
+//! So nothing can say whether the schemas on a maintainer's machine are the ones the
 //! model came from, until something writes that down. `cargo xtask codegen` writes
 //! `schemas.sha256` beside each generated model, and `cargo xtask check-schemas` compares
 //! the schemas it finds against it.

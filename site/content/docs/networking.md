@@ -6,8 +6,8 @@ weight = 110
 group = "Deployment"
 +++
 
-The protocol core owns no socket and reads no clock, which is what makes every timer in the
-standard an ordinary unit test. The `runtime` feature is the only part that owns them.
+The protocol core owns no socket and reads no clock; the `runtime` feature is the only part
+that does.
 
 ## The Hub
 
@@ -40,8 +40,7 @@ loop {
 What it does for you:
 
 * runs every TLS and SHIP handshake **off the loop**, so a peer that is slow, unreachable
-  or waiting for a user holds nothing else up — a control box with ten devices to redial
-  keeps its heartbeats going to the nine that answer;
+  or waiting for a user holds nothing else up;
 * routes each datagram the engine produces to the peer it addresses;
 * runs the opening discovery, so an application hears about a peer only once it knows what
   that peer *is*;
@@ -52,12 +51,12 @@ What it does for you:
 
 Routing is *by* the peer's SPINE device address, so that address is bound to a connection
 once and not afterwards: a peer that restates a different one, or claims one another
-connection holds, is disconnected with `Disconnect::AddressConflict`. Two devices shipped
-with the same vendor and serial produce this without any malice.
+connection holds, is disconnected with `Disconnect::AddressConflict` — as are two devices
+shipped with the same vendor and serial.
 
-`Disconnected` is not the end of a use case. The state machine survives the socket, which
-is the correct behaviour — a heat pump under a limit stays under it while the LAN
-reconverges, and the failsafe timer, not the socket, decides when that stops being true.
+`Disconnected` is not the end of a use case. The state machine survives the socket: a heat
+pump under a limit stays under it while the LAN reconverges, and the failsafe timer decides
+when that ends.
 
 ## Pairing
 
@@ -73,25 +72,22 @@ HubEvent::TrustRequested { peer, origin } => {
 }
 ```
 
-`peer` is a `PendingPeer`: both identities SHIP knows a node by, and both **proved** rather
-than claimed, because the peer completed TLS to get here. The SKI is what §12.2 trusts and
-what is printed on the box; the fingerprint is what a QR code carries as `FPH256`, and what
-the Pairing Service admits a control unit on.
+`peer` is a `PendingPeer`: both identities SHIP knows a node by, both proved by TLS. The
+SKI is what §12.2 trusts and what is printed on the box; the fingerprint is what a QR code
+carries as `FPH256`, and what the Pairing Service admits a control unit on.
 
-`hub.approve(ski)` adds the SKI to the trust store and **completes the handshake it is
-waiting in** — no reconnection, no timeout, no forty hex digits typed in advance. Adding the
-SKI to the `TrustStore` directly does the same, because the store is what the waiting
-handshake watches, so an approval from a user-interface thread needs nothing else.
+`hub.approve(ski)` adds the SKI to the trust store and **completes the waiting handshake** —
+no reconnection. Adding the SKI to the `TrustStore` directly does the same, since the
+waiting handshake watches the store, so a user-interface thread can approve.
 `hub.refuse(ski)` tells the peer `hello: aborted` instead, and both sides report
-`HandshakeFailed`. Neither happens on its own: SHIP IG §2.3 forbids an auto-accept mode,
-and there is none.
+`HandshakeFailed`. There is no auto-accept mode (SHIP IG §2.3).
 
 The same flow runs the other way round. A peer this node dials, and which has not approved
 this node, holds *us* pending while its user decides; `Connected` arrives when they do.
 
 A peer `browse` finds but the store does not trust is reported as `Found { trusted: false }`
-and kept aside; `approve` then dials it. That is the whole of commissioning from the
-control box's side: browse, see, approve.
+and kept aside; `approve` then dials it. Commissioning from the control box's side is
+browse, see, approve.
 
 ### And a PIN is not sent to just anybody
 
@@ -104,15 +100,13 @@ HubEvent::PinWithheld { ski, level } => { /* only trusted at `level`, so it was 
 HubEvent::PinVerified { ski, level } => { /* it proved ours; §12.5 awarded a second factor */ }
 ```
 
-The first event matters because from the far end a withheld PIN looks exactly like having
+`PinWithheld` matters because from the far end a withheld PIN looks exactly like having
 none: the connection carries on with data exchange restricted either way.
 
 ### Without a hub
 
-A driver that owns its own `Engine` — because it has to be testable without a socket — has
-no `Hub` to hear `TrustRequested` from, and needs the SKI just as much: a box that cannot
-*display* it cannot take part in the exchange that most often goes wrong on site. `Node`
-reports it directly, two ways:
+A driver that owns its own `Engine` has no `Hub` to hear `TrustRequested` from, and still
+needs to display the SKI. `Node` reports it directly, two ways:
 
 ```rust
 // Told, on the handshake's own task. Must not block: send it on a channel.
@@ -133,11 +127,11 @@ disappears when its handshake ends — approval, refusal, timeout, dropped socke
 
 ### …or nobody is asked at all
 
-The **SHIP Pairing Service** (TS 1.0.0) exists because a metering control unit is
-installed by an electrician who never sees the household's screen. The unit — `devZ` — is
-configured from the household device's QR code, and announces a `_shippairing._tcp`
-record whose `digest` is an HMAC over its own fields under the printed secret. The
-household device — `devA` — recomputes it and, if it matches, trusts the certificate.
+The **SHIP Pairing Service** (TS 1.0.0) serves a metering control unit installed by an
+electrician who never sees the household's screen. The unit — `devZ` — is configured from
+the household device's QR code, and announces a `_shippairing._tcp` record whose `digest`
+is an HMAC over its own fields under the printed secret. The household device — `devA` —
+recomputes it and, if it matches, trusts the certificate.
 
 **`devA` receives requests**, in two calls:
 
@@ -172,11 +166,10 @@ match requester.poll_action() {
 ```
 
 `Requester` is §4.2's timing, sans-IO. The request goes up **when it is configured**, not
-when a connection succeeds — `devA` cannot trust `devZ` until it has heard it. A
-connection decides when it comes *down*: `on_connected` starts the clock,
-`on_disconnected` stops it, and fifteen uninterrupted minutes settle it for good, reboots
-included. The SRV port is required by DNS-SD and meaningless: §5.3 says it SHALL be one
-nothing listens on.
+when a connection succeeds — `devA` cannot trust `devZ` until it has heard it. A connection
+decides when it comes *down*: `on_connected` starts the clock, `on_disconnected` stops it,
+and fifteen uninterrupted minutes settle it for good, reboots included. The SRV port is
+required by DNS-SD but unused: §5.3 says it SHALL be one nothing listens on.
 
 **What gets trusted is a certificate**, not a key identifier — the request names no SKI —
 so the store holds a `PairedUnit` beside its `TrustedPeer`s, and a matching fingerprint
@@ -187,8 +180,7 @@ connection proves one, so persist on `Connected` as well as on `Paired`. A node 
 **A working pairing is not replaceable.** §4.3 stops `devA` processing requests once it
 has accepted one, and resumes only after fifteen minutes of being unable to reach the unit
 it paired — so a broken unit can be replaced without a factory reset, and a captured
-announcement cannot break a pairing that is doing its job. The hub tracks it, being the
-only thing that knows whether messages are flowing.
+announcement cannot break a working pairing. The hub tracks this.
 
 ## Discovery
 
@@ -210,39 +202,33 @@ guessed at: the SKI is what a trust decision rests on.
 ### A node is not its own peer
 
 A node that announces `_ship._tcp` and browses for it meets its own announcement. That is
-not reported, not remembered and not offered for pairing: its SKI is the one TXT record
-whose claim is already known to be true.
+not reported, not remembered and not offered for pairing.
 
-The rule belongs in the library because TLS cannot enforce it. A node dialling itself
-presents exactly the certificate, the key and the SKI the verifier was told to demand, so
-the handshake succeeds. The invariant is therefore stated where identity stops being a
-claim: a connection proving this node's own SKI is refused with
+TLS cannot catch it — a node dialling itself presents exactly the certificate the verifier
+demands — so a connection proving this node's own SKI is refused with
 `ConnectionError::SelfConnection`, whichever end opened it and however it was reached —
 `remember`, a configured address, or `adopt` from an application's own transport.
 `Hub::approve` refuses the same SKI.
 
-The same holds one layer down. Routing is by SPINE device address, so a peer claiming this
-node's own is `Disconnect::AddressConflict`, and the engine — which cannot close a socket it
-has never seen — discards such a datagram rather than filing this node as its own peer.
+One layer down, a peer claiming this node's own SPINE device address is
+`Disconnect::AddressConflict`, and the engine discards such a datagram rather than filing
+this node as its own peer.
 
 ## Reconnection
 
-`remember` is what keeps a §14a installation working across a router reboot. Nothing tells
-the hub the peer is back, so it keeps asking — backing off from one second to two minutes,
-with the delay **jittered by the peer's SKI**, so a building coming back from a power cut
-does not have every device dialling in the same instant. The dial runs in the background:
-a peer that is down never holds up the ones that are up, and a dial that reaches nobody is
-given up after `CONNECT_TIMEOUT` rather than the operating system's own minutes.
+`remember` keeps a peer reachable across a router reboot: the hub keeps dialling, backing
+off from one second to two minutes, with the delay **jittered by the peer's SKI** so a
+building coming back from a power cut does not dial all at once. Dials run in the
+background, and one that reaches nobody is given up after `CONNECT_TIMEOUT`.
 
 ## `next` is not cancel-safe
 
 **Do not put `hub.next()` in a `tokio::select!` or a `timeout`.** `Hub::run(handler)` is
 the loop that cannot get this wrong.
 
-Reading is cancel-safe — `WebSocketStream` buffers a partial frame — but `next` flushes the
-engine's queue first, and a `Sink::send` dropped part-way leaves **half a frame on the
-wire**. A `next` dropped mid-write leaves a mark; the next call closes that connection with
-`Disconnect::InterruptedWrite` rather than leave the peer's parser out of step.
+Reading is cancel-safe, but `next` flushes the engine's queue first, and a `Sink::send`
+dropped part-way leaves **half a frame on the wire**. The next call then closes that
+connection with `Disconnect::InterruptedWrite`.
 
 Sockets, the listener and mDNS arrive as events. Timers — a deadlock guard included — go to
 `wake_at`; drain other channels, such as a command inbox, on `HubEvent::Tick`:
@@ -264,27 +250,22 @@ timers and returns at once rather than reading with a zero-length timeout.
 
 ## How many connections
 
-A hub holds at most `DEFAULT_MAX_CONNECTIONS` — sixteen — and two to the same peer, which is
-what §12.2.3 legitimately produces while a double connection is arbitrated. The cap counts
-handshakes still running as well as connections held: a peer that dials in and sits in the
-pending state has taken a slot, and a hundred of them would otherwise be a hundred TLS
-sessions waiting for a user who is not there. `Hub::set_max_connections` raises it for a
-gateway that serves more, and lowers it to no less than one, which is the floor §623 sets.
-SHIP caps none of this; [Security](@/docs/security.md#resource-exhaustion) lists every bound.
+A hub holds at most `DEFAULT_MAX_CONNECTIONS` — sixteen — and two to the same peer, which
+§12.2.3 produces while a double connection is arbitrated. The cap counts handshakes still
+running, including peers waiting in the pending state. `Hub::set_max_connections` raises it
+for a gateway, or lowers it to no less than one, the floor §623 sets.
+[Security](@/docs/security.md#resource-exhaustion) lists every bound.
 
-**A slot is reserved in each direction**, which SHIP §8.1 does specify and which a single
-number cannot express. §628 asks a node holding more than one connection to *"always reserve
-one connection for the TCP server port"* — so of `x` connections at most `x-1` may be ones
-this node dialled — and §632 says the same in reverse for ones it accepted — so a gateway
-that has dialled every peer it knows still accepts the Steuerbox that turns up afterwards.
-Past either limit the outcome is the same `TooManyConnections` as the overall cap.
+**A slot is reserved in each direction** (SHIP §8.1). §628 asks a node holding more than one
+connection to *"always reserve one connection for the TCP server port"* — so of `x`
+connections at most `x-1` may be ones this node dialled — and §632 says the same in reverse
+for ones it accepted, so a gateway that has dialled every known peer still accepts a new
+Steuerbox. Past either limit the outcome is `TooManyConnections`.
 
 **Every SHIP node listens.** §623 puts the floor at one active connection, §624 and §628
 both require a listening TCP server, and §638 asks for it to be open whenever the node is
-under its limit. Which end opens the §14a conversation is a use case's business — the
-Energy Guard dials, the Controllable System is dialled — and it says nothing about which
-end binds a port. A node that announces `_ship._tcp` at a port it does not serve is
-retried by every peer on the segment for ever.
+under its limit — regardless of which end a use case says opens the conversation. A node
+that announces `_ship._tcp` at a port it does not serve is retried by every peer for ever.
 
 Beyond the cap a socket is dropped before TLS and reported as
 `HandshakeFailed { error: TooManyConnections }`; a connection that completed its handshake
@@ -294,47 +275,39 @@ room: a cap decides what is *accepted*.
 **A second cap covers the unapproved.** `MAX_PENDING_TRUST` — four — is how many peers may
 be waiting for a decision, **one slot per SKI**: a peer that dials four times is still one
 decision. Beyond the cap a peer is told `hello: aborted` at once and reported as
-`TooManyPendingPairings`, so it retries rather than squatting. Keying on the SKI is safe
-where an address would not be: the SKI came out of a completed TLS handshake.
+`TooManyPendingPairings`, so it retries rather than squatting. The SKI key is safe because
+it comes from a completed TLS handshake.
 
 ## Closing a connection, and blocking a peer
 
 SPINE IG §2.6.2 escalates a peer that stops answering, and its fourth step is *close the
-SHIP connection*. The engine deliberately stops before it: §2.6.4 says one unresponsive use
-case is not a reason to drop a connection carrying others, and only the application knows
-which it has. So the engine reports `SpineEvent::RequestTimedOut` and the decision is yours.
+SHIP connection*. The engine stops before it — §2.6.4: one unresponsive use
+case is not a reason to drop a connection carrying others — and reports
+`SpineEvent::RequestTimedOut`; closing is the application's decision.
 
 ```rust
 hub.close(&ski, ConnectionCloseReason::Unspecific);       // §2.6.2: end this session
 ```
 
-**A closed peer comes back.** Closing says nothing about the future, so a remembered peer is
-redialled on the usual backoff — which is what a wedged peer needs, and is the common case.
-§2.6.3's *block the peer* is the other decision, and it is two calls:
+**A closed peer comes back.** A remembered peer is redialled on the usual backoff.
+§2.6.3's *block the peer* is two calls:
 
 ```rust
 hub.forget_peer(&ski);                                     // stop dialling it back
 hub.close(&ski, ConnectionCloseReason::RemovedConnection); // and end what is up
 ```
 
-Forgetting first matters: between the two the redial schedule is still live, and a peer
-closed while remembered is a peer being dialled again.
+Forget first: a peer closed while remembered is dialled again.
 
-Neither touches trust. A closed peer that dials back in is still approved, because "this
-session is no good" and "this device is not ours" are different decisions with different
-audiences — the second is `TrustStore::forget`.
+Neither touches trust; a closed peer that dials back in is still approved. Removing trust is
+`TrustStore::forget`.
 
 ## Deciding is not answering
 
-`hub.next()` sends what the engine has queued on the way *in*, so a loop that keeps calling
-it never has to think about flushing. The two places that are not a loop do: before
-`shutdown` — which flushes for you — and in a test or a one-shot that stops as soon as it
-has seen what it was waiting for. `Hub::flush` is there for the second.
-
-A Controllable System that accepts a limit and then stops driving its hub has left the
-`result` message in the queue, and the Energy Guard is still waiting for it. Under §14a
-that is the difference between a limitation that was honoured and one that cannot be shown
-to have been.
+`hub.next()` sends what the engine has queued on the way *in*, so a loop never has to
+flush. `shutdown` flushes for you; a test or one-shot that stops as soon as it has seen what
+it was waiting for calls `Hub::flush`. Otherwise a `result` — such as the acknowledgement of
+an accepted limit — stays in the queue and the peer never receives it.
 
 ## Owning your own engine
 
@@ -347,10 +320,9 @@ own — a different transport, a test harness, a gateway — needs the same two 
 let [discovery, use_cases] = engine.start_discovery(now);
 ```
 
-Both are addressed *without* a device part, which the SPINE implementation guide §2.7
-permits for exactly this message and no other: the peer's device address is what the answer
-contains, so it cannot be in the question. `Engine::discover` is the same pair addressed to
-a peer whose address is already known.
+Both are addressed *without* a device part, which SPINE IG §2.7 permits for this message
+only, since the answer is what contains the peer's address. `Engine::discover` is the same
+pair addressed to a known peer.
 
 `Node` is usable without the hub too: `Node::accept` and `Node::connect` run one handshake
 to completion and hand back a `ShipConnection`, and a trust decision added to the store
@@ -369,8 +341,7 @@ loopback.
 ## The two simulators
 
 `networked` is one program playing both sides. The two simulators are the sides as separate
-programs, which is what testing against real hardware needs — a control box with no
-household to limit, or a household appliance with no control box.
+programs, for testing against real hardware.
 
 ```sh
 # In one terminal: the household end. Prints its SKI and its QR payload, and asks on the
@@ -382,8 +353,8 @@ cargo run --example heat_pump --features full
 cargo run --example steuerbox --features full -- --limit 4200
 ```
 
-Answer `y` on each side, which is what pressing the button on a real device amounts to —
-or pass `--trust <SKI>` to either and skip the question. They persist their identity and
+Answer `y` on each side — the button press on a real device — or pass `--trust <SKI>` to
+either and skip the question. They persist their identity and
 their trust store between runs, and print the `lpc:` runtime signals of
 [Certification](@/docs/certification.md) as the state moves. `--reset` is the EEBUS reset
 of SHIP §12.2.2: forget every peer, and the identity with it.

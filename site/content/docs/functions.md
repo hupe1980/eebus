@@ -6,7 +6,7 @@ weight = 65
 group = "Protocol"
 +++
 
-SPINE admits thousands of implementation variations, and "which ones does this implement" is the first question an integrator has to answer. For Restricted Function Exchange the answer is a table, and this is it — **generated from the same source the compiler reads**, by `cargo xtask rfe-table`, so it cannot drift from what the engine does.
+This table lists the Restricted Function Exchange variations this crate implements. It is **generated from the same source the compiler reads**, by `cargo xtask rfe-table`, so it cannot drift from what the engine does.
 
 Of the **142** functions the SPINE payload defines, **141** can be exchanged in part: 98 are lists of identified entries and 43 are single values.
 
@@ -166,6 +166,6 @@ A **delete** is a restricted exchange too: its `selectors` choose the entries an
 
 ## Whole function only
 
-The schemas give one function no selectors and no elements filter, so there is nothing to narrow it by. A feature serving one announces `read` without `partial`, and a peer that sends a filter for it is answered `errorNumber` 8 — the honest answer, and the one that stops a client acting on a reply it thinks was filtered.
+The schemas give one function no selectors and no elements filter, so there is nothing to narrow it by. A feature serving one announces `read` without `partial`, and a peer that sends a filter for it is answered `errorNumber` 8, so no client acts on a reply it thinks was filtered.
 
 - `resultData`

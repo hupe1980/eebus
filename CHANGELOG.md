@@ -4,59 +4,44 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
-## [0.11.0] — unreleased
+## [0.11.0] — 2026-11-08
 
 ### Added
 
-- **`cargo xtask check-schemas`** (contributor tooling). `cargo xtask codegen` now commits
-  `schemas.sha256` beside each generated model: the schemas it was generated from, in
-  `sha256sum` format. `check-schemas` names every schema on a maintainer's machine that is
-  changed, missing or unexpected against that record, and passes, saying so, where the
-  specifications are absent. The crate itself is unchanged.
-
 - **`Identity::from_pem` and `Identity::from_der` restore a stored identity** (#5, reported
-  by `defigli`). Until now an `Identity` could only be made by signing a certificate, so a
-  device that stored its key and came back from a restart signed a *new* one. The SKI
-  survived that, because it follows the key. The fingerprint did not, because it follows
-  the certificate, and the fingerprint is what the Pairing Service trusts (SHIP §10.2) and
-  what the QR code prints as `FPH256`. Each restart made the device's own label wrong, and a
-  unit that restarted between being paired and its first connection was refused. A
-  restored identity now presents the stored certificate byte for byte.
-
-  A restore refuses a pair that does not belong together, each with its own `CertError`: a
-  key from another device (`KeyMismatch`), a certificate or key not on secp256r1
-  (`WrongCurve`), a certificate whose Subject Key Identifier is not the SHA-1 of its key
-  (`SkiMismatch`, the RFC 7093 truncated SHA-256 that common tooling writes), and text that
-  holds no PKCS#8 key (`NoPrivateKey`, `InvalidKey`). Each of those used to load and fail
-  later, as a handshake nobody could complete or as a node whose announced SKI was not the
-  one peers read from its certificate. An expired certificate restores; SHIP has no
-  certificate authority to judge it.
+  by `defigli`). Re-issuing from a stored key kept the SKI but gave the node a new
+  certificate fingerprint on every start, the value the Pairing Service trusts
+  (SHIP §10.2) and the QR code prints as `FPH256`. A restored identity presents the stored
+  certificate byte for byte. A pair that does not belong together is refused:
+  `KeyMismatch`, `WrongCurve` (not secp256r1), `SkiMismatch` (the certificate's SKI is not
+  the SHA-1 of its key), `NoPrivateKey` / `InvalidKey` (no PKCS#8 key). Expired
+  certificates restore.
 
 ### Changed
 
-- **Restart by restoring, not by re-issuing.** The documentation of `cert::self_signed`
-  told a device to call `self_signed_with` on every start after the first. That is the
-  defect above, and it now says to store `certificate_pem` and `key_pem` and restore them.
-  `self_signed_with` is documented as a deliberate re-issue that changes the fingerprint.
-  The simulators keep `identity.cert.pem` beside `identity.key.pem`. A state directory
-  holding only the key, as earlier versions wrote it, keeps its SKI and is issued a
-  certificate once.
+- **Restart by restoring.** The `cert::self_signed` docs say to store `certificate_pem` and
+  `key_pem` and restore both; `self_signed_with` is a deliberate re-issue that changes the
+  fingerprint. The simulators keep `identity.cert.pem` beside `identity.key.pem`; a
+  key-only state directory keeps its SKI and is issued a certificate once.
 
-  **Breaking.** `CertError` is `#[non_exhaustive]` and has four new variants, so a `match`
-  on it needs a wildcard arm. Two behaviour changes compile unchanged:
+- **Breaking:** `CertError` is `#[non_exhaustive]` and has four new variants.
 
   | | 0.10 | 0.11 |
   |---|---|---|
   | `match` on `CertError` | exhaustive | needs `_ =>` |
-  | ⚠️ silent: `key_from_der`, `key_from_pem` on a key that does not parse | `CertError::Generate(_)` | `CertError::InvalidKey(_)` |
-  | ⚠️ silent: `key_from_pem` on a block not labelled `PRIVATE KEY` | parsed if the bytes happened to parse | `CertError::NoPrivateKey` |
-  | restarting a stored identity | `self_signed_with(params, key_from_pem(&key)?)` | `Identity::from_pem(&certificate, &key)` |
+  | ⚠️ silent: `key_from_der` / `key_from_pem`, unparseable key | `CertError::Generate(_)` | `CertError::InvalidKey(_)` |
+  | ⚠️ silent: `key_from_pem`, block not labelled `PRIVATE KEY` | parsed if the bytes parsed | `CertError::NoPrivateKey` |
+  | restoring at start-up | `self_signed_with(params, key_from_pem(&key)?)` | `Identity::from_pem(&certificate, &key)` |
 
-  `hems` builds `eebus` without the `cert` feature, so none of this reaches it.
+  `hems` builds without the `cert` feature and is unaffected.
 
-- **Regenerating the model:** `cargo xtask codegen` and `cargo xtask fixtures` read the
-  specifications from `$EEBUS_REFERENCE`, with the SPINE bundle under `spine/` and the SHIP
-  bundle under `ship/`. Contributor tooling only; the crate is unchanged.
+### Contributor tooling
+
+- `cargo xtask codegen` and `fixtures` find the specifications through `$EEBUS_REFERENCE`
+  (SPINE bundle under `spine/`, SHIP under `ship/`).
+- `cargo xtask codegen` commits `schemas.sha256` beside each generated model, and
+  `cargo xtask check-schemas` names every local schema that is changed, missing or
+  unexpected against it. Without the specifications it reports that and passes.
 
 ## [0.10.1] — 2026-10-11
 
@@ -129,8 +114,8 @@ recommended, and neither visible to a test suite whose every party is a fresh ke
 - **`Hub::set_max_connections(0)` is raised to one**, the floor §623 sets. A node that can
   hold no connection cannot take part at all, which is never what a caller means.
 
-- **A peer could claim this node's own SPINE device address.** D101's mistake one layer
-  down, and the same audit found it. The hub refused a peer that claimed *another peer's*
+- **A peer could claim this node's own SPINE device address.** The self-connection defect one layer
+  down, found by the same audit. The hub refused a peer that claimed *another peer's*
   address, but the scan behind it looked only at the other connections, and this node's own
   device is not one of them — so the collision it missed was the one the innocent cause
   produces most directly: two devices shipped with the same vendor and serial give the same
@@ -801,7 +786,6 @@ API stopped it looking.
   device dialling four times was asked about once and spent four slots, leaving no room for
   a peer a user might actually want to approve. It is now one slot per SKI, which is safe to
   enforce because a SKI came out of a completed TLS handshake and an address proves nothing.
-  (R13)
 
 - **This node's PIN was sent to any peer that asked for one.** SHIP §12.5: "The PIN is an
   authentication secret that must be kept confidential and SHALL only be shared with
@@ -811,7 +795,7 @@ API stopped it looking.
   to check against — safe only because `TrustStore` has no auto-accept mode, which is an
   invariant nothing checked and nothing wrote down. SHIP §12.3.2's trust model is now
   implemented: three categories, Table 10 transcribed, and the three rules that read the
-  numbers. (D97)
+  numbers.
 
 - **What identifies a list entry was guessed from a naming convention, and was wrong in
   both directions.** The generator took an entry's identity to be the leading run of
@@ -838,7 +822,7 @@ API stopped it looking.
   every identifier type and the element it is used as, and two tests derived from §3.4.2.1
   separate identity from reference. Six entry types changed, each checked against the
   element-rules table that governs it, and `tests/list_identifiers.rs` writes the answers
-  down. (D93)
+  down.
 
 - **Nothing subscribed to discovery, so a peer's runtime changes were announced to nobody.**
   §7.5.4 says it outright — "a device that uses use case discovery **should always
@@ -847,13 +831,13 @@ API stopped it looking.
   re-send says nothing about what went. `Hub` now asks for one when discovery completes,
   which is the first moment the peer's device address is known; `Engine::subscribe_to_discovery`
   is the same thing for a driver that owns its engine. One subscription covers both
-  functions — §7.4.1 permits only whole-feature subscriptions. (D94)
+  functions — §7.4.1 permits only whole-feature subscriptions.
 
 - **A partial `nodeManagementUseCaseData` erased every use case a peer plays.** The same
   defect as the discovery tree below and for the same reason: its entries are keyed by an
   `address` the wire makes optional — absent from every SPINE 1.1.1 peer in the corpus — and
   an `actor`, which is not an identifier type, so the generic merge replaced the list. It is
-  now merged by §7.5.4's own rules, beside detailed discovery. (D94)
+  now merged by §7.5.4's own rules, beside detailed discovery.
 
 - **The binding and subscription tables were sent to every peer in full.** §7.4.3: "between
   two devices A and B only those subscription entries are exchanged that concern the devices
@@ -862,7 +846,7 @@ API stopped it looking.
   how — on a §14a box, the grid operator's relationship with the household, handed to
   whatever else is on the LAN. The tables are now built per recipient, and the list element
   is *absent* rather than empty when nothing concerns them, which Table 18 distinguishes
-  deliberately. (D95)
+  deliberately.
 
 - **A relation this device held existed only inside whichever actor asked for it.** §7.4.1
   rule 4 — "Subscription information SHALL be kept persistently by **both** subscription
@@ -870,7 +854,7 @@ API stopped it looking.
   in either direction. `Relations` now records which side this device is on, and the engine
   records a held relation when the `result` for its own request comes back clean. A held
   relation carries no identifier, because Table 18 makes `subscriptionId` optional and says
-  the value is the *server's* to assign. (D95)
+  the value is the *server's* to assign.
 
 - **An accepted partial write on OHPCF's feature notified every subscriber of a compressor
   that had withdrawn everything it announced.** `smartEnergyManagementPsData` is one value
@@ -879,7 +863,7 @@ API stopped it looking.
   compressor's whole `alternatives` element, and §7.4.1 notified every subscriber of the
   result, the writer included. `Engine::accept_write_with` stores the document the
   *application* says the write results in and notifies once; `accept_write` is unchanged and
-  stays right for every list function, which is every other writeable function here. (D96)
+  stays right for every list function, which is every other writeable function here.
 
 - **A peer's discovery tree was destroyed by any conformant runtime update to it.**
   `nodeManagementDetailedDiscoveryData` is not a list in SPINE's sense — it is three parallel
@@ -917,7 +901,7 @@ API stopped it looking.
   `LimitationState`'s five states, `Trust`, `PinState`, every generated enumeration — stay
   exhaustive, because a new variant there means the standard moved and a consumer should be
   made to look. This release alone added five `HubEvent` variants; without the attribute
-  each was a breaking change for a consumer that had done nothing. (D98)
+  each was a breaking change for a consumer that had done nothing.
 - **`Trust::Trusted` carries a `TrustLevel`.** `Trust::VERIFIED` is the old meaning — a
   person approved the SKI, Table 10's `user verified`.
 - **`Handshake::send_pin` returns `bool`** and is gated by §12.5;
@@ -959,7 +943,6 @@ API stopped it looking.
   owed, and report the peer: `GuardEvent::PeerUnresponsive` with what went unanswered, and
   `charging::GuardEvent::Unresponsive`. An unacknowledged limit is recorded in the audit log
   as unaccepted, because the acknowledgement is the evidence and its absence is the fact.
-  (D92)
 
 - **`outOfRange` measurements were handed back as numbers to act on.** MPC §2.5.2 and MDT
   §2.5.1 list the three value states together and say the same of both abnormal ones: "out
@@ -969,7 +952,7 @@ API stopped it looking.
   reading; only `error` invalidates the number". It is not. An out-of-range grid connection
   point reading was reaching an energy manager as a number to plan with; it now returns
   `None`, and the raw `value` field still carries the number for a display, which is a
-  different act. Found while implementing MDT, whose §2.5.1 is the same paragraph. (D91)
+  different act. Found while implementing MDT, whose §2.5.1 is the same paragraph.
 
 **Every identifier a client writes to is the peer's, and four of them were this crate's
 own.** Found by asking what a peer that is not built out of this crate would do with the
@@ -1205,8 +1188,7 @@ data.
   the application. Several *filters* in one command are unaffected.
 
 **A second full audit, of the runtime and the engine's authority checks.** Two of these are
-structural and the rest are defects nobody had reached; each is written up in
-`concepts/DECISIONS.md` (D75–D82).
+structural and the rest are defects nobody had reached.
 
 - **Pairing could not happen while a peer waited.** The SHIP handshake held an unapproved
   peer `pending` and had `set_trust` for the answer since 0.1, and no runtime path ever
@@ -1215,35 +1197,35 @@ structural and the rest are defects nobody had reached; each is written up in
   waits on the trust store beside the socket and the SHIP timer, so an approval completes
   the handshake it is waiting in and a refusal ends it with `hello: aborted`. The hub reports
   the waiting peer as `HubEvent::TrustRequested` and answers with `Hub::approve` and
-  `Hub::refuse`. (D75)
+  `Hub::refuse`.
 - **The hub dialled and accepted inline, and a peer that was down starved every heartbeat.**
   `redial` awaited a ten-second connect from inside `next`, one offline peer per turn;
   a control box with ten unplugged devices stopped reading for the better part of a
   backoff round, and every appliance that *was* connected fell into its failsafe state for
   want of a heartbeat. Handshakes now run in tasks of their own and report back over a
-  channel the loop waits on alongside the sockets. (D76)
+  channel the loop waits on alongside the sockets.
 - **A paired peer could release another peer's binding.** A binding or subscription call
   names its client in the payload, and nothing checked that the address belonged to the
   device SHIP authenticated as the sender. It has to now, or the call is refused with
   `errorNumber` 7; a call that leaves the device part out is completed from the header,
-  which keeps `spine-go`'s spelling working. (D77)
-- **Bindings and subscriptions were unbounded**, which D46 had missed: a peer chooses its own
+  which keeps `spine-go`'s spelling working.
+- **Bindings and subscriptions were unbounded**: a peer chooses its own
   client addresses, so a paired peer could grow both tables one call at a time forever.
   `spine::MAX_RELATIONS_PER_PEER` bounds each kind per device; a peer evicted under
-  `MAX_PEERS` now takes its relations, requests and undecided writes with it. (D78)
+  `MAX_PEERS` now takes its relations, requests and undecided writes with it.
 - **`Engine::accept_write` could not say that it had failed.** A use case that accepted a
   write the engine then could not store had already written "accepted" into the §14a
   record while the peer was told `errorNumber` 3. It returns `Result<(), WriteError>` now,
   `reject_write` returns whether the token was live, and the limitation and charging actors
   record what the peer was told — `NackReason::NotStored` — and put the state machine
-  where a refused write leaves it. (D79)
+  where a refused write leaves it.
 - **Any peer's heartbeat kept a Controllable System out of its failsafe state.** The actor
   took every `deviceDiagnosisHeartbeatData` it was notified as the guard's; it now counts
-  only the diagnosis feature of the entity that holds both bindings (§3.8). (D80)
+  only the diagnosis feature of the entity that holds both bindings (§3.8).
 - **Discovery was filed under the payload's device address, and a payload could rename a
   record.** The header's source — what SHIP authenticated — is the key now; the payload
-  fills a record that has no address yet and nothing else. (D81)
-- **A `write` with no command was acknowledged as a success.** It is `errorNumber` 1. (D82)
+  fills a record that has no address yet and nothing else.
+- **A `write` with no command was acknowledged as a success.** It is `errorNumber` 1.
 - The Controllable System's heartbeat now runs from the moment `install` puts it on the
   wire rather than from the moment its builder was made.
 
@@ -1308,7 +1290,7 @@ structural and the rest are defects nobody had reached; each is written up in
   A peer held in `hello: pending` occupies a connection slot for minutes on nobody's
   authority, and a handful of them held every slot; the one past the cap is now answered
   `hello: aborted` immediately and reported as `ConnectionError::TooManyPendingPairings`,
-  so it retries rather than squatting. Closes R13.
+  so it retries rather than squatting.
 - **Interactive pairing, end to end.** `HubEvent::TrustRequested { ski, origin }` for a peer
   waiting in the SHIP pending state, `Hub::approve` and `Hub::refuse` to answer it, and the
   same through a `Node` driven by hand: `TrustStore` wakes a pending handshake on every
@@ -1432,59 +1414,59 @@ have found.** Before this, the crate could not have talked to a real device at a
 
 **Sixteen defects found by a full audit of the protocol core**, none reachable from a test
 the crate already had. Six are on the receiving side; six are claims the documentation made
-that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
+that the code did not keep.
 
 - **A `delete` ignored its filter, and a command that both deletes and writes did only the
   delete.** LPC UC TS §3.4.1.4's example carries two filters — one withdrawing a limit's
   `timePeriod.endTime`, one writing its new value — and the engine answered the first and
   dropped the second, lifting a curtailment that should have become open-ended. A command's
   filters now run in order, and a delete's `selectors` and `elements` are honoured. New
-  `LocalFeature::delete_filtered` and `CmdData::delete_restricted`. (D60)
+  `LocalFeature::delete_filtered` and `CmdData::delete_restricted`.
 - **A partial notification handed the fragment to the use case.** An omitted `scale` means
   "unchanged", so a measurement notified as a bare `number` was read off by a power of ten.
   The engine keeps the merged state of every function a peer has sent, and `DataNotified`
-  and `ReplyReceived` carry `resolved` alongside `data`. (D66)
+  and `ReplyReceived` carry `resolved` alongside `data`.
 - **Two of the seven corpus devices resolved to zero use cases.**
   `useCaseInformation.address` is optional and absent from every SPINE 1.1.1 peer, and
   `apply_use_case_data` required it. `RemoteUseCase::address` is now an `Option`, resolved
-  from the features instead. (D67)
+  from the features instead.
 - **A partial detailed-discovery notification erased what it did not mention** — the peer's
-  device type, entity list and SPINE version list. (D66)
+  device type, entity list and SPINE version list.
 - **A scale of 23 or more was wrong by a factor of ten.** The exact table of powers of ten
   stops at `10^22` and the assembly past it was off by one. A scale is now applied to the
-  value in exact steps. (D62)
+  value in exact steps.
 - **A four-second safety fallback could be waited on for ever.** `EvCharging::source` used
   `>` and `HeartbeatMonitor::is_alive` used `<=`, so waiting until the instant
   `poll_timeout` published produced no transition — and the same instant again. Both fire at
-  the published instant now. (D74)
+  the published instant now.
 - **An undecided write was never a deadline.** `Engine::poll_timeout` reported only requests
   the device had *sent*, so a Controllable System never expired one and the
   `MAX_DEFERRED_WRITES` queue filled. `Engine::remove_peer` also releases a departed peer's
-  writes. (D63)
+  writes.
 - **A subscription to NodeManagement could never be served**: its functions are computed
-  rather than stored, which `handle_read` knew and `notify` did not. (D61)
+  rather than stored, which `handle_read` knew and `notify` did not.
 - **A response from one peer could answer a request sent to another.** `msgCounter` is
   allocated per engine, so a response now resolves a request only when it comes from the
-  device the request went to. (D64)
+  device the request went to.
 - **A peer's device address was never checked.** It is a routing key and a stored identity,
   and neither its length nor its character class was bounded. New
   `spine::is_usable_device_address`; `validate_device_address` stays the full §7.1.1.2 check
-  for what this node builds. (D73)
+  for what this node builds.
 - **A peer's announced `maxResponseDelay` was parsed and ignored**, so a peer answering
   within the minute it announced was reported as timed out — which is what §2.6.2's
-  staggered retry follows. Both directions are honoured now. (D71)
+  staggered retry follows. Both directions are honoured now.
 - **`{:?}` printed the secrets the documentation said it redacted.** `ShipQr`,
   `PinRequirement` and `HandshakeConfig` all derived `Debug`; `PairingSecret` derived
-  `PartialEq`. Each redacts and compares in constant time now. (D68)
+  `PartialEq`. Each redacts and compares in constant time now.
 - **A `delete` was served on a feature announcing whole-function writes only.**
   `possibleOperations` carries one `partial` flag for the whole of §5.3.4; it is answered
-  `errorNumber` 8. (D60)
+  `errorNumber` 8.
 - **`ShipConnection::next_message` documented the wrong reason for being cancel-safe** —
   "performs no writes", when `tungstenite`'s `read` sends pong and close responses. It is
-  cancel-safe, for a different reason, now named. (D72)
+  cancel-safe, for a different reason, now named.
 - **`Hub::next` cancelled mid-write corrupted the peer's stream silently.** A write in
   flight is marked across its `await`, so the next call closes that connection with
-  `Disconnect::InterruptedWrite`. (D70)
+  `Disconnect::InterruptedWrite`.
 - **`self_signed`'s rustdoc summary was a warning**, because the doc block opened with a
   heading.
 
@@ -1583,7 +1565,7 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 - **`Hub::run(handler)`**, a loop that owns `next` and cannot cancel it.
 - **`ControllableSystemBuilder`**: `ControllableSystemActor::builder(…).install(…)` is the
   only way to obtain an actor, so the step whose omission published no limit description —
-  and so was never sent a limit — cannot be skipped. (D69)
+  and so was never sent a limit — cannot be skipped.
 - **`cargo xtask rfe-table`** and the page it writes,
   [Which functions can be exchanged in part](https://hupe1980.github.io/eebus/docs/functions/):
   141 of the 142 functions the payload defines, generated from the committed
@@ -1741,7 +1723,8 @@ that the code did not keep. Each is written up in `concepts/DECISIONS.md`.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
-[0.10.1]: https://github.com/hupe1980/eebus/compare/v0.10.0...HEAD
+[0.11.0]: https://github.com/hupe1980/eebus/compare/v0.10.1...v0.11.0
+[0.10.1]: https://github.com/hupe1980/eebus/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/hupe1980/eebus/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/hupe1980/eebus/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hupe1980/eebus/compare/v0.7.0...v0.8.0

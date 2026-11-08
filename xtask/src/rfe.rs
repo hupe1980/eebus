@@ -3,8 +3,8 @@
 //! SPINE admits thousands of implementation variations, and the one honest answer to
 //! "which of them does this implement" is the table the engine actually consults. It
 //! exists — the generator resolves the schemas' naming convention into it and
-//! `possibleOperations` is derived from it — and until now it was readable only by opening
-//! a generated Rust file.
+//! `possibleOperations` is derived from it — and is otherwise readable only by opening a
+//! generated Rust file.
 //!
 //! The source here is that generated file rather than the schemas, deliberately: the
 //! schemas are not redistributable and this task has to run without them, and the
@@ -149,11 +149,9 @@ fn render(all: &[String], rows: &BTreeMap<String, Row>) -> String {
 
     let _ = write!(
         out,
-        "SPINE admits thousands of implementation variations, and \"which ones does this \
-         implement\" is the first question an integrator has to answer. For Restricted \
-         Function Exchange the answer is a table, and this is it — **generated from the \
-         same source the compiler reads**, by `cargo xtask rfe-table`, so it cannot drift \
-         from what the engine does.\n\n\
+        "This table lists the Restricted Function Exchange variations this crate \
+         implements. It is **generated from the same source the compiler reads**, by \
+         `cargo xtask rfe-table`, so it cannot drift from what the engine does.\n\n\
          Of the **{total}** functions the SPINE payload defines, **{covered}** can be \
          exchanged in part: {lists} are lists of identified entries and {plains} are single \
          values.\n\n",
@@ -200,8 +198,8 @@ fn render(all: &[String], rows: &BTreeMap<String, Row>) -> String {
         "\n## Whole function only\n\n\
          The schemas give {} no selectors and no elements filter, so there is nothing to \
          narrow {} by. A feature serving one announces `read` without `partial`, and a peer \
-         that sends a filter for it is answered `errorNumber` 8 — the honest answer, and the \
-         one that stops a client acting on a reply it thinks was filtered.\n\n",
+         that sends a filter for it is answered `errorNumber` 8, so no client acts on a \
+         reply it thinks was filtered.\n\n",
         match uncovered.len() {
             1 => "one function".to_string(),
             n => format!("these **{n}** functions"),

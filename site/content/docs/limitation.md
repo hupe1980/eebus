@@ -6,19 +6,16 @@ weight = 80
 group = "Use cases"
 +++
 
-**Limitation of Power Consumption** is how a grid operator keeps a congested low-voltage
-grid intact without disconnecting anyone: an Energy Guard tells a Controllable System how
-much power it may draw, and the system honours it. **Limitation of Power Production** is
+In **Limitation of Power Consumption** an Energy Guard tells a Controllable System how much
+power it may draw, and the system honours it. **Limitation of Power Production** is
 the same thing for feed-in. Together they are the technical basis for §14a EnWG and §9 EEG.
 
 ## The exchange, end to end
 
-Everything between a fresh connection and an acknowledged limit. The pre-scenario half is
-where most integrations go wrong: the binding grants the right to write, the subscription
-is what makes the heartbeat arrive, and §2.11 refuses to evaluate a limit that has no
-recent heartbeat behind it. The heartbeat that counts is the one from the Energy Guard
-entity that holds both bindings — the feature the Controllable System subscribed to under
-§3.8 — not one any peer on the network happens to notify.
+From a fresh connection to an acknowledged limit. The binding grants the right to write,
+the subscription makes the heartbeat arrive, and §2.11 evaluates a limit only with a recent
+heartbeat behind it — from the Energy Guard entity that holds both bindings (the feature
+the Controllable System subscribed to under §3.8), not from any other peer.
 
 ```mermaid
 sequenceDiagram
@@ -65,8 +62,7 @@ sequenceDiagram
 
 ## The state machine
 
-A Controllable System is in exactly one of three states, and the transitions between them
-are the use case:
+A Controllable System is always in one of these states:
 
 ```mermaid
 stateDiagram-v2
@@ -99,15 +95,13 @@ stateDiagram-v2
   unlauto --> unlctrl: heartbeat, then a refusal
 ```
 
-The two `unlimited` states are not the same thing. **`unlimited/controlled`** means an
-Energy Guard is present and is currently asking for nothing — a refusal reaches it too,
-because a refusal proves a controller is there. **`unlimited/autonomous`** means nobody is
-in control and the device is running its own logic, which it may only do once the failsafe
-duration has elapsed.
+**`unlimited/controlled`** means an Energy Guard is present and asking for nothing; a
+refusal also leads here, because it proves a controller is there.
+**`unlimited/autonomous`** means nobody is in control and the device runs its own logic,
+which it may do only once the failsafe duration has elapsed.
 
-The failsafe is mandatory. §14a fixes 4.2 kW as the floor an
-installation must keep available, and the failsafe duration has a minimum so that a brief
-network hiccup does not leave a house heating at full power for hours.
+The failsafe is mandatory. §14a fixes 4.2 kW as the floor an installation must keep
+available, and the failsafe duration has a minimum.
 
 ```rust
 use core::time::Duration;
@@ -122,9 +116,9 @@ let system = ControllableSystem::new(
 
 ## The application decides
 
-A limit write is answered by the use case, not by a generic setter. Under §14a the
-acknowledgement *is* the record that the limit was applied, so it has to say what the
-appliance actually did — and only the appliance knows that.
+A limit write is answered by the application, not by a generic setter: under §14a the
+acknowledgement is the record that the limit was applied, so it reports what the appliance
+actually did.
 
 ```rust
 match engine.poll_event() {
@@ -141,44 +135,39 @@ match engine.poll_event() {
 
 ## The other half: the Energy Guard
 
-The 2026 implementation guides spend most of their pages on the controlling side. Here its
-rules live behind one call:
+The controlling side's rules live behind one call:
 
 ```rust
 guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
 ```
 
-and nothing before it: the guard takes up a peer that announces the Controllable System by
-itself. `require` does not depend on ordering either — a limit asked for before the peer is
-reachable is held, not discarded.
+The guard takes up a peer that announces the Controllable System by itself, and a limit
+required before the peer is reachable is held, not discarded.
 
 Behind that line:
 
 * the peer's own identifiers, read before anything is written. `limitId` is `<l1#(1..1)>`
-  in Table 22 and the two failsafe `keyId`s are `<k1#(1..1)>` and `<k2#(1..1)>` in Table 24:
-  the numbers belong to the device, and what the specification fixes is the limit's type,
-  category, direction and scope, and the keys' names. A guard that assumed its own numbering
-  would write a consumption limit into the production limit of an appliance that serves both
-  — and be acknowledged. Nothing is written until the descriptions come back, which is what
-  `is_ready` means and what `peer_ids` reports;
+  in Table 22 and the two failsafe `keyId`s are `<k1#(1..1)>` and `<k2#(1..1)>` in Table 24;
+  the numbers belong to the device, and the specification fixes only the limit's type,
+  category, direction and scope, and the keys' names. Nothing is written until the
+  descriptions come back (`is_ready`; `peer_ids` reports them);
 * a heartbeat immediately before the write, and only once the peer has subscribed to it
-  (§2.11) — and the heartbeat that counts is one *this* peer could have received, not
-  merely one this guard sent, because a notification reaches subscribers and nobody else;
+  (§2.11), since a notification reaches only subscribers;
 * an opening write on the limit as soon as the bindings settle, whether or not the grid is
-  asking for anything, because until it lands the Controllable System is not in a
-  controllable state at all (§2.11);
+  asking for anything, because until it lands the Controllable System is not controllable
+  (§2.11);
 * never a deactivation as the first limit after a reconnection (§2.13);
 * never a zero duration on an activated limit (§2.2);
 * a refusal retried a minute later, and a minute later again, with the device kept (§2.5);
-* and no more than one write every five minutes otherwise (§2.10) — the opening write
-  excepted, since a limit that follows it must not wait five minutes behind a deactivation.
+* and no more than one write every five minutes otherwise (§2.10), the opening write
+  excepted.
 
 ### The duration is a relative time, and an unreadable one is refused
 
 §3.1.8.2: "Durations used within this Use Case SHALL be presented as relative times. The
 same holds for the `endTime` Element used for the duration of validity ([LPC-004])." The
-*schema* is looser than that — `timePeriod.endTime` is the `AbsoluteOrRelativeTimeType`
-union, so `2026-09-05T10:00:00Z` is schema-valid and use-case-invalid.
+schema allows more: `timePeriod.endTime` is the `AbsoluteOrRelativeTimeType` union, so
+`2026-09-05T10:00:00Z` is schema-valid and use-case-invalid.
 
 `read_limit_write` refuses an `endTime` it cannot read as a relative duration, and the
 refusal reaches the guard as a NACK; reading it as absent would mean no expiry. The same
@@ -188,23 +177,21 @@ setpoint duration, whose §3.1.8.2 says the same thing. See
 [Where a use case is narrower than the schema](@/docs/wire-format.md#where-a-use-case-is-narrower-than-the-schema-the-use-case-wins).
 
 A peer whose `LoadControl` feature describes no limit for this guard's direction reports
-`GuardEvent::NoLimitPublished` and is then left alone. That installation looks commissioned
-from both ends and is not — usually a device that implements the *other* direction, or an
-actor that was built and never installed — and because the read itself succeeds, this event
-is the only place it is visible.
+`GuardEvent::NoLimitPublished` and is then left alone — usually a device that implements
+the other direction, or an actor that was never installed. Because the read succeeds, this
+event is the only sign of it.
 
 ## Scenario 4: what the Energy Guard is limiting
 
-An operator that works in percentages has nothing to multiply until the Controllable System
-says what it is. Scenario 4 is that, and the two values are mutually exclusive:
+Scenario 4 publishes what the Controllable System is, as one of two mutually exclusive
+values:
 
 * **Power Consumption Nominal Max** ([LPC-041]) — the nameplate, what the appliance can
   physically draw. UC TS §2.6.4.1: for a device, and *not* for an energy manager.
 * **Contractual Consumption Nominal Max** ([LPC-042]) — what the customer's contract
   allows. For an energy manager, and not for a device.
 
-Which one is published follows from the configuration rather than from a separate call, so
-the pair cannot drift:
+Which one is published follows from the configuration:
 
 ```rust
 let device = ControllableSystem::new(
@@ -223,9 +210,8 @@ An Energy Guard reads it in the pre-scenario exchange and hears about it as
 
 ## The §14a record
 
-Every accepted or refused limit is recorded with its timestamp, its value and the outcome.
-That log is the evidence a grid operator's limit was honoured, which is what the regulation
-asks for.
+Every accepted or refused limit is recorded with its timestamp, value and outcome — the
+evidence the regulation asks for.
 
 ```rust
 guard.audit().records();   // what was asked, what was answered, when

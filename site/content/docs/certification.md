@@ -6,13 +6,11 @@ weight = 135
 group = "Project"
 +++
 
-Certification for LPC, LPP, MPC and MGCP is a paid laboratory booking. What the laboratory
-runs is published: each use case has a High-Level Test Specification listing its *abstract
-test cases* — an identifier, the requirements it covers, which actor is under test, and
-whether it is mandatory.
+Certification for LPC, LPP, MPC and MGCP is done by a laboratory. Each use case has a
+published High-Level Test Specification listing its *abstract test cases* — an identifier,
+the requirements it covers, the actor under test, and whether it is mandatory.
 
-This crate carries all 203 of them as data, **drives every one of them**, and prints what
-that adds up to.
+This crate carries all 203 of them as data, drives every one, and prints the coverage.
 
 ## The catalogue
 
@@ -33,13 +31,13 @@ Each [`AbstractTestCase`](https://docs.rs/eebus/latest/eebus/conformance/struct.
 carries the specification's own description, the `[LPC-TS-…]` requirements it covers, and
 the conditions that raise an optional marking to mandatory — *"if the device is black-start
 capable"*, *"if the `unlimited/autonomous` state is implemented"*, *"if the phase is one the
-device actually operates on"*. A device's parameter sheet is those conditions answered, so
-the same list tells a manufacturer what it has committed to.
+device actually operates on"*. A device's parameter sheet answers those conditions, so the
+same list tells a manufacturer what it has committed to.
 
 ## A coverage number from `cargo test`
 
 `tests/conformance.rs` drives this crate through the abstract test cases' own steps, one
-test per identifier, and prints what it adds up to:
+test per identifier:
 
 ```text
 $ cargo test --features full --test conformance -- --nocapture coverage
@@ -56,11 +54,10 @@ MGCP  MonitoringAppliance     29/29  100%
       total                  189/203  93%
 ```
 
-The fourteen missing are exactly the seven device-level test cases, counted once for LPC
-and once for LPP; a test holds the gap to that
-set, so the number moves neither by dropping a case nor by relabelling one. The Energy
-Guard's 62 % is the same arithmetic, not a shortfall: three of its eight cases are about a
-device rebooting. Each is listed with the reason:
+The fourteen missing are the seven device-level test cases, counted once for LPC and once
+for LPP; a test holds the gap to exactly that set. The Energy Guard's 62 % is the same
+arithmetic: three of its eight cases are about a device rebooting. Each is listed with the
+reason:
 
 ```text
 Not covered here, and why (the same list for LPP):
@@ -73,9 +70,9 @@ Not covered here, and why (the same list for LPP):
 ```
 
 Each is an obligation on the integrator. `conformance::device_level()` yields them with
-their reasons, so a harness that drives a real device — one that can cut its power and press
-its reset — can iterate exactly those cases, filtered by actor and by what the parameter
-sheet commits to. The suite asserts the list matches the number.
+their reasons, so a harness that can cut a real device's power and press its reset can
+iterate exactly those cases, filtered by actor and by the parameter sheet. The suite asserts
+the list matches the number.
 
 ```rust
 use eebus::conformance;
@@ -93,30 +90,30 @@ The catalogue is behind the default-on `conformance` feature, which a build with
 
 ### What a passing suite still cannot see
 
-Both ends of every test in this repository are this crate, and that hides a whole class of
-defect: anything where the two sides agree on a convention the *specification* left to the
-device. Identifiers are the sharp edge. `limitId`, the failsafe `keyId`s, MGCP's curtailment
-key and a car's per-phase limits are all placeholders — `<l1#(1..1)>`, `<k1#(1..1)>`,
-`<x1>`…`<x3>` — and a client that assumes its own numbering writes a well-formed message to
-a real entry of the peer's and is acknowledged — and every abstract test case still passes.
+Both ends of every test here are this crate, which hides any defect where the two sides
+agree on a convention the *specification* left to the device. Identifiers are the main case:
+`limitId`, the failsafe `keyId`s, MGCP's curtailment key and a car's per-phase limits are
+placeholders — `<l1#(1..1)>`, `<k1#(1..1)>`, `<x1>`…`<x3>` — and a client that assumes its
+own numbering writes a well-formed message to a real entry of the peer's, is acknowledged,
+and still passes every abstract test case.
 
 Two suites cover it. `tests/interop.rs` runs against a live `eebus-go` peer, and
 `tests/foreign_identifiers.rs` builds a Controllable System by hand that numbers everything
 differently — its limit on `7`, its failsafe keys on `5` and `6`, and both directions on one
 `LoadControl` feature so that `limitId` 1 is the *production* limit an LPC guard must not
-touch. Neither is a conformance test; both catch what conformance cannot.
+touch. Neither is a conformance test.
 
-The report prints one softer case alongside them: the library notifies a change the moment
-the application publishes it (SPINE IG §2.4), but whether the *measured* value reaches it
-inside the 120 seconds MPC and MGCP allow is the application's own publish cadence.
+The report also prints one softer case: the library notifies a change as soon as the
+application publishes it (SPINE IG §2.4), but whether the *measured* value arrives inside
+the 120 seconds MPC and MGCP allow depends on the application's publish cadence.
 
 ## The tester hooks
 
-Every High-Level Test Specification carries the same footnote: *"the manufacturer must
-specify conditions on how the test case can be tested (e.g. via debug interface)."* Half of
-the LPC transitions are timers — a duration expiring, a heartbeat that stops — and nothing
-goes on the wire when one fires, so a tester that can only see the wire cannot tell
-`unlimited/controlled` from `failsafe state`.
+Every High-Level Test Specification carries the footnote *"the manufacturer must specify
+conditions on how the test case can be tested (e.g. via debug interface)."* Half of the LPC
+transitions are timers — a duration expiring, a heartbeat that stops — and nothing goes on
+the wire when one fires, so the wire alone cannot tell `unlimited/controlled` from
+`failsafe state`.
 
 [`usecases::signals`](https://docs.rs/eebus/latest/eebus/usecases/signals/index.html) is
 that interface, as a shape rather than a transport:
@@ -143,22 +140,18 @@ lpc:lastHeartbeat     11 s
 lpc:nextDeadline      130 s
 ```
 
-Three details are deliberate:
+* **The state is spelled as §2.3.2 spells it** — `unlimited/controlled`, not
+  `UnlimitedControlled` — matching the specification and the `CF_CS_…` pre-conditions.
+* **An unset value is `-`, never `0`.** Zero watts would read as a device limited to
+  zero, the opposite of unlimited.
+* **`nextDeadline`** shows the timed transitions the wire cannot.
+  `ATC_LPC_COM_PT_CSTransition5_001` waits 120 seconds for one.
 
-* **The state is spelled the way §2.3.2 spells it** — `unlimited/controlled`, not
-  `UnlimitedControlled` — because a laboratory compares it against the specification and
-  against the `CF_CS_…` pre-conditions, not against Rust.
-* **An unset value is `-`, never `0`.** A tester reading nought watts for a limit that was
-  never set would record a device limited to zero, which is the opposite of unlimited.
-* **`nextDeadline` is there** because the timed transitions are exactly what the wire cannot
-  show. `ATC_LPC_COM_PT_CSTransition5_001` waits 120 seconds for one.
-
-A Monitored Unit reports the same way under `mpc:` or `mgcp:`, and a measurand whose value
-state is not `normal` reports the state instead of a number — which is the whole subject of
-the `NT_` test cases in those two specifications.
+A Monitored Unit reports the same way under `mpc:` or `mgcp:`; a measurand whose value state
+is not `normal` reports the state instead of a number, which is what the `NT_` test cases in
+those two specifications check.
 
 ## What this does not claim
 
-A passing test here does not mean a pass in the laboratory — only that the rules are the
-ones the laboratory checks, under the same names, and that what is *not* checked is written
-down.
+A passing test here is not a laboratory pass — only that the rules are the ones the
+laboratory checks, under the same names, and that what is *not* checked is written down.

@@ -1,4 +1,5 @@
-//! Certificates: making a node's own, and reading a peer's identity out of one.
+//! Certificates: making, storing and restoring a node's own, and reading a peer's
+//! identity out of one.
 //!
 //! SHIP has no public key infrastructure and no certificate authority. Every node signs
 //! its own certificate, and a peer decides whether to trust it by comparing the
@@ -16,6 +17,10 @@
 //! * **The extension has to be present.** SHIP §12.2 lets a peer fall back to computing
 //!   the digest itself, but a certificate that omits the extension is one a
 //!   specification-following peer may reject outright.
+//!
+//! A node makes its identity once with [`self_signed`], stores
+//! [`Identity::certificate_pem`] and [`Identity::key_pem`], and restores both with
+//! [`Identity::from_pem`] on every later start.
 //!
 //! Requires the `cert` feature.
 //!
@@ -160,17 +165,12 @@ impl core::fmt::Debug for Identity {
 }
 
 impl Identity {
-    /// Restores a stored identity: **the restart path**.
+    /// Restores a stored identity: the certificate byte for byte, and its key.
     ///
-    /// Gives back the certificate exactly as it was stored, and its key, so the node
-    /// presents the same SKI *and* the same fingerprint as before it restarted. The
-    /// fingerprint matters as much as the SKI. It is what the Pairing Service trusts
-    /// (SHIP §10.2) and what the installation QR code carries as `FPH256`, so a device
-    /// that re-issued its certificate on every start would make its own label wrong.
-    ///
-    /// Reads the forms [`certificate_pem`](Self::certificate_pem) and
-    /// [`key_pem`](Self::key_pem) write. The first `CERTIFICATE` block and the first
-    /// `PRIVATE KEY` (PKCS#8) block are used.
+    /// This is the restart path. The node keeps its SKI *and* its fingerprint, which the
+    /// Pairing Service trusts (SHIP §10.2) and the QR code carries as `FPH256`. Reads what
+    /// [`certificate_pem`](Self::certificate_pem) and [`key_pem`](Self::key_pem) write;
+    /// the first `CERTIFICATE` and the first `PRIVATE KEY` (PKCS#8) block are used.
     ///
     /// ```
     /// use eebus::cert::{self, CertParams, Identity};
@@ -278,15 +278,10 @@ impl Identity {
 ///
 /// # Call this once, at first boot
 ///
-/// A node's SKI is derived from its public key, so generating a *fresh* key generates a
-/// new identity: every peer that had approved the old one no longer recognises the
-/// device, and an installer has to walk the building comparing forty hex digits again.
-///
-/// So a device calls this once, stores [`Identity::certificate_pem`] and
-/// [`Identity::key_pem`], and on every later start restores both with
-/// [`Identity::from_pem`]. That keeps the SKI *and* the certificate's fingerprint, which
-/// the Pairing Service trusts and the QR code prints. [`self_signed_with`] keeps only the
-/// SKI, and is for a deliberate re-issue.
+/// A fresh key is a new SKI, so every peer that approved the old one stops recognising
+/// the device. Call this once, store [`Identity::certificate_pem`] and
+/// [`Identity::key_pem`], and restore both with [`Identity::from_pem`] on every later
+/// start. [`self_signed_with`] keeps only the SKI and is for a deliberate re-issue.
 pub fn self_signed(params: CertParams) -> Result<Identity, CertError> {
     let key = rcgen::KeyPair::generate_for(ALGORITHM)?;
     self_signed_with(params, key)
@@ -294,14 +289,10 @@ pub fn self_signed(params: CertParams) -> Result<Identity, CertError> {
 
 /// Re-issues a self-signed certificate from an existing key.
 ///
-/// Use this to change a certificate on purpose — a longer validity, a corrected common
-/// name. The SKI follows the key, so peers that trusted the SKI keep trusting the node.
-///
-/// **The fingerprint does not survive a re-issue.** It is the hash of the certificate,
-/// so a re-issue is a new one, and a peer that trusted the old fingerprint through the
-/// Pairing Service (SHIP §10.2) no longer recognises the node until SHIP §12.1.3's
-/// certificate update reaches it. Restarting is not a re-issue: restore the stored
-/// certificate with [`Identity::from_pem`] instead.
+/// For changing a certificate on purpose: a longer validity, a corrected common name.
+/// The SKI follows the key and survives. **The fingerprint does not**: a peer that
+/// trusted it through the Pairing Service (SHIP §10.2) needs the §12.1.3 certificate
+/// update. To restart, restore with [`Identity::from_pem`] instead.
 pub fn self_signed_with(params: CertParams, key: rcgen::KeyPair) -> Result<Identity, CertError> {
     use rcgen::{
         CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod,

@@ -1887,7 +1887,7 @@ async fn a_peer_cannot_claim_this_node_s_own_device_address() {
 ///
 /// The engine walks the escalation path and stops before the last rung on purpose: §2.6.4
 /// says one unresponsive use case is not a reason to drop a connection carrying others, and
-/// only the application knows which it has (D92). It reported `RequestTimedOut` and had
+/// only the application knows which it has. It reported `RequestTimedOut` and had
 /// nowhere to send the answer — `forget_peer` documented itself as leaving any connection
 /// up, `adopt` took one in, and nothing handed one back.
 ///

@@ -11,14 +11,11 @@ group = "Deployment"
 There is no certificate authority in EEBUS and no central directory. Each node holds a
 self-signed ECDSA P-256 certificate, and its identity is the **Subject Key Identifier** —
 twenty bytes derived from the public key. Pairing means each side records the other's SKI.
+Nobody has to be online, and no vendor can revoke it.
 
-Nobody has to be online, and no vendor can revoke a heat pump's ability to talk to its own
-energy manager.
-
-The crate enforces it with a custom `rustls` verifier on both sides. The certificate chain
-is not validated against a root store — there is no root — but the presented certificate
-must carry the SKI that was approved, and the SKI must be derived from the key that
-actually completed the handshake.
+A custom `rustls` verifier enforces this on both sides. There is no root store to validate
+against; the presented certificate must carry the approved SKI, and that SKI must be derived
+from the key that completed the handshake.
 
 ## …and trust is a *number*, not a yes
 
@@ -37,23 +34,22 @@ TrustLevel::USER_VERIFIED.permits_pin_transmission();   // true — a person sai
 TrustLevel::AUTO_ACCEPT.permits_pin_transmission();     // false — it is only trusted at 8
 ```
 
-The middle rule is the one with teeth. The QR-code flow of §12.5 exists *because* a node that
-auto-accepts needs a second factor, so handing that secret to a peer admitted by auto-accept
-alone gives it to whoever answered the socket. `send_pin_if_permitted` refuses and raises
-`Event::PinWithheld`.
+A node that auto-accepts needs a second factor, so sending the PIN to a peer admitted by
+auto-accept alone would give it to whoever answered the socket. `send_pin_if_permitted`
+refuses and raises `Event::PinWithheld`.
 
 Categories do not add up: a key verified by auto-accept *and* by a user is at 32, not 40 —
 "only the mechanism which offers the highest trust level in this category SHALL be accounted
 for". PKI trust alone opens nothing, being "no verification mode, as it does not offer the
 necessary user trust".
 
-Proving the PIN earns a second factor, once. §12.5 lets only the first peer since a factory
-default reach 32 — which is what permits it to act as a commissioning tool — and caps every
-later one at 16. `TrustStore::award_pin_trust` applies it, because only the store outlives
-the connection; `Node::eebus_reset` re-opens it.
+Proving the PIN earns a second factor. §12.5 lets only the first peer since a factory
+default reach 32, which permits it to act as a commissioning tool, and caps every later one
+at 16. `TrustStore::award_pin_trust` applies it, since only the store outlives the
+connection; `Node::eebus_reset` re-opens it.
 
-§12.3.2 closes by inviting a layer above SHIP to use these numbers, and a §14a box deciding
-whether the thing on the other end may set a grid limit is that layer.
+§12.3.2 invites a layer above SHIP to use these numbers — for example a §14a box deciding
+whether a peer may set a grid limit.
 
 ## TLS 1.2, mutual, no resumption
 
@@ -70,8 +66,8 @@ whether the thing on the other end may set a grid limit is that layer.
 `cert`, `tls` and `runtime` require exactly one of the `ring` and `aws-lc-rs` features, and
 a build that names both — or neither — stops with a `compile_error!` that says why.
 
-`rustls`' provider is *process-global* and linking both panics on first use, so the choice
-belongs to the binary, not a library.
+`rustls`' provider is process-global and linking both panics on first use, so the binary
+chooses, not a library.
 
 ```sh
 cargo add eebus --features runtime,ring
@@ -79,26 +75,23 @@ cargo add eebus --features runtime,ring
 cargo add eebus --no-default-features --features std,runtime,aws-lc-rs
 ```
 
-Nothing here ever reads the process default. The provider is built explicitly, with exactly
-the three cipher suites and the one key-exchange group §9 permits — the post-quantum hybrids
-`aws-lc-rs` offers by default are dropped, because a SHIP node may not negotiate one — so a
-consumer that has installed its own default keeps it. `eebus::tls::CRYPTO_PROVIDER` says
-which backend a running binary got, which is worth a line in the start-up log.
+The crate never reads the process default. It builds its provider explicitly, with exactly
+the three cipher suites and the one key-exchange group §9 permits — dropping the
+post-quantum hybrids `aws-lc-rs` offers by default — so a consumer's own installed default
+is untouched. `eebus::tls::CRYPTO_PROVIDER` names the backend a running binary got.
 
 ## Forgetting a peer
 
-SHIP §12.2.2 states two things about the trust list, and this crate serves both.
-Persisting it is "STRONGLY RECOMMENDED", because the alternative is asking a user to compare
-forty hex digits again after every power cut — `TrustStore::to_json` and `from_json` are the
-two calls that make saving it a one-liner, and `TrustedPeer` carries the name and SHIP ID a
-person needs to tell one line of the store from the next.
+SHIP §12.2.2 says two things about the trust list. Persisting it is "STRONGLY
+RECOMMENDED": `TrustStore::to_json` and `from_json` save and load it, and `TrustedPeer`
+carries the name and SHIP ID that tell entries apart.
 
-Being able to delete all of it is a SHALL: *"at least the SHIP node SHALL offer a possibility
-to delete all stored foreign public keys (e.g. via factory reset)."* That is
-`Node::eebus_reset`, and it is what an "EEBUS reset" on a device's user interface has to
-reach. It returns how many peers were forgotten, and it deliberately does not restore the
-node's own certificate — §12.1.1 asks a factory reset to bring back the identity printed on
-the label, and only the device knows where that was stored.
+Deleting all of it is a SHALL: *"at least the SHIP node SHALL offer a possibility to delete
+all stored foreign public keys (e.g. via factory reset)."* That is `Node::eebus_reset`, which
+an "EEBUS reset" in a device's user interface calls. It returns how many peers were
+forgotten and does not restore the node's own certificate — §12.1.1 asks a factory reset to
+bring back the identity printed on the label, and only the device knows where that is
+stored.
 
 ## Keeping an identity across restarts
 
@@ -107,26 +100,24 @@ key: every certificate issued over the same key has the same one. The **fingerpr
 follows the certificate: it is the SHA-256 of the whole thing, and it is what the SHIP
 Pairing Service trusts (§10.2) and what the installation QR code carries as `FPH256`.
 
-So a device stores both halves at first boot, `Identity::certificate_pem` and
-`Identity::key_pem`, and restores them on every start with `Identity::from_pem`. It does
-not issue a fresh certificate from the stored key. That would keep the SKI, but give the
-node a new fingerprint each time, and make the QR code on its label wrong.
+A device stores both halves at first boot, `Identity::certificate_pem` and
+`Identity::key_pem`, and restores them on every start with `Identity::from_pem`. Re-issuing
+from the stored key with `self_signed_with` keeps the SKI but changes the fingerprint, which
+makes the QR code on the label wrong.
 
 `Identity::from_pem` refuses a pair that does not belong together: a key from another
 device, a certificate or key on a curve other than secp256r1, or a certificate whose
-Subject Key Identifier was computed by a different method than SHIP's. Each of those would
-otherwise load and fail later, as a handshake no peer can complete or as a SKI that differs
-between what the node announces and what peers read from its certificate.
+Subject Key Identifier was not computed SHIP's way. Each would otherwise fail later, as a
+handshake no peer can complete or as an announced SKI that differs from the certificate's.
 
-Issuing a new certificate from the same key is a deliberate act, a longer validity or a
-corrected name, and peers are told through the procedure below.
+Re-issuing from the same key — for a longer validity or a corrected name — is deliberate,
+and peers are told through the procedure below.
 
 ## Rotating a certificate
 
-Replacing a certificate changes the node's name, so SHIP §12.1.3 defines a procedure rather
-than leaving it to chance: the new material is announced with an `updateCounter`, the peer
-records it, and the relationship survives. The crate implements it end to end, and the
-`Hub` follows the update so an application does not have to.
+Replacing a certificate changes the node's name, so SHIP §12.1.3 defines a procedure: the
+new material is announced with an `updateCounter`, the peer records it, and the relationship
+survives. The crate implements it end to end, and the `Hub` follows updates itself.
 
 ## Pairing
 
@@ -164,21 +155,17 @@ datagrams and bad certificates at any node.
   certificate; the replay guard refuses it verbatim; and §4.3 means a working pairing is
   not replaceable at all. An attacker with the secret and fifteen minutes of the real unit
   being offline can pair, which is the model the specification chose.
-* **A timing oracle on a short secret** — the two comparisons that matter, a SHIP PIN and a
-  pairing secret, go through one constant-time equality rather than stopping at the first
-  differing byte. A PIN's whole defence is the escalating penalty of SHIP §13.4.4.3.4, and
-  that penalty counts *attempts*: an equality that leaks a byte at a time turns eight hex
-  digits into thirty-two guesses, and the penalty never notices.
+* **A timing oracle on a short secret** — a SHIP PIN and a pairing secret are compared in
+  constant time. The escalating penalty of SHIP §13.4.4.3.4 counts *attempts*; an equality
+  that leaked a byte at a time would turn eight hex digits into thirty-two guesses.
 * **Resource exhaustion** — every table a peer can grow is bounded; see
   [below](#resource-exhaustion).
 * **A paired peer acting in another's name** — a binding or subscription call names its
   client in the payload, and the engine accepts it only from the device SHIP authenticated
-  as the sender. Without that, one paired peer could release another's binding — the one
-  thing standing between an Energy Guard's limit and a second energy manager — or grant
-  itself a relation under the other's address. Discovery is filed under the header's
-  source for the same reason, not under whatever device the payload claims to describe.
-  And a heartbeat keeps a Controllable System out of its failsafe state only when it comes
-  from the Energy Guard it subscribed to, not from whichever peer notifies one.
+  as the sender, so one peer cannot release another's binding or take a relation under its
+  address. Discovery is filed under the header's source, not the device the payload
+  describes. A heartbeat keeps a Controllable System out of failsafe only when it comes from
+  the Energy Guard it subscribed to.
 
 What is *not* defended: an attacker with the private key is the node, and an attacker who
 can make the user approve their SKI is paired. Both are the intended semantics of the
@@ -186,8 +173,8 @@ standard.
 
 ### Resource exhaustion
 
-SHIP and SPINE cap none of these, and the omission is exploitable: a device that dials in a
-thousand times takes the memory of every node that answers.
+SHIP and SPINE cap none of these; unbounded, a device that dials in a thousand times takes
+the memory of every node that answers.
 
 | Constant | Bounds | At the limit |
 |---|---|---|
