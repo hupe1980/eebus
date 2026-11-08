@@ -20,12 +20,23 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Internal-only documents (not published) — the architecture notes and the backlog
-concepts/
+# Internal architecture notes (see concepts/README.md), anchored to the repository
+# root. ROADMAP.md is the spec of specs: every open item names its feature specification.
+#
+# The third-party corpus — the EEBUS specifications, implementation guides and test
+# specifications — lives at `concepts/reference/` and is covered by this line: free to
+# download from eebus.org after registration but not redistributable, and indexed in
+# `concepts/REFERENCES.md`.
+/concepts/
 
-# Third-party specifications, test specifications and implementation guides
-# (copyrighted; free to download from eebus.org but not redistributable).
-specs/
+# This project's own feature specifications, and the Spec Kit machinery that produces
+# them: one `specs/NNN-slug/` per ROADMAP item, `.specify/memory/constitution.md`, and
+# the `/speckit-*` skills. Same rule as `concepts/` — internal, and the published tree
+# may not cite a path its reader does not have; scripts/concepts-check.sh fails on one
+# that does. Matching billing, sepa, agentplane and speccoder.
+/specs/
+/.specify/
+/.claude/
 .DS_Store
 
 # Zola output

@@ -380,10 +380,11 @@ cargo +nightly fuzz run spine_datagram
 The specifications are free but not redistributable, so they are not in this repository. To
 regenerate the model you need them locally — register at
 [eebus.org/specifications-media](https://www.eebus.org/specifications-media/), unpack
-`EEBus_SPINE_V1.3.0.zip` and `EEBus_SHIP_TS_Specification_v1.1.0_public.zip` into `specs/`,
-and run:
+`EEBus_SPINE_V1.3.0.zip` into `<dir>/spine/` and `EEBus_SHIP_TS_Specification_v1.1.0_public.zip`
+into `<dir>/ship/` of a directory outside the repository, and run:
 
 ```sh
+export EEBUS_REFERENCE=<dir>
 cargo run -p xtask -- codegen    # regenerate src/model/generated and src/ship/generated
 cargo run -p xtask -- fixtures   # regenerate tests/fixtures from the specification's examples
 ```
@@ -396,7 +397,7 @@ git clone --depth=1 https://github.com/enbility/devices /tmp/devices
 cargo run -p xtask -- devices /tmp/devices   # tests/fixtures/devices
 ```
 
-`specs/` is git-ignored; only generated Rust is committed. The generator formats its output,
+Only generated Rust is committed. The generator formats its output,
 so re-running it when nothing has changed produces no diff.
 
 ## Features

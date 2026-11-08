@@ -6,6 +6,12 @@ Notable changes to `eebus`. The format follows
 
 ## [0.10.1] — unreleased
 
+### Changed
+
+- **Regenerating the model:** `cargo xtask codegen` and `cargo xtask fixtures` read the
+  specifications from `$EEBUS_REFERENCE`, with the SPINE bundle under `spine/` and the SHIP
+  bundle under `ship/`. Contributor tooling only; the crate is unchanged.
+
 ### Fixed
 
 - **An answered keep-alive ping no longer counts as silence.** The pong is consumed inside

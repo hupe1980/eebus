@@ -44,11 +44,15 @@ They are free but **not redistributable**, so they are not in the repository.
 1. Register at [eebus.org/specifications-media](https://www.eebus.org/specifications-media/)
    — free, no membership required.
 2. Download `EEBus_SPINE_V1.3.0.zip` and
-   `EEBus_SHIP_TS_Specification_v1.1.0_public.zip`, and unpack both into `specs/`.
+   `EEBus_SHIP_TS_Specification_v1.1.0_public.zip`.
+3. Unpack the SPINE bundle into `<dir>/spine/` and the SHIP bundle into `<dir>/ship/` of
+   a directory outside the repository, and point the generators at it with
+   `EEBUS_REFERENCE=<dir>`.
 
 ## Running the generators
 
 ```sh
+export EEBUS_REFERENCE=<dir>
 cargo run -p xtask -- codegen    # regenerate src/model/generated and src/ship/generated
 cargo run -p xtask -- fixtures   # regenerate tests/fixtures from the specification's examples
 ```
@@ -63,7 +67,7 @@ cargo run -p xtask -- devices /tmp/devices   # tests/fixtures/devices
 That corpus is captures from real hardware, MIT-licensed and stored as ordinary JSON, so
 the converter projects it into the JSON-UTF8 of SHIP §11.4.
 
-`specs/` is git-ignored. `codegen` formats its output through rustfmt, so re-running any of
+`codegen` formats its output through rustfmt, so re-running any of
 the three generators on unchanged input produces no diff — which makes "is the checked-in
 model current?" a question CI can answer.
 

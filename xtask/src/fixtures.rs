@@ -13,13 +13,16 @@ use std::path::Path;
 use crate::xsd::{self, ComplexDef, Particle, Schema, SimpleDef};
 
 pub fn run(root: &Path) -> Result<String, String> {
-    let base = root.join("specs/EEBus_SPINE_V1.3.0/EEBus_SPINE_V1.3.0_Final_hp");
+    let reference = crate::reference_dir(root);
+    let base = reference.join("spine/EEBus_SPINE_V1.3.0/EEBus_SPINE_V1.3.0_Final_hp");
     let xsd_dir = base.join("XSDs");
     let xml_dir = base.join("ExampleXMLs/RestrictedFunctionExchange");
     if !xml_dir.is_dir() {
         return Err(format!(
-            "SPINE example XMLs not found at {}; unpack EEBus_SPINE_V1.3.0.zip into specs/",
-            xml_dir.display()
+            "SPINE example XMLs not found at {}; unpack EEBus_SPINE_V1.3.0.zip into {}/spine/ \
+             (override with EEBUS_REFERENCE)",
+            xml_dir.display(),
+            reference.display()
         ));
     }
 

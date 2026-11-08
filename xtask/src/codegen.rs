@@ -47,10 +47,11 @@ const SHIP_CHOICES: &[(&str, &str, &str)] = &[
 ];
 
 pub fn run(root: &Path) -> Result<String, String> {
+    let reference = crate::reference_dir(root);
     let spine = Profile {
         label: "SPINE",
         version: "1.3.0",
-        xsd_dir: root.join("specs/EEBus_SPINE_V1.3.0/EEBus_SPINE_V1.3.0_Final_hp/XSDs"),
+        xsd_dir: reference.join("spine/EEBus_SPINE_V1.3.0/EEBus_SPINE_V1.3.0_Final_hp/XSDs"),
         out_dir: root.join("src/model/generated"),
         single_module: None,
         handwritten: &["ElementTagType", "CmdType", "FilterType", "ErrorNumberType"],
@@ -62,8 +63,8 @@ pub fn run(root: &Path) -> Result<String, String> {
     let ship = Profile {
         label: "SHIP",
         version: "1.1.0",
-        xsd_dir: root.join(
-            "specs/EEBus_SHIP_TS_Specification_v1.1.0_public/\
+        xsd_dir: reference.join(
+            "ship/EEBus_SHIP_TS_Specification_v1.1.0_public/\
              EEBus_SHIP_TS_Specification_v1.1.0_public",
         ),
         out_dir: root.join("src/ship/generated"),
@@ -83,9 +84,11 @@ pub fn run(root: &Path) -> Result<String, String> {
             return Err(format!(
                 "{} schemas not found at {}.\n\
                  Download them from https://www.eebus.org/specifications-media/ \
-                 (free registration) and unpack into specs/.",
+                 (free registration) and unpack the SPINE bundle into spine/ and the \
+                 SHIP bundle into ship/ of {} (override with EEBUS_REFERENCE).",
                 profile.label,
-                profile.xsd_dir.display()
+                profile.xsd_dir.display(),
+                reference.display()
             ));
         }
         let schema = xsd::load_dir(&profile.xsd_dir, |stem| {

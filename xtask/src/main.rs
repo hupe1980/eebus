@@ -1,9 +1,9 @@
 //! Repository automation.
 //!
 //! `cargo xtask codegen` regenerates `src/model/generated/` from the SPINE 1.3.0 XML
-//! Schemas. The schemas are not redistributable, so they live in the git-ignored
-//! `specs/` directory and the *generated* Rust is what gets committed: building the
-//! crate never requires access to the specification.
+//! Schemas. The schemas are not redistributable, so they live in a git-ignored
+//! reference directory (see [`reference_dir`]) and the *generated* Rust is what gets
+//! committed: building the crate never requires access to the specification.
 
 use std::path::{Path, PathBuf};
 
@@ -91,6 +91,15 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Where the unpacked EEBUS specifications live: `$EEBUS_REFERENCE` when set, else the
+/// git-ignored `concepts/reference/` of this checkout. Either way the SPINE bundle is
+/// expected under `spine/` and the SHIP bundle under `ship/`.
+pub(crate) fn reference_dir(root: &Path) -> PathBuf {
+    std::env::var_os("EEBUS_REFERENCE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("concepts/reference"))
 }
 
 fn repo_root() -> PathBuf {

@@ -17,7 +17,7 @@ documentation = "https://docs.rs/eebus"
 keywords = ["eebus", "ship", "spine", "energy", "smart-home"]
 categories = ["network-programming", "embedded", "encoding"]
 readme = "README.md"
-exclude = ["specs/", "site/", "xtask/"]
+exclude = ["concepts/", "specs/", ".specify/", ".claude/", "scripts/", "site/", "xtask/"]
 
 [features]
 default = ["std", "pairing", "conformance"]
