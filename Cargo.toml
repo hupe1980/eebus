@@ -57,20 +57,20 @@ full = ["std", "pairing", "conformance", "cert", "tls", "runtime", "mdns", "ring
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
-hmac = { version = "0.12", default-features = false, optional = true }
-sha2 = { version = "0.10", default-features = false, optional = true }
+hmac = { version = "0.13", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
 # No provider here: `crypto` comes with whichever of `ring`/`aws_lc_rs` the consumer picks.
 rcgen = { version = "0.14", default-features = false, features = ["pem"], optional = true }
 pem = { version = "4", default-features = false, features = ["std"], optional = true }
 x509-parser = { version = "0.18", optional = true }
-sha1 = { version = "0.10", default-features = false, optional = true }
+sha1 = { version = "0.11", default-features = false, optional = true }
 time = { version = "0.3", default-features = false, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "logging"], optional = true }
 tokio = { version = "1.53.3", default-features = false, features = ["net", "rt", "time", "macros", "sync", "io-util"], optional = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"], optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
-mdns-sd = { version = "0.21", default-features = false, optional = true }
+mdns-sd = { version = "0.22", default-features = false, optional = true }
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
