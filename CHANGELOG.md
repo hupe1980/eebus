@@ -4,6 +4,24 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [Unreleased]
+
+### Added
+
+- **`ControllableSystemActor::handle_event_with` lets the application decide a limit.**
+  `handle_event` answered every limit it could read as one the appliance follows, so an
+  integrator using the actor could not refuse a limit at all. The new method takes a
+  closure that sees each readable limit on the merged state before it is answered and
+  returns a `LocalDecision`. A refusal is answered with `errorNumber` 7 and recorded in
+  `audit()` as `CannotApply(reason)` with the sender. The heartbeat gate still comes
+  first. `handle_event` keeps its signature and behaviour.
+- **Guidance on refusing a limit by policy**, in the rustdoc of `handle_event_with` and on
+  the site's LPC and security pages. It covers where the binding's authorisation ends,
+  what §14a EnWG leaves no discretion over (LPC UC TS §2.2: a limit the appliance can
+  follow is applied unless self-protection, safety or a legal or regulatory specification
+  requires a refusal), what a refusal does to the state, and a plausibility floor as the
+  worked example. `examples/heat_pump.rs` runs that floor with `--floor <watts>`.
+
 ## [0.11.0] — 2026-11-08
 
 ### Added

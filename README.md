@@ -95,6 +95,11 @@ if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
 }
 ```
 
+`ControllableSystemActor` runs that loop, and asks for the decision through
+`handle_event_with`. The binding decides who may write a limit. Whether the appliance follows
+one is the application's decision, within the narrow room §14a EnWG leaves it; see
+[Refusing a limit by policy](https://hupe1980.github.io/eebus/docs/limitation/#refusing-a-limit-by-policy).
+
 **Both sides of every use case.** A heat pump needs the Controllable System; an energy
 manager needs the Energy Guard, which carries most of the 2026 implementation guides' rules:
 

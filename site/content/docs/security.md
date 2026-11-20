@@ -166,10 +166,19 @@ datagrams and bad certificates at any node.
   address. Discovery is filed under the header's source, not the device the payload
   describes. A heartbeat keeps a Controllable System out of failsafe only when it comes from
   the Energy Guard it subscribed to.
+* **A paired peer that is compromised** — EEBUS authorises a limit by the binding and by
+  nothing finer, so a compromised control box that holds the binding may write any limit.
+  The application decides whether the appliance follows it, in
+  `ControllableSystemActor::handle_event_with`, and can refuse what the regulation does not
+  let a grid operator impose, such as a limit below the §14a minimum. It cannot refuse a
+  lawful limit: a control box can hold a building at that minimum for as long as it likes,
+  and the audit log is what shows it. See
+  [Refusing a limit by policy](@/docs/limitation.md#refusing-a-limit-by-policy).
 
 What is *not* defended: an attacker with the private key is the node, and an attacker who
 can make the user approve their SKI is paired. Both are the intended semantics of the
-standard.
+standard. Nor is a paired control box that writes lawful limits: whether to follow one
+is not left to the appliance.
 
 ### Resource exhaustion
 

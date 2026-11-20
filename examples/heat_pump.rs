@@ -22,6 +22,10 @@
 //! # and the secret it prints in its QR code is what a control unit has to be configured
 //! # with. See `steuerbox --pair-with`.
 //! cargo run --example heat_pump --features runtime,mdns,ring,pairing -- --pairing
+//!
+//! # Refuse an active limit below 4.2 kW, the least §14a EnWG lets a grid operator leave
+//! # one heat pump under a control box. Everything else is still followed.
+//! cargo run --example heat_pump --features runtime,mdns,ring -- --floor 4200
 //! ```
 //!
 //! What it is here to show, beyond `networked.rs`:
@@ -37,6 +41,11 @@
 //!   knows this device's printed secret is trusted on the strength of its certificate
 //!   fingerprint, which is the whole point of the Pairing Service.
 //! * **Identity and trust persist across restarts** (SHIP §12.1.1).
+//! * **The application decides whether to follow a limit.** With `--floor`, every limit
+//!   the pump can read goes through a policy before it is answered, and a refusal is a
+//!   NACK and an entry in the actor's audit log. The binding decides who may write a
+//!   limit; the policy decides only whether a lawful-looking one is plausible, and may not
+//!   refuse one at or above the floor.
 //! * **The tester hooks are printed on every change** — the `lpc:` signals a certification
 //!   laboratory reads, which is the only way to watch a timed transition go by.
 
@@ -53,7 +62,7 @@ use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::tls::ShipTls;
 use eebus::usecases::limitation::{
     self, ControllableSystem, ControllableSystemActor, ControllableSystemBuilder, CsConfig,
-    CsEvent, CsFeatures,
+    CsEvent, CsFeatures, LimitWrite, LocalDecision, RejectReason,
 };
 use eebus::usecases::lpc;
 use eebus::usecases::signals::Signals;
@@ -107,6 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let failsafe: f64 = args.value_or("--failsafe", "4200").parse()?;
     let nominal: f64 = args.value_or("--nominal-max", "11000").parse()?;
+    let floor: Option<f64> = args.value("--floor").map(str::parse).transpose()?;
+    if let Some(floor) = floor {
+        println!("refusing any active limit below {floor:.0} W\n");
+    }
 
     let node = Node::new(ship_id.as_str(), ShipTls::new(identity), trust.clone());
     let fingerprint = node.fingerprint();
@@ -181,7 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("[pump] {ski} is {}", device.as_str());
             }
             HubEvent::Spine(event) => {
-                if let Some(decision) = actor.handle_event(hub.engine_mut(), &event, now) {
+                let decision = actor
+                    .handle_event_with(hub.engine_mut(), &event, now, |write| decide(write, floor));
+                if let Some(decision) = decision {
                     announce_decision(&decision);
                     report(&actor);
                 }
@@ -235,6 +250,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Whether the pump follows a limit it has been sent.
+///
+/// A real appliance would also refuse here for self-protection or safety, such as a
+/// defrost it cannot interrupt. The floor is a plausibility check above what the binding
+/// authorises: a control box may write limits, but §14a EnWG never lets it take a heat
+/// pump below its minimum, so a lower one is refused on that regulatory ground. A limit
+/// at or above the floor, and a deactivation, are always followed — LPC UC TS §2.2 leaves
+/// no other reason to refuse one.
+fn decide(write: &LimitWrite, floor: Option<f64>) -> LocalDecision {
+    match floor {
+        Some(floor) if write.is_active && write.watts < floor => {
+            LocalDecision::Reject(RejectReason::Regulatory)
+        }
+        _ => LocalDecision::Apply,
+    }
 }
 
 /// What a certification laboratory reads off the debug interface.
