@@ -4,6 +4,25 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [Unreleased]
+
+### Added
+
+- **`conformance::protocol`: the SHIP, SPINE and Pairing Service test specifications as
+  data.** Every case of SHIP TS 1.0.0 (33), SPINE TS 1.0.0 (31) and the SHIP Pairing
+  Service TestSpec 1.0.0 (40) — identifier, heading, DUT column, requirement identifiers,
+  and the parameter-sheet conditions under which it applies (`Specification`, `TestCase`,
+  `Condition`). A `ParameterSheet` of declared `(parameter, value)` pairs selects the cases
+  mandatory for a device (`Specification::mandatory`), and `ParameterSheet::unknown`
+  reports a parameter the sheet does not define. `protocol::DEVICE_LEVEL` carries the one
+  case a library cannot answer, `TC_SPS_DIGEST_003`, with its reason and a procedure.
+- **`Coverage::of_ids`**, so a scope given by identifier is measured with the same report;
+  `Coverage::of` is unchanged.
+- `cargo test` prints covered/total per protocol test specification — 24/33, 19/31, 0/40 —
+  counting a case as covered when the doc comment of a `#[test]` names it, and asserts each
+  uncovered set by name in both directions. The README and the site state the figures, and
+  the suite checks that they do.
+
 ## [0.11.0] — 2026-11-08
 
 ### Added
