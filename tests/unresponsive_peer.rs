@@ -55,7 +55,7 @@ fn a_limit_write_that_is_never_answered_is_retried() {
         1,
         "the guard writes the limit again once the peer answers"
     );
-    assert_eq!(pair.accepted()[0].watts, 3_000.0);
+    assert_eq!(pair.accepted()[0].watts(), 3_000.0);
 }
 
 /// And it says so, rather than only recovering quietly.

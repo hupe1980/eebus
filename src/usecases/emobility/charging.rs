@@ -1331,8 +1331,8 @@ mod tests {
                         parameter_id: Some(ElectricalConnectionParameterId(1)),
                         permitted_value_set: Some(vec![ScaledNumberSet {
                             range: Some(vec![ScaledNumberRange {
-                                min: ScaledNumber::from_f64(1_400.0, 0),
-                                max: ScaledNumber::from_f64(11_000.0, 0),
+                                min: ScaledNumber::from_f64(1_400.0, 3),
+                                max: ScaledNumber::from_f64(11_000.0, 3),
                             }]),
                             ..Default::default()
                         }]),
@@ -1342,8 +1342,8 @@ mod tests {
                         parameter_id: Some(ElectricalConnectionParameterId(2)),
                         permitted_value_set: Some(vec![ScaledNumberSet {
                             range: Some(vec![ScaledNumberRange {
-                                min: ScaledNumber::from_f64(6.0, 0),
-                                max: ScaledNumber::from_f64(16.0, 0),
+                                min: ScaledNumber::from_f64(6.0, 3),
+                                max: ScaledNumber::from_f64(16.0, 3),
                             }]),
                             ..Default::default()
                         }]),

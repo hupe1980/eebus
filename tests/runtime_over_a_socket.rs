@@ -1075,7 +1075,7 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
     }
 
     let accepted = accepted.expect("the limit was never accepted over the socket");
-    assert_eq!(accepted.watts, 3_000.0);
+    assert_eq!(accepted.watts(), 3_000.0);
     assert_eq!(
         refusals, 0,
         "the actors arrange the heartbeat and the bindings themselves; a refusal here \
@@ -1089,12 +1089,12 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
         .expect("without panicking");
 
     let (write, outcome) = decided.expect("the appliance decided a limit");
-    assert_eq!(write.watts, 3_000.0);
+    assert_eq!(write.watts(), 3_000.0);
     assert!(outcome.is_accepted());
     assert_eq!(state, LimitationState::Limited);
     assert_eq!(
         effective,
-        eebus::usecases::limitation::EffectiveLimit::Active(3_000.0)
+        eebus::usecases::limitation::EffectiveLimit::active(3_000.0)
     );
 }
 

@@ -853,7 +853,7 @@ pub fn setpoint_data(control: &BatteryControl) -> CmdData {
             setpoint_id: Some(SETPOINT_ID),
             is_setpoint_changeable: Some(true),
             is_setpoint_active: Some(control.is_setpoint_active()),
-            value: ScaledNumber::from_f64(control.setpoint().map(|s| s.watts).unwrap_or(0.0), 0),
+            value: ScaledNumber::from_f64(control.setpoint().map(|s| s.watts).unwrap_or(0.0), 3),
             ..Default::default()
         }]),
     })
@@ -948,7 +948,7 @@ pub fn configuration_values(control: &BatteryControl) -> CmdData {
             DeviceConfigurationKeyValueData {
                 key_id: Some(DEFAULT_KEY),
                 value: Some(DeviceConfigurationKeyValueValue {
-                    scaled_number: ScaledNumber::from_f64(config.default_watts, 0),
+                    scaled_number: ScaledNumber::from_f64(config.default_watts, 3),
                     ..Default::default()
                 }),
                 is_value_changeable: Some(true),
@@ -956,7 +956,7 @@ pub fn configuration_values(control: &BatteryControl) -> CmdData {
             DeviceConfigurationKeyValueData {
                 key_id: Some(FAILSAFE_KEY),
                 value: Some(DeviceConfigurationKeyValueValue {
-                    scaled_number: ScaledNumber::from_f64(config.failsafe_watts, 0),
+                    scaled_number: ScaledNumber::from_f64(config.failsafe_watts, 3),
                     ..Default::default()
                 }),
                 is_value_changeable: Some(true),
@@ -1171,7 +1171,7 @@ mod tests {
                 setpoint_data: Some(alloc::vec![SetpointData {
                     setpoint_id: Some(SETPOINT_ID),
                     is_setpoint_active: Some(true),
-                    value: ScaledNumber::from_f64(-2_000.0, 0),
+                    value: ScaledNumber::from_f64(-2_000.0, 3),
                     time_period: Some(crate::model::TimePeriod {
                         end_time: Some(end_time.into()),
                         ..Default::default()
@@ -1404,6 +1404,25 @@ mod tests {
 
         inverter.on_setpoint(&SetpointWrite::active(-3_000.0), true, secs(13));
         assert_eq!(inverter.effective().watts(), Some(-3_000.0), "discharging");
+    }
+
+    /// A fractional setpoint is published as it was set, not truncated to whole watts.
+    #[test]
+    fn a_fractional_setpoint_is_published_untruncated() {
+        let mut inverter = hybrid();
+        inverter.on_heartbeat(secs(10));
+        inverter.on_control_mode(ControlMode::Power, true, secs(11));
+        inverter.on_setpoint(&SetpointWrite::active(-2_500.5), true, secs(12));
+        let CmdData::SetpointListData(list) = setpoint_data(&inverter) else {
+            panic!("a setpoint list");
+        };
+        let value = list
+            .setpoint_data
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|s| s.value);
+        assert_eq!(value, Some(ScaledNumber::new(-25_005, -1)));
     }
 
     /// The setpoint a `power` mode writes depends on the machine, and the two are not

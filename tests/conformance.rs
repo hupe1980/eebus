@@ -310,7 +310,7 @@ fn atc_lpc_com_pt_egmessages_001() {
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
     assert_eq!(
         pair.pump.system().effective_limit(),
-        EffectiveLimit::Active(APCL_03)
+        EffectiveLimit::active(APCL_03)
     );
     assert_eq!(
         pair.accepted().len(),
@@ -341,7 +341,7 @@ fn atc_lpc_com_pt_egmessages_003() {
         pair.advance(limitation::MIN_WRITE_INTERVAL + secs(1));
         assert_eq!(
             pair.pump.system().effective_limit(),
-            EffectiveLimit::Active(*limit),
+            EffectiveLimit::active(*limit),
             "round {round}"
         );
     }
@@ -371,7 +371,7 @@ fn atc_lpc_com_pt_egmessages_004() {
     pair.guard
         .write_failsafe_limit(&mut pair.guard_engine, &device, 3_500.0, pair.now);
     pair.settle();
-    assert_eq!(pair.pump.system().config().failsafe_watts, 3_500.0);
+    assert_eq!(pair.pump.system().config().failsafe_watts(), 3_500.0);
 
     pair.guard
         .write_failsafe_duration(&mut pair.guard_engine, &device, FCAPL_DUR_02, pair.now);
@@ -414,7 +414,10 @@ fn atc_lpc_com_pt_csconnection_002() {
     cs.on_heartbeat(now);
     now += secs(1);
     assert_eq!(
-        cs.on_failsafe_limit_write(FCAPL_03, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(FCAPL_03, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Rejected(NackReason::SequenceIncomplete),
         "the heartbeat alone does not open the other data points"
     );
@@ -428,10 +431,13 @@ fn atc_lpc_com_pt_csconnection_002() {
 
     now += secs(1);
     assert_eq!(
-        cs.on_failsafe_limit_write(3_800.0, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(3_800.0, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Accepted
     );
-    assert_eq!(cs.config().failsafe_watts, 3_800.0);
+    assert_eq!(cs.config().failsafe_watts(), 3_800.0);
 }
 
 /// Only values at or above zero are accepted, for the limit and for the failsafe limit
@@ -456,13 +462,19 @@ fn atc_lpc_com_pt_csconnection_003() {
 
     now += secs(1);
     assert_eq!(
-        cs.on_failsafe_limit_write(FCAPL_06, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(FCAPL_06, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Rejected(NackReason::NegativeValue)
     );
 
     now += secs(1);
     assert_eq!(
-        cs.on_failsafe_limit_write(FCAPL_03, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(FCAPL_03, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Accepted
     );
 }
@@ -548,7 +560,7 @@ fn atc_lpc_com_pt_csconnection_007() {
             "{value} W"
         );
         assert_eq!(cs.state(), LimitationState::Limited);
-        assert_eq!(cs.effective_limit(), EffectiveLimit::Active(value));
+        assert_eq!(cs.effective_limit(), EffectiveLimit::active(value));
     }
 }
 
@@ -562,11 +574,14 @@ fn atc_lpc_com_pt_csconnection_008() {
         let (mut cs, mut now) = cf_cs_unl_cntrl();
         now += secs(1);
         assert_eq!(
-            cs.on_failsafe_limit_write(limit, now),
+            cs.on_failsafe_limit_write(
+                eebus::model::ScaledNumber::from_f64(limit, 3).unwrap_or_default(),
+                now
+            ),
             WriteOutcome::Accepted,
             "{limit} W"
         );
-        assert_eq!(cs.config().failsafe_watts, limit);
+        assert_eq!(cs.config().failsafe_watts(), limit);
     }
 
     let expectations = [
@@ -593,10 +608,10 @@ fn atc_lpc_com_pt_csconnection_008() {
 fn atc_lpc_com_pt_csinit_001() {
     let (cs, _) = cf_cs_init();
 
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(FCAPL_03));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::failsafe(FCAPL_03));
     assert!(!cs.is_limit_active());
     assert_eq!(
-        cs.config().failsafe_watts,
+        cs.config().failsafe_watts(),
         FCAPL_03,
         "[LPC-TS-019]: the pre-configured value, nothing else"
     );
@@ -615,7 +630,7 @@ fn atc_lpc_com_nt_cslimited_001() {
         WriteOutcome::Rejected(NackReason::NegativeValue)
     );
     assert_eq!(cs.state(), LimitationState::Limited);
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(APCL_03));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::active(APCL_03));
 }
 
 /// A limited system keeps its state and keeps accepting limits even when heartbeats stop
@@ -633,7 +648,7 @@ fn atc_lpc_com_pt_cslimited_002() {
         "ninety seconds of silence does not close a limited system's door"
     );
     assert_eq!(cs.state(), LimitationState::Limited);
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(APCL_04));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::active(APCL_04));
 
     now += secs(1);
     cs.on_heartbeat(now);
@@ -735,7 +750,10 @@ fn atc_lpc_com_pt_csfs_001() {
     // The failsafe values are refused for the older reason of the two: entering the
     // failsafe state re-armed the sequence gate, and no limit write has completed it.
     assert_eq!(
-        cs.on_failsafe_limit_write(FCAPL_03, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(FCAPL_03, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Rejected(NackReason::SequenceIncomplete)
     );
     assert_eq!(
@@ -771,7 +789,7 @@ fn atc_lpc_com_pt_csfs_002() {
             "left the failsafe state after {:?}",
             now - entered
         );
-        assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(FCAPL_03));
+        assert_eq!(cs.effective_limit(), EffectiveLimit::failsafe(FCAPL_03));
     }
 
     cs.handle_timeout(entered + PFSDM);
@@ -811,7 +829,10 @@ fn atc_lpc_com_nt_csunlauto_001() {
     );
     assert_eq!(cs.state(), LimitationState::UnlimitedAutonomous);
     assert_eq!(
-        cs.on_failsafe_limit_write(FCAPL_03, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(FCAPL_03, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Rejected(NackReason::SequenceIncomplete),
         "the sequence gate re-armed when the guard was given up on"
     );
@@ -827,7 +848,10 @@ fn atc_lpc_com_nt_csunlauto_001() {
 
     now += secs(1);
     assert_eq!(
-        cs.on_failsafe_limit_write(FCAPL_03, now),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(FCAPL_03, 3).unwrap_or_default(),
+            now
+        ),
         WriteOutcome::Accepted
     );
 }
@@ -903,7 +927,7 @@ fn atc_lpc_com_pt_cstransition2_001() {
             "{value} W"
         );
         assert_eq!(cs.state(), LimitationState::Limited);
-        assert_eq!(cs.effective_limit(), EffectiveLimit::Active(value));
+        assert_eq!(cs.effective_limit(), EffectiveLimit::active(value));
     }
 }
 
@@ -955,7 +979,7 @@ fn atc_lpc_com_pt_cstransition5_001() {
 
     cs.handle_timeout(due);
     assert_eq!(cs.state(), LimitationState::FailsafeState);
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(FCAPL_03));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::failsafe(FCAPL_03));
 }
 
 /// `limited` → `unlimited/controlled`, because the limit's duration expired.
@@ -1037,7 +1061,7 @@ fn atc_lpc_com_pt_cstransition8_002() {
         now += secs(1);
         let write = LimitWrite {
             is_active: false,
-            watts: value,
+            value: eebus::usecases::limitation::LimitWrite::active(value).value,
             duration: None,
         };
         assert_eq!(

@@ -4,6 +4,44 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [0.13.0] — 2026-11-20
+
+### Added
+
+- **Exact regulatory quantities** (asked for by `emob`). The LPC/LPP limit, the failsafe
+  value and the MGCP curtailment factor and feed-in ceiling are held as the `ScaledNumber`
+  they arrived as; `f64` is a view. Exact spellings: `LimitWrite::active_scaled`,
+  `active_for_scaled`, `scaled()`; `EffectiveLimit::scaled()`; `CsConfig::new_scaled`;
+  `FeedInLimit::new_scaled`, `scaled()`, `factor_scaled()`; `Curtailment::factor_scaled`,
+  `limit_scaled`; `mgcp::curtailment_value_scaled`, `read_curtailment_scaled`.
+- `ScaledNumber` is `Copy`, with `canonical()` (one spelling per value: whole values at
+  scale 0) and an exact `checked_mul`.
+- `EffectiveLimit::active(watts)` and `failsafe(watts)`.
+
+### Fixed
+
+- **The Energy Guard wrote limits at whole watts**, so 4 200.5 W arrived as 4 201 W, and a
+  new limit within half a watt of the last was not written at all.
+- **The Controllable System published its failsafe value and its limit at whole watts**
+  while applying the exact value.
+- **The MGCP feed-in ceiling rounded twice**: 7 % of 9 900 W was 693.0000000000001, and one
+  in twelve whole-watt ceilings came out a fraction above itself.
+- Every other quantity a use case writes keeps three decimals instead of being rounded to a
+  whole unit.
+
+### Changed
+
+- **Breaking:**
+
+  | | 0.12 | 0.13 |
+  |---|---|---|
+  | `LimitWrite.watts: f64` | field | `value: ScaledNumber`; `watts()` |
+  | `EffectiveLimit::Active(f64)`, `Failsafe(f64)` | `f64` payload | `ScaledNumber` payload; `EffectiveLimit::active(watts)` to build one from `f64` |
+  | `CsConfig.failsafe_watts: f64` | field | `failsafe: ScaledNumber`; `failsafe_watts()` |
+  | `ControllableSystem::on_failsafe_limit_write` | `(watts: f64, now)` | `(value: ScaledNumber, now)` |
+  | ⚠️ silent: limits, failsafe values and setpoints with fractions of a watt | rounded to whole watts on the wire | written to three decimals |
+  | ⚠️ silent: `FeedInLimit::watts` | rounded twice | exact, rounded once |
+
 ## [0.12.0] — 2026-11-20
 
 ### Added

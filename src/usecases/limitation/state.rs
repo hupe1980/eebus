@@ -28,7 +28,7 @@
 //!
 //! // A restart starts limited by the failsafe value, not unlimited. [LPC/LPP-901]
 //! assert_eq!(cs.state(), LimitationState::Init);
-//! assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(4_200.0));
+//! assert_eq!(cs.effective_limit(), EffectiveLimit::failsafe(4_200.0));
 //!
 //! // The Energy Guard establishes the link, then sets a limit.
 //! let mut now = Duration::from_secs(10);
@@ -38,12 +38,12 @@
 //!
 //! assert!(outcome.is_accepted());
 //! assert_eq!(cs.state(), LimitationState::Limited);
-//! assert_eq!(cs.effective_limit(), EffectiveLimit::Active(3_000.0));
+//! assert_eq!(cs.effective_limit(), EffectiveLimit::active(3_000.0));
 //! ```
 
 use core::time::Duration;
 
-use crate::model::ErrorNumber;
+use crate::model::{ErrorNumber, ScaledNumber};
 
 /// How often each side sends its heartbeat: "at least every 60 seconds"
 /// ([LPC/LPP-005], [LPC/LPP-006]).
@@ -128,25 +128,52 @@ impl core::fmt::Display for LimitationState {
     }
 }
 
-/// What the system is actually limited to right now.
+/// What the system is actually limited to right now, exactly as it was written or
+/// configured.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EffectiveLimit {
     /// No limitation.
     None,
     /// The Energy Guard's active power limit, in watts.
-    Active(f64),
+    Active(ScaledNumber),
     /// The failsafe active power limit, in watts.
-    Failsafe(f64),
+    Failsafe(ScaledNumber),
 }
 
 impl EffectiveLimit {
+    /// [`Active`](Self::Active) at `watts`, to a milliwatt.
+    pub fn active(watts: f64) -> Self {
+        Self::Active(exact_watts(watts))
+    }
+
+    /// [`Failsafe`](Self::Failsafe) at `watts`, to a milliwatt.
+    pub fn failsafe(watts: f64) -> Self {
+        Self::Failsafe(exact_watts(watts))
+    }
+
     /// The limit in watts, or [`None`] when the device is unrestricted.
     pub fn watts(self) -> Option<f64> {
+        self.scaled().and_then(|value| value.to_f64())
+    }
+
+    /// The limit in watts, exactly, or [`None`] when the device is unrestricted.
+    pub fn scaled(self) -> Option<ScaledNumber> {
         match self {
             EffectiveLimit::None => None,
-            EffectiveLimit::Active(w) | EffectiveLimit::Failsafe(w) => Some(w),
+            EffectiveLimit::Active(value) | EffectiveLimit::Failsafe(value) => Some(value),
         }
     }
+}
+
+/// How many decimals of a watt an `f64` keeps on its way to an exact value: a milliwatt.
+const WATT_DECIMALS: u8 = 3;
+
+/// `watts` as the exact value it stands for, to a milliwatt; absent when it is not a
+/// number, which [`check_watts`] then refuses.
+pub(crate) fn exact_watts(watts: f64) -> ScaledNumber {
+    ScaledNumber::from_f64(watts, WATT_DECIMALS)
+        .map(ScaledNumber::canonical)
+        .unwrap_or_default()
 }
 
 /// A write on the Active Power Consumption or Production Limit.
@@ -154,8 +181,9 @@ impl EffectiveLimit {
 pub struct LimitWrite {
     /// Whether the limit is in force ([LPC/LPP-008]).
     pub is_active: bool,
-    /// The limit in watts. Always at or above zero ([LPC/LPP-001]).
-    pub watts: f64,
+    /// The limit in watts, exactly and in canonical form ([`ScaledNumber::canonical`]).
+    /// Always at or above zero ([LPC/LPP-001]); [`watts`](Self::watts) is the `f64` view.
+    pub value: ScaledNumber,
     /// How long the limit is valid ([LPC/LPP-004]).
     ///
     /// The duration starts running when the write arrives, whether or not the limit is
@@ -191,24 +219,52 @@ impl LimitWrite {
     /// Whether this limit can be written: [`InvalidLimit`] unless its watts are a finite
     /// number at or above zero ([LPC/LPP-001]).
     pub fn check(&self) -> Result<(), InvalidLimit> {
-        check_watts(self.watts)
+        check_watts(self.watts())
     }
 
-    /// An activated limit without a duration.
+    /// The limit in watts; NaN when the value is absent or not representable.
+    pub fn watts(&self) -> f64 {
+        self.value.to_f64().unwrap_or(f64::NAN)
+    }
+
+    /// The limit in watts, exactly.
+    pub fn scaled(&self) -> ScaledNumber {
+        self.value
+    }
+
+    /// An activated limit without a duration, to a milliwatt.
     pub fn active(watts: f64) -> Self {
+        Self::active_scaled(exact_watts(watts))
+    }
+
+    /// An activated limit without a duration, exactly.
+    ///
+    /// ```
+    /// use eebus::model::ScaledNumber;
+    /// use eebus::usecases::limitation::LimitWrite;
+    ///
+    /// let limit = LimitWrite::active_scaled(ScaledNumber::new(42_005, -1));
+    /// assert_eq!(limit.watts(), 4_200.5);
+    /// assert_eq!(limit, LimitWrite::active(4_200.5));
+    /// ```
+    pub fn active_scaled(value: ScaledNumber) -> Self {
         Self {
             is_active: true,
-            watts,
+            value: value.canonical(),
             duration: None,
         }
     }
 
-    /// An activated limit valid for `duration`.
+    /// An activated limit valid for `duration`, to a milliwatt.
     pub fn active_for(watts: f64, duration: Duration) -> Self {
+        Self::active_for_scaled(exact_watts(watts), duration)
+    }
+
+    /// An activated limit valid for `duration`, exactly.
+    pub fn active_for_scaled(value: ScaledNumber, duration: Duration) -> Self {
         Self {
-            is_active: true,
-            watts,
             duration: Some(duration),
+            ..Self::active_scaled(value)
         }
     }
 
@@ -216,7 +272,7 @@ impl LimitWrite {
     pub fn deactivated() -> Self {
         Self {
             is_active: false,
-            watts: 0.0,
+            value: ScaledNumber::whole(0),
             duration: None,
         }
     }
@@ -357,7 +413,7 @@ pub struct CsConfig {
     /// Pre-configured by the vendor or installer, and changeable by the Energy Guard —
     /// which the implementation guide §2.15 makes mandatory, because a device stuck on
     /// a factory default cannot protect anything.
-    pub failsafe_watts: f64,
+    pub failsafe: ScaledNumber,
     /// The Failsafe Duration Minimum ([LPC/LPP-022]), between two and twenty-four hours.
     pub failsafe_duration: Duration,
     /// The largest Failsafe Duration Minimum this device accepts ([LPC/LPP-022/4]).
@@ -377,16 +433,27 @@ pub struct CsConfig {
 }
 
 impl CsConfig {
-    /// A configuration with the two mandatory failsafe values.
+    /// A configuration with the two mandatory failsafe values, the limit to a milliwatt.
     pub fn new(failsafe_watts: f64, failsafe_duration: Duration) -> Self {
+        Self::new_scaled(exact_watts(failsafe_watts), failsafe_duration)
+    }
+
+    /// A configuration with the two mandatory failsafe values, the limit exactly as the
+    /// operator configured it.
+    pub fn new_scaled(failsafe: ScaledNumber, failsafe_duration: Duration) -> Self {
         Self {
-            failsafe_watts,
+            failsafe: failsafe.canonical(),
             failsafe_duration,
             failsafe_duration_max: *FAILSAFE_DURATION_RANGE.end(),
             nominal_max_watts: None,
             contractual_max_watts: None,
             on_cem: false,
         }
+    }
+
+    /// The failsafe limit in watts; NaN when it is absent or not representable.
+    pub fn failsafe_watts(&self) -> f64 {
+        self.failsafe.to_f64().unwrap_or(f64::NAN)
     }
 
     /// Says this Controllable System runs inside a Customer Energy Manager.
@@ -497,10 +564,10 @@ impl ControllableSystem {
     pub fn effective_limit(&self) -> EffectiveLimit {
         match self.state {
             LimitationState::Init | LimitationState::FailsafeState => {
-                EffectiveLimit::Failsafe(self.config.failsafe_watts)
+                EffectiveLimit::Failsafe(self.config.failsafe)
             }
             LimitationState::Limited => match &self.limit {
-                Some(limit) if limit.is_active => EffectiveLimit::Active(limit.watts),
+                Some(limit) if limit.is_active => EffectiveLimit::Active(limit.value),
                 _ => EffectiveLimit::None,
             },
             LimitationState::UnlimitedControlled | LimitationState::UnlimitedAutonomous => {
@@ -584,9 +651,9 @@ impl ControllableSystem {
         // [LPC/LPP-001], implementation guide §3.6: a limit below zero is never valid, nor
         // is one that is not a number. An application can construct a `LimitWrite`
         // directly, so this does not rely on the wire parser having caught it.
-        let refusal = if !write.watts.is_finite() {
+        let refusal = if !write.watts().is_finite() {
             Some(NackReason::NotFinite)
-        } else if write.watts < 0.0 {
+        } else if write.watts() < 0.0 {
             Some(NackReason::NegativeValue)
         } else if let LocalDecision::Reject(reason) = decision {
             Some(NackReason::CannotApply(reason))
@@ -670,19 +737,21 @@ impl ControllableSystem {
     }
 
     /// Applies a write on the failsafe active power limit ([LPC/LPP-021]).
-    pub fn on_failsafe_limit_write(&mut self, watts: f64, now: Duration) -> WriteOutcome {
+    ///
+    /// Stored exactly as it arrived, so what the device publishes is what it applies.
+    pub fn on_failsafe_limit_write(&mut self, value: ScaledNumber, now: Duration) -> WriteOutcome {
         self.handle_timeout(now);
         if let Some(rejection) = self.check_secondary_write(now) {
             return rejection;
         }
-        if !watts.is_finite() {
+        let Some(watts) = value.to_f64().filter(|w| w.is_finite()) else {
             return WriteOutcome::Rejected(NackReason::NotFinite);
-        }
+        };
         // [LPC/LPP-021]: the failsafe limit is a power, and a power below zero is not one.
         if watts < 0.0 {
             return WriteOutcome::Rejected(NackReason::NegativeValue);
         }
-        self.config.failsafe_watts = watts;
+        self.config.failsafe = value.canonical();
         WriteOutcome::Accepted
     }
 
@@ -966,7 +1035,7 @@ impl crate::usecases::signals::Signals<super::Direction> for ControllableSystem 
                     SignalValue::number(
                         self.limit
                             .filter(|_| self.state == LimitationState::Limited)
-                            .map(|l| l.watts),
+                            .map(|l| l.watts()),
                     ),
                 )
                 .in_unit("W"),
@@ -982,7 +1051,7 @@ impl crate::usecases::signals::Signals<super::Direction> for ControllableSystem 
             .with(
                 Signal::new(
                     name("failsafeLimit"),
-                    SignalValue::Number(config.failsafe_watts),
+                    SignalValue::Number(config.failsafe_watts()),
                 )
                 .in_unit("W"),
             )

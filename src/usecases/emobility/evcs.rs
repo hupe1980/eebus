@@ -327,7 +327,7 @@ impl ChargingSummary {
                     value: Some(vec![BillDataTotalValue {
                         value_id: Some(TOTAL_VALUE),
                         unit: Some(UnitOfMeasurement::Wh),
-                        value: ScaledNumber::from_f64(self.energy_wh, 0),
+                        value: ScaledNumber::from_f64(self.energy_wh, 3),
                     }]),
                     cost: Some(vec![BillDataTotalCost {
                         cost_id: Some(TOTAL_COST),

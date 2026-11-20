@@ -128,11 +128,16 @@ pub fn curtailment_description() -> CmdData {
 /// above 100 would tell a client it may feed in more than the building can produce.
 pub fn curtailment_value(percent: f64) -> CmdData {
     let percent = percent.clamp(*CURTAILMENT_RANGE.start(), *CURTAILMENT_RANGE.end());
+    curtailment_value_scaled(ScaledNumber::from_f64(percent, 2).unwrap_or_default())
+}
+
+/// [`curtailment_value`] for a factor given exactly, clamped to [`CURTAILMENT_RANGE`].
+pub fn curtailment_value_scaled(percent: ScaledNumber) -> CmdData {
     CmdData::DeviceConfigurationKeyValueListData(DeviceConfigurationKeyValueListData {
         device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
             key_id: Some(CURTAILMENT_KEY),
             value: Some(DeviceConfigurationKeyValueValue {
-                scaled_number: ScaledNumber::from_f64(percent, 2),
+                scaled_number: clamp_factor(percent),
                 ..Default::default()
             }),
             ..Default::default()
@@ -159,6 +164,14 @@ pub fn find_curtailment_key(data: &CmdData) -> Option<DeviceConfigurationKeyId> 
 /// Returns the percentage. On its own a percentage is not actionable — see
 /// [`FeedInLimit`] for the value an inverter or an energy manager can hold itself to.
 pub fn read_curtailment(data: &CmdData, key: DeviceConfigurationKeyId) -> Option<f64> {
+    read_curtailment_scaled(data, key).and_then(|factor| factor.to_f64())
+}
+
+/// [`read_curtailment`], exactly as it crossed the wire.
+pub fn read_curtailment_scaled(
+    data: &CmdData,
+    key: DeviceConfigurationKeyId,
+) -> Option<ScaledNumber> {
     let CmdData::DeviceConfigurationKeyValueListData(list) = data else {
         return None;
     };
@@ -167,8 +180,21 @@ pub fn read_curtailment(data: &CmdData, key: DeviceConfigurationKeyId) -> Option
         .flatten()
         .find(|entry| entry.key_id == Some(key))
         .and_then(|entry| entry.value.as_ref())
-        .and_then(|value| value.scaled_number.as_ref())
-        .and_then(ScaledNumber::to_f64)
+        .and_then(|value| value.scaled_number)
+        .filter(|factor| factor.to_f64().is_some())
+}
+
+/// A factor held to [`CURTAILMENT_RANGE`], exactly: the ends are whole numbers, so a
+/// factor outside them becomes the end itself rather than an approximation of it.
+fn clamp_factor(percent: ScaledNumber) -> Option<ScaledNumber> {
+    let value = percent.to_f64()?;
+    Some(if value < *CURTAILMENT_RANGE.start() {
+        ScaledNumber::whole(0)
+    } else if value > *CURTAILMENT_RANGE.end() {
+        ScaledNumber::whole(100)
+    } else {
+        percent.canonical()
+    })
 }
 
 /// Scenario 1 as a Monitoring Appliance sees it: a description, then values.
@@ -194,7 +220,7 @@ pub fn read_curtailment(data: &CmdData, key: DeviceConfigurationKeyId) -> Option
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Curtailment {
     key: Option<DeviceConfigurationKeyId>,
-    values: Vec<(DeviceConfigurationKeyId, f64)>,
+    values: Vec<(DeviceConfigurationKeyId, ScaledNumber)>,
 }
 
 impl Curtailment {
@@ -233,7 +259,7 @@ impl Curtailment {
             let (Some(id), Some(value)) = (entry.key_id, entry.value.as_ref()) else {
                 continue;
             };
-            let Some(number) = value.scaled_number.as_ref().and_then(ScaledNumber::to_f64) else {
+            let Some(number) = value.scaled_number.filter(|n| n.to_f64().is_some()) else {
                 continue;
             };
             match self.values.iter_mut().find(|(known, _)| *known == id) {
@@ -254,16 +280,26 @@ impl Curtailment {
     /// [`None`] while either is missing. Not zero: an unread message is not a
     /// curtailment, and the difference is a roof that stops exporting.
     pub fn factor_percent(&self) -> Option<f64> {
+        self.factor_scaled()?.to_f64()
+    }
+
+    /// The factor exactly as it crossed the wire, held to [`CURTAILMENT_RANGE`].
+    pub fn factor_scaled(&self) -> Option<ScaledNumber> {
         let key = self.key?;
         self.values
             .iter()
             .find(|(known, _)| *known == key)
-            .map(|(_, value)| value.clamp(*CURTAILMENT_RANGE.start(), *CURTAILMENT_RANGE.end()))
+            .and_then(|(_, value)| clamp_factor(*value))
     }
 
     /// The factor as a ceiling in watts, given the building's installed peak power.
     pub fn limit(&self, nominal_peak_watts: f64) -> Option<FeedInLimit> {
-        Some(FeedInLimit::new(self.factor_percent()?, nominal_peak_watts))
+        self.limit_scaled(ScaledNumber::from_f64(nominal_peak_watts.max(0.0), 3)?)
+    }
+
+    /// [`limit`](Self::limit) with the peak power given exactly.
+    pub fn limit_scaled(&self, nominal_peak: ScaledNumber) -> Option<FeedInLimit> {
+        Some(FeedInLimit::new_scaled(self.factor_scaled()?, nominal_peak))
     }
 }
 
@@ -292,8 +328,8 @@ impl Curtailment {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FeedInLimit {
-    factor_percent: f64,
-    nominal_peak_watts: f64,
+    factor: ScaledNumber,
+    nominal_peak: ScaledNumber,
 }
 
 impl FeedInLimit {
@@ -302,12 +338,33 @@ impl FeedInLimit {
     /// The factor is clamped to [`CURTAILMENT_RANGE`], as
     /// [`curtailment_value`] clamps it on the way out: a factor above 100 % would
     /// otherwise permit more feed-in than the array can produce, which is not a
-    /// limitation at all.
+    /// limitation at all. Both go to exact values at three decimals.
     pub fn new(factor_percent: f64, nominal_peak_watts: f64) -> Self {
+        Self::new_scaled(
+            ScaledNumber::from_f64(factor_percent, 3).unwrap_or_default(),
+            ScaledNumber::from_f64(nominal_peak_watts.max(0.0), 3).unwrap_or_default(),
+        )
+    }
+
+    /// A ceiling from the factor and the peak power, exactly.
+    ///
+    /// ```
+    /// use eebus::model::ScaledNumber;
+    /// use eebus::usecases::mgcp::FeedInLimit;
+    ///
+    /// let limit = FeedInLimit::new_scaled(ScaledNumber::whole(7), ScaledNumber::whole(9_900));
+    /// assert_eq!(limit.scaled(), Some(ScaledNumber::whole(693)));
+    /// assert_eq!(limit.watts(), 693.0);
+    /// ```
+    pub fn new_scaled(factor_percent: ScaledNumber, nominal_peak: ScaledNumber) -> Self {
+        let nominal_peak = if nominal_peak.to_f64().is_some_and(|w| w < 0.0) {
+            ScaledNumber::whole(0)
+        } else {
+            nominal_peak.canonical()
+        };
         Self {
-            factor_percent: factor_percent
-                .clamp(*CURTAILMENT_RANGE.start(), *CURTAILMENT_RANGE.end()),
-            nominal_peak_watts: nominal_peak_watts.max(0.0),
+            factor: clamp_factor(factor_percent).unwrap_or_default(),
+            nominal_peak,
         }
     }
 
@@ -324,22 +381,38 @@ impl FeedInLimit {
         key: DeviceConfigurationKeyId,
         nominal_peak_watts: f64,
     ) -> Option<Self> {
-        read_curtailment(data, key).map(|factor| Self::new(factor, nominal_peak_watts))
+        let peak = ScaledNumber::from_f64(nominal_peak_watts.max(0.0), 3)?;
+        read_curtailment_scaled(data, key).map(|factor| Self::new_scaled(factor, peak))
     }
 
     /// The factor as it crossed the wire, as a percentage.
     pub fn factor_percent(self) -> f64 {
-        self.factor_percent
+        self.factor.to_f64().unwrap_or(f64::NAN)
+    }
+
+    /// The factor, exactly.
+    pub fn factor_scaled(self) -> ScaledNumber {
+        self.factor
     }
 
     /// The building's cumulated nominal PV peak power, in watts.
     pub fn nominal_peak_watts(self) -> f64 {
-        self.nominal_peak_watts
+        self.nominal_peak.to_f64().unwrap_or(f64::NAN)
     }
 
-    /// The most that may be fed in, in watts.
+    /// The most that may be fed in, in watts, exactly: `factor × peak / 100` on mantissa
+    /// and scale. [`None`] only when the product overflows an `i64` mantissa.
+    pub fn scaled(self) -> Option<ScaledNumber> {
+        let product = self.factor.checked_mul(&self.nominal_peak)?;
+        let scale = product.scale.map_or(0, |s| s.get()).checked_sub(2)?;
+        Some(ScaledNumber::new(product.number?.get(), scale).canonical())
+    }
+
+    /// The most that may be fed in, in watts: [`scaled`](Self::scaled), correctly rounded.
     pub fn watts(self) -> f64 {
-        self.factor_percent / 100.0 * self.nominal_peak_watts
+        self.scaled()
+            .and_then(|watts| watts.to_f64())
+            .unwrap_or_else(|| self.factor_percent() * self.nominal_peak_watts() / 100.0)
     }
 
     /// Whether feeding in this much is within the ceiling.
@@ -356,7 +429,10 @@ impl FeedInLimit {
     ///
     /// [`LimitWrite`]: crate::usecases::limitation::LimitWrite
     pub fn as_production_limit(self) -> crate::usecases::limitation::LimitWrite {
-        crate::usecases::limitation::LimitWrite::active(self.watts())
+        match self.scaled() {
+            Some(watts) => crate::usecases::limitation::LimitWrite::active_scaled(watts),
+            None => crate::usecases::limitation::LimitWrite::active(self.watts()),
+        }
     }
 }
 
@@ -545,6 +621,43 @@ pub static GRID_CONNECTION_POINT: UseCaseDescriptor = UseCaseDescriptor {
 mod tests {
     use super::*;
 
+    /// A ceiling that is a whole number of watts comes out as that number.
+    ///
+    /// `factor / 100 × peak` rounds twice: 7 % of 9 900 W was 693.0000000000001, and
+    /// one in twelve whole-watt ceilings came out a fraction above themselves. On
+    /// mantissa and scale it is exact.
+    #[test]
+    fn a_feed_in_ceiling_is_exact() {
+        for percent in 0..=100i64 {
+            for peak in (1_000..=30_000i64).step_by(100) {
+                let limit = FeedInLimit::new(percent as f64, peak as f64);
+                let exact = percent * peak;
+                assert_eq!(
+                    limit.scaled().map(ScaledNumber::canonical),
+                    Some(ScaledNumber::new(exact, -2).canonical()),
+                    "{percent} % of {peak} W"
+                );
+                if exact % 100 == 0 {
+                    assert_eq!(
+                        limit.watts(),
+                        (exact / 100) as f64,
+                        "{percent} % of {peak} W"
+                    );
+                }
+            }
+        }
+        let mut factor = Curtailment::new();
+        factor.describe(&curtailment_description());
+        factor.apply(&curtailment_value_scaled(ScaledNumber::new(705, -1)));
+        assert_eq!(factor.factor_scaled(), Some(ScaledNumber::new(705, -1)));
+        assert_eq!(
+            factor
+                .limit_scaled(ScaledNumber::whole(10_000))
+                .and_then(FeedInLimit::scaled),
+            Some(ScaledNumber::whole(7_050))
+        );
+    }
+
     #[test]
     fn mgcp_011_the_curtailment_factor_round_trips() {
         let published = curtailment_value(70.0);
@@ -601,7 +714,7 @@ mod tests {
                     DeviceConfigurationKeyValueData {
                         key_id: Some(CURTAILMENT_KEY),
                         value: Some(DeviceConfigurationKeyValueValue {
-                            scaled_number: ScaledNumber::from_f64(9.0, 0),
+                            scaled_number: ScaledNumber::from_f64(9.0, 3),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -644,7 +757,7 @@ mod tests {
         assert_eq!(limit.nominal_peak_watts(), 12_000.0);
 
         // And the value LPP is written with, which is how an inverter hears about it.
-        assert_eq!(limit.as_production_limit().watts, 8_400.0);
+        assert_eq!(limit.as_production_limit().watts(), 8_400.0);
         assert!(limit.as_production_limit().is_active);
     }
 

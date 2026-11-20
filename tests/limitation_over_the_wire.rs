@@ -247,7 +247,7 @@ fn a_limit_reaches_the_heat_pump_and_is_acknowledged() {
 
     assert_eq!(
         link.actor.system().effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS),
+        EffectiveLimit::failsafe(FAILSAFE_WATTS),
         "[LPC-901]: a fresh system runs on the failsafe value"
     );
 
@@ -258,7 +258,7 @@ fn a_limit_reaches_the_heat_pump_and_is_acknowledged() {
     assert_eq!(link.actor.system().state(), LimitationState::Limited);
     assert_eq!(
         link.actor.system().effective_limit(),
-        EffectiveLimit::Active(3_000.0)
+        EffectiveLimit::active(3_000.0)
     );
 
     // And the heat pump now serves the limit it applied, so a peer reading it sees the
@@ -292,7 +292,7 @@ fn ig_2_14_a_limit_without_a_heartbeat_is_refused_over_the_wire() {
     assert_eq!(link.actor.system().state(), LimitationState::Init);
     assert_eq!(
         link.actor.system().effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS),
+        EffectiveLimit::failsafe(FAILSAFE_WATTS),
         "the failsafe still applies"
     );
 
@@ -343,7 +343,7 @@ fn ig_2_15_the_failsafe_values_can_be_written_over_the_wire() {
     link.pump_messages();
 
     assert_eq!(link.last_result(), Some(ErrorNumber::None));
-    assert_eq!(link.actor.system().config().failsafe_watts, 2_000.0);
+    assert_eq!(link.actor.system().config().failsafe_watts(), 2_000.0);
 
     // The new value is what a peer reading the configuration now sees.
     let published = link
@@ -391,7 +391,7 @@ fn ig_2_17_silence_reaches_the_failsafe_and_holds() {
     assert_eq!(link.actor.system().state(), LimitationState::FailsafeState);
     assert_eq!(
         link.actor.system().effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
 
     // Two minutes on — the point at which `init` would have gone unlimited.
@@ -493,7 +493,7 @@ fn a_production_limit_reaches_the_inverter_and_is_acknowledged() {
     assert_eq!(link.actor.system().state(), LimitationState::Limited);
     assert_eq!(
         link.actor.system().effective_limit(),
-        EffectiveLimit::Active(1_500.0)
+        EffectiveLimit::active(1_500.0)
     );
 }
 
@@ -629,7 +629,7 @@ fn ig_3_3_a_partial_limit_write_that_omits_is_limit_active_stays_active() {
     );
     assert_eq!(
         link.actor.system().effective_limit(),
-        EffectiveLimit::Active(2_000.0),
+        EffectiveLimit::active(2_000.0),
         "and the new value is the one in force"
     );
 }

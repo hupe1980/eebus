@@ -416,9 +416,9 @@ async fn eebus_go_writes_a_limit_and_this_crate_applies_it() {
         "a limit was accepted but the state machine did not move"
     );
     assert!(
-        limit.watts > 0.0,
+        limit.watts() > 0.0,
         "eebus-go's limit came through as {} W",
-        limit.watts
+        limit.watts()
     );
 
     // The §14a record, produced against a real Energy Guard.
@@ -568,7 +568,7 @@ async fn this_crate_writes_a_limit_and_eebus_go_applies_it() {
 
     println!("eebus-go accepted {limit:?} from this crate");
     assert!(limit.is_active, "the accepted limit was not an active one");
-    assert_eq!(limit.watts, 4_200.0);
+    assert_eq!(limit.watts(), 4_200.0);
 
     // The §14a record, produced against a real Controllable System.
     assert!(
@@ -703,5 +703,5 @@ async fn eebus_go_dials_this_crate_listening() {
         LimitationState::Limited,
         "a limit was accepted but the state machine did not move"
     );
-    assert!(limit.watts > 0.0);
+    assert!(limit.watts() > 0.0);
 }

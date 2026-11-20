@@ -55,7 +55,7 @@ fn lpc_901_restart_starts_limited_by_the_failsafe_value() {
     assert_eq!(cs.state(), LimitationState::Init);
     assert_eq!(
         cs.effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
     assert!(!cs.is_limit_active(), "[LPC-009/2]");
 }
@@ -76,7 +76,7 @@ fn lpc_904_init_to_limited() {
     let mut cs = new_cs();
     commission(&mut cs, LimitWrite::active(3_000.0));
     assert_eq!(cs.state(), LimitationState::Limited);
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(3_000.0));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::active(3_000.0));
     assert!(cs.is_limit_active(), "[LPC-009/1]");
 }
 
@@ -107,7 +107,7 @@ fn lpc_910_unlimited_controlled_to_limited() {
             .is_accepted()
     );
     assert_eq!(cs.state(), LimitationState::Limited);
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(2_000.0));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::active(2_000.0));
 }
 
 /// Transition 5, [LPC-911]: no heartbeat for two minutes falls back to the failsafe.
@@ -125,7 +125,7 @@ fn lpc_911_unlimited_controlled_to_failsafe() {
     assert_eq!(cs.state(), LimitationState::FailsafeState);
     assert_eq!(
         cs.effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
 }
 
@@ -170,7 +170,7 @@ fn lpc_912_limited_to_failsafe() {
     assert_eq!(cs.state(), LimitationState::FailsafeState);
     assert_eq!(
         cs.effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
 }
 
@@ -290,7 +290,7 @@ fn lpc_907_a_rejection_does_not_change_a_controlled_state() {
         LimitationState::Limited,
         "the earlier limit still holds"
     );
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(3_000.0));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::active(3_000.0));
 }
 
 /// [LPC-918]: a refusal *from the failsafe state* still counts as contact, so the
@@ -346,7 +346,7 @@ fn ig_2_14_a_write_without_a_recent_heartbeat_is_refused() {
     );
     assert_eq!(
         cs.effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
 }
 
@@ -358,14 +358,20 @@ fn ig_2_11_other_data_points_are_refused_before_the_sequence_completes() {
 
     // Pre-heartbeat: nothing is accepted.
     assert_eq!(
-        cs.on_failsafe_limit_write(5_000.0, secs(1)),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(5_000.0, 3).unwrap_or_default(),
+            secs(1)
+        ),
         WriteOutcome::Rejected(NackReason::SequenceIncomplete)
     );
 
     // Post-heartbeat but pre-limit: the limit would be accepted, the failsafe is not.
     cs.on_heartbeat(secs(10));
     assert_eq!(
-        cs.on_failsafe_limit_write(5_000.0, secs(11)),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(5_000.0, 3).unwrap_or_default(),
+            secs(11)
+        ),
         WriteOutcome::Rejected(NackReason::SequenceIncomplete)
     );
 
@@ -374,8 +380,14 @@ fn ig_2_11_other_data_points_are_refused_before_the_sequence_completes() {
         cs.on_limit_write(&LimitWrite::active(3_000.0), LocalDecision::Apply, secs(12))
             .is_accepted()
     );
-    assert!(cs.on_failsafe_limit_write(5_000.0, secs(13)).is_accepted());
-    assert_eq!(cs.config().failsafe_watts, 5_000.0);
+    assert!(
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(5_000.0, 3).unwrap_or_default(),
+            secs(13)
+        )
+        .is_accepted()
+    );
+    assert_eq!(cs.config().failsafe_watts(), 5_000.0);
 }
 
 /// Implementation guide §2.15: the failsafe values are mandatory to accept, so that a
@@ -385,8 +397,14 @@ fn ig_2_15_failsafe_values_are_writeable() {
     let mut cs = new_cs();
     let now = commission(&mut cs, LimitWrite::active(3_000.0));
 
-    assert!(cs.on_failsafe_limit_write(2_000.0, now).is_accepted());
-    assert_eq!(cs.config().failsafe_watts, 2_000.0);
+    assert!(
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(2_000.0, 3).unwrap_or_default(),
+            now
+        )
+        .is_accepted()
+    );
+    assert_eq!(cs.config().failsafe_watts(), 2_000.0);
 
     assert!(
         cs.on_failsafe_duration_write(secs(4 * 3_600), now)
@@ -432,7 +450,7 @@ fn ig_3_6_a_negative_limit_is_refused_and_still_establishes_control() {
         cs.on_limit_write(
             &LimitWrite {
                 is_active: true,
-                watts: -1.0,
+                value: eebus::usecases::limitation::LimitWrite::active(-1.0).value,
                 duration: None
             },
             LocalDecision::Apply,
@@ -458,7 +476,7 @@ fn lpc_907_a_refusal_leaves_the_controlled_states_alone() {
 
     let negative = LimitWrite {
         is_active: true,
-        watts: -1.0,
+        value: eebus::usecases::limitation::LimitWrite::active(-1.0).value,
         duration: None,
     };
     assert_eq!(
@@ -466,7 +484,7 @@ fn lpc_907_a_refusal_leaves_the_controlled_states_alone() {
         WriteOutcome::Rejected(NackReason::NegativeValue)
     );
     assert_eq!(cs.state(), LimitationState::Limited, "still limited");
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Active(3_000.0));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::active(3_000.0));
 }
 
 /// A write with no heartbeat behind it is not evaluated at all, so it is not a refusal
@@ -479,7 +497,7 @@ fn lpc_ts_036_an_unevaluated_write_changes_nothing_even_when_its_value_is_invali
     let outcome = cs.on_limit_write(
         &LimitWrite {
             is_active: true,
-            watts: -1.0,
+            value: eebus::usecases::limitation::LimitWrite::active(-1.0).value,
             duration: None,
         },
         LocalDecision::Apply,
@@ -546,7 +564,7 @@ fn ig_2_17_a_lost_connection_reaches_failsafe_not_init() {
     assert_eq!(cs.state(), LimitationState::FailsafeState);
     assert_eq!(
         cs.effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
 
     // And it holds for the whole minimum duration.
@@ -697,7 +715,7 @@ fn lpc_914_a_stale_heartbeat_is_stale_even_if_no_timer_was_run() {
         WriteOutcome::Rejected(NackReason::NoRecentHeartbeat)
     );
     assert_eq!(cs.state(), LimitationState::FailsafeState);
-    assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(4_200.0));
+    assert_eq!(cs.effective_limit(), EffectiveLimit::failsafe(4_200.0));
 }
 
 /// [LPC-TS-037] is stated per state, not once per device: losing the Energy Guard means
@@ -711,7 +729,10 @@ fn lpc_ts_037_the_ordering_gate_rearms_when_control_is_lost() {
 
     // While controlled, a failsafe write goes through.
     assert_eq!(
-        cs.on_failsafe_limit_write(3_800.0, now + secs(1)),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(3_800.0, 3).unwrap_or_default(),
+            now + secs(1)
+        ),
         WriteOutcome::Accepted
     );
 
@@ -723,10 +744,13 @@ fn lpc_ts_037_the_ordering_gate_rearms_when_control_is_lost() {
     // A heartbeat resumes, but the sequence has not: a failsafe write is refused.
     cs.on_heartbeat(lost + secs(1));
     assert_eq!(
-        cs.on_failsafe_limit_write(1_000.0, lost + secs(2)),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(1_000.0, 3).unwrap_or_default(),
+            lost + secs(2)
+        ),
         WriteOutcome::Rejected(NackReason::SequenceIncomplete)
     );
-    assert_eq!(cs.config().failsafe_watts, 3_800.0, "unchanged");
+    assert_eq!(cs.config().failsafe_watts(), 3_800.0, "unchanged");
 
     // The limit write completes it, and the failsafe write is evaluated again.
     assert_eq!(
@@ -738,10 +762,13 @@ fn lpc_ts_037_the_ordering_gate_rearms_when_control_is_lost() {
         WriteOutcome::Accepted
     );
     assert_eq!(
-        cs.on_failsafe_limit_write(1_000.0, lost + secs(4)),
+        cs.on_failsafe_limit_write(
+            eebus::model::ScaledNumber::from_f64(1_000.0, 3).unwrap_or_default(),
+            lost + secs(4)
+        ),
         WriteOutcome::Accepted
     );
-    assert_eq!(cs.config().failsafe_watts, 1_000.0);
+    assert_eq!(cs.config().failsafe_watts(), 1_000.0);
 }
 
 /// Implementation guide §2.11 and §2.14 come before the application: a write with no
@@ -767,7 +794,38 @@ fn the_heartbeat_gate_wins_over_any_decision() {
         assert_eq!(cs.state(), LimitationState::Init, "{decision:?}");
         assert_eq!(
             cs.effective_limit(),
-            EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+            EffectiveLimit::failsafe(FAILSAFE_WATTS)
         );
     }
+}
+
+/// The operator's failsafe figure is published and applied exactly as configured.
+///
+/// It is a configured figure, not a measurement: an `f64` in between would make it
+/// approximate before the state machine ever held it, and the device used to publish it
+/// rounded to whole watts while applying the unrounded value.
+#[test]
+fn a_failsafe_configured_exactly_is_published_and_applied_exactly() {
+    use eebus::model::{CmdData, ScaledNumber};
+    use eebus::usecases::limitation;
+
+    let exact = ScaledNumber::new(42_005, -1);
+    let cs = limitation::ControllableSystem::new(
+        CsConfig::new_scaled(exact, Duration::from_secs(2 * 3_600)),
+        Duration::ZERO,
+    );
+    assert_eq!(cs.effective_limit(), EffectiveLimit::Failsafe(exact));
+
+    let CmdData::DeviceConfigurationKeyValueListData(list) = limitation::failsafe_values(&cs)
+    else {
+        panic!("the failsafe values are a key-value list");
+    };
+    let published = list
+        .device_configuration_key_value_data
+        .iter()
+        .flatten()
+        .find(|e| e.key_id == Some(limitation::FAILSAFE_LIMIT_KEY))
+        .and_then(|e| e.value.as_ref())
+        .and_then(|v| v.scaled_number);
+    assert_eq!(published, Some(exact), "4200.5 W, not 4201 W");
 }

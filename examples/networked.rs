@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         println!(
                             "[pump] a {:.0} W limit was {}; now {:?} at {:?}",
-                            write.watts,
+                            write.watts(),
                             if outcome.is_accepted() {
                                 "accepted"
                             } else {
@@ -173,13 +173,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 GuardEvent::LimitAccepted { limit, request, .. } => {
                     println!(
                         "[box]  {:.0} W accepted, answering msgCounter {} — the §14a evidence",
-                        limit.watts,
+                        limit.watts(),
                         request.get()
                     );
                     done = true;
                 }
                 GuardEvent::LimitRefused { limit, error, .. } => {
-                    println!("[box]  {:.0} W refused: {error}", limit.watts);
+                    println!("[box]  {:.0} W refused: {error}", limit.watts());
                     done = true;
                 }
                 GuardEvent::PeerHeartbeatLost { .. } => {}

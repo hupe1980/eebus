@@ -535,7 +535,7 @@ proptest! {
                 CsStep::Write { active, watts, duration } => {
                     let write = LimitWrite {
                         is_active: active,
-                        watts,
+                        value: LimitWrite::active(watts).value,
                         duration: duration.map(Duration::from_secs),
                     };
                     cs.on_limit_write(&write, LocalDecision::Apply, now);
@@ -551,7 +551,7 @@ proptest! {
                     cs.interrupt(RejectReason::SafetyRelated, now);
                 }
                 CsStep::FailsafeLimit(watts) => {
-                    cs.on_failsafe_limit_write(watts, now);
+                    cs.on_failsafe_limit_write(eebus::model::ScaledNumber::from_f64(watts, 3).unwrap_or_default(), now);
                 }
                 CsStep::FailsafeDuration(secs) => {
                     cs.on_failsafe_duration_write(Duration::from_secs(secs), now);
@@ -592,7 +592,7 @@ proptest! {
         cs.on_limit_write(
             &LimitWrite {
                 is_active: true,
-                watts,
+                value: LimitWrite::active(watts).value,
                 duration: Some(Duration::from_secs(hold)),
             },
             LocalDecision::Apply,
