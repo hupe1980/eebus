@@ -172,7 +172,7 @@ use eebus::usecases::limitation::{LimitWrite, LocalDecision, RejectReason};
 const FLOOR_WATTS: f64 = 4_200.0;
 
 fn policy(write: &LimitWrite) -> LocalDecision {
-    if write.is_active && write.watts < FLOOR_WATTS {
+    if write.is_active && write.watts() < FLOOR_WATTS {
         LocalDecision::Reject(RejectReason::Regulatory)   // NACK, and on the record
     } else {
         LocalDecision::Apply                              // a deactivation, the floor, anything above
@@ -210,6 +210,23 @@ Before adopting a floor, check:
   prevents it.
 
 `heat_pump --floor 4200` runs this policy in the simulator.
+
+## Exact values
+
+A limit and a failsafe value are regulatory figures, and both actors hold them as the
+`ScaledNumber` they arrived as: what the Energy Guard writes is what the wire carries, what
+the device applies and what it publishes back. The `f64` spelling is a view. A consumer that
+builds no floating point uses the exact one throughout:
+
+```rust
+use eebus::model::ScaledNumber;
+
+let config = CsConfig::new_scaled(ScaledNumber::new(42_005, -1), failsafe_duration);
+guard.require(&device, Some(LimitWrite::active_scaled(ScaledNumber::whole(3_000))), now)?;
+let applied = pump.system().effective_limit().scaled();   // Some(3000 W), exactly
+```
+
+From `f64`, a value keeps three decimals; a whole number of watts goes out at scale 0.
 
 ## The other half: the Energy Guard
 

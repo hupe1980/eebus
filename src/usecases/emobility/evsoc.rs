@@ -103,7 +103,7 @@ pub fn nominal_capacity(watt_hours: f64) -> CmdData {
                     characteristic_type: Some(
                         ElectricalConnectionCharacteristicType::EnergyCapacityNominalMax,
                     ),
-                    value: ScaledNumber::from_f64(watt_hours, 0),
+                    value: ScaledNumber::from_f64(watt_hours, 3),
                     unit: Some(UnitOfMeasurement::Wh),
                 },
             ]),

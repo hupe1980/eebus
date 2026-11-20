@@ -117,6 +117,10 @@ assert!(!limit.permits(9_000.0));
 let write = limit.as_production_limit();
 ```
 
+The ceiling is computed on mantissa and scale, so a whole number of watts comes out as one:
+`FeedInLimit::new_scaled` and `scaled()` take and give it as a `ScaledNumber`, and
+`Curtailment::factor_scaled` is the factor exactly as it crossed the wire.
+
 ### The factor's `keyId` is the connection point's, not yours
 
 MGCP Table 23 spells the identifier `<k1#(1..1)>`: the device picks the number and fixes

@@ -262,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// no other reason to refuse one.
 fn decide(write: &LimitWrite, floor: Option<f64>) -> LocalDecision {
     match floor {
-        Some(floor) if write.is_active && write.watts < floor => {
+        Some(floor) if write.is_active && write.watts() < floor => {
             LocalDecision::Reject(RejectReason::Regulatory)
         }
         _ => LocalDecision::Apply,
@@ -279,7 +279,7 @@ fn announce_decision(decision: &CsEvent) {
     match decision {
         CsEvent::LimitDecided { write, outcome, .. } => println!(
             "[pump] a {:.0} W limit was {}",
-            write.watts,
+            write.watts(),
             if outcome.is_accepted() {
                 "accepted"
             } else {

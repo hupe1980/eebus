@@ -130,6 +130,57 @@ impl ScaledNumber {
         ))
     }
 
+    /// The same value in its one canonical spelling: a whole value at scale 0
+    /// (`42 × 10²` is `4200 × 10⁰`), a fraction with no superfluous decimals
+    /// (`42050 × 10⁻¹` is `4205 × 10⁰`, `42005 × 10⁻¹` stays), zero as `0 × 10⁰`.
+    ///
+    /// Two exact quantities therefore compare equal exactly when they are the same number,
+    /// and a whole number of watts goes out the way every device expects it. A value too
+    /// large for scale 0 keeps the smallest scale that fits. An absent element stays absent.
+    #[must_use]
+    pub fn canonical(self) -> Self {
+        let (Some(number), scale) = (self.number, self.scale) else {
+            return self;
+        };
+        let mut number = number.get();
+        let mut scale = scale.map_or(0, Scale::get);
+        if number == 0 {
+            return Self::new(0, 0);
+        }
+        while scale < 0 && number % 10 == 0 {
+            number /= 10;
+            scale += 1;
+        }
+        while scale > 0 {
+            let Some(widened) = number.checked_mul(10) else {
+                break;
+            };
+            number = widened;
+            scale -= 1;
+        }
+        Self::new(number, scale)
+    }
+
+    /// `self × other`, exactly, or [`None`] when either is absent or the mantissa or the
+    /// scale overflows.
+    ///
+    /// ```
+    /// use eebus::model::ScaledNumber;
+    ///
+    /// // 7 % of 9 900 W is 693 W — not 693.0000000000001.
+    /// let percent = ScaledNumber::new(7, -2);
+    /// let watts = ScaledNumber::whole(9_900).checked_mul(&percent).unwrap();
+    /// assert_eq!(watts.canonical(), ScaledNumber::whole(693));
+    /// ```
+    pub fn checked_mul(&self, other: &Self) -> Option<Self> {
+        let number = self.number?.get().checked_mul(other.number?.get())?;
+        let scale = self
+            .scale
+            .map_or(0, Scale::get)
+            .checked_add(other.scale.map_or(0, Scale::get))?;
+        Some(Self::new(number, scale).canonical())
+    }
+
     /// True when both elements are present, as the implementation guide requires for a
     /// message that is not a partial (Restricted Function Exchange) update.
     pub fn is_complete(&self) -> bool {
@@ -150,6 +201,10 @@ impl ScaledNumber {
         self
     }
 }
+
+/// Both elements are `Copy`, so the whole is: an exact quantity can be passed by value like
+/// the `f64` it stands beside.
+impl Copy for ScaledNumber {}
 
 impl core::fmt::Display for ScaledNumber {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -318,6 +373,39 @@ mod tests {
         assert_eq!(ScaledNumber::from_f64(f64::NAN, 2), None);
         assert_eq!(ScaledNumber::from_f64(f64::INFINITY, 0), None);
         assert_eq!(ScaledNumber::from_f64(f64::NEG_INFINITY, 0), None);
+    }
+
+    #[test]
+    fn exact_values_have_one_spelling_and_multiply_exactly() {
+        assert_eq!(
+            ScaledNumber::new(42, 2).canonical(),
+            ScaledNumber::new(4_200, 0)
+        );
+        assert_eq!(
+            ScaledNumber::new(42_050, -1).canonical(),
+            ScaledNumber::new(4_205, 0)
+        );
+        assert_eq!(
+            ScaledNumber::new(i64::MAX, 1).canonical(),
+            ScaledNumber::new(i64::MAX, 1),
+            "too large for scale 0"
+        );
+        assert_eq!(
+            ScaledNumber::new(0, -3).canonical(),
+            ScaledNumber::new(0, 0)
+        );
+        assert_eq!(
+            ScaledNumber::new(42_005, -1).canonical(),
+            ScaledNumber::new(42_005, -1)
+        );
+        let ceiling = ScaledNumber::whole(9_900)
+            .checked_mul(&ScaledNumber::new(7, -2))
+            .unwrap();
+        assert_eq!(ceiling.to_f64(), Some(693.0));
+        assert_eq!(
+            ScaledNumber::whole(i64::MAX).checked_mul(&ScaledNumber::whole(2)),
+            None
+        );
     }
 
     /// A mantissa `f64` cannot hold reads as no value, not as its neighbour.

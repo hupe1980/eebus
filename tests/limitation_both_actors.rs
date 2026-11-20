@@ -57,14 +57,14 @@ fn the_two_actors_run_the_use_case_between_them() {
     pair.advance(Duration::from_secs(1));
 
     assert_eq!(pair.accepted().len(), 1);
-    assert_eq!(pair.accepted()[0].watts, 3_000.0);
+    assert_eq!(pair.accepted()[0].watts(), 3_000.0);
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
     assert_eq!(
         pair.pump.system().effective_limit(),
-        EffectiveLimit::Active(3_000.0)
+        EffectiveLimit::active(3_000.0)
     );
     assert_eq!(
-        pair.guard.applied_limit(&device).map(|l| l.watts),
+        pair.guard.applied_limit(&device).map(|l| l.watts()),
         Some(3_000.0)
     );
 }
@@ -133,7 +133,7 @@ fn a_refused_limit_is_retried_and_the_peer_is_kept() {
             &device,
             Some(LimitWrite {
                 is_active: true,
-                watts: 1_000.0,
+                value: eebus::usecases::limitation::LimitWrite::active(1_000.0).value,
                 duration: None,
             }),
             pair.now,
@@ -168,7 +168,7 @@ fn an_activated_limit_never_carries_a_zero_duration() {
             &device,
             Some(LimitWrite {
                 is_active: true,
-                watts: 3_000.0,
+                value: eebus::usecases::limitation::LimitWrite::active(3_000.0).value,
                 duration: Some(Duration::ZERO),
             }),
             pair.now,
@@ -214,7 +214,7 @@ fn the_guard_can_change_the_failsafe_values() {
     );
     pair.settle();
 
-    assert_eq!(pair.pump.system().config().failsafe_watts, 2_000.0);
+    assert_eq!(pair.pump.system().config().failsafe_watts(), 2_000.0);
     assert_eq!(
         pair.pump.system().config().failsafe_duration,
         Duration::from_secs(4 * 3_600)
@@ -314,10 +314,10 @@ fn a_write_held_back_by_the_five_minute_ceiling_goes_out_when_it_lifts() {
     // The guard comes back to it without being told to.
     pair.advance(MIN_WRITE_INTERVAL);
     assert_eq!(pair.accepted().len(), 2);
-    assert_eq!(pair.accepted()[1].watts, 2_000.0);
+    assert_eq!(pair.accepted()[1].watts(), 2_000.0);
     assert_eq!(
         pair.pump.system().effective_limit(),
-        EffectiveLimit::Active(2_000.0)
+        EffectiveLimit::active(2_000.0)
     );
 }
 
@@ -361,7 +361,7 @@ fn a_limit_the_system_dropped_is_written_again() {
     assert!(pair.accepted().len() >= 2);
     assert_eq!(
         pair.pump.system().effective_limit(),
-        EffectiveLimit::Active(3_000.0)
+        EffectiveLimit::active(3_000.0)
     );
 }
 
@@ -383,13 +383,13 @@ fn both_sides_keep_the_record_section_14a_asks_for() {
     pair.advance(Duration::from_secs(1));
 
     let written = pair.guard.audit().last().expect("the guard kept a record");
-    assert_eq!(written.write.expect("a readable limit").watts, 3_000.0);
+    assert_eq!(written.write.expect("a readable limit").watts(), 3_000.0);
     assert!(written.outcome.is_accepted());
     assert_eq!(written.peer.as_ref(), Some(&device));
 
     let applied = pair.pump.audit().last().expect("the system kept one too");
     assert!(applied.outcome.is_accepted());
-    assert_eq!(applied.write.expect("a readable limit").watts, 3_000.0);
+    assert_eq!(applied.write.expect("a readable limit").watts(), 3_000.0);
 
     assert_eq!(
         written.request, applied.request,
@@ -653,7 +653,7 @@ fn ig_2_11_the_heartbeat_that_counts_is_one_the_peer_could_receive() {
 /// ground, and everything else is followed.
 fn below_the_floor_is_refused(write: &LimitWrite) -> LocalDecision {
     const FLOOR_WATTS: f64 = 4_200.0;
-    if write.is_active && write.watts < FLOOR_WATTS {
+    if write.is_active && write.watts() < FLOOR_WATTS {
         LocalDecision::Reject(RejectReason::Regulatory)
     } else {
         LocalDecision::Apply
@@ -706,7 +706,7 @@ fn a_limit_below_the_floor_is_refused_by_policy_and_recorded() {
         record.outcome,
         WriteOutcome::Rejected(NackReason::CannotApply(RejectReason::Regulatory))
     );
-    assert_eq!(record.write.expect("a readable limit").watts, 3_000.0);
+    assert_eq!(record.write.expect("a readable limit").watts(), 3_000.0);
     assert_eq!(
         record.peer.as_ref(),
         Some(&guard_device),
@@ -742,7 +742,7 @@ fn the_floor_policy_accepts_a_deactivation_and_a_limit_at_the_floor() {
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
     assert_eq!(
         pair.pump.system().effective_limit(),
-        EffectiveLimit::Active(4_200.0)
+        EffectiveLimit::active(4_200.0)
     );
 }
 
@@ -790,5 +790,45 @@ fn a_limit_that_is_not_a_quantity_is_refused_before_it_is_sent() {
         pair.pump.system().effective_limit().watts(),
         Some(4_200.0),
         "the limit already in force stands"
+    );
+}
+
+/// A limit travels exactly: the value the Energy Guard was given is the value on the wire,
+/// the value the Controllable System applies, and the value it reports back.
+///
+/// The guard used to write at whole watts, so 4 200.5 W arrived as 4 201 W.
+#[test]
+fn a_fractional_limit_arrives_exactly_as_it_was_written() {
+    use eebus::model::ScaledNumber;
+
+    let mut pair = Pair::new();
+    pair.commission();
+    pair.forget_history();
+    let device = pair.device();
+
+    let exact = ScaledNumber::new(42_005, -1);
+    pair.guard
+        .require(&device, Some(LimitWrite::active_scaled(exact)), pair.now)
+        .expect("a valid limit");
+    pair.advance(Duration::from_secs(1));
+
+    assert!(
+        pair.wire()
+            .iter()
+            .any(|line| line.contains(r#"[{"number":42005},{"scale":-1}]"#)),
+        "the wire carries 4200.5, not 4201"
+    );
+    assert_eq!(pair.pump.system().effective_limit().scaled(), Some(exact));
+    assert_eq!(pair.accepted()[0].scaled(), exact);
+
+    // The f64 spelling reaches the same value.
+    pair.forget_history();
+    pair.guard
+        .require(&device, Some(LimitWrite::active(4_200.25)), pair.now)
+        .expect("a valid limit");
+    pair.advance(eebus::usecases::limitation::MIN_WRITE_INTERVAL + Duration::from_secs(1));
+    assert_eq!(
+        pair.pump.system().effective_limit().scaled(),
+        Some(ScaledNumber::new(420_025, -2))
     );
 }

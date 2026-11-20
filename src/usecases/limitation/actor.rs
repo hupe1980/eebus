@@ -172,7 +172,12 @@ pub fn limit_data(system: &ControllableSystem) -> CmdData {
             limit_id: Some(LIMIT_ID),
             is_limit_changeable: Some(true),
             is_limit_active: Some(system.is_limit_active()),
-            value: ScaledNumber::from_f64(system.effective_limit().watts().unwrap_or(0.0), 0),
+            value: Some(
+                system
+                    .effective_limit()
+                    .scaled()
+                    .unwrap_or(ScaledNumber::whole(0)),
+            ),
             ..Default::default()
         }]),
     })
@@ -240,7 +245,7 @@ pub fn constraints(system: &ControllableSystem, direction: Direction) -> CmdData
                 characteristic_id: Some(CHARACTERISTIC_ID),
                 characteristic_context: Some(ElectricalConnectionCharacteristicContext::Entity),
                 characteristic_type: Some(max.characteristic(direction)),
-                value: ScaledNumber::from_f64(max.watts(), 0),
+                value: ScaledNumber::from_f64(max.watts(), 3),
                 unit: Some(UnitOfMeasurement::W),
             }]
         })
@@ -308,7 +313,7 @@ pub fn failsafe_values(system: &ControllableSystem) -> CmdData {
             DeviceConfigurationKeyValueData {
                 key_id: Some(FAILSAFE_LIMIT_KEY),
                 value: Some(DeviceConfigurationKeyValueValue {
-                    scaled_number: ScaledNumber::from_f64(system.config().failsafe_watts, 0),
+                    scaled_number: Some(system.config().failsafe),
                     ..Default::default()
                 }),
                 is_value_changeable: Some(true),
@@ -486,9 +491,12 @@ pub fn read_limit_write(data: &CmdData, limit_id: LoadControlLimitId) -> Option<
     // A `value` that is present but unreadable — a `scale` that overflows `f64`, say —
     // makes the whole write unusable. Refusing it produces a NACK; substituting a number
     // the peer never sent would apply a limit nobody asked for.
-    let watts = match entry.value.as_ref() {
-        Some(value) => value.to_f64()?,
-        None => 0.0,
+    let value = match entry.value {
+        Some(value) => {
+            value.to_f64()?;
+            value.canonical()
+        }
+        None => ScaledNumber::whole(0),
     };
 
     // The same rule for the duration, and here it matters more. §3.1.8.2: "Durations used
@@ -508,7 +516,7 @@ pub fn read_limit_write(data: &CmdData, limit_id: LoadControlLimitId) -> Option<
 
     Some(LimitWrite {
         is_active: entry.is_limit_active.unwrap_or(false),
-        watts,
+        value,
         duration,
     })
 }
@@ -963,7 +971,7 @@ impl ControllableSystemActor {
     /// /// Refuses an active limit below the floor. Everything else is followed: a
     /// /// deactivation, a limit at the floor, a limit above what the pump can draw.
     /// fn policy(write: &LimitWrite) -> LocalDecision {
-    ///     if write.is_active && write.watts < FLOOR_WATTS {
+    ///     if write.is_active && write.watts() < FLOOR_WATTS {
     ///         LocalDecision::Reject(RejectReason::Regulatory)
     ///     } else {
     ///         LocalDecision::Apply
@@ -980,7 +988,7 @@ impl ControllableSystemActor {
     ///         pump.handle_event_with(engine, event, now, policy)
     ///     {
     ///         // Already answered and already in `pump.audit()`; this is for the display.
-    ///         println!("{:.0} W: {:?}", write.watts, outcome);
+    ///         println!("{:.0} W: {:?}", write.watts(), outcome);
     ///     }
     /// }
     ///
@@ -1288,9 +1296,8 @@ impl ControllableSystemActor {
             let result = match key {
                 FAILSAFE_LIMIT_KEY => {
                     let watts = value
-                        .and_then(|v| v.scaled_number.as_ref())
-                        .and_then(ScaledNumber::to_f64)
-                        .unwrap_or(-1.0);
+                        .and_then(|v| v.scaled_number)
+                        .unwrap_or(ScaledNumber::whole(-1));
                     self.system.on_failsafe_limit_write(watts, now)
                 }
                 FAILSAFE_DURATION_KEY => {

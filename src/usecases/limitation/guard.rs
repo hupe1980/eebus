@@ -648,7 +648,7 @@ impl EnergyGuardActor {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
                     key_id: Some(key),
                     value: Some(DeviceConfigurationKeyValueValue {
-                        scaled_number: ScaledNumber::from_f64(watts, 0),
+                        scaled_number: Some(super::state::exact_watts(watts)),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1210,9 +1210,7 @@ fn set_required(tracked: &mut Tracked, limit: Option<LimitWrite>, now: Duration)
 
 /// Two limits that mean the same thing to a Controllable System.
 fn same_limit(a: &LimitWrite, b: &LimitWrite) -> bool {
-    a.is_active == b.is_active
-        && a.duration == b.duration
-        && (!a.is_active || (a.watts - b.watts).abs() < 0.5)
+    a.is_active == b.is_active && a.duration == b.duration && (!a.is_active || a.value == b.value)
 }
 
 /// Applies §2.2 to a limit the application asked for.
@@ -1221,8 +1219,8 @@ fn same_limit(a: &LimitWrite, b: &LimitWrite) -> bool {
 /// one; the guide forbids sending that combination rather than leaving the Controllable
 /// System to reconcile it.
 fn normalise(mut limit: LimitWrite) -> LimitWrite {
-    if limit.watts < 0.0 {
-        limit.watts = 0.0;
+    if limit.watts() < 0.0 {
+        limit.value = ScaledNumber::whole(0);
     }
     if limit.is_active && limit.duration == Some(Duration::ZERO) {
         limit.duration = None;
@@ -1278,7 +1276,7 @@ fn limit_payload(limit: &LimitWrite, limit_id: LoadControlLimitId) -> CmdData {
         load_control_limit_data: Some(vec![LoadControlLimitData {
             limit_id: Some(limit_id),
             is_limit_active: Some(limit.is_active),
-            value: ScaledNumber::from_f64(limit.watts, 0),
+            value: Some(limit.value),
             time_period: limit.duration.map(|d| TimePeriod {
                 end_time: Some(crate::model::format_iso8601_duration(d).into()),
                 ..Default::default()
@@ -1356,7 +1354,7 @@ mod tests {
     fn an_activated_limit_never_carries_a_zero_duration() {
         let limit = normalise(LimitWrite {
             is_active: true,
-            watts: 4_200.0,
+            value: ScaledNumber::whole(4_200),
             duration: Some(Duration::ZERO),
         });
         assert_eq!(limit.duration, None, "the duration is unset, not zeroed");
@@ -1365,7 +1363,7 @@ mod tests {
         // A deactivation may carry one: that combination is what the guide permits.
         let off = normalise(LimitWrite {
             is_active: false,
-            watts: 0.0,
+            value: ScaledNumber::whole(0),
             duration: Some(Duration::ZERO),
         });
         assert_eq!(off.duration, Some(Duration::ZERO));
@@ -1374,7 +1372,7 @@ mod tests {
     #[test]
     fn a_negative_limit_is_clamped_before_it_reaches_the_wire() {
         let limit = normalise(LimitWrite::active(-1.0));
-        assert_eq!(limit.watts, 0.0);
+        assert_eq!(limit.watts(), 0.0);
     }
 
     #[test]

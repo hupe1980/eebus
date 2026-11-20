@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &required {
         Some(limit) if limit.is_active => println!(
             "the grid requires {:.0} W{}\n",
-            limit.watts,
+            limit.watts(),
             match limit.duration {
                 Some(span) => alloc_for(span),
                 None => String::new(),
@@ -304,11 +304,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 GuardEvent::LimitAccepted { limit, request, .. } => println!(
                     "[box]  {:.0} W accepted, answering msgCounter {} — the §14a evidence",
-                    limit.watts,
+                    limit.watts(),
                     request.get()
                 ),
                 GuardEvent::LimitRefused { limit, error, .. } => {
-                    println!("[box]  {:.0} W refused: {error}", limit.watts);
+                    println!("[box]  {:.0} W refused: {error}", limit.watts());
                 }
                 GuardEvent::PeerHeartbeatLost { device } => {
                     println!("[box]  no heartbeat from {}", device.as_str());

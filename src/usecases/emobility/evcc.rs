@@ -386,8 +386,8 @@ impl EvProfile {
                     parameter_id: Some(POWER_PARAMETER),
                     permitted_value_set: Some(vec![ScaledNumberSet {
                         range: Some(vec![ScaledNumberRange {
-                            min: ScaledNumber::from_f64(min, 0),
-                            max: max.and_then(|max| ScaledNumber::from_f64(max, 0)),
+                            min: ScaledNumber::from_f64(min, 3),
+                            max: max.and_then(|max| ScaledNumber::from_f64(max, 3)),
                         }]),
                         ..Default::default()
                     }]),

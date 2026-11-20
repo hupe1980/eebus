@@ -84,7 +84,7 @@ fn main() {
     );
     assert_eq!(
         pump.system().effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
 
     // ---- 3. Discovery -----------------------------------------------------------
@@ -157,13 +157,13 @@ fn main() {
     assert_eq!(pump.system().state(), LimitationState::Limited);
     assert_eq!(
         pump.system().effective_limit(),
-        EffectiveLimit::Active(3_000.0)
+        EffectiveLimit::active(3_000.0)
     );
     println!("6. The heat pump is now in {:?}", pump.system().state());
     println!("   limited to {:?}", pump.system().effective_limit());
     println!(
         "   the guard recorded {:.0} W accepted — the §14a evidence\n",
-        accepted.watts
+        accepted.watts()
     );
 
     // ---- 6. The control box goes quiet ------------------------------------------
@@ -177,7 +177,7 @@ fn main() {
     assert_eq!(pump.system().state(), LimitationState::FailsafeState);
     assert_eq!(
         pump.system().effective_limit(),
-        EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        EffectiveLimit::failsafe(FAILSAFE_WATTS)
     );
     println!(
         "7. After two minutes of silence: {:?}",
