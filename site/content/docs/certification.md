@@ -1,6 +1,6 @@
 +++
 title = "Certification"
-description = "The 203 abstract test cases of the four High-Level Test Specifications as data, a coverage number from cargo test, and the runtime signals a laboratory reads off a device."
+description = "The 203 abstract test cases of the four High-Level Test Specifications and the SHIP, SPINE and Pairing Service test cases as data, a coverage number from cargo test, and the runtime signals a laboratory reads off a device."
 weight = 135
 [extra]
 group = "Project"
@@ -11,6 +11,12 @@ published High-Level Test Specification listing its *abstract test cases* — an
 the requirements it covers, the actor under test, and whether it is mandatory.
 
 This crate carries all 203 of them as data, drives every one, and prints the coverage.
+
+Below the use cases a laboratory also runs the SHIP, SPINE and SHIP Pairing Service test
+specifications. Those are carried too, in `eebus::conformance::protocol`, with each case's
+applicability under the specification's parameter sheet; `cargo test` prints how many of
+each a test names and asserts the rest by name. See
+[Conformance](@/docs/conformance.md#ship-spine-and-the-pairing-service-counted).
 
 ## The catalogue
 

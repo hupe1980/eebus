@@ -25,13 +25,20 @@
 //! `limitation_over_the_wire.rs` and by
 //! [`lpc_and_lpp_differ_only_in_what_they_publish`].
 //!
+//! # SHIP, SPINE and the Pairing Service
+//!
+//! The protocol-level test specifications, `eebus::conformance::protocol`, are measured at
+//! the end of this file: their cases are tested where the code is, each test naming the
+//! case it answers in its doc comment, and the suite collects those names and asserts what
+//! is left uncovered by name.
+//!
 //! # Running it
 //!
 //! ```sh
 //! cargo test --test conformance -- --nocapture coverage
 //! ```
 //!
-//! prints the table.
+//! prints the tables.
 
 // The catalogue is optional — a firmware build leaves tens of kilobytes of test-case
 // descriptions out — so the suite that measures against it is optional too.
@@ -2178,4 +2185,313 @@ fn coverage_of_the_certifiable_use_cases() {
         device_cases * 2,
         "the uncovered set is no longer exactly the device-level cases:\n{report}"
     );
+}
+
+// ---- SHIP, SPINE and the Pairing Service: the protocol-level test specifications --------
+//
+// These three are not driven from a table in this file. Their cases are tested where the
+// code is — the handshake suite, the engine suite, unit tests beside the frame codec — and
+// each such test names the case it answers in its doc comment. The suite below collects
+// those names mechanically and holds the result to named lists, so that the gap is a
+// number `cargo test` prints rather than a grep somebody runs.
+
+use eebus::conformance::protocol::{self, Specification};
+
+/// The cases of each specification that no test names, in catalogue order.
+///
+/// These lists are the claim. A test that starts naming one of these fails the suite until
+/// it is removed here, and a test that stops naming a covered case fails it until it is
+/// added — so the figure moves neither by dropping a test nor by relabelling one.
+const UNCOVERED: [(Specification, &[&str]); 3] = [
+    (
+        Specification::Ship,
+        &[
+            "TC_SHIP_CONN_001",
+            "TC_SHIP_ROLE_003",
+            "TC_SHIP_SEC_001",
+            "TC_SHIP_SEC_002",
+            "TC_SHIP_CMI_001",
+            "TC_SHIP_CMI_002",
+            "TC_SHIP_AMDATA_002",
+            "TC_SHIP_AMDATA_003",
+            "TC_SHIP_AMDATA_004",
+        ],
+    ),
+    (
+        Specification::Spine,
+        &[
+            "TC_SPINE_COMP_001",
+            "TC_SPINE_COMP_004",
+            "TC_SPINE_DATA_004",
+            "TC_SPINE_DDISC_002",
+            "TC_SPINE_ENTITY_001",
+            "TC_SPINE_ENTITY_002",
+            "TC_SPINE_RTS_001",
+            "TC_SPINE_RTS_002",
+            "TC_SPINE_RTS_003",
+            "TC_SPINE_RTC_001",
+            "TC_SPINE_RTC_002",
+            "TC_SPINE_RTC_003",
+        ],
+    ),
+    (
+        Specification::PairingService,
+        &[
+            "TC_SPS_DISC_001",
+            "TC_SPS_DISC_002",
+            "TC_SPS_DISC_003",
+            "TC_SPS_DISC_004",
+            "TC_SPS_DISC_005",
+            "TC_SPS_DISC_006",
+            "TC_SPS_DISC_007",
+            "TC_SPS_DISC_008",
+            "TC_SPS_DISC_009",
+            "TC_SPS_TXT_001",
+            "TC_SPS_TXT_002",
+            "TC_SPS_TXT_003",
+            "TC_SPS_TXT_004",
+            "TC_SPS_TXT_005",
+            "TC_SPS_TXT_006",
+            "TC_SPS_TXT_007",
+            "TC_SPS_TXT_008",
+            "TC_SPS_TXT_009",
+            "TC_SPS_DIGEST_001",
+            "TC_SPS_DIGEST_002",
+            "TC_SPS_DIGEST_003",
+            "TC_SPS_PROC_001",
+            "TC_SPS_PROC_002",
+            "TC_SPS_PROC_003",
+            "TC_SPS_PROC_004",
+            "TC_SPS_PROC_005",
+            "TC_SPS_PROC_006",
+            "TC_SPS_PROC_007",
+            "TC_SPS_PROC_008",
+            "TC_SPS_PROC_009",
+            "TC_SPS_TRUST_001",
+            "TC_SPS_TRUST_002",
+            "TC_SPS_QR_001",
+            "TC_SPS_FP_001",
+            "TC_SPS_FP_002",
+            "TC_SPS_PARA_001",
+            "TC_SPS_PARA_002",
+            "TC_SPS_PARA_003",
+            "TC_SPS_PARA_004",
+            "TC_SPS_PARA_005",
+        ],
+    ),
+];
+
+/// Where the covered/total figures are stated in prose, so a failure says what to edit.
+const PROTOCOL_FIGURES_IN: &[&str] = &["README.md", "site/content/docs/conformance.md"];
+
+/// The protocol-level identifiers named in the doc comments of the tests in one file.
+///
+/// A doc comment counts when it is the `///` block directly above a `#[test]` or
+/// `#[tokio::test]` attribute; other attributes may sit between the two. A module doc, a
+/// code comment, or a doc comment on anything but a test names nothing — prose that cites a
+/// case is not a test of it.
+fn cited_in(source: &str) -> Vec<String> {
+    let mut cited = Vec::new();
+    let mut doc: Vec<&str> = Vec::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if let Some(text) = line.strip_prefix("///") {
+            doc.push(text);
+            continue;
+        }
+        if line.starts_with("#[") {
+            if line.starts_with("#[test]") || line.starts_with("#[tokio::test") {
+                for text in &doc {
+                    cited.extend(identifiers_in(text));
+                }
+            }
+            continue;
+        }
+        doc.clear();
+    }
+    cited
+}
+
+/// Every protocol-level case identifier in a line of text.
+fn identifiers_in(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| {
+            ["TC_SHIP_", "TC_SPINE_", "TC_SPS_"]
+                .iter()
+                .any(|prefix| token.starts_with(prefix))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every protocol-level identifier a test in `src/` or `tests/` names, with where.
+///
+/// `src/conformance/` is the catalogue itself and names every case; it is not a test.
+fn protocol_citations() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("a source directory")
+            .map(|entry| entry.expect("a directory entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                if !path.ends_with("src/conformance") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let source = std::fs::read_to_string(&path).expect("readable source");
+                for id in cited_in(&source) {
+                    out.push((id, path.display().to_string()));
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    walk(&root.join("src"), &mut out);
+    walk(&root.join("tests"), &mut out);
+    out
+}
+
+#[test]
+fn only_a_doc_comment_on_a_test_is_a_citation() {
+    // Each line starts with `|` so that this file's own scan does not read the sample as
+    // tests of this file; the margin is stripped before the sample is scanned.
+    let source = "\
+|//! TC_SHIP_SEC_001 in a module doc names nothing.
+|
+|/// TC_SHIP_SEC_002 on a function that is not a test names nothing.
+|fn helper() {}
+|
+|// TC_SHIP_CMI_001 in a code comment names nothing.
+|/// `TC_SHIP_HELLO_002` and `TC_SPS_QR_001`: this one counts.
+|#[test]
+|fn counted() {}
+|
+|/// TC_SPINE_DATA_004, with an attribute between the comment and the test.
+|#[tokio::test]
+|#[ignore]
+|async fn also_counted() {}
+|
+|/// TC_SPINE_COMP_001 in a doc comment a blank line separates from the test.
+|
+|#[test]
+|fn not_this_one() {}
+"
+    .lines()
+    .map(|line| line.trim_start().strip_prefix('|').unwrap_or(line))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert_eq!(
+        cited_in(&source),
+        ["TC_SHIP_HELLO_002", "TC_SPS_QR_001", "TC_SPINE_DATA_004"]
+    );
+}
+
+/// A cited identifier that names no case is a typo, and would otherwise look like
+/// coverage while counting for nothing.
+#[test]
+fn every_cited_protocol_case_exists() {
+    let unknown: Vec<String> = protocol_citations()
+        .into_iter()
+        .filter(|(id, _)| protocol::find(id).is_none())
+        .map(|(id, place)| format!("{id} in {place}"))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "tests name cases no specification has: {unknown:#?}"
+    );
+}
+
+/// The covered/total figure per specification, printed and asserted.
+///
+/// `cargo test --test conformance -- --nocapture protocol` prints the table.
+#[test]
+fn coverage_of_the_protocol_test_specifications() {
+    let citations = protocol_citations();
+    let claimed: Vec<&str> = citations.iter().map(|(id, _)| id.as_str()).collect();
+
+    let mut report = String::from(
+        "\nEEBUS protocol-level test specification coverage\n\
+         =================================================\n\n",
+    );
+    for (spec, named) in UNCOVERED {
+        let coverage = spec.coverage(&claimed);
+        assert!(coverage.unknown().is_empty(), "{:?}", coverage.unknown());
+        let total = spec.cases().len();
+        report.push_str(&format!(
+            "{:<20} {:>3}/{:<3} {:>3}%\n",
+            spec.name(),
+            coverage.covered(),
+            total,
+            coverage.percent()
+        ));
+
+        let measured = coverage.missing_ids();
+        let newly_uncovered: Vec<&str> = measured
+            .iter()
+            .copied()
+            .filter(|id| !named.contains(id))
+            .collect();
+        let no_longer_uncovered: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|id| !measured.contains(id))
+            .collect();
+        assert!(
+            newly_uncovered.is_empty() && no_longer_uncovered.is_empty(),
+            "{}: the uncovered set moved.\n  no test names any more: {newly_uncovered:?}\n  \
+             now named by a test: {no_longer_uncovered:?}\n\
+             Edit UNCOVERED in tests/conformance.rs, and the figures in {PROTOCOL_FIGURES_IN:?}.",
+            spec.name()
+        );
+        assert_eq!(measured, named, "{}: catalogue order", spec.name());
+    }
+
+    report.push_str("\nNot named by any test:\n");
+    for (spec, named) in UNCOVERED {
+        report.push_str(&format!("  {}\n", spec.name()));
+        for id in named {
+            let case = protocol::find(id).expect("a real case");
+            let owed = case
+                .owed_by_device()
+                .map_or(String::new(), |_| "  [device-level]".to_string());
+            report.push_str(&format!("    {id:<20} {}{owed}\n", case.title));
+        }
+    }
+    println!("{report}");
+
+    // The device-level case is never claimed by the library's own suite.
+    for owed in protocol::DEVICE_LEVEL {
+        assert!(
+            UNCOVERED.iter().any(|(_, named)| named.contains(&owed.id)),
+            "{} is the device's, yet a test here names it",
+            owed.id
+        );
+    }
+}
+
+/// The figures the README and the site state are the ones measured here.
+#[test]
+fn the_published_protocol_figures_are_the_measured_ones() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for file in PROTOCOL_FIGURES_IN {
+        let text = std::fs::read_to_string(root.join(file)).expect("a published file");
+        for (spec, named) in UNCOVERED {
+            let total = spec.cases().len();
+            let figure = format!("{}/{total}", total - named.len());
+            let stated = text.match_indices(&figure).any(|(at, _)| {
+                !text[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_digit())
+            });
+            assert!(
+                stated,
+                "{file} does not state {} as {figure}. Update the figures in: {PROTOCOL_FIGURES_IN:?}",
+                spec.name()
+            );
+        }
+    }
 }
