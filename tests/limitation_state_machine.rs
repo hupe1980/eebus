@@ -743,3 +743,31 @@ fn lpc_ts_037_the_ordering_gate_rearms_when_control_is_lost() {
     );
     assert_eq!(cs.config().failsafe_watts, 1_000.0);
 }
+
+/// Implementation guide §2.11 and §2.14 come before the application: a write with no
+/// heartbeat behind it is not evaluated, so neither a policy that follows it nor one that
+/// refuses it changes the answer or the state.
+///
+/// This is what `ControllableSystemActor::handle_event_with` relies on. Its decision
+/// arrives here as `decision`, so an application cannot take a system out of `init` or
+/// the failsafe state on the word of a peer that is not provably in control.
+#[test]
+fn the_heartbeat_gate_wins_over_any_decision() {
+    for decision in [
+        LocalDecision::Apply,
+        LocalDecision::Reject(RejectReason::Regulatory),
+    ] {
+        let mut cs = new_cs();
+        let outcome = cs.on_limit_write(&LimitWrite::active(3_000.0), decision, secs(5));
+        assert_eq!(
+            outcome,
+            WriteOutcome::Rejected(NackReason::NoRecentHeartbeat),
+            "{decision:?}"
+        );
+        assert_eq!(cs.state(), LimitationState::Init, "{decision:?}");
+        assert_eq!(
+            cs.effective_limit(),
+            EffectiveLimit::Failsafe(FAILSAFE_WATTS)
+        );
+    }
+}

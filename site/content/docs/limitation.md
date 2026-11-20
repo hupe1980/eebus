@@ -133,6 +133,84 @@ match engine.poll_event() {
 }
 ```
 
+`ControllableSystemActor` does all of that, and asks for the decision through
+`handle_event_with`. Its closure sees each limit the pump can read, on the merged state,
+before it is answered. `handle_event` is the same call with a decision that follows every
+limit.
+
+```rust
+let decision = pump.handle_event_with(&mut engine, &event, now, |write| decide(write));
+```
+
+## Refusing a limit by policy
+
+EEBUS authorises a limit by the binding and by nothing finer. Only the entity that holds the
+`LoadControl` binding may write the limit (§3.5), and only its heartbeat counts (§3.8). A
+compromised control box that holds the binding is authorised all the same. The protocol has
+no way to ask whether its *values* are plausible. The application does, and
+`handle_event_with` is where it asks.
+
+The application has little discretion. LPC UC TS §2.2:
+
+> If the CS is NOT located on a CEM, the CS SHALL apply the limit unless the rejection of the
+> limit is required by one of these conditions: Self-protection; safety-related activities;
+> legal or regulatory specifications.
+
+On an energy manager, "uncontrolled loads prevent achieving the limit" is a fourth condition,
+and "the obligation to accept a limit is not bound to any internal device state".
+`RejectReason` is that list and nothing else. §2.16 adds that a limit is accepted even when
+it changes nothing.
+
+Under §14a EnWG a device has no discretion over a limit at or above the minimum the
+regulation leaves it. The grid operator may impose that limit, and the device has to follow
+it. A policy may refuse only what the regulation does not allow the operator to impose:
+
+```rust
+use eebus::usecases::limitation::{LimitWrite, LocalDecision, RejectReason};
+
+/// The least power §14a EnWG lets a grid operator leave this heat pump.
+const FLOOR_WATTS: f64 = 4_200.0;
+
+fn policy(write: &LimitWrite) -> LocalDecision {
+    if write.is_active && write.watts < FLOOR_WATTS {
+        LocalDecision::Reject(RejectReason::Regulatory)   // NACK, and on the record
+    } else {
+        LocalDecision::Apply                              // a deactivation, the floor, anything above
+    }
+}
+
+pump.handle_event_with(&mut engine, &event, now, policy);
+```
+
+The refusal goes to the guard as `errorNumber` 7 with no reason attached ([LPC-003]). It is
+recorded in `pump.audit()` as `Rejected(CannotApply(Regulatory))`, with the device address
+of the peer that sent it. The heartbeat gate is checked first: a write with no recent
+heartbeat is `NoRecentHeartbeat` whatever the policy answers.
+
+Before adopting a floor, check:
+
+* **The floor is set by the regulation.** The implementation guide §4.1.3 refers to
+  BK6-22-300 for it, which sets different figures for charging stations and batteries than
+  for heat pumps and air conditioners, and by how many there are. 4.2 kW is the figure for
+  one appliance under the control box directly.
+* **A floor is for an appliance the control box addresses itself.** Behind an energy manager
+  (§4.1.2, option 2), the manager divides one limit among several appliances, so a low
+  limit for one of them is lawful, and 0 W is a valid limit (§2.16). There the floor, if
+  any, applies to the manager's total.
+* **A refusal does not apply a safer value.** A system that was `limited` or
+  `unlimited/controlled` stays there ([LPC-907]). One in `init` or `failsafe` moves to
+  `unlimited/controlled` ([LPC-902], [LPC-918]). Refusing a 0 W limit during failsafe
+  therefore lifts the failsafe limit. Accepting a value and then not following it is not an
+  option: the acknowledgement is the record that the limit was applied.
+* **The certification body decides.** UC TS §2.2 notes that a vendor will probably have to
+  state in which cases its device refuses a limit, and that the certification authority
+  accepts or declines those cases.
+* **A floor does not stop a compromised control box from holding the appliance at the
+  floor.** That limit is lawful. The audit log shows it afterwards; nothing in the protocol
+  prevents it.
+
+`heat_pump --floor 4200` runs this policy in the simulator.
+
 ## The other half: the Energy Guard
 
 The controlling side's rules live behind one call:

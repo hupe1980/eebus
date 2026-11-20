@@ -15,7 +15,8 @@ use core::time::Duration;
 use common::*;
 use eebus::usecases::limitation::{
     self, ControllableSystem, CsConfig, CsEvent, EffectiveLimit, GuardEvent, LimitWrite,
-    LimitationState, MIN_WRITE_INTERVAL, NominalMax, RETRY_BACKOFF_STEP,
+    LimitationState, LocalDecision, MIN_WRITE_INTERVAL, NackReason, NominalMax, RETRY_BACKOFF_STEP,
+    RejectReason, WriteOutcome,
 };
 use eebus::usecases::lpc;
 
@@ -645,6 +646,104 @@ fn ig_2_11_the_heartbeat_that_counts_is_one_the_peer_could_receive() {
     );
     assert_eq!(pair.accepted().len(), 1);
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
+}
+
+/// The plausibility floor the limitation docs recommend for an appliance the control box
+/// addresses itself: an active limit below the §14a minimum is refused on a regulatory
+/// ground, and everything else is followed.
+fn below_the_floor_is_refused(write: &LimitWrite) -> LocalDecision {
+    const FLOOR_WATTS: f64 = 4_200.0;
+    if write.is_active && write.watts < FLOOR_WATTS {
+        LocalDecision::Reject(RejectReason::Regulatory)
+    } else {
+        LocalDecision::Apply
+    }
+}
+
+/// The application refuses a limit by policy: the Energy Guard is told no, the pump keeps
+/// what it had, and the refusal is on the record with the peer that asked.
+///
+/// The binding is what authorises the guard to write; whether to follow the value is the
+/// application's, through `handle_event_with`.
+#[test]
+fn a_limit_below_the_floor_is_refused_by_policy_and_recorded() {
+    let mut pair = Pair::new();
+    pair.pump_policy = below_the_floor_is_refused;
+    pair.commission();
+    pair.forget_history();
+    let device = pair.device();
+    let guard_device = pair.guard_engine.device().address().clone();
+    let state = pair.pump.system().state();
+    let limit = pair.pump.system().effective_limit();
+
+    pair.guard
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
+    pair.advance(Duration::from_secs(1));
+
+    assert_eq!(pair.refused().len(), 1, "the guard was told no");
+    assert!(pair.accepted().is_empty());
+    assert_eq!(
+        pair.pump.system().state(),
+        state,
+        "[LPC-907]: a refusal keeps the state"
+    );
+    assert_eq!(pair.pump.system().effective_limit(), limit);
+    assert!(pair.decisions.iter().any(|d| matches!(
+        d,
+        CsEvent::LimitDecided {
+            outcome: WriteOutcome::Rejected(NackReason::CannotApply(RejectReason::Regulatory)),
+            ..
+        }
+    )));
+
+    let record = pair
+        .pump
+        .audit()
+        .last()
+        .expect("the refusal is on the record");
+    assert_eq!(
+        record.outcome,
+        WriteOutcome::Rejected(NackReason::CannotApply(RejectReason::Regulatory))
+    );
+    assert_eq!(record.write.expect("a readable limit").watts, 3_000.0);
+    assert_eq!(
+        record.peer.as_ref(),
+        Some(&guard_device),
+        "with the peer that asked"
+    );
+
+    let seen = pair.guard.audit().last().expect("the guard kept a record");
+    assert_eq!(seen.outcome, WriteOutcome::Rejected(NackReason::Unstated));
+    assert_eq!(seen.request, record.request, "of the same message");
+}
+
+/// The same policy follows every limit §14a obliges the appliance to follow: the opening
+/// deactivation, and a limit at the floor itself.
+#[test]
+fn the_floor_policy_accepts_a_deactivation_and_a_limit_at_the_floor() {
+    let mut pair = Pair::new();
+    pair.pump_policy = below_the_floor_is_refused;
+    pair.commission();
+
+    assert_eq!(pair.accepted().len(), 1, "the opening deactivation");
+    assert!(!pair.accepted()[0].is_active);
+    assert!(pair.refused().is_empty());
+    pair.forget_history();
+
+    let device = pair.device();
+    pair.guard
+        .require(&device, Some(LimitWrite::active(4_200.0)), pair.now)
+        .expect("a valid limit");
+    pair.advance(Duration::from_secs(1));
+
+    assert_eq!(pair.accepted().len(), 1);
+    assert!(pair.refused().is_empty());
+    assert_eq!(pair.pump.system().state(), LimitationState::Limited);
+    assert_eq!(
+        pair.pump.system().effective_limit(),
+        EffectiveLimit::Active(4_200.0)
+    );
 }
 
 /// A limit that is not a quantity never reaches the wire ([LPC/LPP-001]).

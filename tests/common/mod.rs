@@ -16,7 +16,7 @@ use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, SpineEvent, n
 use eebus::usecases::descriptor::UseCaseDescriptor;
 use eebus::usecases::limitation::{
     self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures,
-    EnergyGuardActor, GuardEvent, LimitWrite,
+    EnergyGuardActor, GuardEvent, LimitWrite, LocalDecision,
 };
 use eebus::usecases::lpc;
 use eebus::usecases::monitoring::{Measurand, MonitoredUnit, Quantity, Readings};
@@ -48,6 +48,10 @@ pub struct Pair {
     /// been switched off mid-sentence, which is the point — §2.6.2's escalation path is
     /// what a client has instead of knowing.
     pub pump_is_deaf: bool,
+    /// What the heat pump's application answers to a limit it can read.
+    ///
+    /// Follows everything unless a test sets a policy of its own.
+    pub pump_policy: fn(&LimitWrite) -> LocalDecision,
 }
 
 impl Pair {
@@ -119,6 +123,7 @@ impl Pair {
             decisions: Vec::new(),
             trace: Vec::new(),
             pump_is_deaf: false,
+            pump_policy: |_| LocalDecision::Apply,
         }
     }
 
@@ -170,10 +175,12 @@ impl Pair {
             let events: Vec<SpineEvent> =
                 core::iter::from_fn(|| self.pump_engine.poll_event()).collect();
             for event in &events {
-                if let Some(decision) =
-                    self.pump
-                        .handle_event(&mut self.pump_engine, event, self.now)
-                {
+                if let Some(decision) = self.pump.handle_event_with(
+                    &mut self.pump_engine,
+                    event,
+                    self.now,
+                    self.pump_policy,
+                ) {
                     self.decisions.push(decision);
                     moved = true;
                 }

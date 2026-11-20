@@ -228,6 +228,11 @@ impl LimitWrite {
 /// regulatory requirement, or — on an energy manager — uncontrolled loads that make the
 /// limit unreachable. The implementation guide §2.16 is blunt about the rest: a value
 /// that is merely unchanged, or that does not affect the device, is still accepted.
+///
+/// On the wire, the application gives this answer through
+/// [`ControllableSystemActor::handle_event_with`](super::ControllableSystemActor::handle_event_with),
+/// whose documentation also covers refusing a limit by policy and what §14a EnWG leaves no
+/// discretion over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalDecision {
     /// The device will follow the limit.
