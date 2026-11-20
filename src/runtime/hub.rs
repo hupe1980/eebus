@@ -764,6 +764,8 @@ impl Hub {
     /// [`HubEvent::Connected`], [`HubEvent::TrustRequested`] or
     /// [`HubEvent::HandshakeFailed`]. Returns the address bound, which is what an mDNS
     /// announcement needs.
+    ///
+    /// Cancel-safe: cancelled before it returns, it leaves nothing bound.
     pub async fn listen(
         &mut self,
         address: impl ToSocketAddrs,
@@ -1504,16 +1506,23 @@ impl Hub {
     // ---- closing -----------------------------------------------------------------
 
     /// Closes one peer's connections, telling it why.
+    ///
+    /// Cancelling it cuts the close handshakes short: the peer's connections have already left the hub and [`HubEvent::Disconnected`] is already queued.
     pub async fn disconnect(&mut self, ski: &Ski, reason: ConnectionCloseReason) {
+        // Out of the hub, forgotten and reported before anything awaits, so a cancelled
+        // call leaves no half-closed state behind — only a close handshake cut short.
+        let mut closing = Vec::new();
         while let Some(index) = self.links.iter().position(|l| &l.ski == ski) {
-            let link = self.links.remove(index);
-            let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
+            closing.push(self.links.remove(index));
         }
         self.forget(ski);
         self.pending.push_back(HubEvent::Disconnected {
             ski: *ski,
             reason: Disconnect::Local,
         });
+        for link in closing {
+            let _ = link.connection.close(reason, CLOSE_MAX_TIME).await;
+        }
     }
 
     /// Sends everything the engine has queued, without waiting for anything to arrive.
@@ -1586,6 +1595,8 @@ impl Hub {
     /// Anything the engine still has queued is sent first: closing on top of an
     /// unacknowledged write would leave the peer waiting for an answer that was already
     /// decided. The listener and browse tasks end with it.
+    ///
+    /// Cancelling it part-way leaves the hub partly shut down — listener and browse stopped, connections perhaps still open. Calling it again finishes the job.
     pub async fn shutdown(&mut self, reason: ConnectionCloseReason) {
         for task in self.tasks.drain(..) {
             task.abort();

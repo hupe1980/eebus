@@ -4,6 +4,22 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [0.13.1] — 2026-11-20
+
+### Added
+
+- **Every public `async fn` says what cancelling it does** — cancel-safe, or what is cut
+  short — and `cargo xtask check-cancellation` holds it in CI.
+
+### Fixed
+
+- **`ShipConnection::recv` is cancel-safe** (reported by `hems`). It awaited a flush after
+  taking a message off the socket, so a `select!` that dropped it there lost the datagram —
+  on a Steuerbox link, possibly the limit write. It now flushes first and returns a message
+  in the poll that took it. Signature and results are unchanged.
+- **`Hub::disconnect` cancelled part-way left the peer half-forgotten.** It now removes the
+  peer's state and queues `Disconnected` before it awaits the close.
+
 ## [0.13.0] — 2026-11-20
 
 ### Added

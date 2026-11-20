@@ -196,6 +196,8 @@ impl ShipConnection {
     ///
     /// Sent once automatically when the connection opens. Ask again after a peer changes
     /// address.
+    ///
+    /// Cancel-safe: the request is queued before anything awaits.
     pub async fn request_access_methods(&mut self) -> Result<(), ConnectionError> {
         self.handshake.request_access_methods();
         self.flush().await
@@ -322,11 +324,21 @@ impl ShipConnection {
     ///
     /// SHIP messages that are not data are handled on the way past, because an
     /// application working in SPINE has no use for them.
+    ///
+    /// Cancel-safe: it may sit in a `select!` beside a shutdown signal or a deadline. What
+    /// earlier calls queued — SHIP's answers to control messages — is sent first, and that
+    /// [`drain`](Self::drain) is cancel-safe. The read is cancel-safe, and once a message
+    /// has been taken off the socket nothing awaits before it is returned: the answers it
+    /// provokes are queued and go out at the start of the next call (or with any
+    /// [`send`](Self::send)).
     pub async fn recv(&mut self) -> Result<Datagram, ConnectionError> {
         loop {
+            self.drain().await?;
             let message = match self.next_message().await {
                 Ok(message) => message,
                 Err(ConnectionError::NotBinary) => {
+                    // A frame SHIP §10.3 forbids carries nothing to lose; the close that
+                    // answers it is bounded and may be cut short.
                     let close = self.socket.close(Some(CloseFrame {
                         code: 1003.into(),
                         reason: "SHIP carries binary frames only".into(),
@@ -337,7 +349,7 @@ impl ShipConnection {
                 Err(error) => return Err(error),
             };
             self.handle_message(&message)?;
-            self.flush().await?;
+            self.queue_control()?;
             match message {
                 ShipMessage::Data(data) => {
                     if let Some(datagram) = crate::ship::spine_datagram(&data)? {
@@ -406,6 +418,8 @@ impl ShipConnection {
     ///
     /// Bounded by [`CLOSE_MAX_TIME`](super::CLOSE_MAX_TIME): a peer that sent something SHIP forbids and then
     /// stopped reading is not owed a wait.
+    ///
+    /// Cancelling it drops the socket without the close frame; the connection is gone either way.
     pub async fn reject(mut self, code: u16, reason: &str) {
         let close = self.socket.close(Some(CloseFrame {
             code: code.into(),
@@ -447,6 +461,8 @@ impl ShipConnection {
     /// SHIP §10.4 uses these two ways: as a keep-alive on an idle connection, at least
     /// every fifty seconds, and as the liveness probe the double-connection rule of
     /// §12.2.3 falls back to.
+    ///
+    /// Cancel-safe: the ping is queued before anything awaits.
     pub async fn ping(&mut self) -> Result<(), ConnectionError> {
         self.queue_ping()?;
         self.drain().await
@@ -471,6 +487,8 @@ impl ShipConnection {
     ///
     /// Announcing it matters: without it a peer cannot tell a deliberate shutdown from a
     /// network failure, and will keep retrying against a node that has gone on purpose.
+    ///
+    /// Cancelling it drops the socket without finishing the close handshake; the connection is gone either way.
     pub async fn close(
         mut self,
         reason: ConnectionCloseReason,
@@ -560,6 +578,8 @@ impl ShipConnection {
     /// Asks the peer for its key material (SHIP §12.1.3.4).
     ///
     /// `known_update_counter` is what this node has stored for it.
+    ///
+    /// Cancel-safe: the request is queued before anything awaits.
     pub async fn request_key_material(
         &mut self,
         known_update_counter: u16,
@@ -569,6 +589,8 @@ impl ShipConnection {
     }
 
     /// Announces this node's key material to the peer (SHIP §12.1.3.2).
+    ///
+    /// Cancel-safe: the announcement is queued before anything awaits.
     pub async fn send_key_material(&mut self) -> Result<(), ConnectionError> {
         self.handshake.send_key_material(self.clock.elapsed());
         self.flush().await

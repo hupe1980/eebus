@@ -226,7 +226,8 @@ background, and one that reaches nobody is given up after `CONNECT_TIMEOUT`.
 `hub.next()` may sit in a `tokio::select!` or under a `timeout`. Nothing is written *by*
 the future: datagrams, SHIP answers and pings go into each connection's queue, and a message
 leaves it only in the poll in which the socket took it. Dropping the future loses nothing
-and closes nothing.
+and closes nothing. The same holds for `ShipConnection::recv`, for a driver that holds one
+session itself.
 
 Writes progress on every connection at once, so a peer that stops reading holds up no other.
 It is dropped as `Disconnect::Unresponsive` when `MAX_OUTBOX` messages wait for it or none

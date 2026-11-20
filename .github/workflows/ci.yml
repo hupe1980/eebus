@@ -83,6 +83,9 @@ jobs:
       # An enum this crate closes — error, event, outcome, reason — grows as the crate
       # learns, and must not break a consumer's `match` when it does.
       - run: cargo run -p xtask -- check-non-exhaustive
+      # A future dropped in a `select!` loses whatever it was holding at that `await`, and
+      # the signature cannot say so. Every public one says it in its documentation.
+      - run: cargo run -p xtask -- check-cancellation
       # The Restricted Function Exchange table is what `possibleOperations` is derived from
       # and the first thing an integrator asks about, so it is published as a page — and a
       # published page generated from committed source is only true while it is current.
