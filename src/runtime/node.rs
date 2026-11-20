@@ -868,6 +868,8 @@ impl Node {
     /// user may be approving this node at the same time — and an approval added to this
     /// node's [`TrustStore`] meanwhile lets it through; otherwise it ends when the SHIP
     /// timers run out.
+    ///
+    /// Cancel-safe: cancelling it abandons the attempt, and nothing of it stays registered.
     pub async fn connect(
         &self,
         address: impl ToSocketAddrs,
@@ -879,6 +881,8 @@ impl Node {
     /// this node has not approved.
     ///
     /// The dialling half of [`accept_reporting`](Self::accept_reporting); see there.
+    ///
+    /// Cancel-safe, like [`connect`](Self::connect).
     pub async fn connect_reporting(
         &self,
         address: impl ToSocketAddrs,
@@ -896,12 +900,16 @@ impl Node {
     /// Useful for a transport this crate does not provide — a test harness, a tunnel, a
     /// serial bridge — and it is what [`connect`](Self::connect) does once it has a
     /// socket.
+    ///
+    /// Cancel-safe, like [`connect`](Self::connect).
     pub async fn connect_over(&self, stream: TcpStream) -> Result<ShipConnection, ConnectionError> {
         self.connect_over_reporting(stream, None).await
     }
 
     /// [`connect_over`](Self::connect_over), telling `report` when the peer turns out to
     /// be one this node has not approved.
+    ///
+    /// Cancel-safe, like [`connect`](Self::connect).
     pub async fn connect_over_reporting(
         &self,
         stream: TcpStream,
@@ -959,6 +967,8 @@ impl Node {
     /// lets a user read its SKI off a screen — and an approval added to the
     /// [`TrustStore`] meanwhile completes the handshake; a
     /// [`refuse_pairing`](Self::refuse_pairing) ends it with `hello: aborted`.
+    ///
+    /// Cancel-safe: cancelling it abandons the handshake, and a peer that was waiting on approval leaves [`pending_peers`](Self::pending_peers).
     pub async fn accept(&self, stream: TcpStream) -> Result<ShipConnection, ConnectionError> {
         self.accept_reporting(stream, None).await
     }
@@ -992,6 +1002,8 @@ impl Node {
     /// [`HubEvent::TrustRequested`](super::HubEvent::TrustRequested); a driver that owns
     /// its own [`Engine`](crate::spine::Engine) — because it has to be testable without a
     /// socket — calls it directly.
+    ///
+    /// Cancel-safe, like [`accept`](Self::accept).
     pub async fn accept_reporting(
         &self,
         stream: TcpStream,
@@ -1034,6 +1046,8 @@ impl Node {
     /// accept a second connection from a peer already connected is a decision SHIP
     /// §12.2.3 settles by SKI comparison, and belongs to the code owning the connection
     /// table.
+    ///
+    /// Cancel-safe: cancelled before it returns, it leaves nothing bound.
     pub async fn listen(
         &self,
         address: impl ToSocketAddrs,

@@ -120,6 +120,64 @@ async fn two_nodes_meet_over_a_socket_and_exchange_a_datagram() {
     server.await.unwrap();
 }
 
+/// `ShipConnection::recv` in a `select!` loses nothing.
+///
+/// The ordinary shape of a single-session driver: `recv` raced against a shutdown signal and
+/// a deadline. Every call here is cut short after a few microseconds while two hundred
+/// datagrams arrive at an uneven pace, so most calls are dropped while waiting. A message
+/// taken off the socket is returned in the same poll — nothing awaits after it — so each
+/// datagram arrives once and in order.
+#[tokio::test]
+async fn recv_in_a_select_loses_nothing() {
+    const DATAGRAMS: u64 = 200;
+    let (control_box, heat_pump) = pair();
+    let listener = heat_pump.listen("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = heat_pump.accept(stream).await.expect("the handshake");
+        for counter in 1..=DATAGRAMS {
+            let mut datagram = a_read();
+            datagram.header.as_mut().unwrap().msg_counter = Some(MsgCounter(counter));
+            connection.send(&datagram).await.expect("sent");
+            if counter % 3 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        // Hold the connection open until the client has read everything.
+        let _ = connection.recv().await;
+    });
+
+    let mut client = control_box.connect(address).await.expect("the handshake");
+    let mut next = 1;
+    let mut cancelled = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while next <= DATAGRAMS {
+        assert!(std::time::Instant::now() < deadline, "stuck at {next}");
+        let shutdown = core::future::pending::<()>();
+        tokio::select! {
+            received = client.recv() => {
+                let counter = received.expect("a datagram").header.unwrap().msg_counter;
+                assert_eq!(counter, Some(MsgCounter(next)), "in order, none missing");
+                next += 1;
+            }
+            _ = tokio::time::sleep(Duration::from_micros(50)) => cancelled += 1,
+            _ = shutdown => unreachable!(),
+        }
+    }
+    assert!(cancelled > 10, "only {cancelled} calls were cut short");
+
+    client
+        .close(
+            eebus::ship::ConnectionCloseReason::Unspecific,
+            Duration::from_millis(100),
+        )
+        .await
+        .ok();
+    server.abort();
+}
+
 /// A SPINE engine driven over the socket, rather than a hand-built datagram: the control
 /// box discovers what the heat pump is, across TLS and a WebSocket.
 #[tokio::test]

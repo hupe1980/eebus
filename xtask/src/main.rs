@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod cancellation;
 mod codegen;
 mod devices;
 mod enums;
@@ -87,6 +88,16 @@ fn main() {
                 }
             }
         }
+        Some("check-cancellation") => {
+            let root = repo_root();
+            match cancellation::run(&root) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("check-non-exhaustive") => {
             let root = repo_root();
             match enums::run(&root) {
@@ -109,7 +120,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats|check-non-exhaustive|check-schemas>"
+                "usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats|check-non-exhaustive|check-cancellation|check-schemas>"
             );
             if let Some(o) = other {
                 eprintln!("unknown task: {o}");
