@@ -91,6 +91,9 @@ impl Link {
 
 /// `TC_SHIP_ROLE_001` and `TC_SHIP_ROLE_002`: a node completes the handshake as server
 /// and as client, reaching data exchange with the version and format both agreed on.
+///
+/// `TC_SHIP_PROT_001` and `TC_SHIP_PROT_002`: the format both roles settle on in the
+/// protocol handshake is `JSON-UTF8`.
 #[test]
 fn tc_ship_role_001_002_handshake_completes_in_both_roles() {
     let mut link = Link::new(Trust::VERIFIED, Trust::VERIFIED);
