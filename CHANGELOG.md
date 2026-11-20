@@ -23,7 +23,7 @@ Notable changes to `eebus`. The format follows
   `queue_key_request`, `queue_key_material`, `poll_drain`, `drain`, `poll_next_message`,
   `has_output`, `stalled_for`. Constants `MAX_OUTBOX`, `WRITE_STALL_TIMEOUT`.
 - `LimitWrite::check` and `InvalidLimit`.
-- `SECURITY.md`, a `cargo deny` supply-chain job, Dependabot, and
+- `SECURITY.md`, a `cargo deny` supply-chain job, and
   `cargo xtask check-non-exhaustive`.
 
 ### Changed
