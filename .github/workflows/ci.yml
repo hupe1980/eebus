@@ -80,6 +80,9 @@ jobs:
       # saturated. Every test passed; the arithmetic was what was wrong. This bans the
       # shape from the two directories where the wire meets a number.
       - run: cargo run -p xtask -- check-floats
+      # An enum this crate closes — error, event, outcome, reason — grows as the crate
+      # learns, and must not break a consumer's `match` when it does.
+      - run: cargo run -p xtask -- check-non-exhaustive
       # The Restricted Function Exchange table is what `possibleOperations` is derived from
       # and the first thing an integrator asks about, so it is published as a page — and a
       # published page generated from committed source is only true while it is current.
@@ -92,6 +95,15 @@ jobs:
       # catches that in seconds; the fuzzing itself still happens below.
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
       - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # RustSec advisories, yanked crates, licences and sources, per `deny.toml`. Nightly
+      # as well as per change, because an advisory arrives without a commit.
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   docs:
     name: Documentation

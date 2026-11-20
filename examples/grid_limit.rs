@@ -141,7 +141,8 @@ fn main() {
 
     now += Duration::from_secs(1);
     link.guard
-        .require(&pump_address, Some(LimitWrite::active(3_000.0)), now);
+        .require(&pump_address, Some(LimitWrite::active(3_000.0)), now)
+        .expect("a valid limit");
     let events = link.tick(&mut box_engine, &mut pump_engine, now);
     println!("5. Heartbeat, then a 3000 W limit");
 

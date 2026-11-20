@@ -311,8 +311,9 @@ On a network, [`Hub`](https://hupe1980.github.io/eebus/docs/networking/) owns th
 and the clock. It listens, dials and browses **in the background** — a slow or unapproved
 peer holds nothing else up — routes each datagram to the peer it names, keeps idle
 connections alive, resolves double connections, and redials with a backoff spread by the
-peer's SKI. `hub.run(handler)` is the loop: `hub.next()` is not cancel-safe, and a write
-cancelled anyway is closed with `Disconnect::InterruptedWrite`.
+peer's SKI. `hub.run(handler)` is the loop; `hub.next()` is cancel-safe, so it may also
+sit in a `select!` or under a `timeout`. Writes go to every peer at once: one that stops
+reading delays nobody and is dropped as unresponsive.
 
 **Pairing happens while the peer waits.** An unapproved peer completes TLS, is held in the
 SHIP `hello: pending` state and reported as `TrustRequested`; `hub.approve(ski)` completes

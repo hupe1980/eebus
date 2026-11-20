@@ -32,6 +32,7 @@ pub struct Fingerprint([u8; Fingerprint::LEN]);
 
 /// Why a string could not be read as a [`Fingerprint`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FingerprintParseError {
     /// The value did not contain exactly 64 characters.
     #[error("a fingerprint has 64 hexadecimal digits, found {0}")]

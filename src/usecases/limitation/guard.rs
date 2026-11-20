@@ -45,7 +45,9 @@ use crate::spine::{
 use super::Direction;
 use super::actor::{NominalMax, PeerIds};
 use super::audit::{AuditLog, LimitRecord};
-use super::state::{FAILSAFE_DURATION_RANGE, LimitWrite, NackReason, WriteOutcome};
+use super::state::{
+    FAILSAFE_DURATION_RANGE, InvalidLimit, LimitWrite, NackReason, WriteOutcome, check_watts,
+};
 
 /// The first retry after a refusal, and the step each further retry adds (§2.5).
 pub const RETRY_BACKOFF_STEP: Duration = Duration::from_secs(60);
@@ -553,23 +555,52 @@ impl EnergyGuardActor {
     /// Order does not matter. A requirement set before the guard has attached to the
     /// device — which is normal, since a grid operator does not wait for a binding to
     /// settle — is held and applied the moment it does.
-    pub fn require(&mut self, device: &AddressDevice, limit: Option<LimitWrite>, now: Duration) {
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidLimit`] when the limit's watts are not a finite number at or above zero
+    /// ([LPC/LPP-001]). Nothing is scheduled and whatever was required before stands: a
+    /// NaN that reached the wire would be no value at all, and a negative one is a limit
+    /// the device has to refuse — either way the grid operator would be told nothing.
+    pub fn require(
+        &mut self,
+        device: &AddressDevice,
+        limit: Option<LimitWrite>,
+        now: Duration,
+    ) -> Result<(), InvalidLimit> {
+        if let Some(limit) = &limit {
+            limit.check()?;
+        }
         if let Some(tracked) = self.peers.iter_mut().find(|t| &t.peer.device == device) {
             set_required(tracked, limit, now);
-            return;
+            return Ok(());
         }
         self.deferred.retain(|(d, _)| d != device);
         self.deferred.push((device.clone(), limit));
+        Ok(())
     }
 
     /// Sets the same limit for every peer, which is what a grid-wide curtailment is.
     ///
     /// Unlike [`require`](Self::require) this names no device, so there is nothing to hold
     /// for a peer that has not appeared: it applies to the peers attached now.
-    pub fn require_all(&mut self, limit: Option<LimitWrite>, now: Duration) {
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidLimit`], as for [`require`](Self::require), and then no peer's requirement
+    /// changes.
+    pub fn require_all(
+        &mut self,
+        limit: Option<LimitWrite>,
+        now: Duration,
+    ) -> Result<(), InvalidLimit> {
+        if let Some(limit) = &limit {
+            limit.check()?;
+        }
         for tracked in &mut self.peers {
             set_required(tracked, limit, now);
         }
+        Ok(())
     }
 
     /// What the grid requires of devices this guard has not attached to yet.
@@ -594,6 +625,11 @@ impl EnergyGuardActor {
     /// write addressed by this crate's own numbering would land on whatever key that peer
     /// keeps at that index. A `DeviceConfiguration` feature holds every configuration key
     /// a device has, not only this use case's two.
+    ///
+    /// [`None`] as well, with nothing sent, for watts that are not a finite number at or
+    /// above zero — the same refusal [`require`](Self::require) makes, and the one
+    /// [`write_failsafe_duration`](Self::write_failsafe_duration) makes for a duration
+    /// outside its range.
     pub fn write_failsafe_limit(
         &mut self,
         engine: &mut Engine,
@@ -601,6 +637,7 @@ impl EnergyGuardActor {
         watts: f64,
         now: Duration,
     ) -> Option<MsgCounter> {
+        check_watts(watts).ok()?;
         let tracked = self.peers.iter().find(|t| &t.peer.device == device)?;
         if !tracked.bound_configuration {
             return None;
@@ -611,7 +648,7 @@ impl EnergyGuardActor {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
                     key_id: Some(key),
                     value: Some(DeviceConfigurationKeyValueValue {
-                        scaled_number: Some(ScaledNumber::from_f64(watts.max(0.0), 0)),
+                        scaled_number: ScaledNumber::from_f64(watts, 0),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1241,7 +1278,7 @@ fn limit_payload(limit: &LimitWrite, limit_id: LoadControlLimitId) -> CmdData {
         load_control_limit_data: Some(vec![LoadControlLimitData {
             limit_id: Some(limit_id),
             is_limit_active: Some(limit.is_active),
-            value: Some(ScaledNumber::from_f64(limit.watts, 0)),
+            value: ScaledNumber::from_f64(limit.watts, 0),
             time_period: limit.duration.map(|d| TimePeriod {
                 end_time: Some(crate::model::format_iso8601_duration(d).into()),
                 ..Default::default()

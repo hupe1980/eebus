@@ -244,6 +244,7 @@ pub struct WriteToken(u64);
 
 /// Why [`Engine::accept_write`] could not do what the application decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum WriteError {
     /// The token names no write that is still waiting: it was resolved already, abandoned
     /// after the peer stopped waiting ([`SpineEvent::WriteAbandoned`]), or never issued.

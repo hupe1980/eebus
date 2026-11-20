@@ -187,3 +187,6 @@ the memory of every node that answers.
 | `MAX_DEFERRED_WRITES` = 16 | writes waiting on the application | `errorNumber` 3 |
 | `MAX_LIST_ENTRIES` = 128 | entries in one function's list | `errorNumber` 3 |
 | `MAX_DEVICE_ADDRESS_LEN` = 256 | a device address, which must also be printable | datagram discarded |
+| `MAX_OUTBOX` = 256 | messages waiting for one peer that has stopped reading | `Disconnect::Unresponsive` |
+| `WRITE_STALL_TIMEOUT` = 10 s | how long output may wait without the socket taking any | `Disconnect::Unresponsive` |
+| `CONNECT_TIMEOUT` = 10 s | TCP connect of a dial; TLS and WebSocket upgrade of every connection | `ConnectionError::Timeout`, slot returned |

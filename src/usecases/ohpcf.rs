@@ -585,7 +585,7 @@ impl Flexibility {
                     value_list: Some(SmartEnergyManagementPsPowerTimeSlotValueList {
                         value: Some(vec![SmartEnergyManagementPsPowerTimeSlotValueListValue {
                             value_type: Some(self.kind.value_type()),
-                            value: Some(ScaledNumber::from_f64(self.power_watts, 0)),
+                            value: ScaledNumber::from_f64(self.power_watts, 0),
                         }]),
                     }),
                     ..Default::default()

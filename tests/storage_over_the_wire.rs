@@ -240,7 +240,7 @@ fn alloc_vec(watts: f64) -> Vec<eebus::model::SetpointData> {
     vec![eebus::model::SetpointData {
         setpoint_id: Some(cob::SETPOINT_ID),
         is_setpoint_active: Some(true),
-        value: Some(eebus::model::ScaledNumber::from_f64(watts, 0)),
+        value: eebus::model::ScaledNumber::from_f64(watts, 0),
         ..Default::default()
     }]
 }

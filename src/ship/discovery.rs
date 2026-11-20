@@ -49,6 +49,7 @@ pub struct ShipId(String);
 
 /// Why a string could not be read as a [`ShipId`] or a TXT record.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DiscoveryError {
     /// A value was empty where the specification requires content.
     #[error("`{0}` must not be empty")]

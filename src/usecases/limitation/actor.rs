@@ -172,10 +172,7 @@ pub fn limit_data(system: &ControllableSystem) -> CmdData {
             limit_id: Some(LIMIT_ID),
             is_limit_changeable: Some(true),
             is_limit_active: Some(system.is_limit_active()),
-            value: Some(ScaledNumber::from_f64(
-                system.effective_limit().watts().unwrap_or(0.0),
-                0,
-            )),
+            value: ScaledNumber::from_f64(system.effective_limit().watts().unwrap_or(0.0), 0),
             ..Default::default()
         }]),
     })
@@ -243,7 +240,7 @@ pub fn constraints(system: &ControllableSystem, direction: Direction) -> CmdData
                 characteristic_id: Some(CHARACTERISTIC_ID),
                 characteristic_context: Some(ElectricalConnectionCharacteristicContext::Entity),
                 characteristic_type: Some(max.characteristic(direction)),
-                value: Some(ScaledNumber::from_f64(max.watts(), 0)),
+                value: ScaledNumber::from_f64(max.watts(), 0),
                 unit: Some(UnitOfMeasurement::W),
             }]
         })
@@ -311,7 +308,7 @@ pub fn failsafe_values(system: &ControllableSystem) -> CmdData {
             DeviceConfigurationKeyValueData {
                 key_id: Some(FAILSAFE_LIMIT_KEY),
                 value: Some(DeviceConfigurationKeyValueValue {
-                    scaled_number: Some(ScaledNumber::from_f64(system.config().failsafe_watts, 0)),
+                    scaled_number: ScaledNumber::from_f64(system.config().failsafe_watts, 0),
                     ..Default::default()
                 }),
                 is_value_changeable: Some(true),

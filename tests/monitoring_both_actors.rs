@@ -297,7 +297,7 @@ impl GridPair {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
                     key_id: Some(eebus::model::DeviceConfigurationKeyId(1)),
                     value: Some(DeviceConfigurationKeyValueValue {
-                        scaled_number: Some(ScaledNumber::from_f64(12_000.0, 0)),
+                        scaled_number: ScaledNumber::from_f64(12_000.0, 0),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -378,7 +378,7 @@ impl GridPair {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
                     key_id: Some(THEIR_KEY),
                     value: Some(DeviceConfigurationKeyValueValue {
-                        scaled_number: Some(ScaledNumber::from_f64(percent, 2)),
+                        scaled_number: ScaledNumber::from_f64(percent, 2),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -551,7 +551,7 @@ fn a_connection_point_serving_only_scenario_one_is_still_located_and_read() {
                 device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
                     key_id: Some(key),
                     value: Some(DeviceConfigurationKeyValueValue {
-                        scaled_number: Some(ScaledNumber::from_f64(60.0, 2)),
+                        scaled_number: ScaledNumber::from_f64(60.0, 2),
                         ..Default::default()
                     }),
                     ..Default::default()

@@ -109,6 +109,7 @@ pub struct KeyEntry {
 
 /// Why a key-material change was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum KeyError {
     /// An update is already running; finish it before starting another.
     #[error("a certificate update is already in progress")]

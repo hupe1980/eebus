@@ -248,7 +248,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(_) => {
                         println!("[box]  {} plays the Controllable System", device.as_str());
                         if let Some(limit) = required {
-                            guard.require(&device, Some(limit), now);
+                            guard
+                                .require(&device, Some(limit), now)
+                                .expect("a valid limit");
                         }
                     }
                     None => println!("[box]  {} does not play LPC", device.as_str()),

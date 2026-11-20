@@ -296,7 +296,8 @@ fn atc_lpc_com_pt_egmessages_001() {
     // The external stimulus: the grid needs the house held to 5 kW.
     pair.advance(limitation::MIN_WRITE_INTERVAL);
     pair.guard
-        .require(&device, Some(LimitWrite::active(APCL_03)), pair.now);
+        .require(&device, Some(LimitWrite::active(APCL_03)), pair.now)
+        .expect("a valid limit");
     pair.advance(secs(1));
 
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
@@ -320,12 +321,15 @@ fn atc_lpc_com_pt_egmessages_003() {
     let mut pair = Pair::new();
     pair.commission();
     let device = pair.device();
-    pair.guard.require(&device, None, pair.now);
+    pair.guard
+        .require(&device, None, pair.now)
+        .expect("a valid limit");
     pair.advance(secs(1));
 
     for (round, limit) in [APCL_02, APCL_03, APCL_04, APCL_05].iter().enumerate() {
         pair.guard
-            .require(&device, Some(LimitWrite::active(*limit)), pair.now);
+            .require(&device, Some(LimitWrite::active(*limit)), pair.now)
+            .expect("a valid limit");
         // §2.10 holds a guard to one write every five minutes.
         pair.advance(limitation::MIN_WRITE_INTERVAL + secs(1));
         assert_eq!(
@@ -352,7 +356,9 @@ fn atc_lpc_com_pt_egmessages_004() {
 
     // The failsafe values may only be written once the opening sequence has completed
     // ([LPC-TS-037]), which is the deactivation the guard sends first.
-    pair.guard.require(&device, None, pair.now);
+    pair.guard
+        .require(&device, None, pair.now)
+        .expect("a valid limit");
     pair.advance(secs(1));
 
     pair.guard

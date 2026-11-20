@@ -89,6 +89,7 @@ pub struct ShipQr {
 
 /// Why a QR payload could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum QrError {
     /// The payload did not start with the `SHIP;` marker.
     #[error("not a SHIP QR code: missing the `SHIP;` prefix")]

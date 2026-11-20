@@ -24,6 +24,7 @@ pub const MAX_DEVICE_ADDRESS_LEN: usize = 256;
 
 /// Why a device address was rejected.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AddressError {
     /// The address did not begin with the `d:` marker.
     #[error("a device address begins with `d:`")]

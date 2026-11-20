@@ -34,7 +34,8 @@ fn a_limit_write_that_is_never_answered_is_retried() {
     let device = pair.device();
     pair.pump_is_deaf = true;
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     assert!(pair.accepted().is_empty(), "nothing came back");
@@ -71,7 +72,8 @@ fn a_peer_that_never_answers_is_reported() {
     let device = pair.device();
     pair.pump_is_deaf = true;
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
 
     for _ in 0..40 {
         pair.advance(Duration::from_secs(60));
@@ -100,7 +102,8 @@ fn nothing_stays_outstanding_after_the_escalation_path() {
     let device = pair.device();
     pair.pump_is_deaf = true;
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
 
     for _ in 0..60 {
         pair.advance(Duration::from_secs(60));

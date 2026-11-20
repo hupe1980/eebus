@@ -33,6 +33,7 @@ pub struct Ski([u8; Ski::LEN]);
 
 /// Why a string could not be read as a [`Ski`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SkiParseError {
     /// The value did not contain exactly 40 hexadecimal digits.
     #[error("a SKI has 40 hexadecimal digits, found {0}")]

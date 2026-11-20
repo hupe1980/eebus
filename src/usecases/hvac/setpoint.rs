@@ -186,9 +186,9 @@ pub fn constraints_of(entries: &[(SetpointId, f64, f64, Option<f64>)]) -> CmdDat
                 .iter()
                 .map(|(id, min, max, step)| SetpointConstraintsData {
                     setpoint_id: Some(*id),
-                    setpoint_range_min: Some(ScaledNumber::from_f64(*min, 1)),
-                    setpoint_range_max: Some(ScaledNumber::from_f64(*max, 1)),
-                    setpoint_step_size: step.map(|step| ScaledNumber::from_f64(step, 1)),
+                    setpoint_range_min: ScaledNumber::from_f64(*min, 1),
+                    setpoint_range_max: ScaledNumber::from_f64(*max, 1),
+                    setpoint_step_size: step.and_then(|step| ScaledNumber::from_f64(step, 1)),
                 })
                 .collect(),
         ),
@@ -203,7 +203,7 @@ pub fn values(entries: &[(SetpointId, f64)]) -> CmdData {
                 .iter()
                 .map(|(id, degrees)| SetpointData {
                     setpoint_id: Some(*id),
-                    value: Some(ScaledNumber::from_f64(*degrees, 1)),
+                    value: ScaledNumber::from_f64(*degrees, 1),
                     is_setpoint_changeable: Some(true),
                     ..Default::default()
                 })
@@ -222,9 +222,9 @@ pub fn constraints(id: SetpointId, min: f64, max: f64, step: Option<f64>) -> Cmd
     CmdData::SetpointConstraintsListData(SetpointConstraintsListData {
         setpoint_constraints_data: Some(vec![SetpointConstraintsData {
             setpoint_id: Some(id),
-            setpoint_range_min: Some(ScaledNumber::from_f64(min, 1)),
-            setpoint_range_max: Some(ScaledNumber::from_f64(max, 1)),
-            setpoint_step_size: step.map(|step| ScaledNumber::from_f64(step, 1)),
+            setpoint_range_min: ScaledNumber::from_f64(min, 1),
+            setpoint_range_max: ScaledNumber::from_f64(max, 1),
+            setpoint_step_size: step.and_then(|step| ScaledNumber::from_f64(step, 1)),
         }]),
     })
 }
@@ -234,7 +234,7 @@ pub fn value(id: SetpointId, degrees: f64) -> CmdData {
     CmdData::SetpointListData(SetpointListData {
         setpoint_data: Some(vec![SetpointData {
             setpoint_id: Some(id),
-            value: Some(ScaledNumber::from_f64(degrees, 1)),
+            value: ScaledNumber::from_f64(degrees, 1),
             is_setpoint_changeable: Some(true),
             ..Default::default()
         }]),
@@ -673,7 +673,7 @@ impl Setpoints {
         Ok(CmdData::SetpointListData(SetpointListData {
             setpoint_data: Some(vec![SetpointData {
                 setpoint_id: Some(id),
-                value: Some(ScaledNumber::from_f64(degrees, 1)),
+                value: ScaledNumber::from_f64(degrees, 1),
                 ..Default::default()
             }]),
         }))

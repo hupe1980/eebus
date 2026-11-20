@@ -59,7 +59,8 @@ fn record() -> String {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     pair.guard

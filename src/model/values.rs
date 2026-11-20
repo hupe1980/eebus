@@ -55,7 +55,7 @@ impl ScaledNumber {
         Self::new(number, 0)
     }
 
-    /// The value as `number × 10^scale`, or [`None`] if it is not a finite number.
+    /// The value as `number × 10^scale`, or [`None`] if no `f64` is that value.
     ///
     /// An absent `scale` is read as zero, which is what the Resource Specification says
     /// and what peers written against it send.
@@ -65,11 +65,16 @@ impl ScaledNumber {
     /// message, and an unrepresentable value is not a value. Saying so lets the caller
     /// refuse the message instead of acting on a number nobody sent.
     ///
+    /// The same goes for a `number` the `f64` mantissa cannot hold: every integer up to
+    /// 2⁵³ fits, and above it only some do. `2⁵³ + 1` would otherwise arrive as `2⁵³` — a
+    /// different quantity, presented as the one that was sent.
+    ///
     /// ```
     /// use eebus::model::ScaledNumber;
     ///
     /// assert_eq!(ScaledNumber::new(42, 2).to_f64(), Some(4200.0));
     /// assert_eq!(ScaledNumber::new(i64::MAX, 308).to_f64(), None, "overflows f64");
+    /// assert_eq!(ScaledNumber::new((1 << 53) + 1, 0).to_f64(), None, "not an f64 mantissa");
     /// ```
     pub fn to_f64(&self) -> Option<f64> {
         let number = self.number?.get();
@@ -86,14 +91,17 @@ impl ScaledNumber {
     /// ```
     /// use eebus::model::ScaledNumber;
     ///
-    /// assert_eq!(ScaledNumber::from_f64(4200.0, 2), ScaledNumber::new(4200, 0));
-    /// assert_eq!(ScaledNumber::from_f64(23.5, 2), ScaledNumber::new(235, -1));
+    /// assert_eq!(ScaledNumber::from_f64(4200.0, 2), Some(ScaledNumber::new(4200, 0)));
+    /// assert_eq!(ScaledNumber::from_f64(23.5, 2), Some(ScaledNumber::new(235, -1)));
+    /// assert_eq!(ScaledNumber::from_f64(f64::NAN, 2), None);
     /// ```
-    pub fn from_f64(value: f64, max_decimals: u8) -> Self {
-        // Neither infinity nor NaN is a quantity, and the alternative to zero here is a
-        // saturated `i64::MAX` on the wire.
+    ///
+    /// [`None`] for NaN and ±∞, which are not quantities. Every field this goes into is
+    /// optional, so the honest translation of "no value" is an absent element — never a
+    /// zero, which on a limit is a full curtailment nobody asked for.
+    pub fn from_f64(value: f64, max_decimals: u8) -> Option<Self> {
         if !value.is_finite() {
-            return Self::new(0, 0);
+            return None;
         }
         // A value too large for `i64` at scale 0 is still perfectly representable — that
         // is what the scale is for. Raising it until the mantissa fits is the honest
@@ -101,7 +109,7 @@ impl ScaledNumber {
         // asked for on the wire.
         let (value, base_scale) = fit_to_i64(value);
         if base_scale > 0 {
-            return Self::new(round_half_away(value) as i64, base_scale);
+            return Some(Self::new(round_half_away(value) as i64, base_scale));
         }
 
         let max_decimals = i16::from(max_decimals.min(9));
@@ -111,12 +119,15 @@ impl ScaledNumber {
             // The tolerance is relative: an absolute 1e-9 is meaningless beside a
             // megawatt and impossibly strict beside a microamp.
             if abs_f64(scaled - rounded) <= abs_f64(scaled) * 1e-12 && fits_i64(rounded) {
-                return Self::new(rounded as i64, -decimals);
+                return Some(Self::new(rounded as i64, -decimals));
             }
         }
         let scaled = shift_decimal(value, max_decimals);
         let (scaled, extra) = fit_to_i64(scaled);
-        Self::new(round_half_away(scaled) as i64, extra - max_decimals)
+        Some(Self::new(
+            round_half_away(scaled) as i64,
+            extra - max_decimals,
+        ))
     }
 
     /// True when both elements are present, as the implementation guide requires for a
@@ -168,15 +179,18 @@ const I64_LIMIT: f64 = 9.223_372_036_854_775e18;
 /// exactly right. `scale` is a signed 16-bit integer, so a peer reaches that seam in one
 /// schema-valid message.
 ///
-/// The remaining inexactness is inherent to the return type rather than to this
-/// function: a `number` above 2⁵³ does not fit an `f64` mantissa. SPINE carries
-/// quantities, not counters, so that bound is far outside anything a device sends — but
-/// it is the reason this returns `f64` rather than claiming to be exact.
+/// **A `number` the mantissa cannot hold is [`None`].** Every integer up to 2⁵³ is an
+/// `f64`; above it, `number as f64` rounds to a neighbour, and that neighbour would then be
+/// scaled as if it had been sent. Compared in `i128`, because `i64::MAX as f64` is 2⁶³ and
+/// casting that back to `i64` saturates into a false match.
 fn scaled_to_f64(number: i64, scale: i16) -> Option<f64> {
     if number == 0 {
         return Some(0.0);
     }
     let mut value = number as f64;
+    if value as i128 != i128::from(number) {
+        return None;
+    }
     let mut remaining = i32::from(scale);
     while remaining != 0 {
         // Every step scales by an entry of the exact table, so it rounds once. `scale`
@@ -283,10 +297,49 @@ mod tests {
         assert_eq!(ScaledNumber::new(235, -1).to_f64(), Some(23.5));
         assert_eq!(
             ScaledNumber::from_f64(4_200.0, 2),
-            ScaledNumber::new(4_200, 0)
+            Some(ScaledNumber::new(4_200, 0))
         );
-        assert_eq!(ScaledNumber::from_f64(23.5, 2), ScaledNumber::new(235, -1));
-        assert_eq!(ScaledNumber::from_f64(0.125, 3), ScaledNumber::new(125, -3));
+        assert_eq!(
+            ScaledNumber::from_f64(23.5, 2),
+            Some(ScaledNumber::new(235, -1))
+        );
+        assert_eq!(
+            ScaledNumber::from_f64(0.125, 3),
+            Some(ScaledNumber::new(125, -3))
+        );
+    }
+
+    /// NaN and infinity are not quantities, and none of them becomes a zero.
+    ///
+    /// The old answer was `0 × 10⁰`, which on a limit is a full curtailment: an
+    /// application that divided by zero would have switched a building off.
+    #[test]
+    fn a_value_that_is_not_a_number_is_not_converted() {
+        assert_eq!(ScaledNumber::from_f64(f64::NAN, 2), None);
+        assert_eq!(ScaledNumber::from_f64(f64::INFINITY, 0), None);
+        assert_eq!(ScaledNumber::from_f64(f64::NEG_INFINITY, 0), None);
+    }
+
+    /// A mantissa `f64` cannot hold reads as no value, not as its neighbour.
+    #[test]
+    fn a_mantissa_beyond_the_f64_grid_is_not_rounded() {
+        let edge = 1i64 << 53;
+        assert_eq!(ScaledNumber::new(edge, 0).to_f64(), Some(edge as f64));
+        assert_eq!(ScaledNumber::new(edge + 1, 0).to_f64(), None);
+        assert_eq!(ScaledNumber::new(-(edge + 1), 0).to_f64(), None);
+        assert_eq!(
+            ScaledNumber::new(1 << 60, 0).to_f64(),
+            Some((1u64 << 60) as f64)
+        );
+        assert_eq!(
+            ScaledNumber::new(i64::MAX, 0).to_f64(),
+            None,
+            "2⁶³ − 1 is not an f64, however the cast back saturates"
+        );
+        assert_eq!(
+            ScaledNumber::new(i64::MIN, 0).to_f64(),
+            Some(-(2f64.powi(63)))
+        );
     }
 
     #[test]
@@ -330,14 +383,14 @@ mod tests {
     /// and it would reach the wire as a limit nobody asked for.
     #[test]
     fn a_huge_value_raises_the_scale_rather_than_saturating() {
-        let big = ScaledNumber::from_f64(1e30, 2);
+        let big = ScaledNumber::from_f64(1e30, 2).expect("finite");
         assert_eq!(big.to_f64(), Some(1e30));
         assert!(
             big.number.expect("a number").get() < i64::MAX,
             "saturated instead of scaling: {big:?}"
         );
 
-        let negative = ScaledNumber::from_f64(-1e25, 2);
+        let negative = ScaledNumber::from_f64(-1e25, 2).expect("finite");
         assert_eq!(negative.to_f64(), Some(-1e25));
     }
 
@@ -351,7 +404,7 @@ mod tests {
         let watts = [0.0, 1.0, 4200.0, 11_000.0, 23.5, 0.001, 16.0, 6.0, 3_333.33];
         for value in watts {
             let round_tripped = ScaledNumber::from_f64(value, 3)
-                .to_f64()
+                .and_then(|number| number.to_f64())
                 .expect("a finite quantity");
             assert_eq!(round_tripped, value, "{value} did not survive the wire");
         }

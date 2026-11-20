@@ -215,7 +215,7 @@ impl Link {
             load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
                 limit_id: Some(limitation::LIMIT_ID),
                 is_limit_active: Some(active),
-                value: Some(ScaledNumber::from_f64(watts, 0)),
+                value: ScaledNumber::from_f64(watts, 0),
                 ..Default::default()
             }]),
         });
@@ -331,7 +331,7 @@ fn ig_2_15_the_failsafe_values_can_be_written_over_the_wire() {
                 eebus::model::DeviceConfigurationKeyValueData {
                     key_id: Some(limitation::FAILSAFE_LIMIT_KEY),
                     value: Some(eebus::model::DeviceConfigurationKeyValueValue {
-                        scaled_number: Some(ScaledNumber::from_f64(2_000.0, 0)),
+                        scaled_number: ScaledNumber::from_f64(2_000.0, 0),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -614,7 +614,7 @@ fn ig_3_3_a_partial_limit_write_that_omits_is_limit_active_stays_active() {
         load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
             limit_id: Some(limitation::LIMIT_ID),
             is_limit_active: None, // omitted: unchanged
-            value: Some(ScaledNumber::from_f64(2_000.0, 0)),
+            value: ScaledNumber::from_f64(2_000.0, 0),
             ..Default::default()
         }]),
     });
@@ -651,7 +651,7 @@ fn ig_3_1_a_limit_write_without_its_identifier_is_refused() {
         load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
             limit_id: None, // no identifier: this entry names nothing
             is_limit_active: Some(false),
-            value: Some(ScaledNumber::from_f64(0.0, 0)),
+            value: ScaledNumber::from_f64(0.0, 0),
             ..Default::default()
         }]),
     });

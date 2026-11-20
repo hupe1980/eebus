@@ -146,6 +146,7 @@ pub trait Selectors {
 
 /// Why a Restricted Function Exchange filter could not be applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum RestrictError {
     /// The filter addresses a different function than the data it was applied to.
     #[error("the filter addresses a different function than the data")]

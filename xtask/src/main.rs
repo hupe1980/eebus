@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 mod codegen;
 mod devices;
+mod enums;
 mod fixtures;
 mod floats;
 mod naming;
@@ -86,6 +87,16 @@ fn main() {
                 }
             }
         }
+        Some("check-non-exhaustive") => {
+            let root = repo_root();
+            match enums::run(&root) {
+                Ok(report) => println!("{report}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("check-floats") => {
             let root = repo_root();
             match floats::run(&root) {
@@ -98,7 +109,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats|check-schemas>"
+                "usage: cargo xtask <codegen|fixtures|devices|rfe-table|check-floats|check-non-exhaustive|check-schemas>"
             );
             if let Some(o) = other {
                 eprintln!("unknown task: {o}");

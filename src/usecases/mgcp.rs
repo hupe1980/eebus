@@ -132,7 +132,7 @@ pub fn curtailment_value(percent: f64) -> CmdData {
         device_configuration_key_value_data: Some(vec![DeviceConfigurationKeyValueData {
             key_id: Some(CURTAILMENT_KEY),
             value: Some(DeviceConfigurationKeyValueValue {
-                scaled_number: Some(ScaledNumber::from_f64(percent, 2)),
+                scaled_number: ScaledNumber::from_f64(percent, 2),
                 ..Default::default()
             }),
             ..Default::default()
@@ -601,7 +601,7 @@ mod tests {
                     DeviceConfigurationKeyValueData {
                         key_id: Some(CURTAILMENT_KEY),
                         value: Some(DeviceConfigurationKeyValueValue {
-                            scaled_number: Some(ScaledNumber::from_f64(9.0, 0)),
+                            scaled_number: ScaledNumber::from_f64(9.0, 0),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -609,7 +609,7 @@ mod tests {
                     DeviceConfigurationKeyValueData {
                         key_id: Some(their_key),
                         value: Some(DeviceConfigurationKeyValueValue {
-                            scaled_number: Some(ScaledNumber::from_f64(60.0, 2)),
+                            scaled_number: ScaledNumber::from_f64(60.0, 2),
                             ..Default::default()
                         }),
                         ..Default::default()

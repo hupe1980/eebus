@@ -33,7 +33,9 @@ Notable changes to `eebus`. The format follows
   | ⚠️ silent: `key_from_pem`, block not labelled `PRIVATE KEY` | parsed if the bytes parsed | `CertError::NoPrivateKey` |
   | restoring at start-up | `self_signed_with(params, key_from_pem(&key)?)` | `Identity::from_pem(&certificate, &key)` |
 
-  `hems` builds without the `cert` feature and is unaffected.
+  Every build with `tls` or `runtime` has `cert`, since both features enable it. Any node
+  that re-issues at start-up with `self_signed_with` presents a new fingerprint after each
+  restart and should switch to `Identity::from_pem`.
 
 ### Contributor tooling
 

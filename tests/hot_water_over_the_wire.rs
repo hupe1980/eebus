@@ -389,15 +389,15 @@ fn their_constraints() -> CmdData {
         setpoint_constraints_data: Some(vec![
             SetpointConstraintsData {
                 setpoint_id: Some(THEIR_ROOM),
-                setpoint_range_min: Some(ScaledNumber::from_f64(16.0, 1)),
-                setpoint_range_max: Some(ScaledNumber::from_f64(26.0, 1)),
-                setpoint_step_size: Some(ScaledNumber::from_f64(0.5, 1)),
+                setpoint_range_min: ScaledNumber::from_f64(16.0, 1),
+                setpoint_range_max: ScaledNumber::from_f64(26.0, 1),
+                setpoint_step_size: ScaledNumber::from_f64(0.5, 1),
             },
             SetpointConstraintsData {
                 setpoint_id: Some(THEIR_DHW),
-                setpoint_range_min: Some(ScaledNumber::from_f64(40.0, 1)),
-                setpoint_range_max: Some(ScaledNumber::from_f64(65.0, 1)),
-                setpoint_step_size: Some(ScaledNumber::from_f64(1.0, 1)),
+                setpoint_range_min: ScaledNumber::from_f64(40.0, 1),
+                setpoint_range_max: ScaledNumber::from_f64(65.0, 1),
+                setpoint_step_size: ScaledNumber::from_f64(1.0, 1),
             },
         ]),
     })
@@ -408,7 +408,7 @@ fn their_value(degrees: f64) -> CmdData {
     CmdData::SetpointListData(SetpointListData {
         setpoint_data: Some(vec![SetpointData {
             setpoint_id: Some(THEIR_DHW),
-            value: Some(ScaledNumber::from_f64(degrees, 1)),
+            value: ScaledNumber::from_f64(degrees, 1),
             is_setpoint_changeable: Some(true),
             ..Default::default()
         }]),

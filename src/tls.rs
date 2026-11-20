@@ -116,6 +116,7 @@ pub const CRYPTO_PROVIDER: &str = if cfg!(feature = "aws-lc-rs") {
 
 /// Why a TLS configuration could not be built.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TlsError {
     /// rustls refused the configuration.
     #[error("the TLS configuration was refused: {0}")]

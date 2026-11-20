@@ -365,10 +365,7 @@ async fn eebus_go_writes_a_limit_and_this_crate_applies_it() {
     let mut actor = actor.install(hub.engine_mut(), Duration::ZERO);
     hub.dial(std::net::SocketAddr::from(([127, 0, 0, 1], peer.port)));
 
-    // The loop obeys this crate's own rule: `hub.next()` is never wrapped in a `timeout`
-    // or a `select!`, because the flush inside it is not cancel-safe. The deadline is
-    // enforced with `wake_at`, which is what that rule says to use instead — and writing
-    // it the other way first is how easy the mistake is.
+    // The deadline is enforced with `wake_at`, which the hub folds into its own.
     let mut limited = None;
     let started = std::time::Instant::now();
     let budget = Duration::from_secs(60);
@@ -550,7 +547,9 @@ async fn this_crate_writes_a_limit_and_eebus_go_applies_it() {
         // everything §2.11 requires before a limit reaches the wire is its problem.
         if !asked && let Some(device) = peer_device.clone() {
             let now = hub.now();
-            guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
+            guard
+                .require(&device, Some(LimitWrite::active(4_200.0)), now)
+                .expect("a valid limit");
             asked = true;
         }
 
