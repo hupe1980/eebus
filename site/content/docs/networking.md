@@ -221,17 +221,20 @@ off from one second to two minutes, with the delay **jittered by the peer's SKI*
 building coming back from a power cut does not dial all at once. Dials run in the
 background, and one that reaches nobody is given up after `CONNECT_TIMEOUT`.
 
-## `next` is not cancel-safe
+## `next` is cancel-safe
 
-**Do not put `hub.next()` in a `tokio::select!` or a `timeout`.** `Hub::run(handler)` is
-the loop that cannot get this wrong.
+`hub.next()` may sit in a `tokio::select!` or under a `timeout`. Nothing is written *by*
+the future: datagrams, SHIP answers and pings go into each connection's queue, and a message
+leaves it only in the poll in which the socket took it. Dropping the future loses nothing
+and closes nothing.
 
-Reading is cancel-safe, but `next` flushes the engine's queue first, and a `Sink::send`
-dropped part-way leaves **half a frame on the wire**. The next call then closes that
-connection with `Disconnect::InterruptedWrite`.
+Writes progress on every connection at once, so a peer that stops reading holds up no other.
+It is dropped as `Disconnect::Unresponsive` when `MAX_OUTBOX` messages wait for it or none
+has moved for `WRITE_STALL_TIMEOUT`. TLS and the WebSocket upgrade are bounded by
+`CONNECT_TIMEOUT`, so a socket that opens and says nothing gives its slot back.
 
-Sockets, the listener and mDNS arrive as events. Timers — a deadlock guard included — go to
-`wake_at`; drain other channels, such as a command inbox, on `HubEvent::Tick`:
+`Hub::run(handler)` is still the simplest loop. A hand-written one puts timers in
+`wake_at` and drains other channels, such as a command inbox, on `HubEvent::Tick`:
 
 ```rust
 loop {

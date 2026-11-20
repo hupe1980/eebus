@@ -4,6 +4,55 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [0.12.0] — 2026-11-20
+
+### Added
+
+- **`ControllableSystemActor::handle_event_with`: the application decides a limit.**
+  `handle_event` followed every readable limit, so an integrator could not refuse one. The
+  closure sees each limit on the merged state and returns a `LocalDecision`; a refusal is
+  answered with `errorNumber` 7 and recorded in `audit()` with the sender. The site's LPC
+  page says what § 14a EnWG leaves no discretion over (LPC UC TS §2.2), and
+  `examples/heat_pump.rs --floor <watts>` runs a plausibility floor.
+- **`conformance::protocol`: the SHIP, SPINE and Pairing Service test specifications as
+  data** — all 104 cases, with the parameter-sheet conditions under which each applies
+  (`ParameterSheet`, `Specification::mandatory`). `cargo test` prints covered/total per
+  specification (24/33, 19/31, 0/40) and asserts each uncovered set by name.
+  `Coverage::of_ids` measures a scope given by identifier.
+- **`ShipConnection` queues:** `queue`, `queue_ship`, `queue_control`, `queue_ping`,
+  `queue_key_request`, `queue_key_material`, `poll_drain`, `drain`, `poll_next_message`,
+  `has_output`, `stalled_for`. Constants `MAX_OUTBOX`, `WRITE_STALL_TIMEOUT`.
+- `LimitWrite::check` and `InvalidLimit`.
+- `SECURITY.md`, a `cargo deny` supply-chain job, Dependabot, and
+  `cargo xtask check-non-exhaustive`.
+
+### Changed
+
+- **`Hub::next` is cancel-safe**, and so are `run` and `flush`. A message leaves a
+  connection's queue only in the poll in which the socket took it, so a dropped future loses
+  nothing and closes nothing. Writes progress on every connection at once: a peer that stops
+  reading delays nobody and is dropped as `Unresponsive` at `MAX_OUTBOX` queued messages or
+  after `WRITE_STALL_TIMEOUT` without progress. Before, it blocked the whole hub.
+- **TLS and the WebSocket upgrade are bounded by `CONNECT_TIMEOUT`**, dialled and accepted.
+  A socket that opened and said nothing held an accept slot for ever; sixteen closed the
+  node.
+- **Dependencies:** `rustls` ≥ 0.23.46, `tokio-rustls` ≥ 0.26.6, `tokio` ≥ 1.53.3, which
+  clears RUSTSEC-2026-0346 to -0349, -0382 and -0386.
+- **Breaking:**
+
+  | | 0.11 | 0.12 |
+  |---|---|---|
+  | `ScaledNumber::from_f64` | `-> ScaledNumber`, NaN/±∞ → `0` | `-> Option<ScaledNumber>`, NaN/±∞ → `None` |
+  | `EnergyGuardActor::require`, `require_all` | `()` | `Result<(), InvalidLimit>`; a non-finite or negative limit is refused |
+  | `Hub::announce_key_material` | `async`, `Result` | synchronous, queues |
+  | `Hub::keepalive` | public | private |
+  | `Disconnect::InterruptedWrite` | raised on a cancelled `next` | removed |
+  | 22 error, outcome and reason enums (`TlsError`, `HandshakeError`, `FrameError`, `PairingError`, `QrError`, `WriteError`, `NackReason`, `WriteOutcome`, …) | exhaustive | `#[non_exhaustive]`: add `_ =>` |
+  | ⚠️ silent: `ScaledNumber::to_f64`, mantissa above 2⁵³ not exactly an `f64` | rounded | `None` |
+  | ⚠️ silent: `EnergyGuardActor::write_failsafe_limit` with NaN or negative watts | wrote `0` | `None`, nothing sent |
+
+- **Versioning:** a SPINE revision is a major release of this crate.
+
 ## [0.11.0] — 2026-11-08
 
 ### Added
@@ -33,7 +82,9 @@ Notable changes to `eebus`. The format follows
   | ⚠️ silent: `key_from_pem`, block not labelled `PRIVATE KEY` | parsed if the bytes parsed | `CertError::NoPrivateKey` |
   | restoring at start-up | `self_signed_with(params, key_from_pem(&key)?)` | `Identity::from_pem(&certificate, &key)` |
 
-  `hems` builds without the `cert` feature and is unaffected.
+  Every build with `tls` or `runtime` has `cert`, since both features enable it. Any node
+  that re-issues at start-up with `self_signed_with` presents a new fingerprint after each
+  restart and should switch to `Identity::from_pem`.
 
 ### Contributor tooling
 

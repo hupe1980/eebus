@@ -15,6 +15,13 @@
 //!
 //! Use it through [`crate::usecases::lpc`] or [`crate::usecases::lpp`], which carry the
 //! descriptors and the direction constant for their use case.
+//!
+//! **The application decides whether the appliance follows a limit.** The binding decides
+//! who may write one, and nothing in EEBUS is finer than that. An appliance that may have
+//! to refuse a limit — for self-protection, for safety, or by a policy such as a
+//! plausibility floor — answers through
+//! [`ControllableSystemActor::handle_event_with`], whose documentation sets out what §14a
+//! EnWG leaves no discretion over.
 
 use crate::model::{
     DeviceConfigurationKeyName, ElectricalConnectionCharacteristicType, EnergyDirection,

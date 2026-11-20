@@ -313,8 +313,8 @@ impl MonitoredUnit {
                         let (min, max) = slot.range?;
                         Some(MeasurementConstraintsData {
                             measurement_id: Some(slot.measurement_id),
-                            value_range_min: Some(ScaledNumber::from_f64(min, DECIMALS)),
-                            value_range_max: Some(ScaledNumber::from_f64(max, DECIMALS)),
+                            value_range_min: ScaledNumber::from_f64(min, DECIMALS),
+                            value_range_max: ScaledNumber::from_f64(max, DECIMALS),
                             ..Default::default()
                         })
                     })
@@ -358,7 +358,7 @@ impl MonitoredUnit {
                     .map(|slot| MeasurementData {
                         measurement_id: Some(slot.measurement_id),
                         value_type: Some(MeasurementValueType::Value),
-                        value: slot.value.map(|v| ScaledNumber::from_f64(v, DECIMALS)),
+                        value: slot.value.and_then(|v| ScaledNumber::from_f64(v, DECIMALS)),
                         value_state: (slot.state != MeasurementValueState::Normal)
                             .then(|| slot.state.clone()),
                         timestamp: slot.taken_at.clone(),

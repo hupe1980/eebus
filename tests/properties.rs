@@ -112,7 +112,7 @@ proptest! {
     fn a_scaled_number_keeps_its_value(number in -1_000_000i64..1_000_000, scale in -3i16..=3) {
         let original = ScaledNumber::new(number, scale);
         let value = original.to_f64().expect("in range");
-        let rebuilt = ScaledNumber::from_f64(value, 3);
+        let rebuilt = ScaledNumber::from_f64(value, 3).expect("a finite value");
         prop_assert!(
             (rebuilt.to_f64().expect("in range") - value).abs() < 1e-6,
             "{original:?} became {rebuilt:?}"
@@ -123,7 +123,7 @@ proptest! {
     #[test]
     fn from_f64_respects_its_decimal_limit(value in -100_000.0f64..100_000.0, decimals in 0u8..=4) {
         let approximated = ScaledNumber::from_f64(value, decimals)
-            .to_f64()
+            .and_then(|number| number.to_f64())
             .expect("in range");
         let tolerance = 0.5 * 10f64.powi(-i32::from(decimals)) + 1e-9;
         prop_assert!(
@@ -438,7 +438,7 @@ fn a_limit_duration_that_is_not_a_relative_time_is_refused() {
             load_control_limit_data: Some(vec![LoadControlLimitData {
                 limit_id: Some(LoadControlLimitId(1)),
                 is_limit_active: Some(true),
-                value: Some(ScaledNumber::from_f64(4_200.0, 0)),
+                value: ScaledNumber::from_f64(4_200.0, 0),
                 time_period: Some(eebus::model::TimePeriod {
                     end_time: Some(end_time.into()),
                     ..Default::default()

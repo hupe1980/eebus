@@ -17,6 +17,47 @@ carried as data and driven; `cargo test` prints 189/203, and the fourteen not co
 exactly the device-level ones, listed with the reason and held to that by a test. See
 [Certification](@/docs/certification.md).
 
+## SHIP, SPINE and the Pairing Service, counted
+
+The three test specifications below the use cases are carried in
+`eebus::conformance::protocol`: every case of SHIP TS 1.0.0, SPINE TS 1.0.0 and the SHIP
+Pairing Service TestSpec 1.0.0, with its heading, the requirements it verifies and the
+conditions under which it applies. A case counts as covered when the doc comment of a
+`#[test]` names it — a module doc or a code comment does not — and `cargo test` prints the
+figure per specification and asserts the uncovered cases by name, in both directions:
+
+| Test specification | Named by a test |
+|---|---|
+| SHIP TS 1.0.0 | 24/33 |
+| SPINE TS 1.0.0 | 19/31 |
+| SHIP Pairing Service TestSpec 1.0.0 | 0/40 |
+
+```sh
+cargo test --test conformance -- --nocapture protocol
+```
+
+prints the table and the uncovered cases. Every case in these three specifications is
+mandatory *where it applies*, and the parameter sheet decides where: a SHIP case that
+needs an announced SHIP server applies only where `PAR_shipSvc` is `"yes"`, a SPINE case
+about the Energy Guard only to a device whose `DUT Actor` includes `EG`.
+
+```rust
+use eebus::conformance::protocol::{ParameterSheet, Specification};
+
+let sheet = ParameterSheet::new()
+    .declare("PAR_dutRole", "devA")
+    .declare("PAR_eccOfDevA - brainpoolP384r1", "no");
+assert!(sheet.unknown(Specification::PairingService).is_empty());
+for case in Specification::PairingService.mandatory(&sheet) {
+    println!("{} {}", case.id, case.title);
+}
+```
+
+`ParameterSheet::unknown` reports a parameter the specification's sheet does not define,
+because a misspelt one would quietly select fewer cases than the laboratory will run. The
+one case no library can answer — the Pairing Service's ring buffer surviving a power cycle
+— is in `protocol::DEVICE_LEVEL` with the reason and a procedure for the device's harness.
+
 ## The fourteen the library cannot answer
 
 A factory reset, a power cut, a start-up duration, what the appliance actually draws: no
@@ -50,8 +91,8 @@ wrote back the value the device already held. `Skipped` is allowed only where th
 not mandatory for this device — the two black starts are `r`, mandatory only for a device
 that declares itself black-start capable.
 
-`report().coverage()` gives the fourteen as a `Coverage`, to add to the protocol-level 189 of
-203.
+`report().coverage()` gives the fourteen as a `Coverage`, to add to the 189 of 203 this
+crate's own suite covers.
 
 ## Every claim points at a sentence
 

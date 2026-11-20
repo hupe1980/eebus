@@ -909,30 +909,37 @@ impl Node {
     ) -> Result<ShipConnection, ConnectionError> {
         let connector = TlsConnector::from(self.tls.client_config()?);
 
-        // SHIP §9.5 requires SNI to be sent; a SHIP server is required to ignore it, so
-        // any syntactically valid name serves.
-        let server_name =
-            rustls::pki_types::ServerName::try_from("ship.local").expect("a valid DNS name");
-        let stream = connector.connect(server_name, stream).await?;
-        // The certificate `rustls` kept is the peer's identity: SHIP trusts a Subject Key
-        // Identifier, not a name.
-        let peer = PeerIdentity::of(stream.get_ref().1)?;
+        // TLS and the upgrade have no timer of their own, and SHIP's start only once they
+        // are done: a peer that accepts the socket and then says nothing would hold this
+        // dial for ever.
+        let (socket, peer) = bounded(async {
+            // SHIP §9.5 requires SNI to be sent; a SHIP server is required to ignore it,
+            // so any syntactically valid name serves.
+            let server_name =
+                rustls::pki_types::ServerName::try_from("ship.local").expect("a valid DNS name");
+            let stream = connector.connect(server_name, stream).await?;
+            // The certificate `rustls` kept is the peer's identity: SHIP trusts a Subject
+            // Key Identifier, not a name.
+            let peer = PeerIdentity::of(stream.get_ref().1)?;
 
-        let mut request = alloc::format!("wss://ship.local{DEFAULT_PATH}")
-            .into_client_request()
-            .map_err(ConnectionError::WebSocket)?;
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_static(SUBPROTOCOL),
-        );
+            let mut request = alloc::format!("wss://ship.local{DEFAULT_PATH}")
+                .into_client_request()
+                .map_err(ConnectionError::WebSocket)?;
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
 
-        let (socket, response) = tokio_tungstenite::client_async_with_config(
-            request,
-            tokio_rustls::TlsStream::Client(stream),
-            Some(socket_config()),
-        )
+            let (socket, response) = tokio_tungstenite::client_async_with_config(
+                request,
+                tokio_rustls::TlsStream::Client(stream),
+                Some(socket_config()),
+            )
+            .await?;
+            check_subprotocol(response.headers().get("Sec-WebSocket-Protocol"))?;
+            Ok((socket, peer))
+        })
         .await?;
-        check_subprotocol(response.headers().get("Sec-WebSocket-Protocol"))?;
 
         run_handshake(
             socket,
@@ -992,14 +999,20 @@ impl Node {
     ) -> Result<ShipConnection, ConnectionError> {
         stream.set_nodelay(true)?;
         let acceptor = TlsAcceptor::from(self.tls.server_config()?);
-        let stream = acceptor.accept(stream).await?;
-        let peer = PeerIdentity::of(stream.get_ref().1)?;
-
-        let socket = tokio_tungstenite::accept_hdr_async_with_config(
-            tokio_rustls::TlsStream::Server(stream),
-            offer_ship,
-            Some(socket_config()),
-        )
+        // Bounded for the same reason as a dial, and it matters more here: the device that
+        // opens a socket and sends nothing needs no key, no pairing and no SKI, and every
+        // socket it holds is a slot of the hub's connection cap.
+        let (socket, peer) = bounded(async {
+            let stream = acceptor.accept(stream).await?;
+            let peer = PeerIdentity::of(stream.get_ref().1)?;
+            let socket = tokio_tungstenite::accept_hdr_async_with_config(
+                tokio_rustls::TlsStream::Server(stream),
+                offer_ship,
+                Some(socket_config()),
+            )
+            .await?;
+            Ok((socket, peer))
+        })
         .await?;
 
         run_handshake(
@@ -1111,4 +1124,14 @@ fn offer_ship(
         HeaderValue::from_static(SUBPROTOCOL),
     );
     Ok(response)
+}
+
+/// TLS and the WebSocket upgrade, given [`CONNECT_TIMEOUT`](super::CONNECT_TIMEOUT) to
+/// finish before SHIP's own timers take over.
+async fn bounded<T>(
+    transport: impl core::future::Future<Output = Result<T, ConnectionError>>,
+) -> Result<T, ConnectionError> {
+    tokio::time::timeout(super::CONNECT_TIMEOUT, transport)
+        .await
+        .map_err(|_| ConnectionError::Timeout)?
 }

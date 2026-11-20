@@ -507,6 +507,7 @@ pub enum BlackStartActor {
 
 /// What a run concluded about one procedure.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Verdict {
     /// The device did what the specification asks.
     Passed,

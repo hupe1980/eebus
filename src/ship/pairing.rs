@@ -176,6 +176,7 @@ impl fmt::Debug for Nonce {
 
 /// Why a pairing announcement could not be built, read or verified.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PairingError {
     /// A hex-encoded value was malformed.
     #[error("invalid hexadecimal value")]

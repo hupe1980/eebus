@@ -172,10 +172,7 @@ pub fn limit_data(system: &ControllableSystem) -> CmdData {
             limit_id: Some(LIMIT_ID),
             is_limit_changeable: Some(true),
             is_limit_active: Some(system.is_limit_active()),
-            value: Some(ScaledNumber::from_f64(
-                system.effective_limit().watts().unwrap_or(0.0),
-                0,
-            )),
+            value: ScaledNumber::from_f64(system.effective_limit().watts().unwrap_or(0.0), 0),
             ..Default::default()
         }]),
     })
@@ -243,7 +240,7 @@ pub fn constraints(system: &ControllableSystem, direction: Direction) -> CmdData
                 characteristic_id: Some(CHARACTERISTIC_ID),
                 characteristic_context: Some(ElectricalConnectionCharacteristicContext::Entity),
                 characteristic_type: Some(max.characteristic(direction)),
-                value: Some(ScaledNumber::from_f64(max.watts(), 0)),
+                value: ScaledNumber::from_f64(max.watts(), 0),
                 unit: Some(UnitOfMeasurement::W),
             }]
         })
@@ -311,7 +308,7 @@ pub fn failsafe_values(system: &ControllableSystem) -> CmdData {
             DeviceConfigurationKeyValueData {
                 key_id: Some(FAILSAFE_LIMIT_KEY),
                 value: Some(DeviceConfigurationKeyValueValue {
-                    scaled_number: Some(ScaledNumber::from_f64(system.config().failsafe_watts, 0)),
+                    scaled_number: ScaledNumber::from_f64(system.config().failsafe_watts, 0),
                     ..Default::default()
                 }),
                 is_value_changeable: Some(true),
@@ -917,11 +914,90 @@ impl ControllableSystemActor {
     }
 
     /// Handles one engine event, and resolves any write it carries.
+    ///
+    /// Every limit the system can read is answered as one it can follow. An appliance that
+    /// may have to refuse — for self-protection, for safety, or by a policy of its own —
+    /// calls [`handle_event_with`](Self::handle_event_with) instead.
     pub fn handle_event(
         &mut self,
         engine: &mut Engine,
         event: &SpineEvent,
         now: Duration,
+    ) -> Option<CsEvent> {
+        self.handle_event_with(engine, event, now, |_| LocalDecision::Apply)
+    }
+
+    /// Handles one engine event, and asks `decide` whether the appliance follows a limit.
+    ///
+    /// This is where the application decides. `decide` sees each limit write on the
+    /// merged state, before it is answered, and is called at most once per event: only
+    /// for a write on the limit that can be read as one. Its answer goes to
+    /// [`ControllableSystem::on_limit_write`], so the heartbeat-then-limit gate
+    /// (implementation guide §2.11) and the value checks run first and win. A
+    /// [`LocalDecision::Reject`] is answered with `errorNumber` 7, moves the state machine
+    /// as any refusal does, and is filed in [`audit`](Self::audit) as
+    /// [`NackReason::CannotApply`](super::state::NackReason::CannotApply) with the sender's
+    /// device address. The reason stays local; the Energy Guard sees a refusal and nothing
+    /// more ([LPC/LPP-003]).
+    ///
+    /// EEBUS authorises a limit by the binding and nothing finer, so this is the only place
+    /// the *value* a bound control box sends can be questioned — and only narrowly. LPC/LPP
+    /// UC TS §2.2: the system "SHALL apply the limit unless the rejection of the limit is
+    /// required by" self-protection, safety, or a legal or regulatory specification
+    /// ([`RejectReason`](super::state::RejectReason) is that list). Under §14a EnWG every
+    /// limit at or above the minimum the regulation leaves the appliance has to be followed.
+    /// A refusal applies no safer value ([LPC/LPP-902], [LPC/LPP-907], [LPC/LPP-918]).
+    ///
+    /// A plausibility floor refuses what the grid operator may not impose:
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use eebus::spine::{Engine, SpineEvent};
+    /// use eebus::usecases::limitation::{
+    ///     ControllableSystemActor, CsEvent, LimitWrite, LocalDecision, RejectReason,
+    /// };
+    ///
+    /// /// The least power §14a EnWG lets a grid operator leave this heat pump.
+    /// const FLOOR_WATTS: f64 = 4_200.0;
+    ///
+    /// /// Refuses an active limit below the floor. Everything else is followed: a
+    /// /// deactivation, a limit at the floor, a limit above what the pump can draw.
+    /// fn policy(write: &LimitWrite) -> LocalDecision {
+    ///     if write.is_active && write.watts < FLOOR_WATTS {
+    ///         LocalDecision::Reject(RejectReason::Regulatory)
+    ///     } else {
+    ///         LocalDecision::Apply
+    ///     }
+    /// }
+    ///
+    /// fn on_event(
+    ///     pump: &mut ControllableSystemActor,
+    ///     engine: &mut Engine,
+    ///     event: &SpineEvent,
+    ///     now: Duration,
+    /// ) {
+    ///     if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
+    ///         pump.handle_event_with(engine, event, now, policy)
+    ///     {
+    ///         // Already answered and already in `pump.audit()`; this is for the display.
+    ///         println!("{:.0} W: {:?}", write.watts, outcome);
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(policy(&LimitWrite::active(3_000.0)), LocalDecision::Reject(RejectReason::Regulatory));
+    /// assert_eq!(policy(&LimitWrite::active(4_200.0)), LocalDecision::Apply);
+    /// assert_eq!(policy(&LimitWrite::deactivated()), LocalDecision::Apply);
+    /// # let _ = on_event;
+    /// ```
+    ///
+    /// The floor, the cases it does not fit (an appliance behind an energy manager) and what
+    /// it leaves open are on the site, under *Refusing a limit by policy* in the LPC guide.
+    pub fn handle_event_with(
+        &mut self,
+        engine: &mut Engine,
+        event: &SpineEvent,
+        now: Duration,
+        decide: impl FnOnce(&LimitWrite) -> LocalDecision,
     ) -> Option<CsEvent> {
         match event {
             SpineEvent::DataNotified {
@@ -987,6 +1063,7 @@ impl ControllableSystemActor {
                     &write.data,
                     &write.resolved,
                     now,
+                    decide,
                 ))
             }
             SpineEvent::WriteRequested(write) if write.feature == self.device_configuration => {
@@ -1087,6 +1164,7 @@ impl ControllableSystemActor {
         data: &CmdData,
         resolved: &CmdData,
         now: Duration,
+        decide: impl FnOnce(&LimitWrite) -> LocalDecision,
     ) -> CsEvent {
         let peer = from.device.clone();
         // `data` says whether this write addresses the active power limit at all;
@@ -1118,12 +1196,11 @@ impl ControllableSystemActor {
             return CsEvent::LimitUnreadable { request, outcome };
         };
 
-        // A real device asks its controller here whether it can follow the limit; the
-        // state machine handles everything else — the ordering gate, the value range and
-        // the transition.
-        let mut outcome = self
-            .system
-            .on_limit_write(&write, LocalDecision::Apply, now);
+        // The application says whether the appliance follows the limit; the state machine
+        // handles everything else — the ordering gate, the value range and the transition
+        // — and its gate is checked before the decision is.
+        let decision = decide(&write);
+        let mut outcome = self.system.on_limit_write(&write, decision, now);
 
         if outcome.is_accepted() {
             if engine.accept_write(token, now).is_err() {

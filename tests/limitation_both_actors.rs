@@ -15,7 +15,8 @@ use core::time::Duration;
 use common::*;
 use eebus::usecases::limitation::{
     self, ControllableSystem, CsConfig, CsEvent, EffectiveLimit, GuardEvent, LimitWrite,
-    LimitationState, MIN_WRITE_INTERVAL, NominalMax, RETRY_BACKOFF_STEP,
+    LimitationState, LocalDecision, MIN_WRITE_INTERVAL, NackReason, NominalMax, RETRY_BACKOFF_STEP,
+    RejectReason, WriteOutcome,
 };
 use eebus::usecases::lpc;
 
@@ -51,7 +52,8 @@ fn the_two_actors_run_the_use_case_between_them() {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     assert_eq!(pair.accepted().len(), 1);
@@ -79,7 +81,8 @@ fn the_guard_sends_a_heartbeat_before_its_first_limit() {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     assert!(
@@ -98,7 +101,8 @@ fn an_unchanged_limit_is_not_rewritten() {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
     assert_eq!(pair.accepted().len(), 1);
 
@@ -124,15 +128,17 @@ fn a_refused_limit_is_retried_and_the_peer_is_kept() {
     let device = pair.device();
 
     // A limit below zero is one the Controllable System must refuse ([LPC-001]).
-    pair.guard.require(
-        &device,
-        Some(LimitWrite {
-            is_active: true,
-            watts: 1_000.0,
-            duration: None,
-        }),
-        pair.now,
-    );
+    pair.guard
+        .require(
+            &device,
+            Some(LimitWrite {
+                is_active: true,
+                watts: 1_000.0,
+                duration: None,
+            }),
+            pair.now,
+        )
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
     assert_eq!(pair.accepted().len(), 1);
 
@@ -157,15 +163,17 @@ fn an_activated_limit_never_carries_a_zero_duration() {
     pair.forget_history();
 
     let device = pair.device();
-    pair.guard.require(
-        &device,
-        Some(LimitWrite {
-            is_active: true,
-            watts: 3_000.0,
-            duration: Some(Duration::ZERO),
-        }),
-        pair.now,
-    );
+    pair.guard
+        .require(
+            &device,
+            Some(LimitWrite {
+                is_active: true,
+                watts: 3_000.0,
+                duration: Some(Duration::ZERO),
+            }),
+            pair.now,
+        )
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     let accepted = pair.accepted();
@@ -191,7 +199,8 @@ fn the_guard_can_change_the_failsafe_values() {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     // The sequence of §2.11 is complete, so other data points may now be written.
@@ -264,7 +273,8 @@ fn a_new_requirement_is_due_at_once() {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     assert_eq!(
         pair.guard.poll_timeout(),
         pair.now,
@@ -288,14 +298,16 @@ fn a_write_held_back_by_the_five_minute_ceiling_goes_out_when_it_lifts() {
     let device = pair.device();
 
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
     assert_eq!(pair.accepted().len(), 1);
 
     // A minute later the grid wants something else. Five minutes have not passed.
     pair.advance(Duration::from_secs(60));
     pair.guard
-        .require(&device, Some(LimitWrite::active(2_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(2_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::ZERO);
     assert_eq!(pair.accepted().len(), 1, "still just the one write");
 
@@ -323,18 +335,21 @@ fn a_limit_the_system_dropped_is_written_again() {
 
     // A limit with a duration: the Controllable System will deactivate it when it runs
     // out ([LPC-908]).
-    pair.guard.require(
-        &device,
-        Some(LimitWrite::active_for(3_000.0, Duration::from_secs(120))),
-        pair.now,
-    );
+    pair.guard
+        .require(
+            &device,
+            Some(LimitWrite::active_for(3_000.0, Duration::from_secs(120))),
+            pair.now,
+        )
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
     assert_eq!(pair.accepted().len(), 1);
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
 
     // The grid still needs the limit, so the guard should notice and say so again.
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
 
     // Five minutes on: the duration expired long ago and the write ceiling has lifted.
     pair.advance(MIN_WRITE_INTERVAL);
@@ -363,7 +378,8 @@ fn both_sides_keep_the_record_section_14a_asks_for() {
     let device = pair.device();
 
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     let written = pair.guard.audit().last().expect("the guard kept a record");
@@ -395,7 +411,8 @@ fn a_refusal_is_recorded_without_inventing_a_reason() {
     // Drive the system into the failsafe state, where §2.14 refuses a limit that arrives
     // without a fresh heartbeat — and make the guard write one there.
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
     let accepted = pair.guard.audit().len();
 
@@ -414,7 +431,7 @@ fn a_refusal_is_recorded_without_inventing_a_reason() {
             load_control_limit_data: Some(vec![eebus::model::LoadControlLimitData {
                 limit_id: Some(limitation::LIMIT_ID),
                 is_limit_active: Some(true),
-                value: Some(eebus::model::ScaledNumber::from_f64(2_000.0, 0)),
+                value: eebus::model::ScaledNumber::from_f64(2_000.0, 0),
                 ..Default::default()
             }]),
         }),
@@ -592,8 +609,12 @@ fn the_guards_deadline_always_advances() {
         match step {
             5 => pair
                 .guard
-                .require(&device, Some(LimitWrite::active(3_000.0)), pair.now),
-            20 => pair.guard.require(&device, None, pair.now),
+                .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+                .expect("a valid limit"),
+            20 => pair
+                .guard
+                .require(&device, None, pair.now)
+                .expect("a valid limit"),
             _ => {}
         }
     }
@@ -614,7 +635,8 @@ fn ig_2_11_the_heartbeat_that_counts_is_one_the_peer_could_receive() {
 
     let device = pair.device();
     pair.guard
-        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(1));
 
     assert!(
@@ -624,4 +646,149 @@ fn ig_2_11_the_heartbeat_that_counts_is_one_the_peer_could_receive() {
     );
     assert_eq!(pair.accepted().len(), 1);
     assert_eq!(pair.pump.system().state(), LimitationState::Limited);
+}
+
+/// The plausibility floor the limitation docs recommend for an appliance the control box
+/// addresses itself: an active limit below the §14a minimum is refused on a regulatory
+/// ground, and everything else is followed.
+fn below_the_floor_is_refused(write: &LimitWrite) -> LocalDecision {
+    const FLOOR_WATTS: f64 = 4_200.0;
+    if write.is_active && write.watts < FLOOR_WATTS {
+        LocalDecision::Reject(RejectReason::Regulatory)
+    } else {
+        LocalDecision::Apply
+    }
+}
+
+/// The application refuses a limit by policy: the Energy Guard is told no, the pump keeps
+/// what it had, and the refusal is on the record with the peer that asked.
+///
+/// The binding is what authorises the guard to write; whether to follow the value is the
+/// application's, through `handle_event_with`.
+#[test]
+fn a_limit_below_the_floor_is_refused_by_policy_and_recorded() {
+    let mut pair = Pair::new();
+    pair.pump_policy = below_the_floor_is_refused;
+    pair.commission();
+    pair.forget_history();
+    let device = pair.device();
+    let guard_device = pair.guard_engine.device().address().clone();
+    let state = pair.pump.system().state();
+    let limit = pair.pump.system().effective_limit();
+
+    pair.guard
+        .require(&device, Some(LimitWrite::active(3_000.0)), pair.now)
+        .expect("a valid limit");
+    pair.advance(Duration::from_secs(1));
+
+    assert_eq!(pair.refused().len(), 1, "the guard was told no");
+    assert!(pair.accepted().is_empty());
+    assert_eq!(
+        pair.pump.system().state(),
+        state,
+        "[LPC-907]: a refusal keeps the state"
+    );
+    assert_eq!(pair.pump.system().effective_limit(), limit);
+    assert!(pair.decisions.iter().any(|d| matches!(
+        d,
+        CsEvent::LimitDecided {
+            outcome: WriteOutcome::Rejected(NackReason::CannotApply(RejectReason::Regulatory)),
+            ..
+        }
+    )));
+
+    let record = pair
+        .pump
+        .audit()
+        .last()
+        .expect("the refusal is on the record");
+    assert_eq!(
+        record.outcome,
+        WriteOutcome::Rejected(NackReason::CannotApply(RejectReason::Regulatory))
+    );
+    assert_eq!(record.write.expect("a readable limit").watts, 3_000.0);
+    assert_eq!(
+        record.peer.as_ref(),
+        Some(&guard_device),
+        "with the peer that asked"
+    );
+
+    let seen = pair.guard.audit().last().expect("the guard kept a record");
+    assert_eq!(seen.outcome, WriteOutcome::Rejected(NackReason::Unstated));
+    assert_eq!(seen.request, record.request, "of the same message");
+}
+
+/// The same policy follows every limit §14a obliges the appliance to follow: the opening
+/// deactivation, and a limit at the floor itself.
+#[test]
+fn the_floor_policy_accepts_a_deactivation_and_a_limit_at_the_floor() {
+    let mut pair = Pair::new();
+    pair.pump_policy = below_the_floor_is_refused;
+    pair.commission();
+
+    assert_eq!(pair.accepted().len(), 1, "the opening deactivation");
+    assert!(!pair.accepted()[0].is_active);
+    assert!(pair.refused().is_empty());
+    pair.forget_history();
+
+    let device = pair.device();
+    pair.guard
+        .require(&device, Some(LimitWrite::active(4_200.0)), pair.now)
+        .expect("a valid limit");
+    pair.advance(Duration::from_secs(1));
+
+    assert_eq!(pair.accepted().len(), 1);
+    assert!(pair.refused().is_empty());
+    assert_eq!(pair.pump.system().state(), LimitationState::Limited);
+    assert_eq!(
+        pair.pump.system().effective_limit(),
+        EffectiveLimit::Active(4_200.0)
+    );
+}
+
+/// A limit that is not a quantity never reaches the wire ([LPC/LPP-001]).
+///
+/// NaN used to become `0 × 10⁰` — a full curtailment — and a negative limit went out
+/// as asked, for the device to refuse. The guard refuses both itself, tells the
+/// application, and leaves the limit it was already holding in force.
+#[test]
+fn a_limit_that_is_not_a_quantity_is_refused_before_it_is_sent() {
+    let mut pair = Pair::new();
+    pair.commission();
+    pair.guard
+        .require(&pair.device(), Some(LimitWrite::active(4_200.0)), pair.now)
+        .expect("a valid limit");
+    pair.advance(Duration::from_secs(1));
+    pair.forget_history();
+
+    let device = pair.device();
+    for watts in [f64::NAN, f64::INFINITY, -1.0] {
+        let refused = pair
+            .guard
+            .require(&device, Some(LimitWrite::active(watts)), pair.now)
+            .expect_err("refused");
+        assert!(refused.watts.is_nan() || refused.watts == watts);
+        assert!(
+            pair.guard
+                .require_all(Some(LimitWrite::active(watts)), pair.now)
+                .is_err()
+        );
+        assert_eq!(
+            pair.guard
+                .write_failsafe_limit(&mut pair.guard_engine, &device, watts, pair.now),
+            None,
+            "nor as a failsafe value"
+        );
+    }
+    pair.advance(Duration::from_secs(1));
+    assert!(pair.accepted().is_empty(), "nothing new was written");
+    assert!(
+        pair.refused().is_empty(),
+        "and nothing was left for the device to refuse"
+    );
+    assert_eq!(
+        pair.pump.system().effective_limit().watts(),
+        Some(4_200.0),
+        "the limit already in force stands"
+    );
 }

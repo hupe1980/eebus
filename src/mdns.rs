@@ -49,6 +49,7 @@ const LOCAL: &str = ".local.";
 
 /// Why announcing or browsing failed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MdnsError {
     /// The mDNS daemon failed.
     #[error("mDNS failed: {0}")]

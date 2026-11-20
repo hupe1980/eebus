@@ -81,9 +81,9 @@ pub fn constraints(id: MeasurementId, min: f64, max: f64, step: Option<f64>) -> 
     CmdData::MeasurementConstraintsListData(MeasurementConstraintsListData {
         measurement_constraints_data: Some(vec![MeasurementConstraintsData {
             measurement_id: Some(id),
-            value_range_min: Some(ScaledNumber::from_f64(min, 1)),
-            value_range_max: Some(ScaledNumber::from_f64(max, 1)),
-            value_step_size: step.map(|step| ScaledNumber::from_f64(step, 1)),
+            value_range_min: ScaledNumber::from_f64(min, 1),
+            value_range_max: ScaledNumber::from_f64(max, 1),
+            value_step_size: step.and_then(|step| ScaledNumber::from_f64(step, 1)),
         }]),
     })
 }
@@ -116,7 +116,7 @@ pub fn reported(
         measurement_data: Some(vec![MeasurementData {
             measurement_id: Some(id),
             value_type: Some(MeasurementValueType::Value),
-            value: Some(ScaledNumber::from_f64(degrees, 1)),
+            value: ScaledNumber::from_f64(degrees, 1),
             value_source: Some(source),
             value_state: state,
             timestamp: taken_at,

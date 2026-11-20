@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ documentation = "https://docs.rs/eebus"
 keywords = ["eebus", "ship", "spine", "energy", "smart-home"]
 categories = ["network-programming", "embedded", "encoding"]
 readme = "README.md"
-exclude = ["concepts/", "specs/", ".specify/", ".claude/", "scripts/", "site/", "xtask/"]
+exclude = ["concepts/", "specs/", ".specify/", ".claude/", ".github/", "scripts/", "site/", "xtask/", "fuzz/", "deny.toml"]
 
 [features]
 default = ["std", "pairing", "conformance"]
@@ -25,8 +25,8 @@ std = ["serde/std", "serde_json/std", "thiserror/std"]
 # The SHIP Pairing Service: automated trust establishment from a QR-code secret, in both
 # roles. With `runtime` and `mdns` it also turns on the hub's end of it.
 pairing = ["dep:hmac", "dep:sha2"]
-# The 203 HLTS abstract test cases as data (tens of KB). Needed by `tests/conformance.rs`;
-# firmware builds omit it.
+# The test specifications as data: the 203 use-case HLTS cases and the 104 SHIP, SPINE and
+# Pairing Service cases (tens of KB). Needed by `tests/conformance.rs`; firmware omits it.
 conformance = []
 # Cross-implementation tests against a containerised `eebus-go` peer. Off by default and
 # behind `required-features` on the test target: an ordinary `cargo test` stays hermetic,
@@ -65,9 +65,9 @@ pem = { version = "4", default-features = false, features = ["std"], optional = 
 x509-parser = { version = "0.18", optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 time = { version = "0.3", default-features = false, optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
-tokio = { version = "1.37", default-features = false, features = ["net", "rt", "time", "macros", "sync", "io-util"], optional = true }
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "logging"], optional = true }
+tokio = { version = "1.53.3", default-features = false, features = ["net", "rt", "time", "macros", "sync", "io-util"], optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"], optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
 mdns-sd = { version = "0.21", default-features = false, optional = true }

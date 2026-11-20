@@ -496,6 +496,7 @@ impl LocalFeature {
 
 /// Why an operation on a feature failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FeatureError {
     /// The write would leave the function holding more entries than [`MAX_LIST_ENTRIES`].
     #[error("the function would hold more than {MAX_LIST_ENTRIES} entries")]
@@ -632,6 +633,7 @@ impl LocalEntity {
 
 /// Why a device could not be built.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeviceError {
     /// The entity already has a feature of that type (SPINE IG §3.4).
     #[error("an entity may have at most one feature of each type")]

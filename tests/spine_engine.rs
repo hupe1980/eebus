@@ -268,7 +268,7 @@ fn a_feature_that_does_not_require_a_binding_takes_the_write() {
         CmdData::SetpointListData(SetpointListData {
             setpoint_data: Some(vec![SetpointData {
                 setpoint_id: Some(SetpointId(1)),
-                value: Some(ScaledNumber::from_f64(60.0, 1)),
+                value: ScaledNumber::from_f64(60.0, 1),
                 ..Default::default()
             }]),
         }),
@@ -982,7 +982,7 @@ fn limit(watts: f64) -> CmdData {
         load_control_limit_data: Some(vec![LoadControlLimitData {
             limit_id: Some(LoadControlLimitId(1)),
             is_limit_active: Some(true),
-            value: Some(ScaledNumber::from_f64(watts, 0)),
+            value: ScaledNumber::from_f64(watts, 0),
             ..Default::default()
         }]),
     })
@@ -1544,7 +1544,7 @@ fn lpc_3_4_1_4_a_delete_of_one_element_and_a_write_in_one_command() {
         load_control_limit_data: Some(vec![LoadControlLimitData {
             limit_id: Some(LoadControlLimitId(1)),
             is_limit_active: Some(true),
-            value: Some(ScaledNumber::from_f64(4_200.0, 0)),
+            value: ScaledNumber::from_f64(4_200.0, 0),
             time_period: Some(TimePeriod {
                 end_time: Some("2026-08-30T11:00:00Z".into()),
                 ..Default::default()
@@ -1953,7 +1953,7 @@ fn a_notified_delete_narrows_the_merged_state() {
         load_control_limit_data: Some(vec![LoadControlLimitData {
             limit_id: Some(LoadControlLimitId(1)),
             is_limit_active: Some(true),
-            value: Some(ScaledNumber::from_f64(4_200.0, 0)),
+            value: ScaledNumber::from_f64(4_200.0, 0),
             time_period: Some(TimePeriod {
                 end_time: Some("PT2H".into()),
                 ..Default::default()
@@ -2452,7 +2452,7 @@ fn a_payload_with_two_commands_is_refused_rather_than_half_applied() {
                 load_control_limit_data: Some(vec![LoadControlLimitData {
                     limit_id: Some(LoadControlLimitId(1)),
                     is_limit_active: Some(true),
-                    value: Some(ScaledNumber::from_f64(watts, 0)),
+                    value: ScaledNumber::from_f64(watts, 0),
                     ..Default::default()
                 }]),
             },
@@ -2502,7 +2502,7 @@ fn accepting_a_write_the_engine_cannot_store_is_reported() {
         .map(|id| LoadControlLimitData {
             limit_id: Some(LoadControlLimitId(id)),
             is_limit_active: Some(true),
-            value: Some(ScaledNumber::from_f64(1.0, 0)),
+            value: ScaledNumber::from_f64(1.0, 0),
             ..Default::default()
         })
         .collect();

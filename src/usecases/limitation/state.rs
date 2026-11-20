@@ -163,7 +163,37 @@ pub struct LimitWrite {
     pub duration: Option<Duration>,
 }
 
+/// A limit the Energy Guard will not write: its watts are not a finite number at or above
+/// zero ([LPC/LPP-001]).
+///
+/// Refused before anything is sent. NaN or infinity on the wire would be no quantity at
+/// all, and a negative limit is one the Controllable System must refuse — so the guard
+/// says so to the application, which owes the grid operator an answer, instead of to the
+/// peer.
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error("a limit is a finite number of watts at or above zero, not {watts}")]
+#[non_exhaustive]
+pub struct InvalidLimit {
+    /// What was asked for.
+    pub watts: f64,
+}
+
+/// Whether `watts` is something a limit can be ([LPC/LPP-001]).
+pub(crate) fn check_watts(watts: f64) -> Result<(), InvalidLimit> {
+    if watts.is_finite() && watts >= 0.0 {
+        Ok(())
+    } else {
+        Err(InvalidLimit { watts })
+    }
+}
+
 impl LimitWrite {
+    /// Whether this limit can be written: [`InvalidLimit`] unless its watts are a finite
+    /// number at or above zero ([LPC/LPP-001]).
+    pub fn check(&self) -> Result<(), InvalidLimit> {
+        check_watts(self.watts)
+    }
+
     /// An activated limit without a duration.
     pub fn active(watts: f64) -> Self {
         Self {
@@ -198,6 +228,11 @@ impl LimitWrite {
 /// regulatory requirement, or — on an energy manager — uncontrolled loads that make the
 /// limit unreachable. The implementation guide §2.16 is blunt about the rest: a value
 /// that is merely unchanged, or that does not affect the device, is still accepted.
+///
+/// On the wire, the application gives this answer through
+/// [`ControllableSystemActor::handle_event_with`](super::ControllableSystemActor::handle_event_with),
+/// whose documentation also covers refusing a limit by policy and what §14a EnWG leaves no
+/// discretion over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalDecision {
     /// The device will follow the limit.
@@ -210,6 +245,7 @@ pub enum LocalDecision {
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize,
 )]
+#[non_exhaustive]
 pub enum RejectReason {
     /// Following the limit would damage the device.
     #[error("self-protection")]
@@ -231,6 +267,7 @@ pub enum RejectReason {
 /// "command rejected", for a refusal. Under §14a the pair is also the evidence the
 /// operator is required to be able to produce (implementation guide §4.1.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum WriteOutcome {
     /// Accepted: `ACK`, [LPC/LPP-002].
     Accepted,
@@ -261,6 +298,7 @@ impl WriteOutcome {
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize,
 )]
+#[non_exhaustive]
 pub enum NackReason {
     /// The device cannot follow the value.
     #[error("cannot apply the value: {0}")]

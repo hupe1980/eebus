@@ -8,6 +8,10 @@
 //! it is mandatory. This module is that list, [`CATALOGUE`], transcribed from the four
 //! 1.0.2 specifications.
 //!
+//! Below the use cases the laboratory runs three more lists — the SHIP, SPINE and SHIP
+//! Pairing Service test specifications — and [`protocol`] carries those, with the
+//! parameter-sheet conditions that decide which of their cases apply to a device.
+//!
 //! Having it as data buys two things:
 //!
 //! * **A coverage number before the slot is booked.** [`Coverage`] takes the test-case
@@ -46,6 +50,7 @@
 //! ```
 
 pub mod harness;
+pub mod protocol;
 
 use crate::usecases::descriptor::{Support, actors, names};
 
@@ -140,14 +145,20 @@ impl Coverage {
     /// [`unknown`](Self::unknown) rather than silently counted: a typo in a test-case
     /// identifier would otherwise inflate the number it was meant to justify.
     pub fn of<'a>(scope: impl IntoIterator<Item = &'a AbstractTestCase>, claimed: &[&str]) -> Self {
+        Self::of_ids(scope.into_iter().map(|case| case.id), claimed)
+    }
+
+    /// [`of`](Self::of) for a scope given by identifier, which is how the protocol-level
+    /// catalogue in [`protocol`] is measured.
+    pub fn of_ids(scope: impl IntoIterator<Item = &'static str>, claimed: &[&str]) -> Self {
         let mut report = Self::default();
         let mut matched = alloc::vec::Vec::new();
-        for case in scope {
-            if claimed.contains(&case.id) {
-                report.covered.push(case.id);
-                matched.push(case.id);
+        for id in scope {
+            if claimed.contains(&id) {
+                report.covered.push(id);
+                matched.push(id);
             } else {
-                report.missing.push(case.id);
+                report.missing.push(id);
             }
         }
         for claim in claimed {

@@ -14,7 +14,8 @@ alongside the code. [What EEBUS is](https://hupe1980.github.io/eebus/docs/introd
 [LPC and LPP](https://hupe1980.github.io/eebus/docs/limitation/) ·
 [Conformance](https://hupe1980.github.io/eebus/docs/conformance/)
 
-> **Status: pre-1.0; the API is unstable.** The stack is complete from the socket to the
+> **Status: pre-1.0; a minor release may break, and its changelog lists every break.** A
+> SPINE revision will always be a major release. The stack is complete from the socket to the
 > use case. The four certifiable use cases — LPC, LPP, MPC and MGCP — are implemented on
 > **both** sides and measured against all 203 of their published abstract test cases.
 > Twenty-four more are implemented: seven e-mobility, four for inverters, PV strings and
@@ -95,11 +96,16 @@ if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
 }
 ```
 
+`ControllableSystemActor` runs that loop, and asks for the decision through
+`handle_event_with`. The binding decides who may write a limit. Whether the appliance follows
+one is the application's decision, within the narrow room §14a EnWG leaves it; see
+[Refusing a limit by policy](https://hupe1980.github.io/eebus/docs/limitation/#refusing-a-limit-by-policy).
+
 **Both sides of every use case.** A heat pump needs the Controllable System; an energy
 manager needs the Energy Guard, which carries most of the 2026 implementation guides' rules:
 
 ```rust
-guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
+guard.require(&device, Some(LimitWrite::active(4_200.0)), now)?;
 ```
 
 The guard takes up a peer that announces the Controllable System by itself, and holds a
@@ -188,12 +194,29 @@ Specifications as data, the suite **drives every one of them**, and `cargo test`
 power cut, a start-up duration — counted once for LPC and once for LPP, each listed with its
 reason and held to that by a test.
 
-For those, `eebus::conformance::harness` carries the steps and expected results for a
-consumer to drive **against its own running binary**, judged against the device's declared
-parameter sheet: the failsafe defaults a factory reset must restore, the `StartUpDur` a
-black start has to come back inside, the sixty seconds a rebooted Energy Guard has to send a
-heartbeat and a limit in. A persistence test that writes back the value the device already
-held is reported *inconclusive*.
+The three test specifications below the use cases are carried the same way, in
+`eebus::conformance::protocol`: every case of SHIP TS 1.0.0, SPINE TS 1.0.0 and the SHIP
+Pairing Service TestSpec 1.0.0, with the requirements it verifies and the parameter-sheet
+conditions under which it applies, so a device's declaration selects the cases that are
+mandatory for it. A case counts as covered when a test names it in its doc comment, and
+`cargo test` prints the figure and **asserts the uncovered cases by name**:
+
+| Test specification | Named by a test |
+|---|---|
+| SHIP TS 1.0.0 | 24/33 |
+| SPINE TS 1.0.0 | 19/31 |
+| SHIP Pairing Service TestSpec 1.0.0 | 0/40 |
+
+The Pairing Service is implemented and unit-tested, but none of those tests names one of its
+cases, so the figure is zero rather than a guess. One case, a ring buffer that survives a
+power cycle, is the device's to answer.
+
+For the use-case device-level cases, `eebus::conformance::harness` carries the steps and
+expected results for a consumer to drive **against its own running binary**, judged against
+the device's declared parameter sheet: the failsafe defaults a factory reset must restore,
+the `StartUpDur` a black start has to come back inside, the sixty seconds a rebooted Energy
+Guard has to send a heartbeat and a limit in. A persistence test that writes back the value
+the device already held is reported *inconclusive*.
 
 ## The wire format
 
@@ -260,6 +283,7 @@ position is dropped.
 | | where a use case narrows the schema the narrower rule is enforced: a limit duration and a compressor's start time are spans, and one that cannot be read is refused rather than treated as absent | LPC/LPP/COB §3.1.8.2, SEMPS XSD |
 | | heat pump compressor flexibility: the CEM *starts* an optional consumption process, and stops, pauses and resumes it — with the binding scenario 2 needs | OHPCF 1.0.0 §2.5, §3.4.2 |
 | **Certification** | the 203 abstract test cases of the four HLTS as data, all driven: 189/203 | LPC/LPP/MPC/MGCP HLTS 1.0.2 |
+| | every case of the SHIP, SPINE and Pairing Service test specifications as data, with its applicability under the parameter sheet, and the uncovered cases asserted by name | SHIP TS, SPINE TS, SPS TestSpec 1.0.0 |
 | | the other fourteen as a harness a consumer runs against its **own binary**: seven procedures with the specification's steps, judged against its declared parameter sheet | LPC HLTS 1.0.2 tables 15–34, §6.11.8 |
 | | runtime signals for a laboratory's debug interface | the HLTS "e.g. via debug interface" footnote |
 | **Transport** | node certificates, TLS 1.2 with mutual auth | SHIP §9, §12 (`cert`, `tls`) |
@@ -311,8 +335,9 @@ On a network, [`Hub`](https://hupe1980.github.io/eebus/docs/networking/) owns th
 and the clock. It listens, dials and browses **in the background** — a slow or unapproved
 peer holds nothing else up — routes each datagram to the peer it names, keeps idle
 connections alive, resolves double connections, and redials with a backoff spread by the
-peer's SKI. `hub.run(handler)` is the loop: `hub.next()` is not cancel-safe, and a write
-cancelled anyway is closed with `Disconnect::InterruptedWrite`.
+peer's SKI. `hub.run(handler)` is the loop; `hub.next()` is cancel-safe, so it may also
+sit in a `select!` or under a `timeout`. Writes go to every peer at once: one that stops
+reading delays nobody and is dropped as unresponsive.
 
 **Pairing happens while the peer waits.** An unapproved peer completes TLS, is held in the
 SHIP `hello: pending` state and reported as `TrustRequested`; `hub.approve(ski)` completes
@@ -392,7 +417,7 @@ The generator formats its output, so re-running it on unchanged inputs produces 
 |---|---|---|
 | `std` | ✅ | Standard library. Without it the crate builds `no_std + alloc`. |
 | `pairing` | ✅ | SHIP Pairing Service, both roles (`hmac`, `sha2`); with `runtime` and `mdns`, the hub's end of it too. |
-| `conformance` | ✅ | The 203 abstract test cases of the four HLTS as data (tens of kilobytes of static strings); `--no-default-features` leaves it out. |
+| `conformance` | ✅ | The 203 abstract test cases of the four HLTS and the cases of the SHIP, SPINE and Pairing Service test specifications as data (tens of kilobytes of static strings); `--no-default-features` leaves it out. |
 | `cert` | — | Generating, restoring and reading node certificates (`rcgen`, `x509-parser`). |
 | `tls` | — | TLS 1.2 as SHIP §9 requires it (`rustls`). |
 | `runtime` | — | Sockets on Tokio: TCP, TLS, WebSocket, the SHIP handshake, the connection table. |

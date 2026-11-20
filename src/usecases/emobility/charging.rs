@@ -543,7 +543,7 @@ pub fn limit_data(currents: &ChargingCurrents, active: bool, limits: &PhaseLimit
                         limit_id: Some(limits.limit_for(&phase)?),
                         is_limit_changeable: Some(true),
                         is_limit_active: Some(active),
-                        value: Some(ScaledNumber::from_f64(amperes, DECIMALS)),
+                        value: ScaledNumber::from_f64(amperes, DECIMALS),
                         ..Default::default()
                     })
                 })
@@ -696,8 +696,8 @@ pub fn permitted_value_sets(connection: u32, min: f64, max: f64, phases: &[Phase
                             parameter_id: Some(ElectricalConnectionParameterId(id.get())),
                             permitted_value_set: Some(vec![ScaledNumberSet {
                                 range: Some(vec![ScaledNumberRange {
-                                    min: Some(ScaledNumber::from_f64(min, DECIMALS)),
-                                    max: Some(ScaledNumber::from_f64(max, DECIMALS)),
+                                    min: ScaledNumber::from_f64(min, DECIMALS),
+                                    max: ScaledNumber::from_f64(max, DECIMALS),
                                 }]),
                                 ..Default::default()
                             }]),
@@ -1331,8 +1331,8 @@ mod tests {
                         parameter_id: Some(ElectricalConnectionParameterId(1)),
                         permitted_value_set: Some(vec![ScaledNumberSet {
                             range: Some(vec![ScaledNumberRange {
-                                min: Some(ScaledNumber::from_f64(1_400.0, 0)),
-                                max: Some(ScaledNumber::from_f64(11_000.0, 0)),
+                                min: ScaledNumber::from_f64(1_400.0, 0),
+                                max: ScaledNumber::from_f64(11_000.0, 0),
                             }]),
                             ..Default::default()
                         }]),
@@ -1342,8 +1342,8 @@ mod tests {
                         parameter_id: Some(ElectricalConnectionParameterId(2)),
                         permitted_value_set: Some(vec![ScaledNumberSet {
                             range: Some(vec![ScaledNumberRange {
-                                min: Some(ScaledNumber::from_f64(6.0, 0)),
-                                max: Some(ScaledNumber::from_f64(16.0, 0)),
+                                min: ScaledNumber::from_f64(6.0, 0),
+                                max: ScaledNumber::from_f64(16.0, 0),
                             }]),
                             ..Default::default()
                         }]),

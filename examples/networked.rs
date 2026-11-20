@@ -123,10 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..64 {
         let now = hub.now();
-        // Not `tokio::time::timeout(.., hub.next())`: `Hub::next` is not cancel-safe, and
-        // dropping it mid-write leaves half a frame on the wire. A deadline goes to
-        // `wake_at`, which the hub folds into its own and answers with a `Tick` — so the
-        // loop still cannot hang, and the read is never interrupted.
+        // A deadline goes to `wake_at`, which the hub folds into its own and answers with a
+        // `Tick`, so the loop cannot hang. (`timeout(.., hub.next())` would do as well:
+        // `next` is cancel-safe.)
         hub.wake_at(now + Duration::from_secs(5));
         let event = hub.next().await?;
         let mut reports = Vec::new();
@@ -150,7 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // as soon as the bindings settle, and waiting to be told would leave a
                 // conformant appliance in `init`.
                 if let Some(limit) = required.take() {
-                    guard.require(&device, Some(limit), now);
+                    guard
+                        .require(&device, Some(limit), now)
+                        .expect("a valid limit");
                 }
             }
             HubEvent::Spine(event) => {

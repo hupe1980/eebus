@@ -386,6 +386,7 @@ pub enum AbortReason {
 
 /// An error in driving the state machine, as opposed to a protocol-level abort.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HandshakeError {
     /// The handshake has already finished or aborted.
     #[error("the handshake is no longer running (phase {0:?})")]

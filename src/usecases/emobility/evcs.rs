@@ -327,14 +327,14 @@ impl ChargingSummary {
                     value: Some(vec![BillDataTotalValue {
                         value_id: Some(TOTAL_VALUE),
                         unit: Some(UnitOfMeasurement::Wh),
-                        value: Some(ScaledNumber::from_f64(self.energy_wh, 0)),
+                        value: ScaledNumber::from_f64(self.energy_wh, 0),
                     }]),
                     cost: Some(vec![BillDataTotalCost {
                         cost_id: Some(TOTAL_COST),
                         cost_type: Some(BillCostType::AbsolutePrice),
                         value_id: Some(TOTAL_VALUE),
                         currency: Some(self.currency.clone()),
-                        cost: Some(ScaledNumber::from_f64(self.cost, 2)),
+                        cost: ScaledNumber::from_f64(self.cost, 2),
                         ..Default::default()
                     }]),
                     ..Default::default()
@@ -351,12 +351,12 @@ impl ChargingSummary {
             position_type: Some(kind),
             value: Some(vec![BillDataPositionValue {
                 value_id: Some(TOTAL_VALUE),
-                value_percentage: Some(ScaledNumber::from_f64(share.energy_percent, 2)),
+                value_percentage: ScaledNumber::from_f64(share.energy_percent, 2),
                 ..Default::default()
             }]),
             cost: Some(vec![BillDataPositionCost {
                 cost_id: Some(TOTAL_COST),
-                cost_percentage: Some(ScaledNumber::from_f64(share.cost_percent, 2)),
+                cost_percentage: ScaledNumber::from_f64(share.cost_percent, 2),
                 ..Default::default()
             }]),
             ..Default::default()

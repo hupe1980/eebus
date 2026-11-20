@@ -376,10 +376,8 @@ use eebus::ship::ConnectionCloseReason;
 
 /// Drives `hub` until `pick` accepts an event, or `budget` runs out.
 ///
-/// The deadline goes to `wake_at`, not around `hub.next()`: `next` is not cancel-safe, and
-/// a test that models the misuse is a test people copy. A tick that arrives early — the
-/// hub uses `wake_at` for its own arbitration too — is re-armed rather than mistaken for
-/// the deadline.
+/// The deadline goes to `wake_at`. A tick that arrives early — the hub uses `wake_at` for
+/// its own arbitration too — is re-armed rather than mistaken for the deadline.
 async fn wait_for<T>(
     hub: &mut Hub,
     budget: Duration,
@@ -1050,7 +1048,9 @@ async fn a_limit_arrives_over_a_socket_and_is_accepted() {
                     limitation::locate(remote, lpc::DIRECTION).is_some(),
                     "it plays the use case"
                 );
-                guard.require(&device, Some(LimitWrite::active(3_000.0)), now);
+                guard
+                    .require(&device, Some(LimitWrite::active(3_000.0)), now)
+                    .expect("a valid limit");
             }
             HubEvent::Spine(event) => {
                 reports.extend(guard.handle_event(hub.engine_mut(), &event, now))
@@ -1155,87 +1155,243 @@ async fn a_full_hub_refuses_a_connection_rather_than_growing() {
     server.abort();
 }
 
-/// A `next` future cancelled mid-write is noticed, and the connection goes.
+/// Cancelling `Hub::next` under traffic loses nothing, reorders nothing and closes
+/// nothing.
 ///
-/// This is D33's hazard made deterministic. Cancelling `Hub::next` while it is writing
-/// leaves a partial WebSocket frame on the wire; the peer's parser is then out of step
-/// with the stream and every message after it is misread, invisibly from this side. The
-/// hub cannot repair that — but it can *know*, and closing the connection turns a session
-/// that quietly stops working into a reconnection.
-///
-/// The peer here answers discovery and then stops reading, so the socket buffers fill and
-/// the write is genuinely parked at an `await` rather than racing to completion.
+/// Every call here is cut short — most after a single poll — while two hundred reads and
+/// their replies are in flight. A message leaves a connection's queue only in the poll in
+/// which the socket accepted it, and accepted bytes wait in the WebSocket layer's buffer
+/// for the next poll, so however often the future is dropped every read is answered once,
+/// no request is retried, and the connection is never closed.
 #[tokio::test]
-async fn a_write_interrupted_by_a_cancelled_next_closes_the_connection() {
-    let (control_box, heat_pump) = pair();
+async fn cancelling_next_under_traffic_loses_nothing() {
+    use eebus::spine::SpineEvent;
 
-    // A peer that answers discovery and then stops reading entirely. The connection stays
-    // open — it is the *reading* that stops, which is what fills the buffers.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stopped = stop.clone();
+    let (control_box, heat_pump) = pair();
     let mut server = Hub::new(heat_pump, pump_engine());
     let address = server.listen("127.0.0.1:0").await.unwrap();
-    let server = tokio::spawn(async move {
+    let server = serve(server);
+
+    let mut hub = Hub::new(control_box, box_engine());
+    hub.dial(address);
+    let device = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+        HubEvent::PeerDiscovered { device, .. } => Some(device),
+        _ => None,
+    })
+    .await;
+
+    // One in flight at a time. After every read is issued, `next` is polled exactly once
+    // and dropped: that poll hands the new datagram to the socket and, unless something
+    // else is already waiting, has nothing to read yet — so the future is abandoned in the
+    // middle of its work.
+    const READS: usize = 200;
+    const IN_FLIGHT: usize = 1;
+    let target = eebus::spine::feature_address(&device, &[1], 1);
+    let source = hub.engine().device().address_of(&[1], 1);
+    let mut issued = 0;
+    let mut replies = 0;
+    let mut cancelled = 0;
+    let mut events = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while replies < READS {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {replies} of {READS} reads were answered"
+        );
+        while issued < READS && issued - replies < IN_FLIGHT {
+            let now = hub.now();
+            hub.engine_mut().read(
+                &target,
+                &source,
+                eebus::model::Function::LoadControlLimitListData,
+                now,
+            );
+            issued += 1;
+            match futures_util::FutureExt::now_or_never(hub.next()) {
+                Some(event) => events.push(event),
+                None => cancelled += 1,
+            }
+        }
+        let event = match events.pop() {
+            Some(event) => event,
+            None => match tokio::time::timeout(Duration::from_millis(5), hub.next()).await {
+                Ok(event) => event,
+                Err(_) => {
+                    cancelled += 1;
+                    continue;
+                }
+            },
+        };
+        match event.expect("no transport error") {
+            HubEvent::Spine(SpineEvent::ReplyReceived { .. }) => replies += 1,
+            HubEvent::Spine(event @ SpineEvent::RequestRetried { .. })
+            | HubEvent::Spine(event @ SpineEvent::RequestTimedOut { .. }) => {
+                panic!("a request was lost on the way: {event:?}")
+            }
+            HubEvent::Disconnected { reason, .. } => {
+                panic!("cancelling `next` closed the connection: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        cancelled >= READS / 4,
+        "only {cancelled} calls were cut short, so the test proves little"
+    );
+    assert_eq!(hub.peers().count(), 1, "and the connection is still up");
+
+    server.abort();
+}
+
+/// A peer that stops reading is dropped as unresponsive, and costs the others nothing.
+///
+/// The heat pump answers discovery and then never reads again, so the control box's
+/// queue for it fills. Writes progress on every connection at once rather than one
+/// connection at a time, so the second heat pump keeps answering throughout; the stalled
+/// one is dropped the moment its queue reaches `MAX_OUTBOX`, rather than holding the
+/// memory, or the loop, for as long as it likes.
+#[tokio::test]
+async fn a_peer_that_stops_reading_is_dropped_and_delays_nobody() {
+    use eebus::spine::SpineEvent;
+
+    let box_trust = TrustStore::new();
+    let control_box = node("i:46925_u:ControlBox-1", box_trust.clone());
+    let stalled_trust = TrustStore::new();
+    let stalled_pump = node("i:46925_u:HeatPump-1", stalled_trust.clone());
+    let healthy_trust = TrustStore::new();
+    let healthy_pump = node("i:46925_u:HeatPump-2", healthy_trust.clone());
+    box_trust.trust(stalled_pump.ski());
+    box_trust.trust(healthy_pump.ski());
+    stalled_trust.trust(control_box.ski());
+    healthy_trust.trust(control_box.ski());
+    let stalled_ski = stalled_pump.ski();
+    let healthy_ski = healthy_pump.ski();
+
+    // Answers discovery, then never reads again; the socket stays open.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
+    let mut stalled = Hub::new(stalled_pump, pump_engine());
+    let stalled_address = stalled.listen("127.0.0.1:0").await.unwrap();
+    let stalled = tokio::spawn(async move {
         while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            server.wake_at(server.now() + Duration::from_millis(20));
-            if server.next().await.is_err() {
+            stalled.wake_at(stalled.now() + Duration::from_millis(20));
+            if stalled.next().await.is_err() {
                 break;
             }
         }
         core::future::pending::<()>().await;
     });
 
+    let mut healthy_device =
+        LocalDevice::new("i:46925", "HeatPump-2", DeviceType::HeatGenerationSystem).unwrap();
+    healthy_device
+        .add_entity(
+            LocalEntity::new([1], EntityType::HeatPumpAppliance)
+                .with_feature(eebus::usecases::limitation::load_control_feature(1)),
+        )
+        .unwrap();
+    let mut healthy = Hub::new(healthy_pump, Engine::new(healthy_device));
+    let healthy_address = healthy.listen("127.0.0.1:0").await.unwrap();
+    let healthy = serve(healthy);
+
     let mut hub = Hub::new(control_box, box_engine());
-    hub.dial(address);
-    let device = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
-        HubEvent::PeerDiscovered { device, .. } => Some(device),
-        HubEvent::Disconnected { .. } => panic!("the connection ended early"),
-        _ => None,
-    })
-    .await;
+    hub.dial(stalled_address);
+    hub.dial(healthy_address);
+    let mut devices = Vec::new();
+    while devices.len() < 2 {
+        let found = wait_for(&mut hub, Duration::from_secs(5), |_, event| match event {
+            HubEvent::PeerDiscovered { ski, device } => Some((ski, device)),
+            HubEvent::Disconnected { .. } => panic!("a connection ended early"),
+            _ => None,
+        })
+        .await;
+        devices.push(found);
+    }
+    let device_of = |ski| {
+        devices
+            .iter()
+            .find(|(s, _)| *s == ski)
+            .map(|(_, d)| d.clone())
+            .unwrap()
+    };
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Enough traffic that the kernel and TLS buffers cannot swallow it all.
-    let target = eebus::spine::feature_address(&device, &[1], 1);
+    // Far more than one peer's queue may hold, and far more than the kernel and TLS
+    // buffers swallow.
     let source = hub.engine().device().address_of(&[1], 1);
+    let stalled_target = eebus::spine::feature_address(&device_of(stalled_ski), &[1], 1);
     for _ in 0..50_000 {
         let now = hub.now();
         hub.engine_mut().read(
-            &target,
+            &stalled_target,
             &source,
             eebus::model::Function::LoadControlLimitListData,
             now,
         );
     }
-
-    // Cancel `next` while it is parked in that write. The peer is not reading, so this is
-    // not a race: the future cannot make progress and the timeout must win.
-    let cancelled = tokio::time::timeout(Duration::from_millis(500), hub.next()).await;
-    assert!(
-        cancelled.is_err(),
-        "the write completed, so nothing was cancelled and the test proves nothing"
+    let healthy_target = eebus::spine::feature_address(&device_of(healthy_ski), &[1], 1);
+    let now = hub.now();
+    hub.engine_mut().read(
+        &healthy_target,
+        &source,
+        eebus::model::Function::LoadControlLimitListData,
+        now,
     );
 
-    // The very next call has to report it rather than carry on over a stream the peer can
-    // no longer parse.
-    let event = tokio::time::timeout(Duration::from_secs(5), hub.next())
-        .await
-        .expect("the hub answered")
-        .expect("no transport error");
-    assert!(
-        matches!(
-            event,
-            HubEvent::Disconnected {
-                reason: Disconnect::InterruptedWrite,
-                ..
+    let mut dropped = false;
+    let mut answered = false;
+    while !(dropped && answered) {
+        let event = tokio::time::timeout(Duration::from_secs(5), hub.next())
+            .await
+            .expect("the loop never waits on the stalled peer")
+            .expect("no transport error");
+        match event {
+            HubEvent::Disconnected { ski, reason } => {
+                assert_eq!(ski, stalled_ski, "only the stalled peer goes");
+                assert_eq!(reason, Disconnect::Unresponsive);
+                dropped = true;
             }
-        ),
-        "expected the interrupted write to be reported, saw {event:?}"
-    );
-    assert_eq!(hub.peers().count(), 0, "and the connection is gone");
+            HubEvent::Spine(SpineEvent::ReplyReceived { feature, .. })
+                if feature.device.as_ref() == Some(&device_of(healthy_ski)) =>
+            {
+                answered = true;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(hub.peers().collect::<Vec<_>>(), vec![healthy_ski]);
 
-    server.abort();
+    stalled.abort();
+    healthy.abort();
+}
+
+/// A socket that never says anything gives its accept slot back.
+///
+/// TLS and the WebSocket upgrade have no timers of their own, and SHIP's start only after
+/// them, so a device that opens a connection and stays silent — no key, no pairing, no
+/// SKI — used to hold a slot of the connection cap for as long as it liked. Sixteen of
+/// them closed the node to everybody.
+#[tokio::test]
+async fn a_silent_socket_gives_its_slot_back() {
+    let (_, heat_pump) = pair();
+    let mut hub = Hub::new(heat_pump, pump_engine());
+    let address = hub.listen("127.0.0.1:0").await.unwrap();
+
+    let silent = tokio::net::TcpStream::connect(address).await.unwrap();
+    let started = std::time::Instant::now();
+    let error = wait_for(
+        &mut hub,
+        eebus::runtime::CONNECT_TIMEOUT + Duration::from_secs(5),
+        |_, event| match event {
+            HubEvent::HandshakeFailed { error, .. } => Some(error),
+            _ => None,
+        },
+    )
+    .await;
+    assert!(matches!(*error, ConnectionError::Timeout), "{error:?}");
+    assert!(started.elapsed() >= eebus::runtime::CONNECT_TIMEOUT - Duration::from_millis(100));
+    drop(silent);
 }
 
 // ---- the SHIP Pairing Service ------------------------------------------------------

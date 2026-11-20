@@ -291,7 +291,8 @@ fn a_limit_is_written_to_the_identifier_the_peer_published() {
     );
 
     pair.guard
-        .require(&device, Some(LimitWrite::active(4_200.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(4_200.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(20));
 
     let written = pair
@@ -370,7 +371,8 @@ fn a_peer_that_publishes_no_matching_limit_is_reported_and_left_alone() {
     );
 
     pair.guard
-        .require(&device, Some(LimitWrite::active(4_200.0)), pair.now);
+        .require(&device, Some(LimitWrite::active(4_200.0)), pair.now)
+        .expect("a valid limit");
     pair.advance(Duration::from_secs(60));
 
     assert!(

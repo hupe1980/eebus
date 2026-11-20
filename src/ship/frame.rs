@@ -60,6 +60,7 @@ pub enum ShipMessage {
 
 /// Why a received frame could not be read.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FrameError {
     /// The frame carried no bytes at all.
     #[error("empty SHIP frame")]

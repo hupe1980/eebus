@@ -1,6 +1,9 @@
 //! One SHIP connection: a socket, and the handshake that makes it usable.
 
+use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use core::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -78,6 +81,13 @@ pub enum ConnectionError {
     /// meets its own announcement, which is the ordinary way to arrive here.
     #[error("the peer is this node itself")]
     SelfConnection,
+    /// The peer has stopped taking what this node sends.
+    ///
+    /// [`MAX_OUTBOX`] messages are waiting for it, which is a table a peer grows by not
+    /// reading — so it is capped like every other one, and the connection goes rather than
+    /// the memory.
+    #[error("the peer has stopped reading: {MAX_OUTBOX} messages are waiting for it")]
+    Backlogged,
     /// The TLS configuration was refused.
     #[error("{0}")]
     Tls(#[from] crate::tls::TlsError),
@@ -110,7 +120,24 @@ pub struct ShipConnection {
     peer_key_material: Vec<crate::ship::KeyMaterialState>,
     /// The `updateCounter` the peer's `hello` carried (§12.1.3.4).
     peer_key_counter: Option<u16>,
+    /// What is waiting to be handed to the socket, oldest first.
+    ///
+    /// A message leaves it only in the poll in which the socket accepted it, so a write
+    /// future dropped at any point loses nothing: what was not accepted is still here, and
+    /// what was accepted is in the WebSocket layer's own buffer, which the next poll
+    /// carries on flushing.
+    outbox: VecDeque<Message>,
+    /// Whether the socket holds accepted bytes that have not been flushed.
+    unflushed: bool,
+    /// Since when, on [`age`](Self::age)'s clock, output has waited without progress.
+    stalled_since: Option<Duration>,
 }
+
+/// How many messages may wait for one peer before it is judged to have stopped reading.
+///
+/// The burst a connection opens with is a few dozen datagrams; a healthy peer never comes
+/// near this, and a stalled one costs at most this many encoded messages.
+pub const MAX_OUTBOX: usize = 256;
 
 impl ShipConnection {
     /// The SKI of the peer on the other end.
@@ -175,16 +202,120 @@ impl ShipConnection {
     }
 
     /// Sends a SPINE datagram.
+    ///
+    /// Cancel-safe: [`queue`](Self::queue) followed by [`drain`](Self::drain).
     pub async fn send(&mut self, datagram: &Datagram) -> Result<(), ConnectionError> {
-        let message = crate::ship::spine_message(datagram)?;
-        self.send_ship(&message).await
+        self.queue(datagram)?;
+        self.drain().await
     }
 
-    /// Sends a SHIP message as it stands.
+    /// Sends a SHIP message as it stands. Cancel-safe, like [`send`](Self::send).
     pub async fn send_ship(&mut self, message: &ShipMessage) -> Result<(), ConnectionError> {
+        self.queue_ship(message)?;
+        self.drain().await
+    }
+
+    /// Queues a SPINE datagram for the peer without waiting for the socket.
+    ///
+    /// It goes out on the next [`drain`](Self::drain) or [`poll_drain`](Self::poll_drain).
+    /// Fails with [`ConnectionError::Backlogged`] when [`MAX_OUTBOX`] messages are already
+    /// waiting.
+    pub fn queue(&mut self, datagram: &Datagram) -> Result<(), ConnectionError> {
+        let message = crate::ship::spine_message(datagram)?;
+        self.queue_ship(&message)
+    }
+
+    /// Queues a SHIP message as it stands. See [`queue`](Self::queue).
+    pub fn queue_ship(&mut self, message: &ShipMessage) -> Result<(), ConnectionError> {
         let bytes = message.encode()?;
-        self.socket.send(Message::Binary(bytes.into())).await?;
+        self.enqueue(Message::Binary(bytes.into()))
+    }
+
+    /// Queues what the SHIP state machine wants to send — control answers, the close
+    /// announcement, key material. See [`queue`](Self::queue).
+    pub fn queue_control(&mut self) -> Result<(), ConnectionError> {
+        while let Some(message) = self.handshake.poll_transmit() {
+            let bytes = message.encode()?;
+            self.enqueue(Message::Binary(bytes.into()))?;
+        }
         Ok(())
+    }
+
+    /// Queues a WebSocket ping, the SHIP §10.4 keep-alive. See [`queue`](Self::queue).
+    pub fn queue_ping(&mut self) -> Result<(), ConnectionError> {
+        self.enqueue(Message::Ping(Vec::new().into()))?;
+        self.awaiting_pong = true;
+        Ok(())
+    }
+
+    fn enqueue(&mut self, message: Message) -> Result<(), ConnectionError> {
+        if self.outbox.len() >= MAX_OUTBOX {
+            return Err(ConnectionError::Backlogged);
+        }
+        self.outbox.push_back(message);
+        Ok(())
+    }
+
+    /// Whether anything is queued or accepted-but-unflushed.
+    pub fn has_output(&self) -> bool {
+        !self.outbox.is_empty() || self.unflushed
+    }
+
+    /// How long queued output has waited without the socket taking any of it.
+    ///
+    /// [`None`] while output moves, or when there is none. A peer that stops reading shows
+    /// up here first: its socket buffers fill, and then nothing moves.
+    pub fn stalled_for(&self) -> Option<Duration> {
+        self.stalled_since
+            .map(|since| self.clock.elapsed().saturating_sub(since))
+    }
+
+    /// Hands queued messages to the socket and flushes it, as far as it will go now.
+    ///
+    /// `Ready(Ok(()))` once everything queued is on its way; `Pending` while the socket
+    /// pushes back. A message is taken out of the queue only in the same poll in which
+    /// the socket accepted it, and accepted bytes stay in the WebSocket layer's buffer
+    /// until a later poll flushes them — so this can be abandoned between any two polls
+    /// without losing a message or leaving a partial frame on the wire.
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>> {
+        use futures_util::Sink;
+        let now = self.clock.elapsed();
+        let mut moved = false;
+        while !self.outbox.is_empty() {
+            match Pin::new(&mut self.socket).poll_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                Poll::Pending => return self.pending_drain(moved, now),
+            }
+            let message = self.outbox.pop_front().expect("checked non-empty");
+            if let Err(error) = Pin::new(&mut self.socket).start_send(message) {
+                return Poll::Ready(Err(error.into()));
+            }
+            self.unflushed = true;
+            moved = true;
+        }
+        if self.unflushed {
+            match Pin::new(&mut self.socket).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.unflushed = false,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                Poll::Pending => return self.pending_drain(moved, now),
+            }
+        }
+        self.stalled_since = None;
+        Poll::Ready(Ok(()))
+    }
+
+    fn pending_drain(&mut self, moved: bool, now: Duration) -> Poll<Result<(), ConnectionError>> {
+        if moved || self.stalled_since.is_none() {
+            self.stalled_since = Some(now);
+        }
+        Poll::Pending
+    }
+
+    /// Waits until everything queued has been flushed. Cancel-safe; see
+    /// [`poll_drain`](Self::poll_drain).
+    pub async fn drain(&mut self) -> Result<(), ConnectionError> {
+        core::future::poll_fn(|cx| self.poll_drain(cx)).await
     }
 
     /// Waits for the next SPINE datagram.
@@ -196,13 +327,11 @@ impl ShipConnection {
             let message = match self.next_message().await {
                 Ok(message) => message,
                 Err(ConnectionError::NotBinary) => {
-                    let _ = self
-                        .socket
-                        .close(Some(CloseFrame {
-                            code: 1003.into(),
-                            reason: "SHIP carries binary frames only".into(),
-                        }))
-                        .await;
+                    let close = self.socket.close(Some(CloseFrame {
+                        code: 1003.into(),
+                        reason: "SHIP carries binary frames only".into(),
+                    }));
+                    let _ = tokio::time::timeout(super::CLOSE_MAX_TIME, close).await;
                     return Err(ConnectionError::NotBinary);
                 }
                 Err(error) => return Err(error),
@@ -232,33 +361,63 @@ impl ShipConnection {
     /// The WebSocket layer may write pong/close replies while reading; `tungstenite` never
     /// blocks on them and carries an unflushed one to the next read, so a dropped future
     /// leaves no partial frame. An inbound partial frame is buffered and resumed on the
-    /// next call (a `WebSocketStream` guarantee), and nothing the caller queued is sent
-    /// here — the half [`Hub::next`](crate::runtime::Hub::next) cannot promise.
+    /// next call (a `WebSocketStream` guarantee). Nothing the caller queued is sent here;
+    /// that is [`poll_drain`](Self::poll_drain)'s.
     ///
     /// A frame SHIP §10.3 forbids comes back as an error rather than being answered here,
     /// because that answer is a close frame this node composes rather than one the
     /// WebSocket layer owes. The answer is [`reject`](Self::reject).
     pub async fn next_message(&mut self) -> Result<ShipMessage, ConnectionError> {
-        self.read_frame().await
+        core::future::poll_fn(|cx| self.poll_next_message(cx)).await
+    }
+
+    /// [`next_message`](Self::next_message) as a poll, for a caller that multiplexes
+    /// several connections in one future.
+    pub fn poll_next_message(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ShipMessage, ConnectionError>> {
+        use futures_util::Stream;
+        loop {
+            let frame = match Pin::new(&mut self.socket).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Err(ConnectionError::Closed)),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error.into())),
+                Poll::Ready(Some(Ok(frame))) => frame,
+            };
+            match frame {
+                Message::Binary(bytes) => {
+                    return Poll::Ready(ShipMessage::decode(&bytes).map_err(Into::into));
+                }
+                // §10.3 forbids it; the caller answers with 1003 through `reject`.
+                Message::Text(_) => return Poll::Ready(Err(ConnectionError::NotBinary)),
+                Message::Close(_) => return Poll::Ready(Err(ConnectionError::Closed)),
+                Message::Pong(_) => self.awaiting_pong = false,
+                // Tungstenite queues the pong itself while reading, and never blocks on
+                // writing it — so a ping costs this loop nothing but another turn.
+                Message::Ping(_) | Message::Frame(_) => {}
+            }
+        }
     }
 
     /// Closes the socket with a WebSocket status code, for a frame SHIP does not allow.
     ///
     /// §10.3: a text frame is answered with 1003, "unsupported data".
+    ///
+    /// Bounded by [`CLOSE_MAX_TIME`](super::CLOSE_MAX_TIME): a peer that sent something SHIP forbids and then
+    /// stopped reading is not owed a wait.
     pub async fn reject(mut self, code: u16, reason: &str) {
-        let _ = self
-            .socket
-            .close(Some(CloseFrame {
-                code: code.into(),
-                reason: reason.to_string().into(),
-            }))
-            .await;
+        let close = self.socket.close(Some(CloseFrame {
+            code: code.into(),
+            reason: reason.to_string().into(),
+        }));
+        let _ = tokio::time::timeout(super::CLOSE_MAX_TIME, close).await;
     }
 
     /// Feeds a received message to the SHIP state machine.
     ///
-    /// Control messages are answered from here — the answer is queued, and goes out on
-    /// the next [`flush`](Self::flush) — so an application working in SPINE never sees
+    /// Control messages are answered from here — the answer is held by the state machine,
+    /// and goes out on the next [`flush`](Self::flush) or [`queue_control`](Self::queue_control) — so an application working in SPINE never sees
     /// them. Data messages are the caller's.
     pub fn handle_message(&mut self, message: &ShipMessage) -> Result<(), ConnectionError> {
         if matches!(message, ShipMessage::Control(_) | ShipMessage::End(_)) {
@@ -289,9 +448,8 @@ impl ShipConnection {
     /// every fifty seconds, and as the liveness probe the double-connection rule of
     /// §12.2.3 falls back to.
     pub async fn ping(&mut self) -> Result<(), ConnectionError> {
-        self.socket.send(Message::Ping(Vec::new().into())).await?;
-        self.awaiting_pong = true;
-        Ok(())
+        self.queue_ping()?;
+        self.drain().await
     }
 
     /// Whether a ping is still unanswered.
@@ -319,7 +477,8 @@ impl ShipConnection {
         max_time: Duration,
     ) -> Result<(), ConnectionError> {
         self.handshake.close(reason, max_time, self.clock.elapsed());
-        let _ = self.flush().await;
+        // Bounded like the wait below: a peer that stopped reading cannot hold the close.
+        let _ = tokio::time::timeout(max_time, self.flush()).await;
 
         // Wait for the confirmation, but not past the time the peer was given.
         let deadline = tokio::time::sleep(max_time);
@@ -327,7 +486,7 @@ impl ShipConnection {
         loop {
             tokio::select! {
                 _ = &mut deadline => break,
-                message = self.read_frame() => match message {
+                message = self.next_message() => match message {
                     Ok(ShipMessage::End(_)) => break,
                     Ok(message) => {
                         let _ = self.handle_message(&message);
@@ -337,7 +496,7 @@ impl ShipConnection {
             }
         }
 
-        let _ = self.socket.close(None).await;
+        let _ = tokio::time::timeout(max_time, self.socket.close(None)).await;
         Ok(())
     }
 
@@ -346,17 +505,13 @@ impl ShipConnection {
         self.clock.elapsed()
     }
 
-    /// Sends everything the handshake has queued.
+    /// Sends everything the handshake has queued, and everything queued before it.
     ///
-    /// Not cancel-safe: a dropped future may leave a control message half-written. Call
-    /// it where cancellation cannot happen, which is what
-    /// [`next_message`](Self::next_message) exists to make possible.
+    /// Cancel-safe: [`queue_control`](Self::queue_control) followed by
+    /// [`drain`](Self::drain).
     pub async fn flush(&mut self) -> Result<(), ConnectionError> {
-        while let Some(message) = self.handshake.poll_transmit() {
-            let bytes = message.encode()?;
-            self.socket.send(Message::Binary(bytes.into())).await?;
-        }
-        Ok(())
+        self.queue_control()?;
+        self.drain().await
     }
 
     /// Takes what the handshake learned from a control message.
@@ -419,23 +574,18 @@ impl ShipConnection {
         self.flush().await
     }
 
-    /// One frame off the socket, refusing what SHIP §10.3 forbids.
-    async fn read_frame(&mut self) -> Result<ShipMessage, ConnectionError> {
-        loop {
-            let Some(frame) = self.socket.next().await else {
-                return Err(ConnectionError::Closed);
-            };
-            match frame? {
-                Message::Binary(bytes) => return Ok(ShipMessage::decode(&bytes)?),
-                // §10.3 forbids it; the caller answers with 1003 through `reject`.
-                Message::Text(_) => return Err(ConnectionError::NotBinary),
-                Message::Close(_) => return Err(ConnectionError::Closed),
-                Message::Pong(_) => self.awaiting_pong = false,
-                // Tungstenite queues the pong itself while reading, and never blocks on
-                // writing it — so a ping costs this loop nothing but another turn.
-                Message::Ping(_) | Message::Frame(_) => {}
-            }
-        }
+    /// Queues a request for the peer's key material; see
+    /// [`request_key_material`](Self::request_key_material) and [`queue`](Self::queue).
+    pub fn queue_key_request(&mut self, known_update_counter: u16) -> Result<(), ConnectionError> {
+        self.handshake.request_key_material(known_update_counter);
+        self.queue_control()
+    }
+
+    /// Queues this node's key material; see [`send_key_material`](Self::send_key_material)
+    /// and [`queue`](Self::queue).
+    pub fn queue_key_material(&mut self) -> Result<(), ConnectionError> {
+        self.handshake.send_key_material(self.clock.elapsed());
+        self.queue_control()
     }
 }
 
@@ -445,6 +595,7 @@ impl ShipConnection {
 /// commissioning tool: §12.5 makes the first peer to present a valid PIN since a factory
 /// default eligible for that role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PinOutcome {
     /// The peer proved it holds this node's PIN.
     Verified {
@@ -568,6 +719,9 @@ pub(crate) async fn run_handshake(
                 pin_events: core::mem::take(&mut pin_events),
                 peer_key_material: Vec::new(),
                 peer_key_counter,
+                outbox: VecDeque::new(),
+                unflushed: false,
+                stalled_since: None,
             };
             connection.flush().await?;
             return Ok(connection);
