@@ -216,11 +216,13 @@ Before adopting a floor, check:
 The controlling side's rules live behind one call:
 
 ```rust
-guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
+guard.require(&device, Some(LimitWrite::active(4_200.0)), now)?;
 ```
 
 The guard takes up a peer that announces the Controllable System by itself, and a limit
-required before the peer is reachable is held, not discarded.
+required before the peer is reachable is held, not discarded. A limit that is not a finite
+number of watts at or above zero is refused with `InvalidLimit` before anything is sent
+([LPC-001]); the limit already in force stands.
 
 Behind that line:
 

@@ -104,7 +104,7 @@ limit after a reconnection, a refusal retried a minute later, one write per five
 otherwise — live behind a single call.
 
 ```rust
-guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
+guard.require(&device, Some(LimitWrite::active(4_200.0)), now)?;
 ```
 
 ## Generated from the schemas, not from a reading of them

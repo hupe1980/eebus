@@ -105,7 +105,7 @@ one is the application's decision, within the narrow room §14a EnWG leaves it; 
 manager needs the Energy Guard, which carries most of the 2026 implementation guides' rules:
 
 ```rust
-guard.require(&device, Some(LimitWrite::active(4_200.0)), now);
+guard.require(&device, Some(LimitWrite::active(4_200.0)), now)?;
 ```
 
 The guard takes up a peer that announces the Controllable System by itself, and holds a
@@ -207,16 +207,16 @@ mandatory for it. A case counts as covered when a test names it in its doc comme
 | SPINE TS 1.0.0 | 19/31 |
 | SHIP Pairing Service TestSpec 1.0.0 | 0/40 |
 
-The Pairing Service is implemented and unit-tested, but no test is yet written against its
-cases, so the figure says so rather than guessing. One of its cases, a ring buffer that has
-to survive a power cycle, is the device's to answer.
+The Pairing Service is implemented and unit-tested, but none of those tests names one of its
+cases, so the figure is zero rather than a guess. One case, a ring buffer that survives a
+power cycle, is the device's to answer.
 
-For the use-case device-level cases, `eebus::conformance::harness` carries the steps and expected results for a
-consumer to drive **against its own running binary**, judged against the device's declared
-parameter sheet: the failsafe defaults a factory reset must restore, the `StartUpDur` a
-black start has to come back inside, the sixty seconds a rebooted Energy Guard has to send a
-heartbeat and a limit in. A persistence test that writes back the value the device already
-held is reported *inconclusive*.
+For the use-case device-level cases, `eebus::conformance::harness` carries the steps and
+expected results for a consumer to drive **against its own running binary**, judged against
+the device's declared parameter sheet: the failsafe defaults a factory reset must restore,
+the `StartUpDur` a black start has to come back inside, the sixty seconds a rebooted Energy
+Guard has to send a heartbeat and a limit in. A persistence test that writes back the value
+the device already held is reported *inconclusive*.
 
 ## The wire format
 

@@ -940,40 +940,15 @@ impl ControllableSystemActor {
     /// device address. The reason stays local; the Energy Guard sees a refusal and nothing
     /// more ([LPC/LPP-003]).
     ///
-    /// # Where authorisation ends and policy begins
+    /// EEBUS authorises a limit by the binding and nothing finer, so this is the only place
+    /// the *value* a bound control box sends can be questioned — and only narrowly. LPC/LPP
+    /// UC TS §2.2: the system "SHALL apply the limit unless the rejection of the limit is
+    /// required by" self-protection, safety, or a legal or regulatory specification
+    /// ([`RejectReason`](super::state::RejectReason) is that list). Under §14a EnWG every
+    /// limit at or above the minimum the regulation leaves the appliance has to be followed.
+    /// A refusal applies no safer value ([LPC/LPP-902], [LPC/LPP-907], [LPC/LPP-918]).
     ///
-    /// EEBUS authorises a limit by the binding and by nothing finer. The engine lets only
-    /// the entity holding the `LoadControl` binding write the limit (implementation guide
-    /// §3.5), and only that entity's heartbeat counts (§3.8). A compromised control box
-    /// that holds the binding is authorised all the same. Whether to trust the *value* it
-    /// sends is the application's decision, and this is the only place it can make it.
-    ///
-    /// That decision is narrow. LPC and LPP UC TS §2.2: a Controllable System "SHALL apply
-    /// the limit unless the rejection of the limit is required by one of these conditions:
-    /// Self-protection; safety-related activities; legal or regulatory specifications",
-    /// with "uncontrolled loads prevent achieving the limit" added for one on an energy
-    /// manager, and "the obligation to accept a limit is not bound to any internal device
-    /// state". [`RejectReason`](super::state::RejectReason) is that list. A limit the
-    /// appliance can follow that none of them covers has to be accepted, even when it
-    /// changes nothing (implementation guide §2.16). Under §14a EnWG this includes every
-    /// limit at or above the minimum the regulation leaves the appliance. A policy can
-    /// question a peer's limits; it cannot overrule them.
-    ///
-    /// A refusal does not apply a safer value. A system that was `limited` or
-    /// `unlimited/controlled` stays there ([LPC/LPP-907]), and one in `init` or the
-    /// failsafe state moves to `unlimited/controlled` ([LPC/LPP-902], [LPC/LPP-918]).
-    /// So refusing a 0 W limit during failsafe lifts the failsafe limit. The answer is ACK
-    /// or NACK, and an ACK for a value the appliance then does not follow would be a false
-    /// §14a record.
-    ///
-    /// # A plausibility floor
-    ///
-    /// §14a EnWG leaves a controllable appliance a minimum it may always draw. The figure
-    /// depends on the kind of appliance and on how many there are, and the implementation
-    /// guide §4.1.3 refers to the Bundesnetzagentur's determination BK6-22-300 for it.
-    /// For one heat pump or wallbox under the control box directly it is 4.2 kW. A limit
-    /// below it is one the grid operator may not impose, and refusing it is refusing on a
-    /// regulatory ground:
+    /// A plausibility floor refuses what the grid operator may not impose:
     ///
     /// ```
     /// use core::time::Duration;
@@ -1015,14 +990,8 @@ impl ControllableSystemActor {
     /// # let _ = on_event;
     /// ```
     ///
-    /// The floor belongs to an appliance the control box addresses itself. Behind an
-    /// energy manager (implementation guide §4.1.2, option 2) the manager divides one limit
-    /// among several appliances, so a low limit for one of them is lawful, and 0 W is a
-    /// valid limit (§2.16). There the floor, if any, applies to the manager's total.
-    ///
-    /// What a floor does not close: a compromised control box can still hold the appliance
-    /// *at* the floor for as long as it likes, because that is a limit the grid operator
-    /// may impose. [`audit`](Self::audit) is what shows it afterwards.
+    /// The floor, the cases it does not fit (an appliance behind an energy manager) and what
+    /// it leaves open are on the site, under *Refusing a limit by policy* in the LPC guide.
     pub fn handle_event_with(
         &mut self,
         engine: &mut Engine,
