@@ -113,14 +113,20 @@ fn an_unset_value_is_not_reported_as_zero() {
     );
 }
 
-/// LPP reports the same values under its own prefix — the two use cases are separate
-/// certifications with separate parameter sheets.
+/// The LPP tester observes the signed active production limit ([LPP-001]) and the
+/// unsigned failsafe setting ([LPP-010]) under the same prefix.
 #[test]
-fn lpp_reports_the_same_values_under_its_own_prefix() {
+fn lpp_reports_the_signed_active_limit_under_its_own_prefix() {
     let signals = limited_system().signals(lpp::DIRECTION);
     assert_eq!(
         signals.get("lpp:limit").and_then(SignalValue::as_f64),
-        Some(3_000.0)
+        Some(-3_000.0)
+    );
+    assert_eq!(
+        signals
+            .get("lpp:failsafeLimit")
+            .and_then(SignalValue::as_f64),
+        Some(4_200.0)
     );
     assert_eq!(signals.get("lpc:limit"), None);
 }

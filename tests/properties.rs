@@ -416,7 +416,11 @@ fn an_unrepresentable_limit_value_is_refused() {
         }]),
     });
     assert_eq!(
-        eebus::usecases::limitation::read_limit_write(&data, LoadControlLimitId(1)),
+        eebus::usecases::limitation::read_limit_write(
+            &data,
+            LoadControlLimitId(1),
+            eebus::usecases::lpc::DIRECTION
+        ),
         None,
         "an overflowing value makes the whole write unusable"
     );
@@ -452,7 +456,8 @@ fn a_limit_duration_that_is_not_a_relative_time_is_refused() {
         assert_eq!(
             eebus::usecases::limitation::read_limit_write(
                 &with_end_time(unreadable),
-                LoadControlLimitId(1)
+                LoadControlLimitId(1),
+                eebus::usecases::lpc::DIRECTION
             ),
             None,
             "{unreadable:?} is not a relative time, so the write is unusable"
@@ -464,12 +469,14 @@ fn a_limit_duration_that_is_not_a_relative_time_is_refused() {
     let read = eebus::usecases::limitation::read_limit_write(
         &with_end_time("PT2H"),
         LoadControlLimitId(1),
+        eebus::usecases::lpc::DIRECTION,
     )
     .expect("a well-formed write");
     assert_eq!(read.duration, Some(Duration::from_secs(7_200)));
     let expired = eebus::usecases::limitation::read_limit_write(
         &with_end_time("PT0S"),
         LoadControlLimitId(1),
+        eebus::usecases::lpc::DIRECTION,
     )
     .expect("a well-formed write");
     assert_eq!(expired.duration, Some(Duration::ZERO));
@@ -670,5 +677,47 @@ mod restore {
             let _ = Identity::from_der(identity.certificate_der(), &noise);
             let _ = Identity::from_der(&noise, &identity.key_der());
         }
+    }
+}
+
+/// 018-limitation-commissioning/SR-020. Validate the mantissa before a floating-point
+/// view can erase its sign; an unrepresentable reciprocal sign is an error.
+#[test]
+fn production_limit_sign_is_exact_at_the_numeric_boundaries() {
+    use eebus::usecases::{
+        limitation::{LimitWrite, read_limit_write},
+        lpp,
+    };
+    let wire_value = |value| {
+        CmdData::LoadControlLimitListData(LoadControlLimitListData {
+            load_control_limit_data: Some(vec![LoadControlLimitData {
+                limit_id: Some(LoadControlLimitId(7)),
+                is_limit_active: Some(true),
+                value: Some(value),
+                ..Default::default()
+            }]),
+        })
+    };
+    let decode =
+        |value| read_limit_write(&wire_value(value), LoadControlLimitId(7), lpp::DIRECTION);
+    assert!(LimitWrite::active(-0.0001).check().is_err());
+    assert!(
+        LimitWrite::active_for(-0.0001, Duration::from_secs(5))
+            .check()
+            .is_err()
+    );
+    assert!(
+        LimitWrite::active_scaled(ScaledNumber::new(-1, i16::MIN))
+            .check()
+            .is_err()
+    );
+    assert_eq!(decode(ScaledNumber::new(1, i16::MIN)), None);
+    assert_eq!(decode(ScaledNumber::whole(i64::MIN)), None);
+    assert_eq!(decode(ScaledNumber::new(-1, i16::MAX)), None);
+    for (number, scale) in [(1, i16::MIN), (4000123456, -6), (1 << 53, 0)] {
+        assert_eq!(
+            decode(ScaledNumber::new(-number, scale)).unwrap().value,
+            ScaledNumber::new(number, scale)
+        );
     }
 }

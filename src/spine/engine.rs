@@ -56,6 +56,11 @@ pub enum SpineEvent {
         /// The peer.
         device: AddressDevice,
     },
+    /// The engine discarded a peer's discovery data, requests and bindings.
+    PeerRemoved {
+        /// The device whose session ended or whose discovery record was evicted.
+        device: AddressDevice,
+    },
     /// A deferred write went unanswered long enough that the peer has stopped waiting.
     ///
     /// The application was handed a [`WriteRequest`] and never called
@@ -100,6 +105,9 @@ pub enum SpineEvent {
     /// (SPINE IG §3.3). A measurement notified as a bare `number` with its `scale` left
     /// out is off by whatever the stored scale was.
     DataNotified {
+        /// Whether the peer sent a partial or delete update. A fresh reader needs a
+        /// complete initial snapshot before treating merged fields as current.
+        is_partial: bool,
         /// The feature the data came from.
         feature: FeatureAddress,
         /// The payload, exactly as it arrived — a fragment, if the notification was
@@ -114,6 +122,9 @@ pub enum SpineEvent {
     /// A reply to a *partial* read is a fragment too (§5.3.4.5), so this carries both
     /// payloads for the same reason [`DataNotified`](Self::DataNotified) does.
     ReplyReceived {
+        /// Whether the peer sent a partial or delete update. A fresh reader needs a
+        /// complete initial snapshot before treating merged fields as current.
+        is_partial: bool,
         /// The feature that replied.
         feature: FeatureAddress,
         /// The payload, exactly as it arrived.
@@ -464,6 +475,14 @@ struct Pending {
     awaiting: Awaiting,
 }
 
+#[derive(Clone, Debug)]
+struct RemoteFunction {
+    feature: FeatureAddress,
+    data: CmdData,
+    /// A full value has been received since this cache entry was created.
+    complete: bool,
+}
+
 /// What this device knows about one peer.
 #[derive(Clone, Debug)]
 struct Peer {
@@ -473,7 +492,7 @@ struct Peer {
     ///
     /// A partial notification is a fragment, and reading a fragment needs the value it is
     /// a fragment *of*. See [`MAX_REMOTE_FUNCTIONS`].
-    data: Vec<(FeatureAddress, CmdData)>,
+    data: Vec<RemoteFunction>,
     /// The peer's detailed discovery document, merged by §7.1.5's rules.
     ///
     /// Deliberately not in `data`. Two reasons, and each on its own would be enough:
@@ -819,6 +838,25 @@ impl Engine {
         self.outbox.pop_front()
     }
 
+    /// Stops retries and drops queued transmissions of an obsolete local request.
+    /// Transmissions already delivered to the transport cannot be recalled.
+    pub(crate) fn cancel_request(&mut self, request: MsgCounter) {
+        if let Some(index) = self.pending.iter().position(|p| p.request == request) {
+            let pending = self.pending.remove(index);
+            self.discard_transmissions(&pending);
+        }
+    }
+
+    fn discard_transmissions(&mut self, pending: &Pending) {
+        self.outbox.retain(|datagram| {
+            !datagram
+                .header
+                .as_ref()
+                .and_then(|h| h.msg_counter)
+                .is_some_and(|counter| pending.transmissions.contains(&counter))
+        });
+    }
+
     /// The next thing that happened.
     pub fn poll_event(&mut self) -> Option<SpineEvent> {
         self.events.pop_front()
@@ -889,6 +927,7 @@ impl Engine {
         }
         self.pending = still_pending;
         for request in abandoned {
+            self.discard_transmissions(&request);
             self.events.push_back(SpineEvent::RequestTimedOut {
                 request: request.request,
                 destination: request.destination,
@@ -1315,6 +1354,7 @@ impl Engine {
             // given up on anyway.
             while self.pending.len() >= MAX_PENDING_REQUESTS {
                 let oldest = self.pending.remove(0);
+                self.discard_transmissions(&oldest);
                 self.events.push_back(SpineEvent::RequestTimedOut {
                     request: oldest.request,
                     destination: oldest.destination,
@@ -1585,7 +1625,12 @@ impl Engine {
                     .as_ref()
                     .is_none_or(|peer| Some(peer) == from.device.as_ref())
         })?;
-        Some(self.pending.remove(index))
+        let pending = self.pending.remove(index);
+        if pending.retries > 0 {
+            // A late answer to the original send can cross a retry still in the outbox.
+            self.discard_transmissions(&pending);
+        }
+        Some(pending)
     }
 
     fn handle_read(
@@ -1814,6 +1859,28 @@ impl Engine {
     /// [`WriteError::UnknownToken`].
     pub fn accept_write(&mut self, token: WriteToken, now: Duration) -> Result<(), WriteError> {
         self.finish_write(token, None, now)
+    }
+
+    /// Whether an application decision can still answer this request.
+    pub(crate) fn can_answer_write(&self, token: WriteToken, now: Duration) -> bool {
+        self.deferred
+            .iter()
+            .any(|write| write.token == token && now < write.deadline)
+    }
+
+    /// Resolve this pending write against the application's current state. A snapshot
+    /// taken when it was queued may predate an earlier write's decision or a timer.
+    pub(crate) fn resolve_pending_write(
+        &self,
+        token: WriteToken,
+        mut current: CmdData,
+    ) -> Option<CmdData> {
+        let write = self.deferred.iter().find(|write| write.token == token)?;
+        if current.key() != write.data.key() {
+            return None;
+        }
+        write.ops.resolve(&mut current, &write.data).ok()?;
+        Some(current)
     }
 
     /// Accepts a deferred write, and stores what the *application* decided rather than
@@ -2102,11 +2169,13 @@ impl Engine {
 
         self.events.push_back(match classifier {
             CmdClassifier::Reply => SpineEvent::ReplyReceived {
+                is_partial: ops.partial || !ops.deletes.is_empty(),
                 feature: source.clone(),
                 data,
                 resolved,
             },
             _ => SpineEvent::DataNotified {
+                is_partial: ops.partial || !ops.deletes.is_empty(),
                 feature: source.clone(),
                 data,
                 resolved,
@@ -2251,12 +2320,16 @@ impl Engine {
         let position = peer
             .data
             .iter()
-            .position(|(feature, held)| same_feature(feature, source) && held.key() == key);
+            .position(|entry| same_feature(&entry.feature, source) && entry.data.key() == key);
 
-        let mut resolved = match position {
-            Some(index) => peer.data.remove(index).1,
+        let full_update = !ops.partial && ops.deletes.is_empty();
+        let (mut resolved, complete) = match position {
+            Some(index) => {
+                let previous = peer.data.remove(index);
+                (previous.data, previous.complete || full_update)
+            }
             None => match CmdData::empty(key) {
-                Some(empty) => empty,
+                Some(empty) => (empty, full_update),
                 // A function with no empty value cannot be merged into; the fragment is
                 // all there is to report.
                 None => return data.clone(),
@@ -2274,7 +2347,11 @@ impl Engine {
         if peer.data.len() >= MAX_REMOTE_FUNCTIONS {
             peer.data.remove(0);
         }
-        peer.data.push((source.clone(), resolved.clone()));
+        peer.data.push(RemoteFunction {
+            feature: source.clone(),
+            data: resolved.clone(),
+            complete,
+        });
         resolved
     }
 
@@ -2297,12 +2374,33 @@ impl Engine {
         if function == &Function::NodeManagementUseCaseData {
             return Some(&peer.use_cases);
         }
-        peer.data
+        Self::cached_function(peer, feature, function).map(|entry| &entry.data)
+    }
+
+    fn cached_function<'a>(
+        peer: &'a Peer,
+        feature: &FeatureAddress,
+        function: &Function,
+    ) -> Option<&'a RemoteFunction> {
+        peer.data.iter().find(|entry| {
+            same_feature(&entry.feature, feature) && &Function::from(entry.data.key()) == function
+        })
+    }
+
+    /// A function whose partial updates still have their complete baseline.
+    pub(crate) fn complete_remote_data(
+        &self,
+        feature: &FeatureAddress,
+        function: &Function,
+    ) -> Option<&CmdData> {
+        let device = feature.device.as_ref()?;
+        let peer = self
+            .peers
             .iter()
-            .find(|(held, data)| {
-                same_feature(held, feature) && &Function::from(data.key()) == function
-            })
-            .map(|(_, data)| data)
+            .find(|p| p.remote.address.as_ref() == Some(device))?;
+        Self::cached_function(peer, feature, function)
+            .filter(|entry| entry.complete)
+            .map(|entry| &entry.data)
     }
 
     fn handle_result(&mut self, cmd: &Cmd, reference: Option<MsgCounter>, from: &FeatureAddress) {
@@ -2556,10 +2654,26 @@ impl Engine {
     /// limit that was never decided is worth a line in the record.
     pub fn remove_peer(&mut self, device: &AddressDevice) {
         self.relations.remove_device(device);
-        self.peers
-            .retain(|p| p.remote.address.as_ref() != Some(device));
+        if let Some(index) = self
+            .peers
+            .iter()
+            .position(|p| p.remote.address.as_ref() == Some(device))
+        {
+            self.peers.remove(index);
+            self.events.push_back(SpineEvent::PeerRemoved {
+                device: device.clone(),
+            });
+        }
         self.pending
             .retain(|p| p.destination.device.as_ref() != Some(device));
+        self.outbox.retain(|datagram| {
+            datagram
+                .header
+                .as_ref()
+                .and_then(|h| h.address_destination.as_ref())
+                .and_then(|address| address.device.as_ref())
+                != Some(device)
+        });
 
         let (gone, live): (Vec<_>, Vec<_>) = self
             .deferred

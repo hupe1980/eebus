@@ -41,22 +41,6 @@ real network; see [On a network](@/docs/networking.md#the-two-simulators).
 its acknowledgement, and the failsafe taking over when the control box goes quiet. Every
 datagram crosses the SHIP framing and the JSON-UTF8 codec; nothing crosses a socket.
 
-```text
-1. SHIP handshake complete after 9 frames
-   version 1.1, format JSON-UTF8
-3. Discovery found the heat pump
-   plays     limitationOfPowerConsumption as ControllableSystem
-   scenarios [1, 2, 3, 4]
-4. Bound as the Energy Guard
-   the heat pump takes limits from entity 1 feature 1
-5. Heartbeat, then a 3000 W limit
-6. The heat pump is now in Limited
-   limited to Active(3000.0)
-   the guard recorded 3000 W accepted — the §14a evidence
-7. After two minutes of silence: FailsafeState
-   limited to Failsafe(4200.0)
-```
-
 `networked` does the same thing over loopback: two nodes generate certificates, approve
 each other's SKI, complete TLS 1.2 with mutual authentication and the SHIP handshake, then
 discover, bind and exchange a limit.
@@ -100,24 +84,24 @@ The SHIP handshake works the same way. See [Architecture](@/docs/architecture.md
 
 ## Answer a limit
 
-Under §14a EnWG the acknowledgement is the record that the limit was applied, so the
-application answers the write through the use case, not a generic setter.
+Pass incoming events to the installed Controllable System actor. It reads the merged state of partial writes,
+validates the signed wire value for the configured direction and calls your policy with
+the local magnitude in watts. Return `LocalDecision::Apply` when the appliance can follow
+the limit.
 
 ```rust
-use eebus::spine::SpineEvent;
-use eebus::usecases::limitation::{self, WriteOutcome};
+use eebus::usecases::limitation::CsEvent;
 
-if let Some(SpineEvent::WriteRequested(w)) = engine.poll_event() {
-    // `resolved` is the update merged into what is stored; `data` is what arrived.
-    let write = limitation::read_limit_write(&w.resolved, limitation::LIMIT_ID)?;
-    let outcome = system.on_limit_write(&write, decide(&write), now);
-    if outcome.is_accepted() {
-        engine.accept_write(w.token, now)?;                          // ACK — or what the peer was told instead
-    } else {
-        engine.reject_write(w.token, outcome.error_number(), now);   // NACK
+while let Some(event) = engine.poll_event() {
+    if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
+        pump.handle_event_with(&mut engine, &event, now, decide)
+    {
+        println!("{} W, active={}: {outcome:?}", write.watts(), write.is_active);
     }
 }
 ```
+
+The actor sends the acknowledgment or refusal and records the outcome in `pump.audit()`.
 
 ## Where to go next
 

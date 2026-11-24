@@ -832,3 +832,160 @@ fn a_fractional_limit_arrives_exactly_as_it_was_written() {
         Some(ScaledNumber::new(420_025, -2))
     );
 }
+
+/// 018-limitation-commissioning/SR-020. The actor API takes magnitudes, while both
+/// writes and peer readback carry the passive wire sign of the active power limit.
+#[test]
+fn commissioned_guards_send_directional_limits_and_settle_after_readback() {
+    use eebus::model::{CmdClassifier, CmdData, Function, ScaledNumber};
+    use eebus::usecases::limitation::Direction;
+
+    for (direction, sign) in [(Direction::Consumption, 1), (Direction::Production, -1)] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
+        let device = pair.device();
+        for (requirement, active, magnitude) in [
+            (Some(LimitWrite::active(4_000.0)), true, 4_000),
+            (
+                Some(LimitWrite::active_for(4_000.0, Duration::from_secs(1_200))),
+                true,
+                4_000,
+            ),
+            (Some(LimitWrite::active(0.0)), true, 0),
+            (None, false, 0),
+        ] {
+            pair.trace.clear();
+            pair.forget_history();
+            pair.guard.require(&device, requirement, pair.now).unwrap();
+            for _ in 0..5 {
+                pair.advance(Duration::from_secs(60));
+            }
+            assert_eq!(pair.accepted().len(), 1);
+            let applied = pair.guard.applied_limit(&device).unwrap();
+            assert_eq!(applied.is_active, active);
+            assert_eq!(applied.value, ScaledNumber::whole(magnitude));
+
+            let writes: Vec<_> = pair
+                .trace
+                .iter()
+                .filter(|(from, datagram)| {
+                    *from == "box"
+                        && datagram.header.as_ref().unwrap().cmd_classifier
+                            == Some(CmdClassifier::Write)
+                })
+                .collect();
+            assert_eq!(writes.len(), 1);
+            let write = round_trip(&writes[0].1);
+            let command = &write.payload.as_ref().unwrap().cmd.as_ref().unwrap()[0];
+            let server = pair.pump_load_control();
+            let stored = pair
+                .pump_engine
+                .device()
+                .resolve(&server)
+                .unwrap()
+                .data(&Function::LoadControlLimitListData)
+                .unwrap();
+            for data in [command.data.as_ref().unwrap(), stored] {
+                let CmdData::LoadControlLimitListData(list) = data else {
+                    panic!("expected limit list")
+                };
+                let entry = &list.load_control_limit_data.as_ref().unwrap()[0];
+                assert_eq!(entry.value, Some(ScaledNumber::whole(sign * magnitude)));
+                assert_eq!(entry.is_limit_active, Some(active));
+            }
+
+            // Force an actual SPINE read after the ACK, beyond which the guard treats
+            // the peer's report as authoritative. Keep heartbeats fresh for a complete
+            // write interval to expose even a rate-limited corrective write.
+            pair.trace.clear();
+            let client = pair.guard_client();
+            pair.guard_engine.read(
+                &server,
+                &client,
+                Function::LoadControlLimitListData,
+                pair.now,
+            );
+            pair.settle();
+            for _ in 0..5 {
+                pair.advance(Duration::from_secs(60));
+            }
+            assert!(pair.trace.iter().all(|(from, d)| *from != "box"
+                || d.header.as_ref().unwrap().cmd_classifier != Some(CmdClassifier::Write)));
+        }
+    }
+}
+
+/// 018-limitation-commissioning/SR-021. A device may reconnect under the same
+/// address. Its previous bindings, metadata and outbound packets must not authorize
+/// a write in the new session.
+#[test]
+fn reconnect_recommissions_before_reapplying_the_grid_requirement() {
+    let mut pair = Pair::with_direction(eebus::usecases::lpp::DIRECTION);
+    pair.commission();
+    let device = pair.device();
+    let grid_limit = LimitWrite::active(4_000.0);
+    pair.guard
+        .require(&device, Some(grid_limit), pair.now)
+        .unwrap();
+    pair.guard.handle_timeout(&mut pair.guard_engine, pair.now);
+
+    pair.guard_engine.remove_peer(&device);
+    let guard_device = pair.guard_engine.device().address().clone();
+    pair.pump_engine.remove_peer(&guard_device);
+    assert!(pair.guard_engine.poll_transmit().is_none());
+    pair.settle();
+    assert!(!pair.guard.is_ready(&device));
+    assert!(pair.pump.guard().is_none());
+    assert_eq!(pair.guard.applied_limit(&device), None);
+    assert!(
+        pair.guard
+            .deferred_requirements()
+            .any(|(peer, limit)| peer == &device && limit == Some(grid_limit))
+    );
+
+    pair.forget_history();
+    pair.commission();
+    pair.advance(Duration::from_secs(11));
+    assert!(pair.guard.is_ready(&device));
+    assert_eq!(pair.accepted(), [grid_limit]);
+    assert_eq!(
+        pair.pump.system().effective_limit(),
+        EffectiveLimit::active(4_000.0)
+    );
+}
+
+#[test]
+fn only_the_bound_clients_release_changes_the_identified_guard() {
+    use eebus::spine::SpineEvent;
+
+    let mut pair = Pair::new();
+    pair.commission();
+    let client = pair.guard_client();
+    let configuration = pair.pump_engine.device().address_of(&[1], 2);
+    let another_client = pair.guard_engine.device().address_of(&[1], 2);
+    let unrelated_feature = pair.pump_engine.device().address_of(&[1], 3);
+
+    for (client, server) in [
+        (another_client, configuration.clone()),
+        (client.clone(), unrelated_feature),
+    ] {
+        let release = SpineEvent::BindingReleased { client, server };
+        pair.pump
+            .handle_event(&mut pair.pump_engine, &release, pair.now);
+        assert!(pair.pump.guard().is_some());
+    }
+    let release = SpineEvent::BindingReleased {
+        client: client.clone(),
+        server: configuration.clone(),
+    };
+    pair.pump
+        .handle_event(&mut pair.pump_engine, &release, pair.now);
+    assert!(pair.pump.guard().is_none());
+    let rebound = SpineEvent::BindingGranted {
+        client,
+        server: configuration,
+    };
+    pair.pump
+        .handle_event(&mut pair.pump_engine, &rebound, pair.now);
+    assert!(pair.pump.guard().is_some());
+}

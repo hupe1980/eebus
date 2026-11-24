@@ -487,7 +487,9 @@ fn a_production_limit_reaches_the_inverter_and_is_acknowledged() {
     link.commission();
 
     link.heartbeat();
-    let result = link.write_limit(1_500.0, true).expect("an acknowledgement");
+    let result = link
+        .write_limit(-1_500.0, true)
+        .expect("an acknowledgement");
 
     assert_eq!(result, ErrorNumber::None, "ACK, [LPP-002/1]");
     assert_eq!(link.actor.system().state(), LimitationState::Limited);
@@ -495,6 +497,24 @@ fn a_production_limit_reaches_the_inverter_and_is_acknowledged() {
         link.actor.system().effective_limit(),
         EffectiveLimit::active(1_500.0)
     );
+}
+
+/// A limit carrying the opposite wire sign cannot replace an acknowledged limit.
+#[test]
+fn opposite_wire_sign_is_refused_in_both_directions() {
+    for (mut link, valid) in [(Link::new(), 4_000.0), (Link::producing(), -4_000.0)] {
+        link.commission();
+        link.heartbeat();
+        assert_eq!(link.write_limit(valid, true), Some(ErrorNumber::None));
+        assert_eq!(
+            link.write_limit(-valid, true),
+            Some(ErrorNumber::CommandRejected)
+        );
+        assert_eq!(
+            link.actor.system().effective_limit(),
+            EffectiveLimit::active(4_000.0)
+        );
+    }
 }
 
 /// What LPP changes is what the Controllable System *publishes*: the direction of the
@@ -685,4 +705,148 @@ fn ig_3_1_a_limit_write_without_its_identifier_is_refused() {
         LimitationState::Limited,
         "and the limit that was in force is untouched"
     );
+}
+
+/// 018-limitation-commissioning/SR-020. Inheriting a signed limit or its relative
+/// endTime in a partial update must preserve the original expiry.
+#[test]
+fn partial_production_updates_keep_the_previous_deadline() {
+    use eebus::model::{LoadControlLimitData, LoadControlLimitListData, TimePeriod};
+
+    for active_after_update in [false, true] {
+        let mut link = Link::producing();
+        link.commission();
+        link.heartbeat();
+        let client = link.guard_client();
+        let server = link.pump_feature(1);
+        let limit = |entry| {
+            CmdData::LoadControlLimitListData(LoadControlLimitListData {
+                load_control_limit_data: Some(vec![entry]),
+            })
+        };
+        link.guard.write(
+            &server,
+            &client,
+            limit(LoadControlLimitData {
+                limit_id: Some(limitation::LIMIT_ID),
+                is_limit_active: Some(!active_after_update),
+                value: Some(ScaledNumber::new(-40005, -1)),
+                time_period: Some(TimePeriod {
+                    end_time: Some("PT1M".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            true,
+            link.now,
+        );
+        link.pump_messages();
+        assert_eq!(link.last_result(), Some(ErrorNumber::None));
+
+        link.now += Duration::from_secs(45);
+        // Both partial writes arrive before the actor decides either. The second
+        // inherits the first one's new value and the same running timer.
+        link.guard.write(
+            &server,
+            &client,
+            limit(LoadControlLimitData {
+                limit_id: Some(limitation::LIMIT_ID),
+                value: Some(ScaledNumber::new(-37505, -1)),
+                ..Default::default()
+            }),
+            true,
+            link.now,
+        );
+        link.guard.write(
+            &server,
+            &client,
+            limit(LoadControlLimitData {
+                limit_id: Some(limitation::LIMIT_ID),
+                is_limit_active: Some(active_after_update),
+                ..Default::default()
+            }),
+            true,
+            link.now,
+        );
+        link.pump_messages();
+        assert_eq!(link.last_result(), Some(ErrorNumber::None));
+        let published = |link: &Link| {
+            let data = link
+                .pump
+                .device()
+                .resolve(&server)
+                .unwrap()
+                .data(&Function::LoadControlLimitListData)
+                .unwrap();
+            limitation::read_limit_write(data, limitation::LIMIT_ID, lpp::DIRECTION).unwrap()
+        };
+        let stored = published(&link);
+        assert_eq!(stored.duration, Some(Duration::from_secs(15)));
+        assert_eq!(stored.is_active, active_after_update);
+        assert_eq!(stored.value, ScaledNumber::new(37505, -1));
+
+        link.now += Duration::from_secs(15);
+        link.actor.handle_timeout(&mut link.pump, link.now);
+        let expired = published(&link);
+        assert!(!expired.is_active);
+        assert_eq!(expired.duration, None);
+    }
+}
+
+/// An abandoned or overdue SPINE token cannot change either the active
+/// production limit or the fallback configuration.
+#[test]
+fn stale_limit_and_failsafe_requests_never_reach_the_application() {
+    for disconnected in [true, false] {
+        let mut link = Link::producing();
+        link.commission();
+        link.heartbeat();
+        assert_eq!(link.write_limit(-4_000.0, true), Some(ErrorNumber::None));
+        let audit_count = link.actor.audit().len();
+        let client = link.guard_client();
+        let changed = limitation::ControllableSystem::new(
+            CsConfig::new(2_000.0, Duration::from_secs(7_200)),
+            link.now,
+        );
+        for (feature, data) in [
+            (
+                1,
+                limitation::limit_data(&changed, lpp::DIRECTION, link.now),
+            ),
+            (2, limitation::failsafe_values(&changed)),
+        ] {
+            link.guard
+                .write(&link.pump_feature(feature), &client, data, true, link.now);
+        }
+        while let Some(datagram) = link.guard.poll_transmit() {
+            link.pump.handle_datagram(&round_trip(&datagram), link.now);
+        }
+        let events: Vec<_> = core::iter::from_fn(|| link.pump.poll_event())
+            .filter(|event| matches!(event, SpineEvent::WriteRequested(_)))
+            .collect();
+        assert_eq!(events.len(), 2);
+        if disconnected {
+            link.pump.remove_peer(link.guard.device().address());
+        } else {
+            link.now += Duration::from_secs(11);
+        }
+        for event in &events {
+            assert!(
+                link.actor
+                    .handle_event_with(&mut link.pump, event, link.now, |_| panic!(
+                        "abandoned write reached policy"
+                    ))
+                    .is_none()
+            );
+        }
+        assert_eq!(link.actor.audit().len(), audit_count);
+        assert_eq!(
+            link.actor.system().effective_limit(),
+            EffectiveLimit::active(4_000.0)
+        );
+        assert_eq!(
+            link.actor.system().config().failsafe_watts(),
+            FAILSAFE_WATTS
+        );
+    }
 }

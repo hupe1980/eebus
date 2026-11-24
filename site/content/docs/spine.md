@@ -292,7 +292,9 @@ way down the tree. A `scaledNumber` arriving with a bare `number` must keep its 
 *partial* update, the ordinary shape of a subscribed measurement (IG §3.2.2). The engine
 keeps the merged state of every function a peer has sent, and `SpineEvent::DataNotified` and
 `ReplyReceived` carry `data` for what arrived and `resolved` for the merged result, as a
-deferred write does. Read `resolved`.
+deferred write does. The `is_partial` field identifies a partial update or a delete.
+For commissioning, wait for a complete snapshot of each required function in the current
+session before relying on subsequent merged updates.
 
 **A delete is filtered too, and a command may carry more than one filter.** `selectors`
 choose the entries a delete addresses; `elements` choose the parts of them, and the entries
