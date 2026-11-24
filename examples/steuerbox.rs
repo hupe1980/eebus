@@ -253,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .expect("a valid limit");
                         }
                     }
-                    None => println!("[box]  {} does not play LPC", device.as_str()),
+                    None => println!("[box]  no unique LPC target on {}", device.as_str()),
                 }
             }
             HubEvent::Spine(event) => {
@@ -295,7 +295,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for report in reports {
             match report {
                 GuardEvent::Ready { device } => {
-                    println!("[box]  bound to {}", device.as_str());
+                    println!(
+                        "[box]  writable consumption limit ready on {}",
+                        device.as_str()
+                    );
                 }
                 GuardEvent::ConstraintsLearned { nominal_max, .. } => println!(
                     "[box]  it can draw at most {:.0} W ({:?})",
@@ -313,12 +316,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 GuardEvent::PeerHeartbeatLost { device } => {
                     println!("[box]  no heartbeat from {}", device.as_str());
                 }
-                GuardEvent::NoLimitPublished { device } => {
-                    // The installation looks finished from both ends and is not: the
-                    // device answered discovery and describes no limit for this
-                    // direction. An installer needs to be told; nothing else will.
+                GuardEvent::LimitUnavailable { device, reason } => {
                     println!(
-                        "[box]  {} publishes no limit for this direction — nothing will be written",
+                        "[box]  cannot commission a limit on {}: {reason}",
                         device.as_str()
                     );
                 }

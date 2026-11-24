@@ -400,6 +400,7 @@ fn a_heartbeat_from_somebody_else_does_not_count() {
     pair.ev.handle_event(
         &mut pair.car,
         &SpineEvent::DataNotified {
+            is_partial: false,
             feature: elsewhere,
             data: beat.clone(),
             resolved: beat,

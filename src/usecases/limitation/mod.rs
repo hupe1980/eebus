@@ -9,9 +9,8 @@
 //!
 //! So the state machine and the actor are written once here and pointed by
 //! [`Direction`]. What differs between the two use cases is the direction announced in
-//! the limit description, the name of the failsafe configuration key, and the use-case
-//! descriptor a device publishes — everything else is shared, which means a fix to one is
-//! a fix to both.
+//! the limit description, the wire sign of the active power limit, the failsafe key, and
+//! the use-case descriptor. The application and state machine use magnitudes in watts.
 //!
 //! Use it through [`crate::usecases::lpc`] or [`crate::usecases::lpp`], which carry the
 //! descriptors and the direction constant for their use case.
@@ -25,6 +24,7 @@
 
 use crate::model::{
     DeviceConfigurationKeyName, ElectricalConnectionCharacteristicType, EnergyDirection,
+    ScaledNumber,
 };
 use crate::usecases::descriptor::names;
 
@@ -42,9 +42,8 @@ pub use state::*;
 
 /// Which of the two limitation use cases an actor is playing.
 ///
-/// The state machine does not depend on this — a limit is a number of watts either way —
-/// but everything a Controllable System *publishes* does: the `limitDirection` in the
-/// limit description, and the name of the failsafe configuration key.
+/// Both state machines use nonnegative magnitudes. The direction determines the active
+/// limit’s wire sign (§2.8.1), its description, and the failsafe configuration key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Direction {
     /// Limitation of Power Consumption: how much the device may draw.
@@ -58,6 +57,16 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// Converts between the SPINE active-limit sign and the local magnitude. Applying
+    /// the same operation twice gives the original quantity. Multiplying the mantissa
+    /// exactly also detects the one signed integer that has no positive counterpart.
+    fn apply_limit_sign(self, value: ScaledNumber) -> Option<ScaledNumber> {
+        match self {
+            Self::Consumption => Some(value.canonical()),
+            Self::Production => value.checked_mul(&ScaledNumber::whole(-1)),
+        }
+    }
+
     /// The `limitDirection` of the limit description (LPC/LPP Table 22).
     pub const fn energy_direction(self) -> EnergyDirection {
         match self {

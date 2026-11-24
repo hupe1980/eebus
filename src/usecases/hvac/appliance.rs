@@ -769,6 +769,7 @@ mod tests {
 
     fn notified(feature: &FeatureAddress, data: CmdData) -> SpineEvent {
         SpineEvent::DataNotified {
+            is_partial: false,
             feature: feature.clone(),
             data: data.clone(),
             resolved: data,

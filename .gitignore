@@ -37,6 +37,7 @@ target
 /specs/
 /.specify/
 /.claude/
+/.agents/skills/speckit-*/
 .DS_Store
 
 # Zola output

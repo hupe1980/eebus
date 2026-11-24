@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut done = false;
         for report in reports {
             match report {
-                GuardEvent::Ready { .. } => println!("[box]  bound to the LoadControl feature"),
+                GuardEvent::Ready { .. } => println!("[box]  writable consumption limit ready"),
                 GuardEvent::ConstraintsLearned { nominal_max, .. } => println!(
                     "[box]  it can draw at most {:.0} W — scenario 4",
                     nominal_max.watts()
@@ -183,8 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     done = true;
                 }
                 GuardEvent::PeerHeartbeatLost { .. } => {}
-                GuardEvent::NoLimitPublished { .. } => {
-                    println!("[box]  it publishes no limit to write to — not commissioned");
+                GuardEvent::LimitUnavailable { reason, .. } => {
+                    println!("[box]  cannot commission the consumption limit: {reason}");
                     done = true;
                 }
                 GuardEvent::PeerUnresponsive { outstanding, .. } => {

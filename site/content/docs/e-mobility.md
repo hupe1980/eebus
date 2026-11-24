@@ -184,9 +184,3 @@ Before matching on an actor name:
 The wallbox asks for a summary by setting `updateRequired` [EVCS-009], and clears it once the
 write arrives. Tables 6 and 8 both warn the result "SHOULD NOT be used for actual billing as
 it may also contain approximated values".
-
-## Not here: CEVC
-
-**Coordinated EV Charging** is not implemented. It has three actors, power sequences,
-incentive tables, and a charging plan negotiated between the car and the energy broker
-rather than a ceiling imposed on it.

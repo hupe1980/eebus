@@ -21,12 +21,15 @@ use eebus::model::{
     DeviceConfigurationKeyValueDescriptionListData, DeviceConfigurationKeyValueType, DeviceType,
     EnergyDirection, EntityType, FeatureType, Function, LoadControlCategory, LoadControlLimitData,
     LoadControlLimitDescriptionData, LoadControlLimitDescriptionListData, LoadControlLimitId,
-    LoadControlLimitType, MeasurementId, Role, ScopeType, UnitOfMeasurement,
+    LoadControlLimitListData, LoadControlLimitType, MeasurementId, Role, ScopeType,
+    UnitOfMeasurement,
 };
 use eebus::spine::{
     Engine, LocalDevice, LocalEntity, LocalFeature, Operations, SpineEvent, node_management,
 };
-use eebus::usecases::limitation::{self, EnergyGuardActor, GuardEvent, LimitWrite};
+use eebus::usecases::limitation::{
+    self, EnergyGuardActor, GuardEvent, LimitResolutionError, LimitWrite,
+};
 use eebus::usecases::{lpc, lpp};
 
 /// What this appliance calls its consumption limit. Not 1, and not what the crate uses.
@@ -107,6 +110,11 @@ impl Foreign {
 
         // Its published state, in its own numbering.
         set(&mut them, &load_control, limits);
+        set(
+            &mut them,
+            &load_control,
+            CmdData::LoadControlLimitListData(their_current_limits()),
+        );
         set(&mut them, &configuration, their_failsafe_descriptions());
 
         Self {
@@ -307,7 +315,10 @@ fn a_limit_is_written_to_the_identifier_the_peer_published() {
     // And the production limit — `limitId` 1, where a guard that assumed its own
     // numbering would have put it — was never touched.
     assert!(
-        pair.stored_limit(THEIR_PRODUCTION_LIMIT).is_none(),
+        pair.stored_limit(THEIR_PRODUCTION_LIMIT)
+            .unwrap()
+            .value
+            .is_none(),
         "the production limit is not this guard's to write"
     );
 }
@@ -359,9 +370,13 @@ fn a_peer_that_publishes_no_matching_limit_is_reported_and_left_alone() {
     let device = pair.device();
 
     assert!(
-        pair.reports
-            .iter()
-            .any(|r| matches!(r, GuardEvent::NoLimitPublished { .. })),
+        pair.reports.iter().any(|r| matches!(
+            r,
+            GuardEvent::LimitUnavailable {
+                reason: LimitResolutionError::NoDescription,
+                ..
+            }
+        )),
         "the one place this installation's failure is visible: {:?}",
         pair.reports
     );
@@ -376,7 +391,10 @@ fn a_peer_that_publishes_no_matching_limit_is_reported_and_left_alone() {
     pair.advance(Duration::from_secs(60));
 
     assert!(
-        pair.stored_limit(THEIR_PRODUCTION_LIMIT).is_none(),
+        pair.stored_limit(THEIR_PRODUCTION_LIMIT)
+            .unwrap()
+            .value
+            .is_none(),
         "an LPC guard does not write into an LPP limit for want of anything better"
     );
     assert!(
@@ -388,19 +406,371 @@ fn a_peer_that_publishes_no_matching_limit_is_reported_and_left_alone() {
     );
 }
 
-/// The same appliance, read by an LPP guard, resolves to the *other* identifier.
-///
-/// One device, one feature, two limits: which one is addressed is decided by the
-/// direction and nothing else.
+fn their_current_limits() -> LoadControlLimitListData {
+    LoadControlLimitListData {
+        load_control_limit_data: Some(
+            [THEIR_CONSUMPTION_LIMIT, THEIR_PRODUCTION_LIMIT]
+                .into_iter()
+                .map(|id| LoadControlLimitData {
+                    limit_id: Some(id),
+                    is_limit_changeable: Some(true),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+    }
+}
+
+// 018-limitation-commissioning/SR-021
 #[test]
-fn the_other_use_case_resolves_to_the_other_limit() {
-    let description = their_limit_descriptions();
+fn one_writable_limit_is_resolved_independently_of_list_order() {
+    use LimitResolutionError::*;
+    let CmdData::LoadControlLimitDescriptionListData(descriptions) = their_limit_descriptions()
+    else {
+        unreachable!()
+    };
+    let current = their_current_limits();
+    let id = THEIR_PRODUCTION_LIMIT;
+    let check = |descriptions: LoadControlLimitDescriptionListData,
+                 current: LoadControlLimitListData,
+                 expected| {
+        for reverse_descriptions in [false, true] {
+            for reverse_current in [false, true] {
+                let mut descriptions = descriptions.clone();
+                let mut current = current.clone();
+                if reverse_descriptions {
+                    descriptions
+                        .load_control_limit_description_data
+                        .as_mut()
+                        .unwrap()
+                        .reverse();
+                }
+                if reverse_current {
+                    current.load_control_limit_data.as_mut().unwrap().reverse();
+                }
+                assert_eq!(
+                    limitation::resolve_writable_limit(&descriptions, &current, lpp::DIRECTION),
+                    expected
+                );
+            }
+        }
+    };
+    check(descriptions.clone(), current.clone(), Ok(id));
     assert_eq!(
-        limitation::find_limit_id(&description, lpc::DIRECTION),
-        Some(THEIR_CONSUMPTION_LIMIT)
+        limitation::resolve_writable_limit(&descriptions, &current, lpc::DIRECTION),
+        Ok(THEIR_CONSUMPTION_LIMIT)
     );
+    for (entries, expected) in [
+        (vec![described(id, EnergyDirection::Consume)], NoDescription),
+        (
+            vec![
+                described(id, EnergyDirection::Produce),
+                described(LoadControlLimitId(14), EnergyDirection::Produce),
+            ],
+            AmbiguousDescriptions,
+        ),
+        (
+            vec![
+                described(id, EnergyDirection::Produce),
+                described(id, EnergyDirection::Consume),
+            ],
+            ReusedId(id),
+        ),
+    ] {
+        check(
+            LoadControlLimitDescriptionListData {
+                load_control_limit_description_data: Some(entries),
+            },
+            current.clone(),
+            Err(expected),
+        );
+    }
+    for (field_id, unit, expected) in [
+        (None, Some(UnitOfMeasurement::W), MissingId),
+        (Some(id), None, WrongUnit(id)),
+        (Some(id), Some(UnitOfMeasurement::Wh), WrongUnit(id)),
+    ] {
+        let mut descriptions = descriptions.clone();
+        let first = &mut descriptions
+            .load_control_limit_description_data
+            .as_mut()
+            .unwrap()[0];
+        first.limit_id = field_id;
+        first.unit = unit;
+        check(descriptions, current.clone(), Err(expected));
+    }
+    for (flags, expected) in [
+        (vec![], MissingCurrent(id)),
+        (vec![Some(false)], NotChangeable(id)),
+        (vec![None], NotChangeable(id)),
+        (vec![Some(false), Some(true)], AmbiguousCurrent(id)),
+        (vec![Some(true), Some(true)], AmbiguousCurrent(id)),
+    ] {
+        let current = LoadControlLimitListData {
+            load_control_limit_data: Some(
+                flags
+                    .into_iter()
+                    .map(|flag| LoadControlLimitData {
+                        limit_id: Some(id),
+                        is_limit_changeable: flag,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        };
+        check(descriptions.clone(), current, Err(expected));
+    }
+}
+
+// 018-limitation-commissioning/SR-021
+#[test]
+fn invalid_current_data_stops_pending_writes_and_a_correction_recommissions_the_target() {
+    let mut pair = Foreign::new(their_limit_descriptions());
+    pair.commission();
+    let device = pair.device();
+    let target = pair.them.device().address_of(&[1], 1);
+    pair.advance(Duration::from_secs(11));
+    pair.guard
+        .require(&device, Some(LimitWrite::active(4000.0)), pair.now)
+        .unwrap();
+    pair.guard.handle_timeout(&mut pair.guard_engine, pair.now);
+    // Take the in-flight write off the wire but keep its ACK back until after revocation.
+    let write = core::iter::from_fn(|| pair.guard_engine.poll_transmit())
+        .find(|d| {
+            d.header.as_ref().unwrap().cmd_classifier == Some(eebus::model::CmdClassifier::Write)
+        })
+        .unwrap();
+    let counter = write.header.as_ref().unwrap().msg_counter.unwrap();
+    let mut current = their_current_limits();
+    current.load_control_limit_data.as_mut().unwrap()[0].is_limit_changeable = Some(false);
+    set(
+        &mut pair.them,
+        &target,
+        CmdData::LoadControlLimitListData(current.clone()),
+    );
+    pair.them
+        .notify(&target, &Function::LoadControlLimitListData, pair.now);
+    pair.settle();
+    assert!(!pair.guard.is_ready(&device));
+    assert_eq!(pair.guard.peer_ids(&device).unwrap().limit, None);
+    assert!(pair.reports.iter().any(|event| matches!(
+        event,
+        GuardEvent::LimitUnavailable {
+            reason: LimitResolutionError::NotChangeable(THEIR_CONSUMPTION_LIMIT),
+            ..
+        }
+    )));
+    pair.advance(Duration::from_secs(300));
+    pair.advance(Duration::from_secs(300));
+    assert_ne!(
+        pair.stored_limit(THEIR_CONSUMPTION_LIMIT)
+            .unwrap()
+            .is_limit_active,
+        Some(true),
+        "the transport must not retry a revoked write"
+    );
+    let new = LoadControlLimitId(81);
+    current
+        .load_control_limit_data
+        .as_mut()
+        .unwrap()
+        .push(LoadControlLimitData {
+            limit_id: Some(new),
+            is_limit_changeable: Some(true),
+            ..Default::default()
+        });
+    set(
+        &mut pair.them,
+        &target,
+        CmdData::LoadControlLimitListData(current),
+    );
+    pair.them
+        .notify(&target, &Function::LoadControlLimitListData, pair.now);
+    pair.settle();
+    assert!(!pair.guard.is_ready(&device));
+    let CmdData::LoadControlLimitDescriptionListData(mut descriptions) = their_limit_descriptions()
+    else {
+        unreachable!()
+    };
+    descriptions
+        .load_control_limit_description_data
+        .as_mut()
+        .unwrap()[1]
+        .limit_id = Some(new);
+    set(
+        &mut pair.them,
+        &target,
+        CmdData::LoadControlLimitDescriptionListData(descriptions),
+    );
+    pair.them.notify(
+        &target,
+        &Function::LoadControlLimitDescriptionListData,
+        pair.now,
+    );
+    pair.settle();
+    assert!(pair.guard.is_ready(&device));
+    assert_eq!(pair.guard.peer_ids(&device).unwrap().limit, Some(new));
     assert_eq!(
-        limitation::find_limit_id(&description, lpp::DIRECTION),
-        Some(THEIR_PRODUCTION_LIMIT)
+        pair.stored_limit(new).unwrap().value.unwrap().to_f64(),
+        Some(4000.0)
     );
+    let late_ack = SpineEvent::ResultReceived {
+        request: counter,
+        error: eebus::spine::ErrorNumber::None,
+    };
+    assert_eq!(
+        pair.guard
+            .handle_event(&mut pair.guard_engine, &late_ack, pair.now),
+        None
+    );
+}
+
+// 018-limitation-commissioning/SR-021
+#[test]
+fn device_discovery_revokes_an_ambiguous_target_and_retains_the_requirement() {
+    let mut pair = Foreign::new(their_limit_descriptions());
+    pair.commission();
+    let device = pair.device();
+    assert!(pair.guard.is_ready(&device));
+    pair.guard
+        .require(&device, Some(LimitWrite::active(4000.0)), pair.now)
+        .unwrap();
+
+    pair.them.add_use_case([2], 1, &lpc::CONTROLLABLE_SYSTEM);
+    pair.commission();
+    assert!(!pair.guard.is_ready(&device));
+    assert_eq!(
+        pair.guard.deferred_requirements().next(),
+        Some((&device, Some(LimitWrite::active(4000.0))))
+    );
+    let mut remote = pair.guard_engine.peer(&device).unwrap().clone();
+    for _ in 0..2 {
+        assert!(limitation::locate(&remote, lpc::DIRECTION).is_none());
+        remote.use_cases.reverse();
+    }
+}
+
+// 018-limitation-commissioning/SR-021
+#[test]
+fn a_partial_list_after_cache_eviction_needs_a_new_full_read() {
+    use eebus::model::Filter;
+    use eebus::spine::MAX_REMOTE_FUNCTIONS;
+
+    let mut pair = Foreign::new(their_limit_descriptions());
+    pair.commission();
+    let device = pair.device();
+    let load = pair.them.device().address_of(&[1], 1);
+    let client = pair.guard_engine.device().address_of(&[1], 1);
+    let current = Function::LoadControlLimitListData;
+    let descriptions = Function::LoadControlLimitDescriptionListData;
+    for entity_id in 2..2 + MAX_REMOTE_FUNCTIONS as u32 {
+        let entity = LocalEntity::new([entity_id], EntityType::HeatPumpAppliance)
+            .with_feature(limitation::load_control_feature(1));
+        pair.them.device_mut().add_entity(entity).unwrap();
+        let address = pair.them.device().address_of(&[entity_id], 1);
+        set(
+            &mut pair.them,
+            &address,
+            CmdData::LoadControlLimitListData(their_current_limits()),
+        );
+        pair.guard_engine
+            .read(&address, &client, current.clone(), pair.now);
+        pair.settle();
+    }
+    assert!(
+        pair.guard_engine
+            .remote_data(&load, &descriptions)
+            .is_none()
+    );
+
+    // The appliance reports a complete current list and a description fragment.
+    // Hold its answer to the guard's new read until the fragment has been processed.
+    pair.them.notify(&load, &current, pair.now);
+    pair.them.notify(&load, &descriptions, pair.now);
+    let full = pair.them.poll_transmit().unwrap();
+    let mut fragment = pair.them.poll_transmit().unwrap();
+    fragment.payload.as_mut().unwrap().cmd.as_mut().unwrap()[0].filter =
+        Some(vec![Filter::partial()]);
+    for message in [full, fragment] {
+        pair.guard_engine.handle_datagram(&message, pair.now);
+        while let Some(event) = pair.guard_engine.poll_event() {
+            pair.guard
+                .handle_event(&mut pair.guard_engine, &event, pair.now);
+        }
+    }
+    assert!(!pair.guard.is_ready(&device));
+    assert_eq!(pair.guard.peer_ids(&device).unwrap().limit, None);
+    pair.settle();
+    assert!(
+        pair.guard.is_ready(&device),
+        "the guard must fetch a fresh baseline"
+    );
+}
+
+// 018-limitation-commissioning/SR-021
+#[test]
+fn reattachment_needs_fresh_complete_lists_from_the_selected_feature() {
+    let mut pair = Foreign::new(their_limit_descriptions());
+    pair.commission();
+    let device = pair.device();
+    let peer = pair.guard.peers().next().unwrap().clone();
+    let load = peer.load_control.clone();
+    let elsewhere = peer.device_configuration.clone();
+    pair.guard.attach(&mut pair.guard_engine, peer, pair.now);
+    for (target, partial, data) in [
+        (elsewhere, false, their_limit_descriptions()),
+        (load.clone(), true, their_limit_descriptions()),
+        (
+            load,
+            false,
+            CmdData::LoadControlLimitListData(their_current_limits()),
+        ),
+    ] {
+        let event = SpineEvent::DataNotified {
+            feature: target,
+            is_partial: partial,
+            resolved: data.clone(),
+            data,
+        };
+        pair.guard
+            .handle_event(&mut pair.guard_engine, &event, pair.now);
+    }
+    assert_eq!(pair.guard.peer_ids(&device).unwrap().limit, None);
+    pair.settle();
+    assert!(pair.guard.is_ready(&device));
+}
+
+// 018-limitation-commissioning/SR-021
+#[test]
+fn discovery_requires_a_single_write_capable_load_control_feature() {
+    let mut pair = Foreign::new(their_limit_descriptions());
+    pair.commission();
+    let mut remote = pair.guard_engine.peer(&pair.device()).unwrap().clone();
+    let entity = remote
+        .entities
+        .iter_mut()
+        .find(|entity| entity.address == [1])
+        .unwrap();
+    let load = entity
+        .features
+        .iter_mut()
+        .find(|f| f.feature_type == FeatureType::LoadControl)
+        .unwrap();
+    load.functions
+        .retain(|property| property.function != Some(Function::LoadControlLimitListData));
+    assert!(limitation::locate(&remote, lpc::DIRECTION).is_none());
+
+    let mut remote = pair.guard_engine.peer(&pair.device()).unwrap().clone();
+    let entity = remote
+        .entities
+        .iter_mut()
+        .find(|entity| entity.address == [1])
+        .unwrap();
+    let mut second = entity
+        .feature(&FeatureType::LoadControl, Role::Server)
+        .unwrap()
+        .clone();
+    second.address.feature = Some(eebus::model::AddressFeature(12));
+    entity.features.push(second);
+    assert!(limitation::locate(&remote, lpc::DIRECTION).is_none());
 }

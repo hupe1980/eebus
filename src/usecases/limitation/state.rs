@@ -182,7 +182,8 @@ pub struct LimitWrite {
     /// Whether the limit is in force ([LPC/LPP-008]).
     pub is_active: bool,
     /// The limit in watts, exactly and in canonical form ([`ScaledNumber::canonical`]).
-    /// Always at or above zero ([LPC/LPP-001]); [`watts`](Self::watts) is the `f64` view.
+    /// Both use cases take a nonnegative magnitude. The actors encode and decode the
+    /// active production limit with a negative wire sign (LPP §2.8.1).
     pub value: ScaledNumber,
     /// How long the limit is valid ([LPC/LPP-004]).
     ///
@@ -194,10 +195,7 @@ pub struct LimitWrite {
 /// A limit the Energy Guard will not write: its watts are not a finite number at or above
 /// zero ([LPC/LPP-001]).
 ///
-/// Refused before anything is sent. NaN or infinity on the wire would be no quantity at
-/// all, and a negative limit is one the Controllable System must refuse — so the guard
-/// says so to the application, which owes the grid operator an answer, instead of to the
-/// peer.
+/// Reported to the application before the guard schedules a write.
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 #[error("a limit is a finite number of watts at or above zero, not {watts}")]
 #[non_exhaustive]
@@ -219,7 +217,12 @@ impl LimitWrite {
     /// Whether this limit can be written: [`InvalidLimit`] unless its watts are a finite
     /// number at or above zero ([LPC/LPP-001]).
     pub fn check(&self) -> Result<(), InvalidLimit> {
-        check_watts(self.watts())
+        let watts = self.watts();
+        if self.value.number.is_some_and(|number| number.get() < 0) {
+            // Even a scaled value tiny enough to round to zero still has an exact sign.
+            return Err(InvalidLimit { watts });
+        }
+        check_watts(watts)
     }
 
     /// The limit in watts; NaN when the value is absent or not representable.
@@ -234,7 +237,13 @@ impl LimitWrite {
 
     /// An activated limit without a duration, to a milliwatt.
     pub fn active(watts: f64) -> Self {
-        Self::active_scaled(exact_watts(watts))
+        let value = exact_watts(watts);
+        // A negative fraction of a milliwatt may round to zero. Preserve the
+        // validation failure instead of turning it into an active zero limit.
+        if watts < 0.0 && value.number.is_some_and(|number| number.get() == 0) {
+            return Self::active_scaled(ScaledNumber::default());
+        }
+        Self::active_scaled(value)
     }
 
     /// An activated limit without a duration, exactly.
@@ -257,7 +266,10 @@ impl LimitWrite {
 
     /// An activated limit valid for `duration`, to a milliwatt.
     pub fn active_for(watts: f64, duration: Duration) -> Self {
-        Self::active_for_scaled(exact_watts(watts), duration)
+        Self {
+            duration: Some(duration),
+            ..Self::active(watts)
+        }
     }
 
     /// An activated limit valid for `duration`, exactly.
@@ -359,8 +371,8 @@ pub enum NackReason {
     /// The device cannot follow the value.
     #[error("cannot apply the value: {0}")]
     CannotApply(RejectReason),
-    /// A negative limit, which [LPC/LPP-001] and implementation guide §3.6 forbid.
-    #[error("a limit below zero is not permitted")]
+    /// A negative local magnitude or failsafe setting.
+    #[error("a limit magnitude below zero is not permitted")]
     NegativeValue,
     /// A limit that is not a finite number, which [LPC/LPP-001] does not admit: a
     /// `scaledNumber` whose `scale` overflows `f64` is refused, not read as unrestricted.
@@ -576,6 +588,15 @@ impl ControllableSystem {
         }
     }
 
+    /// The last accepted active power limit, with activation following the current
+    /// state (LPC/LPP-009). The failsafe setting belongs to its own data point.
+    pub(super) fn reported_limit(&self, now: Duration) -> LimitWrite {
+        let mut limit = self.limit.unwrap_or_else(LimitWrite::deactivated);
+        limit.duration = self.limit_expiry.map(|expiry| expiry.saturating_sub(now));
+        limit.is_active = self.is_limit_active() && limit.duration != Some(Duration::ZERO);
+        limit
+    }
+
     /// Whether the limit is currently activated, which is what
     /// `loadControlLimitData.isLimitActive` reports ([LPC/LPP-009]).
     pub fn is_limit_active(&self) -> bool {
@@ -648,12 +669,10 @@ impl ControllableSystem {
             return WriteOutcome::Rejected(NackReason::NoRecentHeartbeat);
         }
 
-        // [LPC/LPP-001], implementation guide §3.6: a limit below zero is never valid, nor
-        // is one that is not a number. An application can construct a `LimitWrite`
-        // directly, so this does not rely on the wire parser having caught it.
+        // An application can construct a local magnitude directly, bypassing the parser.
         let refusal = if !write.watts().is_finite() {
             Some(NackReason::NotFinite)
-        } else if write.watts() < 0.0 {
+        } else if write.value.number.is_some_and(|number| number.get() < 0) {
             Some(NackReason::NegativeValue)
         } else if let LocalDecision::Reject(reason) = decision {
             Some(NackReason::CannotApply(reason))
@@ -668,7 +687,7 @@ impl ControllableSystem {
         self.sequence_complete = true;
         self.awaiting_write_since = None;
         self.limit = Some(*write);
-        self.limit_expiry = write.duration.map(|d| now + d);
+        self.limit_expiry = write.duration.map(|d| now.saturating_add(d));
 
         // [LPC/LPP-007] and implementation guide §2.2: a duration of zero deactivates the
         // limit at once, and is accepted rather than refused.
@@ -702,17 +721,11 @@ impl ControllableSystem {
         self.refuse(NackReason::Unreadable, now)
     }
 
-    /// Takes back an acceptance the engine could not store.
-    ///
-    /// [`on_limit_write`](Self::on_limit_write) moved the machine on the decision to
-    /// accept; the peer was then answered with an error, so what it holds is what a
-    /// *refused* write leaves — the previous limit, in the controlled state a refusal
-    /// lands in ([LPC/LPP-907]). This puts the machine there, so that what it reports
-    /// agrees with what went on the wire.
-    pub fn on_unstored_limit_write(&mut self, now: Duration) {
-        self.limit = None;
-        self.limit_expiry = None;
-        self.enter(LimitationState::UnlimitedControlled, now);
+    /// The prospective write could not be committed. Keep the last accepted limit
+    /// and apply only the refusal transition.
+    pub(super) fn on_unstored_limit_write(&mut self, now: Duration) -> WriteOutcome {
+        self.handle_timeout(now);
+        self.refuse(NackReason::NotStored, now)
     }
 
     /// The state change every refused limit write makes, whatever the reason.
@@ -744,11 +757,11 @@ impl ControllableSystem {
         if let Some(rejection) = self.check_secondary_write(now) {
             return rejection;
         }
-        let Some(watts) = value.to_f64().filter(|w| w.is_finite()) else {
+        if value.to_f64().is_none() {
             return WriteOutcome::Rejected(NackReason::NotFinite);
-        };
-        // [LPC/LPP-021]: the failsafe limit is a power, and a power below zero is not one.
-        if watts < 0.0 {
+        }
+        // The failsafe setting is nonnegative in both use cases.
+        if value.number.is_some_and(|number| number.get() < 0) {
             return WriteOutcome::Rejected(NackReason::NegativeValue);
         }
         self.config.failsafe = value.canonical();
@@ -823,12 +836,15 @@ impl ControllableSystem {
         }
 
         // [LPC/LPP-908]: an expired duration deactivates the limit.
-        if self.state == LimitationState::Limited
-            && let Some(expiry) = self.limit_expiry
-            && now >= expiry
-        {
-            self.enter(LimitationState::UnlimitedControlled, now);
-            return;
+        if self.limit_expiry.is_some_and(|expiry| now >= expiry) {
+            if let Some(limit) = &mut self.limit {
+                limit.duration = None;
+            }
+            self.limit_expiry = None;
+            if self.state == LimitationState::Limited {
+                self.enter(LimitationState::UnlimitedControlled, now);
+                return;
+            }
         }
 
         match self.state {
@@ -904,9 +920,7 @@ impl ControllableSystem {
                 // Without a heartbeat to measure from, the clock runs from the moment
                 // the state was entered, so the failsafe is still reached.
                 consider(self.last_heartbeat.unwrap_or(self.entered_state_at) + HEARTBEAT_TIMEOUT);
-                if self.state == LimitationState::Limited
-                    && let Some(expiry) = self.limit_expiry
-                {
+                if let Some(expiry) = self.limit_expiry {
                     consider(expiry);
                 }
             }
@@ -980,6 +994,8 @@ impl ControllableSystem {
             LimitationState::FailsafeState | LimitationState::UnlimitedAutonomous
         ) {
             self.sequence_complete = false;
+            self.limit = None;
+            self.limit_expiry = None;
         }
     }
 }
@@ -1035,7 +1051,8 @@ impl crate::usecases::signals::Signals<super::Direction> for ControllableSystem 
                     SignalValue::number(
                         self.limit
                             .filter(|_| self.state == LimitationState::Limited)
-                            .map(|l| l.watts()),
+                            .and_then(|l| direction.apply_limit_sign(l.value))
+                            .and_then(|value| value.to_f64()),
                     ),
                 )
                 .in_unit("W"),

@@ -127,10 +127,11 @@ let what_is_it = keys.name_of(some_key_from_a_value_list);
 A wrong identifier produces no error: the write is well-formed, names a real entry, and is
 applied and acknowledged to the wrong value.
 
-Each use case wraps the resolver its data needs — `limitation::PeerIds`,
-`mgcp::Curtailment`, `charging::PhaseLimits`, `evcc::EvReader` — and the actors use it. An
-application only has to let the actor read the descriptions before expecting it to write;
-`EnergyGuardActor::is_ready` reports when it has.
+For an LPC or LPP write, the guard also reads the current limit list on the same feature.
+It joins by `limitId` to verify that the matched entry is writable. A custom controller
+can perform the same check with `limitation::resolve_writable_limit`.
+`EnergyGuardActor::is_ready` reports whether the target is commissioned.
+See [Commissioning a writable limit](@/docs/limitation.md#commissioning-a-writable-limit).
 
 ## What is implemented
 
@@ -171,12 +172,8 @@ sides, the appliance's and the manager's.
 The twelve HVAC rows are the complete contents of the two HVAC specification bundles,
 `EEBUS_HVAC_SystemFunction_UseCases_V1.0.0` and `EEBUS_HVAC_Temperature_UseCases_V1.0.0`.
 
-Not implemented: **CEVC** (Coordinated EV Charging — see
-[Not here: CEVC](@/docs/e-mobility.md#not-here-cevc)) and **ITPCM** (Incentive Table Based
-Power Consumption Management), both a price signal over `incentiveTable` that an appliance
-plans against. No device in the eight-device corpus announces either; the SMA Home Manager 2
-announces [OHPCF](https://docs.rs/eebus/latest/eebus/usecases/ohpcf/index.html), the
-direct-control alternative.
+The supported exchanges are listed above. Price-based planning with CEVC or ITPCM
+is outside the crate's scope.
 
 ## The four levers that can ask for *more*
 
@@ -198,9 +195,8 @@ The grid, e-mobility and storage use cases can only ask an appliance to do less 
 
 ## Two use cases, one implementation
 
-LPC and LPP are the same use case in opposite directions: the same four scenarios, table
-numbers and thirteen state transitions, with requirement identifiers differing only in the
-prefix. The state machine and both actors are written once and pointed by a `Direction`:
+LPC and LPP share four scenarios and thirteen state transitions. The actor's `Direction`
+selects the peer's use case, published characteristics and wire sign of the active limit.
 
 ```rust
 ControllableSystemActor::builder(system, lpc::DIRECTION, features).install(&mut engine, now)

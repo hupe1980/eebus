@@ -1375,16 +1375,17 @@ async fn a_peer_that_stops_reading_is_dropped_and_delays_nobody() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Far more than one peer's queue may hold, and far more than the kernel and TLS
-    // buffers swallow.
+    // One-way notifications fill the transport queue without consuming the engine's
+    // bounded pending-request slots. The hub dispatches this batch before polling sockets.
     let source = hub.engine().device().address_of(&[1], 1);
-    let stalled_target = eebus::spine::feature_address(&device_of(stalled_ski), &[1], 1);
-    for _ in 0..50_000 {
-        let now = hub.now();
-        hub.engine_mut().read(
-            &stalled_target,
-            &source,
-            eebus::model::Function::LoadControlLimitListData,
+    let server = node_management(hub.engine().device().address());
+    let subscriber = node_management(&device_of(stalled_ski));
+    hub.engine_mut().insert_subscription(&subscriber, &server);
+    let now = hub.now();
+    for _ in 0..=eebus::runtime::MAX_OUTBOX {
+        hub.engine_mut().notify(
+            &server,
+            &eebus::model::Function::NodeManagementDetailedDiscoveryData,
             now,
         );
     }

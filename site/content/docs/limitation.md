@@ -33,7 +33,9 @@ sequenceDiagram
     EG->>CS: bindingRequest DeviceConfiguration
     CS-->>EG: granted
     EG->>CS: read loadControlLimitDescriptionListData
-    CS-->>EG: limitId 7 · obligation · consume
+    CS-->>EG: limitId 7 · obligation · consume · W
+    EG->>CS: read loadControlLimitListData
+    CS-->>EG: limitId 7 · isLimitChangeable true
     EG->>CS: read deviceConfigurationKeyValueDescriptionListData
     CS-->>EG: failsafe keys 5 and 6
     EG->>CS: subscriptionRequest ×4 · LoadControl · DeviceConfiguration<br>DeviceDiagnosis · ElectricalConnection
@@ -116,66 +118,43 @@ let system = ControllableSystem::new(
 
 ## The application decides
 
-A limit write is answered by the application, not by a generic setter: under §14a the
-acknowledgement is the record that the limit was applied, so it reports what the appliance
-actually did.
+Pass each event to the Controllable System actor. For a readable limit, the policy receives
+the merged state of the addressed entry and decides whether the appliance can apply it.
+The actor handles the result message and audit record.
 
 ```rust
-match engine.poll_event() {
-    Some(SpineEvent::WriteRequested(w)) => {
-        let write = limitation::read_limit_write(&w.resolved)?;   // merged, not the fragment
-        match system.on_limit_write(&write, decide(&write), now) {
-            WriteOutcome::Accepted => engine.accept_write(w.token, now),           // ACK
-            outcome => engine.reject_write(w.token, outcome.error_number(), now),  // NACK
-        }
-    }
-    _ => {}
+if let Some(CsEvent::LimitDecided { write, outcome, .. }) =
+    pump.handle_event_with(&mut engine, &event, now, decide)
+{
+    println!("{} W, active={}: {outcome:?}", write.watts(), write.is_active);
 }
 ```
 
-`ControllableSystemActor` does all of that, and asks for the decision through
-`handle_event_with`. Its closure sees each limit the pump can read, on the merged state,
-before it is answered. `handle_event` is the same call with a decision that follows every
-limit.
-
-```rust
-let decision = pump.handle_event_with(&mut engine, &event, now, |write| decide(write));
-```
+A policy for an inverter receives a positive magnitude for a nonzero production cap.
+Use `write.is_active` to distinguish an active zero from a release. Applications that
+always follow valid limits can use `handle_event`.
 
 ## Refusing a limit by policy
 
-EEBUS authorises a limit by the binding and by nothing finer. Only the entity that holds the
-`LoadControl` binding may write the limit (§3.5), and only its heartbeat counts (§3.8). A
-compromised control box that holds the binding is authorised all the same. The protocol has
-no way to ask whether its *values* are plausible. The application does, and
-`handle_event_with` is where it asks.
+Only the peer holding the `LoadControl` binding can write a limit. Use
+`handle_event_with` to apply device policy. LPC §2.2 permits an appliance to refuse
+for self-protection, safety or a regulatory requirement. An energy manager may also
+refuse if uncontrolled loads prevent it from meeting the limit.
 
-The application has little discretion. LPC UC TS §2.2:
-
-> If the CS is NOT located on a CEM, the CS SHALL apply the limit unless the rejection of the
-> limit is required by one of these conditions: Self-protection; safety-related activities;
-> legal or regulatory specifications.
-
-On an energy manager, "uncontrolled loads prevent achieving the limit" is a fourth condition,
-and "the obligation to accept a limit is not bound to any internal device state".
-`RejectReason` is that list and nothing else. §2.16 adds that a limit is accepted even when
-it changes nothing.
-
-Under §14a EnWG a device has no discretion over a limit at or above the minimum the
-regulation leaves it. The grid operator may impose that limit, and the device has to follow
-it. A policy may refuse only what the regulation does not allow the operator to impose:
+The following example assumes a directly controlled heat pump with a configured
+4,200 W minimum. Use the floor applicable to the installation.
 
 ```rust
 use eebus::usecases::limitation::{LimitWrite, LocalDecision, RejectReason};
 
-/// The least power §14a EnWG lets a grid operator leave this heat pump.
+/// Configured minimum for this installation.
 const FLOOR_WATTS: f64 = 4_200.0;
 
 fn policy(write: &LimitWrite) -> LocalDecision {
     if write.is_active && write.watts() < FLOOR_WATTS {
-        LocalDecision::Reject(RejectReason::Regulatory)   // NACK, and on the record
+        LocalDecision::Reject(RejectReason::Regulatory)
     } else {
-        LocalDecision::Apply                              // a deactivation, the floor, anything above
+        LocalDecision::Apply
     }
 }
 
@@ -187,36 +166,33 @@ recorded in `pump.audit()` as `Rejected(CannotApply(Regulatory))`, with the devi
 of the peer that sent it. The heartbeat gate is checked first: a write with no recent
 heartbeat is `NoRecentHeartbeat` whatever the policy answers.
 
-Before adopting a floor, check:
+An energy manager can allocate its total limit among several appliances, including
+a 0 W allocation. Apply a site-wide floor at the manager. A refusal keeps a
+`limited` system limited. In `init` or `failsafe`, a policy refusal transitions
+to `unlimited/controlled` (LPC-902, LPC-907, LPC-918).
 
-* **The floor is set by the regulation.** The implementation guide §4.1.3 refers to
-  BK6-22-300 for it, which sets different figures for charging stations and batteries than
-  for heat pumps and air conditioners, and by how many there are. 4.2 kW is the figure for
-  one appliance under the control box directly.
-* **A floor is for an appliance the control box addresses itself.** Behind an energy manager
-  (§4.1.2, option 2), the manager divides one limit among several appliances, so a low
-  limit for one of them is lawful, and 0 W is a valid limit (§2.16). There the floor, if
-  any, applies to the manager's total.
-* **A refusal does not apply a safer value.** A system that was `limited` or
-  `unlimited/controlled` stays there ([LPC-907]). One in `init` or `failsafe` moves to
-  `unlimited/controlled` ([LPC-902], [LPC-918]). Refusing a 0 W limit during failsafe
-  therefore lifts the failsafe limit. Accepting a value and then not following it is not an
-  option: the acknowledgement is the record that the limit was applied.
-* **The certification body decides.** UC TS §2.2 notes that a vendor will probably have to
-  state in which cases its device refuses a limit, and that the certification authority
-  accepts or declines those cases.
-* **A floor does not stop a compromised control box from holding the appliance at the
-  floor.** That limit is lawful. The audit log shows it afterwards; nothing in the protocol
-  prevents it.
-
-`heat_pump --floor 4200` runs this policy in the simulator.
+Run the example policy with `cargo run --example heat_pump --features full -- --floor 4200`.
 
 ## Exact values
 
-A limit and a failsafe value are regulatory figures, and both actors hold them as the
-`ScaledNumber` they arrived as: what the Energy Guard writes is what the wire carries, what
-the device applies and what it publishes back. The `f64` spelling is a view. A consumer that
-builds no floating point uses the exact one throughout:
+The local API accepts a nonnegative magnitude for both directions. A 10 kW inverter
+limited to 40% of rated output receives a −4,000 W active production limit. Its local
+policy sees 4,000 W and its SPINE readback reports −4,000 W.
+
+| Grid request | Local `require` argument | LPC wire value | LPP wire value | `isLimitActive` |
+|---|---|---:|---:|---|
+| Limit to 4 kW | `Some(LimitWrite::active(4_000.0))` | +4,000 W | −4,000 W | `true` |
+| Limit to zero | `Some(LimitWrite::active(0.0))` | 0 W | 0 W | `true` |
+| Release the limit | `None` | 0 W | 0 W | `false` |
+
+The sign applies specifically to the Active Power Production Limit. Failsafe Production
+Active Power Limit, Power Production Nominal Max and Contractual Production Nominal Max
+all use nonnegative wire values. The tester signal `lpp:limit` follows the active limit’s
+wire sign. Application policies and audit records report the magnitude. When
+`isLimitActive` is false the peer ignores the numeric limit. See §2.8.1 and Tables 22–23 of the [LPP technical specification](https://www.eebus.org/specifications/).
+
+Use `ScaledNumber` to pass precise decimal magnitudes through the guard, the appliance's
+policy and its audit log.
 
 ```rust
 use eebus::model::ScaledNumber;
@@ -236,28 +212,56 @@ The controlling side's rules live behind one call:
 guard.require(&device, Some(LimitWrite::active(4_200.0)), now)?;
 ```
 
-The guard takes up a peer that announces the Controllable System by itself, and a limit
-required before the peer is reachable is held, not discarded. A limit that is not a finite
-number of watts at or above zero is refused with `InvalidLimit` before anything is sent
-([LPC-001]); the limit already in force stands.
+The guard holds a requirement made before the peer is reachable. A successful
+`require` schedules the requirement. `GuardEvent::LimitAccepted` reports the
+acknowledgment from the peer. An invalid magnitude returns `InvalidLimit` before
+scheduling and preserves the existing requirement.
 
-Behind that line:
+After commissioning, the guard sends a heartbeat before the opening write (§2.11).
+On reconnect it reapplies the current requirement (§2.13). An active write carries
+a positive duration or no expiry (§2.2). Ordinary writes are spaced five minutes
+apart (§2.10). After a refusal the retry delay increases by one minute per refusal (§2.5).
 
-* the peer's own identifiers, read before anything is written. `limitId` is `<l1#(1..1)>`
-  in Table 22 and the two failsafe `keyId`s are `<k1#(1..1)>` and `<k2#(1..1)>` in Table 24;
-  the numbers belong to the device, and the specification fixes only the limit's type,
-  category, direction and scope, and the keys' names. Nothing is written until the
-  descriptions come back (`is_ready`; `peer_ids` reports them);
-* a heartbeat immediately before the write, and only once the peer has subscribed to it
-  (§2.11), since a notification reaches only subscribers;
-* an opening write on the limit as soon as the bindings settle, whether or not the grid is
-  asking for anything, because until it lands the Controllable System is not controllable
-  (§2.11);
-* never a deactivation as the first limit after a reconnection (§2.13);
-* never a zero duration on an activated limit (§2.2);
-* a refusal retried a minute later, and a minute later again, with the device kept (§2.5);
-* and no more than one write every five minutes otherwise (§2.10), the opening write
-  excepted.
+### Commissioning a writable limit
+
+When a request names a device, discovery must identify a single eligible Controllable
+System for the selected direction. Its `LoadControl` feature must advertise write access
+to `loadControlLimitListData`. The guard reads two lists on that feature.
+
+1. **Descriptions.** Exactly one entry must specify `signDependentAbsValueLimit`,
+   `obligation`, the requested direction and `activePowerLimit`. It must declare unit
+   `W` and have a `limitId` used once in this feature's descriptions.
+2. **Current limits.** Exactly one entry must carry that ID, with
+   `isLimitChangeable = true`. A read-only entry, a missing flag or a duplicate leaves
+   the target unavailable.
+
+List order has no effect. Commissioning starts from a complete snapshot of each list.
+Later partial updates are merged into those snapshots. If the engine has evicted a
+snapshot, the guard reads the missing list again before accepting a partial update as
+evidence of writability. The guard waits for both bindings
+before the opening write. It learns the two failsafe key IDs separately from the peer's
+`DeviceConfiguration` descriptions. `is_ready` reports readiness for the limit and
+`peer_ids` exposes the discovered identifiers.
+
+A controller that already has both resolved lists for one feature can call the resolver
+directly.
+
+```rust
+use eebus::usecases::limitation::{Direction, resolve_writable_limit};
+
+let id = resolve_writable_limit(&descriptions, &current, Direction::Production)?;
+```
+
+A failed lookup returns `LimitResolutionError`. The guard reports an unusable limit as
+`GuardEvent::LimitUnavailable { device, reason }`. Surface the reason to the installer.
+If refreshed lists invalidate a previously writable limit, the guard suspends limit writes
+until it can resolve a writable target again.
+
+When the engine removes a peer, forward `SpineEvent::PeerRemoved` to the guard with
+`handle_event`. The guard retains the grid requirement and repeats commissioning on
+reconnection. To stop controlling a peer and discard the requirement, call
+`guard.detach(&mut engine, &device)`. To lift the limit on a connected appliance, call
+`guard.require(&device, None, now)` and wait for its acknowledgment.
 
 ### The duration is a relative time, and an unreadable one is refused
 
@@ -266,17 +270,17 @@ same holds for the `endTime` Element used for the duration of validity ([LPC-004
 schema allows more: `timePeriod.endTime` is the `AbsoluteOrRelativeTimeType` union, so
 `2026-09-05T10:00:00Z` is schema-valid and use-case-invalid.
 
+For custom integrations, `limit_data(&system, direction, now)` publishes the duration
+remaining at the supplied monotonic time. A three-minute limit has two minutes left
+when read one minute after acceptance. A partial write updating only the wattage
+retains that deadline.
+
 `read_limit_write` refuses an `endTime` it cannot read as a relative duration, and the
 refusal reaches the guard as a NACK; reading it as absent would mean no expiry. The same
 rule covers a `scaledNumber` whose scale overflows, and
 [COB](https://docs.rs/eebus/latest/eebus/usecases/cob/index.html) applies it to its own
 setpoint duration, whose §3.1.8.2 says the same thing. See
 [Where a use case is narrower than the schema](@/docs/wire-format.md#where-a-use-case-is-narrower-than-the-schema-the-use-case-wins).
-
-A peer whose `LoadControl` feature describes no limit for this guard's direction reports
-`GuardEvent::NoLimitPublished` and is then left alone — usually a device that implements
-the other direction, or an actor that was never installed. Because the read succeeds, this
-event is the only sign of it.
 
 ## Scenario 4: what the Energy Guard is limiting
 

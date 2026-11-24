@@ -4,6 +4,28 @@ Notable changes to `eebus`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/), with the usual pre-1.0 caveat that a minor bump may break.
 
+## [0.14.0] — 2026-11-24
+
+### Fixed
+
+- A 4,000 W request produces a −4,000 W active LPP write and a +4,000 W LPC write.
+  Matching signed readback settles the guard. Active zero and release have distinct activation flags.
+- Timed limits report their remaining validity. A partial write that omits the expiry
+  preserves the deadline. Rejected or expired writes preserve the previously applied limit.
+- The guard suspends writes when the target becomes ambiguous or read-only. Reconnection
+  requires fresh bindings and limit data before reapplying the grid requirement.
+
+### Breaking changes
+
+| Previous API or behavior | Replacement |
+|---|---|
+| `find_limit_id`, `PeerIds::learn` | `resolve_writable_limit(&descriptions, &current, direction)` requires one writable limit in watts on the selected feature. |
+| `GuardEvent::NoLimitPublished` | `GuardEvent::LimitUnavailable { device, reason }` reports a typed resolution error. |
+| `guard.detach(&device)` | `guard.detach(&mut engine, &device)` cancels pending limit writes and forgets the requirement. Forward `SpineEvent::PeerRemoved` on disconnect to retain the requirement. |
+| Custom limit encoders and decoders | Use `limit_data(&system, direction, now)` and `read_limit_write(&resolved, limit_id, direction)`. The `lpp:limit` tester signal carries signed watts. |
+| Constructing or matching `DataNotified` and `ReplyReceived` | Set `is_partial` for partial updates and deletes. Matches can use `..`. |
+| `ControllableSystem::on_unstored_limit_write` | Use `ControllableSystemActor::handle_event_with` for policy decisions. |
+
 ## [0.13.1] — 2026-11-20
 
 ### Added
@@ -1828,6 +1850,10 @@ that the code did not keep.
 First tagged version. SHIP transport, SPINE model and engine, the Tokio runtime, and six
 use cases: LPC, LPP, MPC, MGCP, EVSECC and OPEV.
 
+[0.14.0]: https://github.com/hupe1980/eebus/compare/v0.13.1...v0.14.0
+[0.13.1]: https://github.com/hupe1980/eebus/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/hupe1980/eebus/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/hupe1980/eebus/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hupe1980/eebus/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/hupe1980/eebus/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/hupe1980/eebus/compare/v0.9.0...v0.10.0

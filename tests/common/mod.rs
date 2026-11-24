@@ -15,11 +15,11 @@ use eebus::model::{Datagram, DeviceType, EntityType, FeatureAddress, FeatureType
 use eebus::spine::{Engine, LocalDevice, LocalEntity, LocalFeature, SpineEvent, node_management};
 use eebus::usecases::descriptor::UseCaseDescriptor;
 use eebus::usecases::limitation::{
-    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures,
+    self, ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures, Direction,
     EnergyGuardActor, GuardEvent, LimitWrite, LocalDecision,
 };
-use eebus::usecases::lpc;
 use eebus::usecases::monitoring::{Measurand, MonitoredUnit, Quantity, Readings};
+use eebus::usecases::{lpc, lpp};
 use eebus::usecases::{mgcp, mpc};
 
 pub const FAILSAFE_WATTS: f64 = 4_200.0;
@@ -56,6 +56,26 @@ pub struct Pair {
 
 impl Pair {
     pub fn new() -> Self {
+        Self::with_direction(Direction::Consumption)
+    }
+
+    pub fn with_direction(direction: Direction) -> Self {
+        let (guard_role, cs_role, name, device_type, entity) = match direction {
+            Direction::Consumption => (
+                &lpc::ENERGY_GUARD,
+                &lpc::CONTROLLABLE_SYSTEM,
+                "HeatPump-1",
+                DeviceType::HeatGenerationSystem,
+                EntityType::HeatPumpAppliance,
+            ),
+            Direction::Production => (
+                &lpp::ENERGY_GUARD,
+                &lpp::CONTROLLABLE_SYSTEM,
+                "Inverter-1",
+                DeviceType::Inverter,
+                EntityType::Inverter,
+            ),
+        };
         let now = Duration::ZERO;
 
         let mut guard_device = LocalDevice::new(
@@ -74,14 +94,13 @@ impl Pair {
         let client = guard_device.address_of(&[1], 1);
         let guard_diagnosis = guard_device.address_of(&[1], 2);
         let mut guard_engine = Engine::new(guard_device);
-        guard_engine.add_use_case([1], 1, &lpc::ENERGY_GUARD);
-        let guard = EnergyGuardActor::new(lpc::DIRECTION, client, guard_diagnosis, now);
+        guard_engine.add_use_case([1], 1, guard_role);
+        let guard = EnergyGuardActor::new(direction, client, guard_diagnosis, now);
 
-        let mut pump_device =
-            LocalDevice::new("i:67890", "HeatPump-1", DeviceType::HeatGenerationSystem).unwrap();
+        let mut pump_device = LocalDevice::new("i:67890", name, device_type).unwrap();
         pump_device
             .add_entity(
-                LocalEntity::new([1], EntityType::HeatPumpAppliance)
+                LocalEntity::new([1], entity)
                     .with_feature(limitation::load_control_feature(1))
                     .with_feature(limitation::device_configuration_feature(2))
                     .with_feature(limitation::device_diagnosis_feature(3))
@@ -95,14 +114,14 @@ impl Pair {
         let diagnosis_client = pump_device.address_of(&[1], 5);
         let electrical = pump_device.address_of(&[1], 4);
         let mut pump_engine = Engine::new(pump_device);
-        pump_engine.add_use_case([1], 1, &lpc::CONTROLLABLE_SYSTEM);
+        pump_engine.add_use_case([1], 1, cs_role);
         let pump = ControllableSystemActor::builder(
             ControllableSystem::new(
                 CsConfig::new(FAILSAFE_WATTS, Duration::from_secs(2 * 3_600))
                     .with_nominal_max(NOMINAL_MAX_WATTS),
                 now,
             ),
-            lpc::DIRECTION,
+            direction,
             CsFeatures {
                 load_control,
                 device_configuration: configuration,
@@ -148,7 +167,7 @@ impl Pair {
         // not anybody has asked for a limit.
         let device = self.pump_engine.device().address().clone();
         let remote = self.guard_engine.peer(&device).expect("the heat pump");
-        limitation::locate(remote, lpc::DIRECTION).expect("a Controllable System");
+        limitation::locate(remote, self.guard.direction()).expect("a Controllable System");
         self.settle();
     }
 

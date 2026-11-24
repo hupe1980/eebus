@@ -1,22 +1,6 @@
-//! A grid operator's control box limits a heat pump, end to end.
-//!
-//! This is the §14a EnWG exchange in miniature, using every layer of the crate: the SHIP
-//! handshake brings two nodes to the point where they may exchange data, the SPINE engine
-//! discovers what the other one is and negotiates the permission to write, and the two
-//! Limitation of Power Consumption actors — Energy Guard on one side, Controllable System
-//! on the other — do the rest.
-//!
-//! Run it with:
-//!
-//! ```sh
-//! cargo run --example grid_limit
-//! ```
-//!
-//! Everything is in-memory and driven by a virtual clock: there is no socket, no TLS and
-//! no mDNS, because none of the protocol logic needs any of them. Both sides are the real
-//! actors, so the ordering rules the implementation guides impose — heartbeat before
-//! limit, never deactivate on reconnection, retry a refusal rather than dropping the
-//! device — are the crate's, not this file's.
+//! Run a control box and heat pump on a virtual clock with `cargo run --example grid_limit`.
+//! The actors discover each other, bind and exchange a consumption limit. When the
+//! control box stops sending heartbeats, the heat pump enters failsafe.
 
 use core::time::Duration;
 

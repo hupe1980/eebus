@@ -1513,7 +1513,11 @@ impl Hub {
         // call leaves no half-closed state behind — only a close handshake cut short.
         let mut closing = Vec::new();
         while let Some(index) = self.links.iter().position(|l| &l.ski == ski) {
-            closing.push(self.links.remove(index));
+            let link = self.links.remove(index);
+            if let Some(device) = &link.device {
+                self.engine.remove_peer(device);
+            }
+            closing.push(link);
         }
         self.forget(ski);
         self.pending.push_back(HubEvent::Disconnected {

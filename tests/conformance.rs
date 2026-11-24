@@ -17,13 +17,10 @@
 //!
 //! # LPC and LPP
 //!
-//! The two specifications state the same 51 abstract test cases under different prefixes,
-//! and this crate answers them with one state machine: `ControllableSystem` has no
-//! direction in it, because a limit is a number of watts either way. A test here
-//! therefore covers the LPC identifier and its LPP twin, and the part that genuinely does
-//! differ — what each use case *publishes* — is checked separately in
-//! `limitation_over_the_wire.rs` and by
-//! [`lpc_and_lpp_differ_only_in_what_they_publish`].
+//! The LPC and LPP catalogues specify the same state transitions. The shared
+//! Controllable System state machine operates on power magnitudes. The commissioned
+//! actor tests below run in both directions. The wire tests in
+//! `limitation_over_the_wire.rs` check the signed active limit independently.
 //!
 //! # SHIP, SPINE and the Pairing Service
 //!
@@ -176,35 +173,39 @@ fn cf_cs_unl_auto() -> (ControllableSystem, Duration) {
 /// sixty seconds apart. [LPC-TS-006]
 #[test]
 fn atc_lpc_com_pt_egheartbeat_001() {
-    let mut pair = Pair::new();
-    pair.commission();
+    for direction in [lpc::DIRECTION, lpp::DIRECTION] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
 
-    let diagnosis = pair.guard_engine.device().address_of(&[1], 2);
-    let mut beats: Vec<(u64, Duration)> = Vec::new();
-    for _ in 0..400 {
-        pair.advance(secs(1));
-        let counter = pair
-            .guard_engine
-            .device()
-            .resolve(&diagnosis)
-            .and_then(|feature| feature.data(&eebus::model::Function::DeviceDiagnosisHeartbeatData))
-            .and_then(limitation::read_heartbeat);
-        if let Some(counter) = counter
-            && beats.last().map(|(seen, _)| *seen) != Some(counter)
-        {
-            beats.push((counter, pair.now));
+        let diagnosis = pair.guard_engine.device().address_of(&[1], 2);
+        let mut beats: Vec<(u64, Duration)> = Vec::new();
+        for _ in 0..400 {
+            pair.advance(secs(1));
+            let counter = pair
+                .guard_engine
+                .device()
+                .resolve(&diagnosis)
+                .and_then(|feature| {
+                    feature.data(&eebus::model::Function::DeviceDiagnosisHeartbeatData)
+                })
+                .and_then(limitation::read_heartbeat);
+            if let Some(counter) = counter
+                && beats.last().map(|(seen, _)| *seen) != Some(counter)
+            {
+                beats.push((counter, pair.now));
+            }
+            if beats.len() >= 5 {
+                break;
+            }
         }
-        if beats.len() >= 5 {
-            break;
+        assert!(
+            beats.len() >= 5,
+            "five heartbeats in five minutes: {beats:?}"
+        );
+        for window in beats.windows(2) {
+            let gap = window[1].1.saturating_sub(window[0].1);
+            assert!(gap <= secs(60), "{gap:?} between two heartbeats");
         }
-    }
-    assert!(
-        beats.len() >= 5,
-        "five heartbeats in five minutes: {beats:?}"
-    );
-    for window in beats.windows(2) {
-        let gap = window[1].1.saturating_sub(window[0].1);
-        assert!(gap <= secs(60), "{gap:?} between two heartbeats");
     }
 }
 
@@ -212,35 +213,39 @@ fn atc_lpc_com_pt_egheartbeat_001() {
 /// [LPC-TS-007]
 #[test]
 fn atc_lpc_com_pt_csheartbeat_001() {
-    let mut pair = Pair::new();
-    pair.commission();
+    for direction in [lpc::DIRECTION, lpp::DIRECTION] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
 
-    let diagnosis = pair.pump_engine.device().address_of(&[1], 3);
-    let mut beats: Vec<(u64, Duration)> = Vec::new();
-    for _ in 0..400 {
-        pair.advance(secs(1));
-        let counter = pair
-            .pump_engine
-            .device()
-            .resolve(&diagnosis)
-            .and_then(|feature| feature.data(&eebus::model::Function::DeviceDiagnosisHeartbeatData))
-            .and_then(limitation::read_heartbeat);
-        if let Some(counter) = counter
-            && beats.last().map(|(seen, _)| *seen) != Some(counter)
-        {
-            beats.push((counter, pair.now));
+        let diagnosis = pair.pump_engine.device().address_of(&[1], 3);
+        let mut beats: Vec<(u64, Duration)> = Vec::new();
+        for _ in 0..400 {
+            pair.advance(secs(1));
+            let counter = pair
+                .pump_engine
+                .device()
+                .resolve(&diagnosis)
+                .and_then(|feature| {
+                    feature.data(&eebus::model::Function::DeviceDiagnosisHeartbeatData)
+                })
+                .and_then(limitation::read_heartbeat);
+            if let Some(counter) = counter
+                && beats.last().map(|(seen, _)| *seen) != Some(counter)
+            {
+                beats.push((counter, pair.now));
+            }
+            if beats.len() >= 5 {
+                break;
+            }
         }
-        if beats.len() >= 5 {
-            break;
+        assert!(
+            beats.len() >= 5,
+            "five heartbeats in five minutes: {beats:?}"
+        );
+        for window in beats.windows(2) {
+            let gap = window[1].1.saturating_sub(window[0].1);
+            assert!(gap <= secs(60), "{gap:?} between two heartbeats");
         }
-    }
-    assert!(
-        beats.len() >= 5,
-        "five heartbeats in five minutes: {beats:?}"
-    );
-    for window in beats.windows(2) {
-        let gap = window[1].1.saturating_sub(window[0].1);
-        assert!(gap <= secs(60), "{gap:?} between two heartbeats");
     }
 }
 
@@ -249,75 +254,79 @@ fn atc_lpc_com_pt_csheartbeat_001() {
 /// until it lands the system is not controllable at all. [LPC-TS-030]
 #[test]
 fn atc_lpc_com_pt_egconnection_002() {
-    let mut pair = Pair::new();
-    pair.commission();
+    for direction in [lpc::DIRECTION, lpp::DIRECTION] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
 
-    // The Controllable System loses the Energy Guard and falls into the failsafe state.
-    let device = pair.device();
-    pair.guard.detach(&device);
-    pair.now += secs(200);
-    pair.pump.handle_timeout(&mut pair.pump_engine, pair.now);
-    assert_eq!(
-        pair.pump.system().state(),
-        LimitationState::FailsafeState,
-        "CF_CS_FS"
-    );
-    pair.forget_history();
+        // The Controllable System loses the Energy Guard and falls into the failsafe state.
+        let device = pair.device();
+        pair.guard.detach(&mut pair.guard_engine, &device);
+        pair.now += secs(200);
+        pair.pump.handle_timeout(&mut pair.pump_engine, pair.now);
+        assert_eq!(
+            pair.pump.system().state(),
+            LimitationState::FailsafeState,
+            "CF_CS_FS"
+        );
+        pair.forget_history();
 
-    // The connection comes back, and the guard runs the opening sequence again.
-    let remote = pair
-        .guard_engine
-        .peer(&device)
-        .expect("the peer is still known");
-    let peer = limitation::locate(remote, lpc::DIRECTION).expect("a Controllable System");
-    pair.guard.attach(&mut pair.guard_engine, peer, pair.now);
-    pair.settle();
-    pair.advance(secs(11));
+        // The connection comes back, and the guard runs the opening sequence again.
+        let remote = pair
+            .guard_engine
+            .peer(&device)
+            .expect("the peer is still known");
+        let peer = limitation::locate(remote, direction).expect("a Controllable System");
+        pair.guard.attach(&mut pair.guard_engine, peer, pair.now);
+        pair.settle();
+        pair.advance(secs(11));
 
-    assert_eq!(
-        pair.pump.system().state(),
-        LimitationState::UnlimitedControlled,
-        "a heartbeat and a following limit write, within sixty seconds of each other"
-    );
-    assert_eq!(pair.accepted().len(), 1);
+        assert_eq!(
+            pair.pump.system().state(),
+            LimitationState::UnlimitedControlled,
+            "a heartbeat and a following limit write, within sixty seconds of each other"
+        );
+        assert_eq!(pair.accepted().len(), 1);
+    }
 }
 
 /// The Energy Guard causes the Controllable System to leave `unlimited/controlled` for
 /// `limited` on an external stimulus, with no duration on the limit. [LPC-TS-001]
 #[test]
 fn atc_lpc_com_pt_egmessages_001() {
-    let mut pair = Pair::new();
-    pair.commission();
+    for direction in [lpc::DIRECTION, lpp::DIRECTION] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
 
-    // CF_CS_UnlCntrl: the opening deactivation every Energy Guard sends. Nothing here
-    // asks for it — implementation guide §2.11 requires the guard to send it as soon as
-    // the bindings settle, and it attaches itself to a peer that announces the
-    // Controllable System, so the pre-condition establishes itself.
-    let device = pair.device();
-    pair.advance(secs(1));
-    assert_eq!(
-        pair.pump.system().state(),
-        LimitationState::UnlimitedControlled
-    );
+        // CF_CS_UnlCntrl: the opening deactivation every Energy Guard sends. Nothing here
+        // asks for it — implementation guide §2.11 requires the guard to send it as soon as
+        // the bindings settle, and it attaches itself to a peer that announces the
+        // Controllable System, so the pre-condition establishes itself.
+        let device = pair.device();
+        pair.advance(secs(1));
+        assert_eq!(
+            pair.pump.system().state(),
+            LimitationState::UnlimitedControlled
+        );
 
-    // The external stimulus: the grid needs the house held to 5 kW.
-    pair.advance(limitation::MIN_WRITE_INTERVAL);
-    pair.guard
-        .require(&device, Some(LimitWrite::active(APCL_03)), pair.now)
-        .expect("a valid limit");
-    pair.advance(secs(1));
+        // The external stimulus: the grid needs the house held to 5 kW.
+        pair.advance(limitation::MIN_WRITE_INTERVAL);
+        pair.guard
+            .require(&device, Some(LimitWrite::active(APCL_03)), pair.now)
+            .expect("a valid limit");
+        pair.advance(secs(1));
 
-    assert_eq!(pair.pump.system().state(), LimitationState::Limited);
-    assert_eq!(
-        pair.pump.system().effective_limit(),
-        EffectiveLimit::active(APCL_03)
-    );
-    assert_eq!(
-        pair.accepted().len(),
-        2,
-        "the opening deactivation the guard sends itself, and the limit that answers the \
-         stimulus"
-    );
+        assert_eq!(pair.pump.system().state(), LimitationState::Limited);
+        assert_eq!(
+            pair.pump.system().effective_limit(),
+            EffectiveLimit::active(APCL_03)
+        );
+        assert_eq!(
+            pair.accepted().len(),
+            2,
+            "the opening deactivation the guard sends itself, and the limit that answers the \
+             stimulus"
+        );
+    }
 }
 
 /// The Energy Guard sends valid messages over an extended period, and a Controllable
@@ -325,58 +334,62 @@ fn atc_lpc_com_pt_egmessages_001() {
 /// [LPC-TS-002]
 #[test]
 fn atc_lpc_com_pt_egmessages_003() {
-    let mut pair = Pair::new();
-    pair.commission();
-    let device = pair.device();
-    pair.guard
-        .require(&device, None, pair.now)
-        .expect("a valid limit");
-    pair.advance(secs(1));
-
-    for (round, limit) in [APCL_02, APCL_03, APCL_04, APCL_05].iter().enumerate() {
+    for direction in [lpc::DIRECTION, lpp::DIRECTION] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
+        let device = pair.device();
         pair.guard
-            .require(&device, Some(LimitWrite::active(*limit)), pair.now)
+            .require(&device, None, pair.now)
             .expect("a valid limit");
-        // §2.10 holds a guard to one write every five minutes.
-        pair.advance(limitation::MIN_WRITE_INTERVAL + secs(1));
+        pair.advance(secs(1));
+
+        for (round, limit) in [APCL_02, APCL_03, APCL_04, APCL_05].iter().enumerate() {
+            pair.guard
+                .require(&device, Some(LimitWrite::active(*limit)), pair.now)
+                .expect("a valid limit");
+            // §2.10 holds a guard to one write every five minutes.
+            pair.advance(limitation::MIN_WRITE_INTERVAL + secs(1));
+            assert_eq!(
+                pair.pump.system().effective_limit(),
+                EffectiveLimit::active(*limit),
+                "round {round}"
+            );
+        }
         assert_eq!(
-            pair.pump.system().effective_limit(),
-            EffectiveLimit::active(*limit),
-            "round {round}"
+            pair.accepted().len(),
+            5,
+            "the opening deactivation, then four limits"
         );
+        assert!(pair.refused().is_empty());
     }
-    assert_eq!(
-        pair.accepted().len(),
-        5,
-        "the opening deactivation, then four limits"
-    );
-    assert!(pair.refused().is_empty());
 }
 
 /// The Energy Guard writes the failsafe values and they take. [LPC-TS-003],
 /// [LPC-TS-011/1], [LPC-TS-013/1]
 #[test]
 fn atc_lpc_com_pt_egmessages_004() {
-    let mut pair = Pair::new();
-    pair.commission();
-    let device = pair.device();
+    for direction in [lpc::DIRECTION, lpp::DIRECTION] {
+        let mut pair = Pair::with_direction(direction);
+        pair.commission();
+        let device = pair.device();
 
-    // The failsafe values may only be written once the opening sequence has completed
-    // ([LPC-TS-037]), which is the deactivation the guard sends first.
-    pair.guard
-        .require(&device, None, pair.now)
-        .expect("a valid limit");
-    pair.advance(secs(1));
+        // The failsafe values may only be written once the opening sequence has completed
+        // ([LPC-TS-037]), which is the deactivation the guard sends first.
+        pair.guard
+            .require(&device, None, pair.now)
+            .expect("a valid limit");
+        pair.advance(secs(1));
 
-    pair.guard
-        .write_failsafe_limit(&mut pair.guard_engine, &device, 3_500.0, pair.now);
-    pair.settle();
-    assert_eq!(pair.pump.system().config().failsafe_watts(), 3_500.0);
+        pair.guard
+            .write_failsafe_limit(&mut pair.guard_engine, &device, 3_500.0, pair.now);
+        pair.settle();
+        assert_eq!(pair.pump.system().config().failsafe_watts(), 3_500.0);
 
-    pair.guard
-        .write_failsafe_duration(&mut pair.guard_engine, &device, FCAPL_DUR_02, pair.now);
-    pair.settle();
-    assert_eq!(pair.pump.system().config().failsafe_duration, FCAPL_DUR_02);
+        pair.guard
+            .write_failsafe_duration(&mut pair.guard_engine, &device, FCAPL_DUR_02, pair.now);
+        pair.settle();
+        assert_eq!(pair.pump.system().config().failsafe_duration, FCAPL_DUR_02);
+    }
 }
 
 // ---- 8 Abstract test cases for CS: connection ---------------------------------
@@ -1240,11 +1253,9 @@ fn atc_lpc_ins2_pt_cstransition1_001() {
 
 // ---- what makes LPC and LPP two use cases -------------------------------------
 
-/// The claim that one state machine answers both specifications rests on the two
-/// differing only in what they publish. This checks the difference, so that the claim
-/// above it is not taken on trust.
+/// Each direction publishes the names used by its own specification.
 #[test]
-fn lpc_and_lpp_differ_only_in_what_they_publish() {
+fn lpc_and_lpp_publish_direction_specific_identifiers() {
     assert_eq!(
         lpc::DIRECTION.failsafe_limit_key().as_str(),
         "failsafeConsumptionActivePowerLimit"
@@ -2501,6 +2512,10 @@ fn coverage_of_the_protocol_test_specifications() {
 fn the_published_protocol_figures_are_the_measured_ones() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for file in PROTOCOL_FIGURES_IN {
+        // The published crate includes the README. The Pages site ships separately.
+        if file.starts_with("site/") && !root.join("site").exists() {
+            continue;
+        }
         let text = std::fs::read_to_string(root.join(file)).expect("a published file");
         for (spec, named) in UNCOVERED {
             let total = spec.cases().len();

@@ -36,7 +36,7 @@ use super::{Direction, FAILSAFE_DURATION_MINIMUM_KEY};
 ///
 /// The specification's placeholder `<l1#1>` leaves the number to the device, so this is a
 /// local choice and nothing else. **It is not a number to address a peer by.** A client
-/// finds a peer's limit with [`find_limit_id`], which matches on the elements the
+/// finds a peer's limit with [`resolve_writable_limit`], which matches on the elements the
 /// specification does fix — the limit type, the category, the direction and the scope.
 ///
 /// The failure this prevents is silent and specific. A device that serves LPC *and* LPP
@@ -165,22 +165,31 @@ pub fn limit_description(direction: Direction) -> CmdData {
     })
 }
 
-/// The current limit, as `loadControlLimitListData` (LPC/LPP Table 23).
-pub fn limit_data(system: &ControllableSystem) -> CmdData {
+/// The active power limit with its wire sign and remaining duration at `now`
+/// (LPC/LPP Table 23). Use the same monotonic clock as the state machine.
+pub fn limit_data(system: &ControllableSystem, direction: Direction, now: Duration) -> CmdData {
+    let mut entry = limit_entry(&system.reported_limit(now), LIMIT_ID, direction);
+    entry.is_limit_changeable = Some(true);
     CmdData::LoadControlLimitListData(LoadControlLimitListData {
-        load_control_limit_data: Some(vec![LoadControlLimitData {
-            limit_id: Some(LIMIT_ID),
-            is_limit_changeable: Some(true),
-            is_limit_active: Some(system.is_limit_active()),
-            value: Some(
-                system
-                    .effective_limit()
-                    .scaled()
-                    .unwrap_or(ScaledNumber::whole(0)),
-            ),
-            ..Default::default()
-        }]),
+        load_control_limit_data: Some(vec![entry]),
     })
+}
+
+pub(super) fn limit_entry(
+    limit: &LimitWrite,
+    limit_id: LoadControlLimitId,
+    direction: Direction,
+) -> LoadControlLimitData {
+    LoadControlLimitData {
+        limit_id: Some(limit_id),
+        is_limit_active: Some(limit.is_active),
+        value: direction.apply_limit_sign(limit.value),
+        time_period: limit.duration.map(|duration| crate::model::TimePeriod {
+            end_time: Some(crate::model::format_iso8601_duration(duration).into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// The nominal maximum a Controllable System publishes in scenario 4.
@@ -370,34 +379,92 @@ pub fn heartbeat(
     })
 }
 
-/// Finds the `limitId` a Controllable System publishes this use case's limit under.
+/// Why a single writable active power limit could not be commissioned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LimitResolutionError {
+    /// The peer has not supplied both complete, usable lists for this feature.
+    #[error("the limit description and current lists are not both available")]
+    MissingSnapshot,
+    /// No description matches the requested direction, type, category and scope.
+    #[error("no matching active power limit description")]
+    NoDescription,
+    /// More than one description matches, even if the identifiers differ.
+    #[error("multiple matching active power limit descriptions")]
+    AmbiguousDescriptions,
+    /// The matching description omits its primary identifier.
+    #[error("the active power limit description has no limitId")]
+    MissingId,
+    /// Another description on this feature uses the selected identifier.
+    #[error("limitId {0} is reused in the limit descriptions")]
+    ReusedId(LoadControlLimitId),
+    /// The matching description omits its unit or specifies a unit other than watts.
+    #[error("limitId {0} must be measured in watts")]
+    WrongUnit(LoadControlLimitId),
+    /// The current list has no entry with the selected identifier.
+    #[error("no current entry for limitId {0}")]
+    MissingCurrent(LoadControlLimitId),
+    /// The current list contains the selected identifier more than once.
+    #[error("multiple current entries for limitId {0}")]
+    AmbiguousCurrent(LoadControlLimitId),
+    /// The current entry omits its changeable flag or explicitly denies writes.
+    #[error("limitId {0} does not declare isLimitChangeable=true")]
+    NotChangeable(LoadControlLimitId),
+}
+
+/// Resolves one writable LPC or LPP limit from the **same LoadControl feature's**
+/// resolved description and current lists (LPC/LPP Tables 22–23).
 ///
-/// Give it a `loadControlLimitDescriptionListData` — the peer's, read during
-/// pre-scenario communication. The specification leaves `limitId` to the device
-/// (`<l1#(1..1)>`, "SHALL be used as the primary identifier") and fixes everything that
-/// says what the limit *is*: `signDependentAbsValueLimit`, `obligation`, the direction,
-/// and the `activePowerLimit` scope (LPC/LPP Table 22). Those four are what this matches
-/// on, and they are what distinguishes the consumption limit from the production one on a
-/// device that serves both.
-///
-/// [`None`] means the peer published no such limit — a device that is not a Controllable
-/// System for this direction, or one that has not answered yet. An Energy Guard must not
-/// write until it has an answer, because the only alternative is guessing at a number
-/// that addresses something else.
-pub fn find_limit_id(data: &CmdData, direction: Direction) -> Option<LoadControlLimitId> {
-    let CmdData::LoadControlLimitDescriptionListData(list) = data else {
-        return None;
-    };
-    list.load_control_limit_description_data
+/// The identifier must be unique in both lists. Under a partial update an omitted
+/// field retains its previous value, so pass full or merged snapshots.
+pub fn resolve_writable_limit(
+    descriptions: &LoadControlLimitDescriptionListData,
+    current: &LoadControlLimitListData,
+    direction: Direction,
+) -> Result<LoadControlLimitId, LimitResolutionError> {
+    let descriptions = descriptions
+        .load_control_limit_description_data
+        .as_deref()
+        .unwrap_or_default();
+    let mut candidates = descriptions.iter().filter(|entry| {
+        entry.limit_type == Some(LoadControlLimitType::SignDependentAbsValueLimit)
+            && entry.limit_category == Some(LoadControlCategory::Obligation)
+            && entry.limit_direction == Some(direction.energy_direction())
+            && entry.scope_type == Some(ScopeType::ActivePowerLimit)
+    });
+    let selected = candidates
+        .next()
+        .ok_or(LimitResolutionError::NoDescription)?;
+    if candidates.next().is_some() {
+        return Err(LimitResolutionError::AmbiguousDescriptions);
+    }
+    let id = selected.limit_id.ok_or(LimitResolutionError::MissingId)?;
+    if descriptions
+        .iter()
+        .filter(|e| e.limit_id == Some(id))
+        .nth(1)
+        .is_some()
+    {
+        return Err(LimitResolutionError::ReusedId(id));
+    }
+    if selected.unit != Some(UnitOfMeasurement::W) {
+        return Err(LimitResolutionError::WrongUnit(id));
+    }
+    let mut entries = current
+        .load_control_limit_data
         .iter()
         .flatten()
-        .find(|entry| {
-            entry.limit_type == Some(LoadControlLimitType::SignDependentAbsValueLimit)
-                && entry.limit_category == Some(LoadControlCategory::Obligation)
-                && entry.limit_direction == Some(direction.energy_direction())
-                && entry.scope_type == Some(ScopeType::ActivePowerLimit)
-        })
-        .and_then(|entry| entry.limit_id)
+        .filter(|e| e.limit_id == Some(id));
+    let entry = entries
+        .next()
+        .ok_or(LimitResolutionError::MissingCurrent(id))?;
+    if entries.next().is_some() {
+        return Err(LimitResolutionError::AmbiguousCurrent(id));
+    }
+    if entry.is_limit_changeable != Some(true) {
+        return Err(LimitResolutionError::NotChangeable(id));
+    }
+    Ok(id)
 }
 
 /// The identifiers a peer chose for the data this use case addresses.
@@ -410,7 +477,7 @@ pub fn find_limit_id(data: &CmdData, direction: Direction) -> Option<LoadControl
 /// gets back says the write succeeded.
 ///
 /// [`EnergyGuardActor`](super::EnergyGuardActor) keeps one of these per peer and fills it
-/// from the two description reads it sends on [`attach`](super::EnergyGuardActor::attach).
+/// from its description and current-list reads on [`attach`](super::EnergyGuardActor::attach).
 /// It is public for a guard built by hand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PeerIds {
@@ -428,30 +495,11 @@ impl PeerIds {
         Self::default()
     }
 
-    /// Learns what one description payload says, and reports whether anything changed.
-    ///
-    /// Takes either description function and ignores anything else, so a caller can hand
-    /// it every payload that arrives from the peer without sorting them first.
-    pub fn learn(&mut self, data: &CmdData, direction: Direction) -> bool {
-        let mut changed = false;
-        if let Some(limit) = find_limit_id(data, direction)
-            && self.limit != Some(limit)
-        {
-            self.limit = Some(limit);
-            changed = true;
-        }
-        for (slot, name) in [
-            (&mut self.failsafe_limit, direction.failsafe_limit_key()),
-            (&mut self.failsafe_duration, FAILSAFE_DURATION_MINIMUM_KEY),
-        ] {
-            if let Some(key) = crate::usecases::addressing::find_key_id(data, &name)
-                && *slot != Some(key)
-            {
-                *slot = Some(key);
-                changed = true;
-            }
-        }
-        changed
+    pub(super) fn learn_failsafe_keys(&mut self, data: &CmdData, direction: Direction) {
+        self.failsafe_limit =
+            crate::usecases::addressing::find_key_id(data, &direction.failsafe_limit_key());
+        self.failsafe_duration =
+            crate::usecases::addressing::find_key_id(data, &FAILSAFE_DURATION_MINIMUM_KEY);
     }
 
     /// Whether the limit can be addressed, which is what a limit write needs.
@@ -460,44 +508,45 @@ impl PeerIds {
     }
 }
 
-/// Reads a `loadControlLimitListData` payload as a limit change.
+/// Reads a `loadControlLimitListData` payload as a local magnitude in watts.
+/// A value with the wrong wire sign or an unrepresentable magnitude is rejected.
 ///
 /// `limit_id` is the identifier the limit is published under **on the device the payload
 /// belongs to**: this device's own [`LIMIT_ID`] when a Controllable System reads a write
-/// addressed to it, and the peer's — from [`find_limit_id`] — when an Energy Guard reads
+/// addressed to it, and the peer's — from [`resolve_writable_limit`] — when an Energy Guard reads
 /// what a peer reports about itself. Returns [`None`] when the payload names a different
 /// limit, which the Controllable System refuses rather than guesses at.
 ///
 /// **Give this the resolved state, not a partial update.** It reads the payload as a
-/// complete description of the limit, so an absent `isLimitActive` reads as *not active*.
-/// That is right for a full value and wrong for a fragment, where an omitted element means
-/// *unchanged* (SPINE IG §3.3) — a partial write adjusting only `value` would otherwise
-/// read as a deactivation. Pass [`WriteRequest::resolved`], which is the update already
-/// merged into what is stored; [`WriteRequest::data`] is for asking *which* entries the
-/// write addresses.
+/// complete description of the limit, so it requires the value and activation flag.
+/// A partial write can omit either to mean *unchanged* (SPINE IG §3.3). Pass
+/// [`WriteRequest::resolved`] for the resulting state and use [`WriteRequest::data`]
+/// to determine which entries the write addresses.
 ///
 /// [`WriteRequest::resolved`]: crate::spine::WriteRequest::resolved
 /// [`WriteRequest::data`]: crate::spine::WriteRequest::data
-pub fn read_limit_write(data: &CmdData, limit_id: LoadControlLimitId) -> Option<LimitWrite> {
+pub fn read_limit_write(
+    data: &CmdData,
+    limit_id: LoadControlLimitId,
+    direction: Direction,
+) -> Option<LimitWrite> {
     let CmdData::LoadControlLimitListData(list) = data else {
         return None;
     };
-    let entry = list
+    let mut matching = list
         .load_control_limit_data
         .as_ref()?
         .iter()
-        .find(|e| e.limit_id == Some(limit_id))?;
+        .filter(|entry| entry.limit_id == Some(limit_id));
+    let entry = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
 
     // A `value` that is present but unreadable — a `scale` that overflows `f64`, say —
     // makes the whole write unusable. Refusing it produces a NACK; substituting a number
     // the peer never sent would apply a limit nobody asked for.
-    let value = match entry.value {
-        Some(value) => {
-            value.to_f64()?;
-            value.canonical()
-        }
-        None => ScaledNumber::whole(0),
-    };
+    let value = direction.apply_limit_sign(entry.value?)?;
 
     // The same rule for the duration, and here it matters more. §3.1.8.2: "Durations used
     // within this Use Case SHALL be presented as relative times. The same holds for the
@@ -514,11 +563,13 @@ pub fn read_limit_write(data: &CmdData, limit_id: LoadControlLimitId) -> Option<
         None => None,
     };
 
-    Some(LimitWrite {
-        is_active: entry.is_limit_active.unwrap_or(false),
+    let limit = LimitWrite {
+        is_active: entry.is_limit_active?,
         value,
         duration,
-    })
+    };
+    limit.check().ok()?;
+    Some(limit)
 }
 
 /// Reads a heartbeat notification's counter.
@@ -839,7 +890,9 @@ impl ControllableSystemActor {
         let mut limit_changed = false;
         if let Some(feature) = engine.device_mut().resolve_mut(&load_control) {
             let _ = feature.set_data(limit_description(self.direction));
-            limit_changed = feature.set_data(limit_data(&self.system)).unwrap_or(false);
+            limit_changed = feature
+                .set_data(limit_data(&self.system, self.direction, now))
+                .unwrap_or(false);
         }
         let mut failsafe_changed = false;
         if let Some(feature) = engine.device_mut().resolve_mut(&configuration) {
@@ -906,15 +959,23 @@ impl ControllableSystemActor {
     /// way and no other.
     pub fn handle_timeout(&mut self, engine: &mut Engine, now: Duration) -> Option<CsEvent> {
         let diagnosis = self.device_diagnosis.clone();
-        self.heartbeat.tick(engine, &diagnosis, now);
+        let heartbeat_due = self.heartbeat.tick(engine, &diagnosis, now);
 
         let before = self.system.state();
+        let remaining = self.system.reported_limit(now).duration;
         self.system.handle_timeout(now);
         let after = self.system.state();
+        // Refresh a running countdown at the heartbeat cadence. Calling this method
+        // more frequently must not generate a new notification on every tick.
+        if before != after
+            || remaining == Some(Duration::ZERO)
+            || (heartbeat_due && remaining.is_some())
+        {
+            self.publish(engine, now);
+        }
         if before == after {
             return None;
         }
-        self.publish(engine, now);
         Some(CsEvent::StateChanged {
             from: before,
             to: after,
@@ -1049,30 +1110,40 @@ impl ControllableSystemActor {
                 self.follow_the_guards_heartbeat(engine, now);
                 None
             }
-            SpineEvent::BindingReleased { server, .. } => {
-                if same_entity_address(server, &self.load_control) {
-                    self.bound_load_control = None;
-                } else if same_entity_address(server, &self.device_configuration) {
-                    self.bound_configuration = None;
+            SpineEvent::BindingReleased { client, server } => {
+                let binding = if crate::spine::same_feature(server, &self.load_control) {
+                    &mut self.bound_load_control
+                } else if crate::spine::same_feature(server, &self.device_configuration) {
+                    &mut self.bound_configuration
+                } else {
+                    return None;
+                };
+                if binding
+                    .as_ref()
+                    .is_some_and(|bound| crate::spine::same_feature(bound, client))
+                {
+                    *binding = None;
+                    self.forget_guard();
                 }
-                self.guard = None;
-                self.guard_diagnosis = None;
-                self.subscribed = false;
-                self.guard_discovery_asked = false;
                 None
             }
+            SpineEvent::PeerRemoved { device } => {
+                for binding in [&mut self.bound_load_control, &mut self.bound_configuration] {
+                    if binding.as_ref().and_then(|client| client.device.as_ref()) == Some(device) {
+                        *binding = None;
+                    }
+                }
+                if self.guard.as_ref().and_then(|guard| guard.device.as_ref()) == Some(device) {
+                    self.forget_guard();
+                }
+                None
+            }
+            // The engine may have timed out or disconnected a peer while the event
+            // was queued. Only a live request may change the appliance or its audit.
+            SpineEvent::WriteRequested(write) if !engine.can_answer_write(write.token, now) => None,
             // `data` for the entries a write addresses, `resolved` for what they become.
             SpineEvent::WriteRequested(write) if write.feature == self.load_control => {
-                Some(self.decide_limit(
-                    engine,
-                    write.token,
-                    write.request,
-                    &write.from,
-                    &write.data,
-                    &write.resolved,
-                    now,
-                    decide,
-                ))
+                Some(self.decide_limit(engine, write, now, decide))
             }
             SpineEvent::WriteRequested(write) if write.feature == self.device_configuration => {
                 Some(self.decide_failsafe(
@@ -1086,6 +1157,13 @@ impl ControllableSystemActor {
             }
             _ => None,
         }
+    }
+
+    fn forget_guard(&mut self) {
+        self.guard = None;
+        self.guard_diagnosis = None;
+        self.subscribed = false;
+        self.guard_discovery_asked = false;
     }
 
     /// §3.8: the Energy Guard entity is the one that binds both features.
@@ -1162,30 +1240,30 @@ impl ControllableSystemActor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn decide_limit(
         &mut self,
         engine: &mut Engine,
-        token: WriteToken,
-        request: crate::model::MsgCounter,
-        from: &FeatureAddress,
-        data: &CmdData,
-        resolved: &CmdData,
+        request: &crate::spine::WriteRequest,
         now: Duration,
         decide: impl FnOnce(&LimitWrite) -> LocalDecision,
     ) -> CsEvent {
-        let peer = from.device.clone();
-        // `data` says whether this write addresses the active power limit at all;
-        // `resolved` says what that limit becomes, with anything the partial write left
-        // out filled in from what is stored (SPINE IG §3.3).
-        // The identifier is this device's own: the write arrived at a feature this
-        // device published, under the `limitId` it published there.
-        let addressed = read_limit_write(data, LIMIT_ID).is_some();
+        let peer = request.from.device.clone();
+        // Only the arriving fragment tells us which entries the sender addressed;
+        // only the merged snapshot tells us what a partial update will apply.
+        let addressed = matches!(&request.data, CmdData::LoadControlLimitListData(list)
+            if matches!(list.load_control_limit_data.as_deref(), Some([entry]) if entry.limit_id == Some(LIMIT_ID)));
         let write = if addressed {
-            read_limit_write(resolved, LIMIT_ID)
+            // A partial write inherits its omitted fields from *now*. In particular,
+            // copying an old relative endTime would restart the limit's timer.
+            let current = limit_data(&self.system, self.direction, now);
+            engine
+                .resolve_pending_write(request.token, current)
+                .and_then(|resolved| read_limit_write(&resolved, LIMIT_ID, self.direction))
         } else {
             None
         };
+        let token = request.token;
+        let request = request.request;
         let Some(write) = write else {
             // Two different refusals share this path, and they differ in one way that
             // matters: whether the state machine hears about it. A write that never named
@@ -1208,20 +1286,17 @@ impl ControllableSystemActor {
         // handles everything else — the ordering gate, the value range and the transition
         // — and its gate is checked before the decision is.
         let decision = decide(&write);
-        let mut outcome = self.system.on_limit_write(&write, decision, now);
-
+        let mut next = self.system.clone();
+        let mut outcome = next.on_limit_write(&write, decision, now);
         if outcome.is_accepted() {
-            if engine.accept_write(token, now).is_err() {
-                // The decision was to accept and the engine could not store it, so what
-                // went to the peer was an error. The record has to say what the peer was
-                // told, not what this system meant — and the state machine, which moved
-                // on the decision, is put back where a refusal leaves it.
-                outcome = WriteOutcome::Rejected(super::state::NackReason::NotStored);
-                self.system.on_unstored_limit_write(now);
+            let data = limit_data(&next, self.direction, now);
+            if engine.accept_write_with(token, data, now).is_ok() {
+                self.system = next;
+            } else {
+                outcome = self.system.on_unstored_limit_write(now);
             }
-            // The peer reads back what was applied, not what it asked for.
-            self.publish(engine, now);
         } else {
+            self.system = next;
             engine.reject_write(token, outcome.error_number(), now);
         }
         self.log(request, write, outcome, peer, now);
@@ -1325,11 +1400,6 @@ impl ControllableSystemActor {
         }
         CsEvent::FailsafeDecided { request, outcome }
     }
-}
-
-/// Whether two addresses name features of the same entity.
-fn same_entity_address(a: &FeatureAddress, b: &FeatureAddress) -> bool {
-    crate::spine::same_entity(a, b)
 }
 
 impl crate::usecases::signals::Signals for ControllableSystemActor {

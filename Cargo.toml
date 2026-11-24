@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "eebus"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ documentation = "https://docs.rs/eebus"
 keywords = ["eebus", "ship", "spine", "energy", "smart-home"]
 categories = ["network-programming", "embedded", "encoding"]
 readme = "README.md"
-exclude = ["concepts/", "specs/", ".specify/", ".claude/", ".github/", "scripts/", "site/", "xtask/", "fuzz/", "deny.toml"]
+exclude = ["concepts/", "specs/", ".specify/", ".agents/", ".claude/", ".github/", "scripts/", "site/", "xtask/", "fuzz/", "deny.toml"]
 
 [features]
 default = ["std", "pairing", "conformance"]
